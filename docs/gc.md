@@ -5,7 +5,7 @@
 ## Construction
 
 ```python
-from vkv import GCVersioned
+from kvit import GCVersioned
 
 v = GCVersioned(high_water_bytes=10_000)
 
@@ -13,7 +13,7 @@ v = GCVersioned(high_water_bytes=10_000)
 v = GCVersioned(high_water_bytes=10_000, low_water_bytes=5_000)
 
 # With a shared store and branch
-from vkv.kv.memory import Memory
+from kvit.kv.memory import Memory
 store = Memory()
 v = GCVersioned(store, branch="main", high_water_bytes=50_000)
 ```
@@ -112,7 +112,7 @@ Frozen dataclass returned by `rebase()` and `maybe_rebase()`.
 ## Example
 
 ```python
-from vkv import GCVersioned
+from kvit import GCVersioned
 
 v = GCVersioned(high_water_bytes=200, low_water_bytes=100)
 
@@ -136,7 +136,7 @@ print(v.get("c"))             # b"zzz..." (retained)
 For the set/commit pattern, wrap GCVersioned in Staged:
 
 ```python
-from vkv import GCVersioned, Staged
+from kvit import GCVersioned, Staged
 
 v = GCVersioned(high_water_bytes=10_000)
 s = Staged(v)
@@ -148,7 +148,7 @@ s.commit()
 Or use the factory:
 
 ```python
-import vkv
+import kvit
 
-s = vkv.store(high_water_bytes=10_000)
+s = kvit.store(high_water_bytes=10_000)
 ```

@@ -2,7 +2,7 @@
 
 import pytest
 
-from vkv import Live
+from kvit import Live
 
 
 class TestLiveBasic:

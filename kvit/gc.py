@@ -92,7 +92,6 @@ class GCVersioned(Versioned):
         info: dict | None = None,
     ) -> "MergeResult":
         """Commit changes, then run GC if above high water mark."""
-        from .versioned import MergeResult
 
         result = super().commit(
             updates,

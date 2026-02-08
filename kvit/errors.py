@@ -1,4 +1,4 @@
-"""vkv error types."""
+"""kvit error types."""
 
 
 class ConcurrencyError(Exception):

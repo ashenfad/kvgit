@@ -1,4 +1,4 @@
-# vkv
+# kvit
 
 Versioned key-value store with git-like commit, branch, and merge semantics.
 
@@ -17,17 +17,17 @@ Values are bytes. Commits are content-addressable. Branches are cheap. Merges ar
 ## Install
 
 ```bash
-pip install vkv            # in-memory only
-pip install vkv[disk]      # adds disk backend via diskcache
+pip install kvit            # in-memory only
+pip install kvit[disk]      # adds disk backend via diskcache
 ```
 
 ## Quick example
 
 ```python
-import vkv
+import kvit
 
 # Create a store (Staged backed by in-memory Versioned)
-s = vkv.store()
+s = kvit.store()
 
 # Write and commit
 s.set("user", b"alice")
@@ -35,10 +35,10 @@ s.set("score", b"\x00" * 8)
 s.commit()
 
 # Content types handle typed merge logic
-from vkv import counter
+from kvit import counter
 
 ct = counter()
-s2 = vkv.store()
+s2 = kvit.store()
 s2.set("hits", ct.encode(100))
 s2.commit()
 

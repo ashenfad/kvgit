@@ -2,8 +2,8 @@
 
 import pytest
 
-from vkv import MergeConflict, MergeResult, Versioned, counter
-from vkv.kv.memory import Memory
+from kvit import MergeConflict, MergeResult, Versioned, counter
+from kvit.kv.memory import Memory
 
 
 class TestVersionedBasic:
@@ -720,7 +720,7 @@ class TestMergeResultReturn:
         v1 = Versioned(store)
         v1.commit({"x": b"1"})
 
-        from vkv.versioned import BRANCH_HEAD, _to_bytes
+        from kvit.versioned import BRANCH_HEAD, _to_bytes
 
         v2 = Versioned(store)
 

@@ -2,7 +2,7 @@
 
 import threading
 
-from vkv.kv.memory import Memory
+from kvit.kv.memory import Memory
 
 
 class TestMemoryBasic:

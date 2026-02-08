@@ -2,18 +2,18 @@
 
 `Versioned` is the central class. It provides a commit log over any `KVStore` backend, with reads, atomic commit+merge, branching, and history traversal.
 
-Most users should use `Staged` (via `vkv.store()`) for the set/remove/commit pattern. `Versioned` is the lower-level engine that `Staged` wraps.
+Most users should use `Staged` (via `kvit.store()`) for the set/remove/commit pattern. `Versioned` is the lower-level engine that `Staged` wraps.
 
 ## Construction
 
 ```python
-from vkv import Versioned
+from kvit import Versioned
 
 # Default: in-memory store, "main" branch, new empty commit
 v = Versioned()
 
 # Shared store, specific branch
-from vkv.kv.memory import Memory
+from kvit.kv.memory import Memory
 store = Memory()
 v1 = Versioned(store, branch="main")
 v2 = Versioned(store, branch="dev")
@@ -93,7 +93,7 @@ v.commit(info={"checkpoint": True})
 
 #### Three-way merge behavior
 
-When HEAD has diverged, vkv computes the LCA and diffs both sides:
+When HEAD has diverged, kvit computes the LCA and diffs both sides:
 
 - Keys changed only by us: taken
 - Keys changed only by them: taken
