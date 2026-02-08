@@ -2,9 +2,9 @@
 
 import pytest
 
-from vkv import ConcurrencyError, GCVersioned
-from vkv.kv.memory import Memory
-from vkv.versioned import BRANCH_HEAD, _to_bytes
+from kvit import ConcurrencyError, GCVersioned
+from kvit.kv.memory import Memory
+from kvit.versioned import BRANCH_HEAD, _to_bytes
 
 
 class TestGCNoOp:

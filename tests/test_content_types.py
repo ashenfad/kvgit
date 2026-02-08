@@ -1,7 +1,7 @@
 """Tests for content types."""
 
-from vkv import Versioned, counter, json_value, last_writer_wins
-from vkv.kv.memory import Memory
+from kvit import Versioned, counter, json_value, last_writer_wins
+from kvit.kv.memory import Memory
 
 
 class TestCounter:

@@ -2,8 +2,8 @@
 
 import pytest
 
-from vkv import MergeResult, Namespaced, Staged, Versioned, counter
-from vkv.kv.memory import Memory
+from kvit import MergeResult, Namespaced, Staged, Versioned, counter
+from kvit.kv.memory import Memory
 
 
 def _staged(store=None, **kwargs):

@@ -5,7 +5,7 @@ import tempfile
 
 import pytest
 
-from vkv.kv.disk import Disk
+from kvit.kv.disk import Disk
 
 
 @pytest.fixture

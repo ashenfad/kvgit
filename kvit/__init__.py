@@ -1,4 +1,4 @@
-"""vkv: Versioned key-value store."""
+"""kvit: Versioned key-value store."""
 
 from .content_types import ContentType, counter, json_value, last_writer_wins
 from .errors import ConcurrencyError, MergeConflict

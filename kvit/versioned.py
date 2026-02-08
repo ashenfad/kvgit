@@ -235,7 +235,7 @@ class Versioned:
         """Register a ContentType for a key (sets its merge function).
 
         Args:
-            ct: A ContentType instance (from vkv.content_types).
+            ct: A ContentType instance (from kvit.content_types).
         """
         self._content_types[key] = ct
         self.set_merge_fn(key, ct.as_merge_fn())

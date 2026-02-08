@@ -5,7 +5,7 @@
 `Store` is the primary user-facing interface. It provides set/get/commit semantics. All high-level types implement it.
 
 ```python
-from vkv import Store
+from kvit import Store
 ```
 
 | Method | Signature | Description |
@@ -26,30 +26,30 @@ from vkv import Store
 
 `Live` raises `NotImplementedError` for `commit`, `reset`, `create_branch`, `checkout`, and `list_branches`.
 
-## Factory: `vkv.store()`
+## Factory: `kvit.store()`
 
 The simplest way to create a Store:
 
 ```python
-import vkv
+import kvit
 
 # Default: Staged backed by in-memory Versioned
-s = vkv.store()
+s = kvit.store()
 
 # Live store (immediate writes, no versioning)
-s = vkv.store(type="live")
+s = kvit.store(type="live")
 
 # With disk persistence
-s = vkv.store(storage="disk", path="/path/to/db")
+s = kvit.store(storage="disk", path="/path/to/db")
 
 # With garbage collection
-s = vkv.store(high_water_bytes=10_000)
+s = kvit.store(high_water_bytes=10_000)
 
 # Custom branch
-s = vkv.store(branch="dev")
+s = kvit.store(branch="dev")
 ```
 
-### `vkv.store(type="versioned", storage="memory", *, path=None, branch="main", high_water_bytes=None, low_water_bytes=None)`
+### `kvit.store(type="versioned", storage="memory", *, path=None, branch="main", high_water_bytes=None, low_water_bytes=None)`
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -67,7 +67,7 @@ s = vkv.store(branch="dev")
 `Staged` wraps a `Versioned` instance. Individual `set()` / `remove()` calls are buffered in memory. `commit()` flushes them as a single atomic commit.
 
 ```python
-from vkv import Staged, Versioned
+from kvit import Staged, Versioned
 
 v = Versioned()
 s = Staged(v)
@@ -125,7 +125,7 @@ s.set_default_merge(fn)              # delegates to Versioned
 `Live` wraps a `KVStore` directly. Writes take effect immediately. Versioning operations (`commit`, `reset`, `create_branch`, `checkout`, `list_branches`) raise `NotImplementedError`.
 
 ```python
-from vkv import Live
+from kvit import Live
 
 s = Live()
 s.set("k", b"v")
@@ -147,10 +147,10 @@ Creates an in-memory backend if None.
 `Namespaced` provides a key-prefixed view over any `Store`. All keys are transparently prefixed with `namespace/`.
 
 ```python
-from vkv import Namespaced
-import vkv
+from kvit import Namespaced
+import kvit
 
-s = vkv.store()
+s = kvit.store()
 agent = Namespaced(s, "agent")
 config = Namespaced(s, "config")
 
@@ -232,7 +232,7 @@ ns.list_branches()        # delegates to underlying store
 All backends implement the `KVStore` abstract base class. Values are bytes-only; serialization is handled by higher layers.
 
 ```python
-from vkv import KVStore
+from kvit import KVStore
 ```
 
 ### Methods
@@ -253,14 +253,14 @@ from vkv import KVStore
 
 ### Compare-and-Swap (CAS)
 
-`cas(key, value, expected)` sets `key` to `value` only if the current value equals `expected`. Pass `expected=None` to require the key not exist. Returns `True` on success. This is the foundation of vkv's optimistic concurrency.
+`cas(key, value, expected)` sets `key` to `value` only if the current value equals `expected`. Pass `expected=None` to require the key not exist. Returns `True` on success. This is the foundation of kvit's optimistic concurrency.
 
 ## Memory
 
 In-memory backend. Fast, no dependencies, no persistence.
 
 ```python
-from vkv.kv.memory import Memory
+from kvit.kv.memory import Memory
 
 store = Memory()
 ```
@@ -274,11 +274,11 @@ The underlying dict is accessible as `store.memory` for debugging.
 Persistent backend via [diskcache](https://pypi.org/project/diskcache/). Requires the `disk` extra.
 
 ```bash
-pip install vkv[disk]
+pip install kvit[disk]
 ```
 
 ```python
-from vkv.kv.disk import Disk
+from kvit.kv.disk import Disk
 
 store = Disk("/path/to/db")
 ```
@@ -288,7 +288,7 @@ store = Disk("/path/to/db")
 Implement `KVStore` to use any storage:
 
 ```python
-from vkv import KVStore
+from kvit import KVStore
 
 class RedisStore(KVStore):
     def get(self, key):
@@ -310,7 +310,7 @@ class RedisStore(KVStore):
 Raised when a CAS operation fails during `commit()` or `rebase()`. Another writer updated HEAD between when this branch started and when the commit was attempted.
 
 ```python
-from vkv import ConcurrencyError
+from kvit import ConcurrencyError
 
 try:
     v.commit({"k": b"v"})
@@ -324,7 +324,7 @@ except ConcurrencyError:
 Raised when a three-way merge encounters keys that both sides changed and no merge function resolves them.
 
 ```python
-from vkv import MergeConflict
+from kvit import MergeConflict
 
 try:
     v.commit({"k": b"v"})

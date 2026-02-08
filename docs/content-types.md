@@ -1,6 +1,6 @@
 # Content Types
 
-Content types bundle encode, decode, and merge logic for typed values. They sit on top of the bytes-only `Versioned` layer -- vkv never interprets your data; you bring your own types.
+Content types bundle encode, decode, and merge logic for typed values. They sit on top of the bytes-only `Versioned` layer -- kvit never interprets your data; you bring your own types.
 
 ## ContentType
 
@@ -24,7 +24,7 @@ Converts the content type into a bytes-level merge function suitable for `Versio
 ### Registration
 
 ```python
-from vkv import Versioned, counter
+from kvit import Versioned, counter
 
 v = Versioned()
 ct = counter()
@@ -46,8 +46,8 @@ An integer counter. Values are stored as signed big-endian (default) or little-e
 Merge strategy: `ours + theirs - old`. Both sides' increments are preserved.
 
 ```python
-from vkv import Versioned, counter
-from vkv.kv.memory import Memory
+from kvit import Versioned, counter
+from kvit.kv.memory import Memory
 
 ct = counter()
 
@@ -74,7 +74,7 @@ ct.decode(v2.get("hits"))  # 135 (115 + 120 - 100)
 Identity encode/decode (values must already be bytes). Merge always returns `theirs`.
 
 ```python
-from vkv import last_writer_wins
+from kvit import last_writer_wins
 
 ct = last_writer_wins()
 ct.merge(b"old", b"ours", b"theirs")  # b"theirs"
@@ -85,7 +85,7 @@ ct.merge(b"old", b"ours", b"theirs")  # b"theirs"
 JSON-encoded values. Defaults to last-writer-wins on decoded values. Pass a custom `merge_fn` for smarter merging.
 
 ```python
-from vkv import json_value
+from kvit import json_value
 
 # Default: LWW on decoded JSON
 ct = json_value()
@@ -109,7 +109,7 @@ ct = json_value(merge_fn=merge_lists)
 Build your own by providing encode, decode, and merge functions:
 
 ```python
-from vkv import ContentType
+from kvit import ContentType
 
 def encode_set(s: set) -> bytes:
     import json

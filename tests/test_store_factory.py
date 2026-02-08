@@ -1,8 +1,8 @@
-"""Tests for the vkv.store() factory function."""
+"""Tests for the kvit.store() factory function."""
 
 import pytest
 
-from vkv import Live, Staged, store
+from kvit import Live, Staged, store
 
 
 class TestStoreFactory:
@@ -41,7 +41,7 @@ class TestStoreFactory:
             s.commit()
 
     def test_gc_versioned(self):
-        from vkv import GCVersioned
+        from kvit import GCVersioned
 
         s = store(high_water_bytes=5000)
         assert isinstance(s, Staged)

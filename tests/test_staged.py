@@ -1,7 +1,7 @@
 """Tests for the Staged buffered-write layer."""
 
-from vkv import MergeResult, Staged, Versioned
-from vkv.kv.memory import Memory
+from kvit import MergeResult, Staged, Versioned
+from kvit.kv.memory import Memory
 
 
 class TestStagedBasic:
