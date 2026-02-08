@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Iterable
 
-from .versioned import Versioned
+from .versioned import MergeFn, MergeResult, Versioned
 
 
 class Namespaced:
@@ -72,3 +72,74 @@ class Namespaced:
 
     def __contains__(self, key: str) -> bool:
         return self._prefixed(key) in self.base_store
+
+    # -- Write operations --
+
+    def snapshot(
+        self,
+        updates: dict[str, bytes] | None = None,
+        removals: set[str] | None = None,
+        *,
+        info: dict | None = None,
+    ) -> str:
+        """Create a commit with namespaced key changes."""
+        prefixed_updates = (
+            {self._prefixed(k): v for k, v in updates.items()}
+            if updates else None
+        )
+        prefixed_removals = (
+            {self._prefixed(k) for k in removals}
+            if removals else None
+        )
+        return self.base_store.snapshot(
+            prefixed_updates, prefixed_removals, info=info
+        )
+
+    def merge(
+        self,
+        on_conflict: str = "raise",
+        *,
+        merge_fns: dict[str, MergeFn] | None = None,
+        default_merge: MergeFn | None = None,
+        info: dict | None = None,
+    ) -> MergeResult:
+        """Merge the underlying branch (delegates to base store).
+
+        Per-key merge_fns are auto-prefixed with the namespace.
+        """
+        prefixed_fns = (
+            {self._prefixed(k): v for k, v in merge_fns.items()}
+            if merge_fns else None
+        )
+        return self.base_store.merge(
+            on_conflict,
+            merge_fns=prefixed_fns,
+            default_merge=default_merge,
+            info=info,
+        )
+
+    def set_merge_fn(self, key: str, fn: MergeFn) -> None:
+        """Register a merge function for a namespaced key."""
+        self.base_store.set_merge_fn(self._prefixed(key), fn)
+
+    def set_content_type(self, key: str, ct) -> None:
+        """Register a ContentType for a namespaced key."""
+        self.base_store.set_content_type(self._prefixed(key), ct)
+
+    def set_default_merge(self, fn: MergeFn) -> None:
+        """Register a default merge function (store-wide)."""
+        self.base_store.set_default_merge(fn)
+
+    # -- Convenience properties --
+
+    @property
+    def current_commit(self) -> str:
+        return self.base_store.current_commit
+
+    @property
+    def base_commit(self) -> str:
+        return self.base_store.base_commit
+
+    @property
+    def last_merge_result(self) -> MergeResult | None:
+        return self.base_store.last_merge_result

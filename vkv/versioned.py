@@ -47,6 +47,9 @@ class MergeResult:
     auto_merged_keys: tuple[str, ...]
     carried_keys: tuple[str, ...]
 
+    def __bool__(self) -> bool:
+        return self.merged
+
 
 @dataclass
 class MetaEntry:
@@ -304,7 +307,7 @@ class Versioned:
         merge_fns: dict[str, MergeFn] | None = None,
         default_merge: MergeFn | None = None,
         info: dict | None = None,
-    ) -> bool:
+    ) -> MergeResult:
         """Atomically update HEAD to this branch's tip.
 
         If HEAD has diverged, attempts a three-way merge using the
@@ -317,8 +320,7 @@ class Versioned:
             info: Optional info dict for the merge commit.
 
         Returns:
-            True if HEAD was updated. False if on_conflict='abandon'
-            and the operation could not complete.
+            A MergeResult (truthy when merged, falsy otherwise).
 
         Raises:
             ConcurrencyError: If on_conflict='raise' and CAS fails.
@@ -329,14 +331,15 @@ class Versioned:
 
         # Case 1: No local changes
         if self._current_commit == self._base_commit:
-            self.last_merge_result = MergeResult(
+            result = MergeResult(
                 merged=True,
                 commit=self._current_commit,
                 strategy="no_op",
                 auto_merged_keys=(),
                 carried_keys=(),
             )
-            return True
+            self.last_merge_result = result
+            return result
 
         current_head = self.latest_head
 
@@ -346,16 +349,25 @@ class Versioned:
             new_head = pickle.dumps(self._current_commit)
             if self.store.cas(branch_key, new_head, expected=expected):
                 self._base_commit = self._current_commit
-                self.last_merge_result = MergeResult(
+                result = MergeResult(
                     merged=True,
                     commit=self._current_commit,
                     strategy="fast_forward",
                     auto_merged_keys=(),
                     carried_keys=tuple(self._commit_keys.keys()),
                 )
-                return True
+                self.last_merge_result = result
+                return result
             if on_conflict == "abandon":
-                return False
+                result = MergeResult(
+                    merged=False,
+                    commit=None,
+                    strategy="fast_forward",
+                    auto_merged_keys=(),
+                    carried_keys=(),
+                )
+                self.last_merge_result = result
+                return result
             raise ConcurrencyError(
                 f"HEAD changed from {self._base_commit}. Reset and retry."
             )
@@ -377,13 +389,21 @@ class Versioned:
         merge_fns: dict[str, MergeFn] | None,
         default_merge: MergeFn | None,
         info: dict | None,
-    ) -> bool:
+    ) -> MergeResult:
         """Perform a three-way merge between our branch and their HEAD."""
         branch_key = BRANCH_HEAD % self._branch
         lca = self._find_lca(self._current_commit, their_head)
         if lca is None:
             if on_conflict == "abandon":
-                return False
+                result = MergeResult(
+                    merged=False,
+                    commit=None,
+                    strategy="three_way",
+                    auto_merged_keys=(),
+                    carried_keys=(),
+                )
+                self.last_merge_result = result
+                return result
             raise ConcurrencyError(
                 "No common ancestor found between current commit and HEAD."
             )
@@ -541,7 +561,7 @@ class Versioned:
             self._current_commit = merge_hash
             self._base_commit = merge_hash
             self._meta = merged_meta
-            self.last_merge_result = MergeResult(
+            result = MergeResult(
                 merged=True,
                 commit=merge_hash,
                 strategy="three_way",
@@ -552,10 +572,19 @@ class Versioned:
                     if k not in auto_merged and k not in merged_values
                 ),
             )
-            return True
+            self.last_merge_result = result
+            return result
 
         if on_conflict == "abandon":
-            return False
+            result = MergeResult(
+                merged=False,
+                commit=None,
+                strategy="three_way",
+                auto_merged_keys=(),
+                carried_keys=(),
+            )
+            self.last_merge_result = result
+            return result
         raise ConcurrencyError(
             "HEAD changed during three-way merge. Reset and retry."
         )
@@ -575,6 +604,22 @@ class Versioned:
             return None
         return Versioned(
             self.store, commit_hash=commit_hash, branch=self._branch
+        )
+
+    def create_branch(self, name: str) -> "Versioned":
+        """Fork the current commit onto a new branch.
+
+        Returns a new Versioned instance on the new branch, pointing
+        at the same commit as self.
+
+        Raises ValueError if the branch already exists.
+        """
+        branch_key = BRANCH_HEAD % name
+        if self.store.get(branch_key) is not None:
+            raise ValueError(f"Branch '{name}' already exists")
+        self.store.set(branch_key, pickle.dumps(self._current_commit))
+        return Versioned(
+            self.store, commit_hash=self._current_commit, branch=name
         )
 
     def reset_to(self, commit_hash: str) -> bool:

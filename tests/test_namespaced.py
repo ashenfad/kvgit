@@ -2,7 +2,8 @@
 
 import pytest
 
-from vkv import Namespaced, Versioned
+from vkv import MergeResult, Namespaced, Versioned, counter
+from vkv.kv.memory import Memory
 
 
 class TestNamespacedBasic:
@@ -101,3 +102,115 @@ class TestNamespacedValidation:
     def test_invalid_store_type_rejected(self):
         with pytest.raises(TypeError, match="not dict"):
             Namespaced({}, "ns")  # type: ignore
+
+
+class TestNamespacedWrite:
+    def test_snapshot_auto_prefixes(self):
+        v = Versioned()
+        ns = Namespaced(v, "myns")
+        ns.snapshot({"k": b"v"})
+        assert v.get("myns/k") == b"v"
+
+    def test_snapshot_removals_prefixed(self):
+        v = Versioned()
+        ns = Namespaced(v, "app")
+        ns.snapshot({"x": b"1", "y": b"2"})
+        ns.snapshot(removals={"x"})
+        assert ns.get("x") is None
+        assert ns.get("y") == b"2"
+
+    def test_snapshot_with_info(self):
+        v = Versioned()
+        ns = Namespaced(v, "app")
+        ns.snapshot({"k": b"v"}, info={"author": "test"})
+        assert v.commit_info() == {"author": "test"}
+
+    def test_merge_delegates(self):
+        store = Memory()
+        v1 = Versioned(store)
+        ns1 = Namespaced(v1, "app")
+        ns1.snapshot({"k": b"1"})
+        ns1.merge()
+
+        v2 = Versioned(store)
+        ns2 = Namespaced(v2, "app")
+        ns2.snapshot({"k": b"2"})
+
+        result = ns2.merge()
+        assert isinstance(result, MergeResult)
+        assert result.merged
+
+    def test_merge_fns_auto_prefixed(self):
+        """merge_fns keys are auto-prefixed with namespace."""
+        store = Memory()
+        v1 = Versioned(store)
+        ns1 = Namespaced(v1, "ns")
+        ns1.snapshot({"k": b"base"})
+        ns1.merge()
+
+        v2 = Versioned(store)
+        ns2 = Namespaced(v2, "ns")
+
+        ns1.snapshot({"k": b"v1_update"})
+        ns1.merge()
+        ns2.snapshot({"k": b"v2_update"})
+
+        # Merge fn concatenates both values
+        concat = lambda old, ours, theirs: ours + b"+" + theirs
+        result = ns2.merge(merge_fns={"k": concat})
+        assert result.merged
+        # ours=ns2's value, theirs=HEAD (v1's value)
+        assert ns2.get("k") == b"v2_update+v1_update"
+
+    def test_set_content_type_prefixed(self):
+        """set_content_type registers with the prefixed key."""
+        store = Memory()
+        ct = counter()
+
+        v1 = Versioned(store)
+        ns1 = Namespaced(v1, "stats")
+        ns1.snapshot({"hits": ct.encode(10)})
+        ns1.merge()
+
+        v2 = Versioned(store)
+        ns2 = Namespaced(v2, "stats")
+        ns2.set_content_type("hits", ct)
+
+        ns1.snapshot({"hits": ct.encode(15)})
+        ns1.merge()
+        ns2.snapshot({"hits": ct.encode(20)})
+
+        assert ns2.merge()
+        assert ct.decode(ns2.get("hits")) == 25  # 15 + 20 - 10
+
+    def test_two_namespaces_independent_writes(self):
+        v = Versioned()
+        ns1 = Namespaced(v, "one")
+        ns2 = Namespaced(v, "two")
+        ns1.snapshot({"k": b"from-one"})
+        ns2.snapshot({"k": b"from-two"})
+        assert ns1.get("k") == b"from-one"
+        assert ns2.get("k") == b"from-two"
+
+
+class TestNamespacedProperties:
+    def test_current_commit_delegates(self):
+        v = Versioned()
+        ns = Namespaced(v, "app")
+        assert ns.current_commit == v.current_commit
+        ns.snapshot({"k": b"v"})
+        assert ns.current_commit == v.current_commit
+
+    def test_base_commit_delegates(self):
+        v = Versioned()
+        ns = Namespaced(v, "app")
+        assert ns.base_commit == v.base_commit
+
+    def test_last_merge_result_delegates(self):
+        store = Memory()
+        v = Versioned(store)
+        ns = Namespaced(v, "app")
+        ns.snapshot({"k": b"v"})
+        ns.merge()
+        assert ns.last_merge_result is v.last_merge_result
+        assert ns.last_merge_result.merged

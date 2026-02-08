@@ -1,6 +1,6 @@
 """Tests for the Versioned commit log."""
 
-from vkv import Versioned
+from vkv import MergeResult, Versioned
 from vkv.kv.memory import Memory
 
 
@@ -408,6 +408,50 @@ class TestBranches:
         old = v.checkout(h)
         assert old._branch == "dev"
 
+    def test_create_branch_forks_current_commit(self):
+        store = Memory()
+        v = Versioned(store)
+        v.snapshot({"a": b"1"})
+        v.merge()
+
+        dev = v.create_branch("dev")
+        assert dev._branch == "dev"
+        assert dev.current_commit == v.current_commit
+        assert dev.get("a") == b"1"
+
+    def test_create_branch_diverge_and_merge(self):
+        store = Memory()
+        v = Versioned(store)
+        v.snapshot({"base": b"0"})
+        v.merge()
+
+        dev = v.create_branch("dev")
+        dev.snapshot({"feature": b"1"})
+        dev.merge()
+
+        # Main doesn't see dev's data
+        main = Versioned(store, branch="main")
+        assert main.get("feature") is None
+        assert main.get("base") == b"0"
+
+    def test_create_branch_already_exists(self):
+        import pytest
+
+        store = Memory()
+        v = Versioned(store)
+        with pytest.raises(ValueError, match="already exists"):
+            v.create_branch("main")
+
+    def test_create_branch_appears_in_branches_list(self):
+        store = Memory()
+        v = Versioned(store)
+        v.create_branch("dev")
+        v.create_branch("staging")
+        branches = Versioned.branches(store)
+        assert "dev" in branches
+        assert "staging" in branches
+        assert "main" in branches
+
 
 class TestThreeWayMerge:
     def test_auto_merge_non_overlapping(self):
@@ -671,3 +715,81 @@ class TestThreeWayMerge:
         assert v2.get("existing") is None
         assert v2.get("new_key") == b"new"
         assert v2.get("keep") == b"yes"
+
+
+class TestMergeResultReturn:
+    def test_merge_result_truthy(self):
+        r = MergeResult(
+            merged=True, commit="abc", strategy="no_op",
+            auto_merged_keys=(), carried_keys=(),
+        )
+        assert r
+        assert bool(r) is True
+
+    def test_merge_result_falsy(self):
+        r = MergeResult(
+            merged=False, commit=None, strategy="fast_forward",
+            auto_merged_keys=(), carried_keys=(),
+        )
+        assert not r
+        assert bool(r) is False
+
+    def test_merge_returns_result_object(self):
+        """merge() returns a MergeResult, not just a bool."""
+        store = Memory()
+        v = Versioned(store)
+        v.snapshot({"x": b"1"})
+        result = v.merge()
+        assert isinstance(result, MergeResult)
+        assert result.merged is True
+        assert result.strategy == "fast_forward"
+        assert result.commit == v.current_commit
+
+    def test_no_op_returns_result(self):
+        """No local changes returns a no_op MergeResult."""
+        v = Versioned()
+        result = v.merge()
+        assert isinstance(result, MergeResult)
+        assert result.strategy == "no_op"
+
+    def test_three_way_returns_result(self):
+        """Three-way merge returns a MergeResult with details."""
+        store = Memory()
+        v1 = Versioned(store)
+        v1.snapshot({"base": b"0"})
+        v1.merge()
+
+        v2 = Versioned(store)
+        v1.snapshot({"a": b"1"})
+        v1.merge()
+        v2.snapshot({"b": b"2"})
+
+        result = v2.merge()
+        assert isinstance(result, MergeResult)
+        assert result.strategy == "three_way"
+        assert result.merged is True
+        assert result.commit is not None
+
+    def test_abandon_returns_falsy_result(self):
+        """on_conflict='abandon' returns MergeResult with merged=False."""
+        store = Memory()
+        v1 = Versioned(store)
+        v1.snapshot({"x": b"1"})
+        v1.merge()
+
+        # v2 branches from v1's first commit (before the snapshot)
+        # but v1 has already advanced HEAD via merge
+        # Manually tamper with HEAD so CAS fails on fast-forward
+        from vkv.versioned import BRANCH_HEAD
+        import pickle
+
+        v2 = Versioned(store)
+        v2.snapshot({"y": b"2"})
+
+        # Overwrite HEAD to something v2 doesn't expect
+        store.set(BRANCH_HEAD % "main", pickle.dumps("bogus_hash"))
+
+        result = v2.merge(on_conflict="abandon")
+        assert isinstance(result, MergeResult)
+        assert not result
+        assert result.merged is False
