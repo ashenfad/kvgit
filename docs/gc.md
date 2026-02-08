@@ -30,7 +30,7 @@ v = GCVersioned(store, branch="main", high_water_bytes=50_000)
 
 ## How It Works
 
-1. Every `snapshot()` call checks total persisted user-data size
+1. Every `commit()` call checks total persisted user-data size
 2. If total exceeds `high_water_bytes`, a rebase is triggered
 3. Rebase sorts user keys by access recency (coldest first, then largest)
 4. Keys are dropped until total is at or below `low_water_bytes`
@@ -41,9 +41,9 @@ System keys (prefixed with `__`) are always retained.
 
 ## Methods
 
-### `snapshot(updates=None, removals=None, *, info=None) -> str`
+### `commit(updates=None, removals=None, *, on_conflict="raise", merge_fns=None, default_merge=None, info=None) -> MergeResult`
 
-Same as `Versioned.snapshot()`, but automatically runs GC afterward if above high water. If a rebase occurs, returns the rebase commit hash instead of the snapshot hash.
+Same as `Versioned.commit()`, but automatically runs GC afterward if above high water.
 
 ### `maybe_rebase() -> RebaseResult`
 
@@ -117,19 +117,38 @@ from vkv import GCVersioned
 v = GCVersioned(high_water_bytes=200, low_water_bytes=100)
 
 # Write some data
-v.snapshot({"a": b"x" * 40})
-v.merge()
-v.snapshot({"b": b"y" * 40})
-v.merge()
+v.commit({"a": b"x" * 40})
+v.commit({"b": b"y" * 40})
 
-# This snapshot pushes total to 120 bytes, triggers rebase
+# This commit pushes total to 120 bytes, triggers rebase
 # Oldest key ("a") gets dropped
-h = v.snapshot({"c": b"z" * 40})
-v.merge()
+v.commit({"c": b"z" * 40})
 
 result = v.last_rebase_result
 print(result.performed)       # True
 print(result.dropped_keys)    # ("a",)
 print(v.get("a"))             # None (dropped)
 print(v.get("c"))             # b"zzz..." (retained)
+```
+
+## Using with Staged
+
+For the set/commit pattern, wrap GCVersioned in Staged:
+
+```python
+from vkv import GCVersioned, Staged
+
+v = GCVersioned(high_water_bytes=10_000)
+s = Staged(v)
+
+s.set("key", b"value")
+s.commit()
+```
+
+Or use the factory:
+
+```python
+import vkv
+
+s = vkv.store(high_water_bytes=10_000)
 ```

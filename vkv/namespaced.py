@@ -1,29 +1,32 @@
-"""Namespaced: key-prefixed view over a Versioned store."""
+"""Namespaced: key-prefixed view over a Store."""
 
 from __future__ import annotations
 
 from typing import Iterable
 
-from .versioned import MergeFn, MergeResult, Versioned
+from .store import Store
+from .versioned import MergeFn, MergeResult
 
 
 class Namespaced:
-    """A namespaced view over a Versioned store.
+    """A namespaced view over a Store.
 
     Keys are prefixed with ``namespace/``. Nested namespaces are
     supported by wrapping another Namespaced instance.
 
+    Implements the ``Store`` protocol.
+
     Args:
-        store: A Versioned or Namespaced instance to wrap.
+        store: Any Store (Staged, Live, or another Namespaced).
         namespace: The namespace name (must not contain ``/``).
     """
 
-    def __init__(self, store: Versioned | Namespaced, namespace: str) -> None:
+    def __init__(self, store: Store, namespace: str) -> None:
         if "/" in namespace:
             raise ValueError("Namespace names cannot contain '/'")
-        if not isinstance(store, (Versioned, Namespaced)):
+        if not isinstance(store, Store):
             raise TypeError(
-                f"Namespaced can only wrap Versioned or Namespaced, "
+                f"Namespaced requires a Store, "
                 f"not {type(store).__name__}"
             )
 
@@ -34,30 +37,25 @@ class Namespaced:
         else:
             self.namespace = namespace
 
-    @property
-    def base_store(self) -> Versioned:
-        """The underlying Versioned store (unwraps nesting)."""
-        if isinstance(self._store, Namespaced):
-            return self._store.base_store
-        return self._store
-
     def _prefixed(self, key: str) -> str:
         return f"{self.namespace}/{key}"
 
+    # -- Read operations --
+
     def get(self, key: str) -> bytes | None:
         """Get a value from the namespaced view."""
-        return self.base_store.get(self._prefixed(key))
+        return self._store.get(self._prefixed(key))
 
     def get_many(self, *keys: str) -> dict[str, bytes]:
         """Get multiple values from the namespaced view."""
         prefixed = {self._prefixed(k): k for k in keys}
-        result = self.base_store.get_many(*prefixed.keys())
+        result = self._store.get_many(*prefixed.keys())
         return {prefixed[pk]: v for pk, v in result.items()}
 
     def keys(self) -> Iterable[str]:
         """Direct child keys in this namespace (not nested)."""
         prefix = f"{self.namespace}/"
-        for key in self.base_store.keys():
+        for key in self._store.keys():
             if key.startswith(prefix):
                 remainder = key[len(prefix):]
                 if remainder and "/" not in remainder:
@@ -66,88 +64,84 @@ class Namespaced:
     def descendant_keys(self) -> Iterable[str]:
         """All keys under this namespace, including nested."""
         prefix = f"{self.namespace}/"
-        for key in self.base_store.keys():
+        for key in self._store.keys():
             if key.startswith(prefix):
                 yield key[len(prefix):]
 
     def __contains__(self, key: str) -> bool:
-        return self._prefixed(key) in self.base_store
+        return self._prefixed(key) in self._store
 
     # -- Write operations --
 
-    def snapshot(
-        self,
-        updates: dict[str, bytes] | None = None,
-        removals: set[str] | None = None,
-        *,
-        info: dict | None = None,
-    ) -> str:
-        """Create a commit with namespaced key changes."""
-        prefixed_updates = (
-            {self._prefixed(k): v for k, v in updates.items()}
-            if updates else None
-        )
-        prefixed_removals = (
-            {self._prefixed(k) for k in removals}
-            if removals else None
-        )
-        return self.base_store.snapshot(
-            prefixed_updates, prefixed_removals, info=info
-        )
+    def set(self, key: str, value: bytes) -> None:
+        """Set a value in the namespaced view."""
+        self._store.set(self._prefixed(key), value)
 
-    def merge(
-        self,
-        on_conflict: str = "raise",
-        *,
-        merge_fns: dict[str, MergeFn] | None = None,
-        default_merge: MergeFn | None = None,
-        info: dict | None = None,
-    ) -> MergeResult:
-        """Merge the underlying branch (delegates to base store).
+    def remove(self, key: str) -> None:
+        """Remove a key from the namespaced view."""
+        self._store.remove(self._prefixed(key))
 
-        Per-key merge_fns are auto-prefixed with the namespace.
-        """
-        prefixed_fns = (
-            {self._prefixed(k): v for k, v in merge_fns.items()}
-            if merge_fns else None
-        )
-        return self.base_store.merge(
-            on_conflict,
-            merge_fns=prefixed_fns,
-            default_merge=default_merge,
-            info=info,
-        )
+    # -- Commit / reset --
+
+    def commit(self, **kwargs) -> MergeResult:
+        """Commit changes (delegates to underlying store)."""
+        return self._store.commit(**kwargs)
+
+    def reset(self) -> None:
+        """Reset the underlying store."""
+        self._store.reset()
+
+    # -- Merge function registry --
 
     def set_merge_fn(self, key: str, fn: MergeFn) -> None:
         """Register a merge function for a namespaced key."""
-        self.base_store.set_merge_fn(self._prefixed(key), fn)
+        if hasattr(self._store, "set_merge_fn"):
+            self._store.set_merge_fn(self._prefixed(key), fn)
 
     def set_content_type(self, key: str, ct) -> None:
         """Register a ContentType for a namespaced key."""
-        self.base_store.set_content_type(self._prefixed(key), ct)
+        if hasattr(self._store, "set_content_type"):
+            self._store.set_content_type(self._prefixed(key), ct)
 
     def get_content_type(self, key: str):
         """Retrieve the ContentType registered for a namespaced key, or None."""
-        return self.base_store.get_content_type(self._prefixed(key))
+        if hasattr(self._store, "get_content_type"):
+            return self._store.get_content_type(self._prefixed(key))
+        return None
 
     def set_default_merge(self, fn: MergeFn) -> None:
         """Register a default merge function (store-wide)."""
-        self.base_store.set_default_merge(fn)
+        if hasattr(self._store, "set_default_merge"):
+            self._store.set_default_merge(fn)
+
+    def create_branch(self, name: str):
+        """Create a branch (delegates to underlying store)."""
+        return self._store.create_branch(name)
+
+    def checkout(self, commit_hash: str, *, branch: str | None = None):
+        """Checkout a commit (delegates to underlying store)."""
+        return self._store.checkout(commit_hash, branch=branch)
 
     def list_branches(self) -> list[str]:
         """List all branch names in the store."""
-        return self.base_store.list_branches()
+        return self._store.list_branches()
 
     # -- Convenience properties --
 
     @property
-    def current_commit(self) -> str:
-        return self.base_store.current_commit
+    def current_commit(self) -> str | None:
+        if hasattr(self._store, "current_commit"):
+            return self._store.current_commit
+        return None
 
     @property
-    def base_commit(self) -> str:
-        return self.base_store.base_commit
+    def base_commit(self) -> str | None:
+        if hasattr(self._store, "base_commit"):
+            return self._store.base_commit
+        return None
 
     @property
     def last_merge_result(self) -> MergeResult | None:
-        return self.base_store.last_merge_result
+        if hasattr(self._store, "last_merge_result"):
+            return self._store.last_merge_result
+        return None

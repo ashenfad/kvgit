@@ -79,21 +79,17 @@ class TestContentTypeIntegration:
         ct = counter()
 
         v1 = Versioned(store)
-        v1.snapshot({"hits": ct.encode(10)})
-        v1.merge()
+        v1.commit({"hits": ct.encode(10)})
 
         v2 = Versioned(store)
         v2.set_content_type("hits", ct)
 
         # v1 increments to 15
-        v1.snapshot({"hits": ct.encode(15)})
-        v1.merge()
+        v1.commit({"hits": ct.encode(15)})
 
         # v2 increments to 20
-        v2.snapshot({"hits": ct.encode(20)})
-
-        # Merge: 15 + 20 - 10 = 25
-        assert v2.merge()
+        # Three-way merge: 15 + 20 - 10 = 25
+        assert v2.commit({"hits": ct.encode(20)})
         assert ct.decode(v2.get("hits")) == 25
 
     def test_set_content_type_registers_merge_fn(self):
@@ -102,18 +98,15 @@ class TestContentTypeIntegration:
         ct = counter()
 
         v1 = Versioned(store)
-        v1.snapshot({"x": ct.encode(0)})
-        v1.merge()
+        v1.commit({"x": ct.encode(0)})
 
         v2 = Versioned(store)
         v2.set_content_type("x", ct)
 
-        v1.snapshot({"x": ct.encode(5)})
-        v1.merge()
-        v2.snapshot({"x": ct.encode(3)})
+        v1.commit({"x": ct.encode(5)})
 
         # Without content type this would be a MergeConflict
-        assert v2.merge()
+        assert v2.commit({"x": ct.encode(3)})
         assert ct.decode(v2.get("x")) == 8  # 5 + 3 - 0
 
     def test_json_end_to_end(self):
@@ -129,15 +122,12 @@ class TestContentTypeIntegration:
         store = Memory()
 
         v1 = Versioned(store)
-        v1.snapshot({"tags": ct.encode(["a", "b"])})
-        v1.merge()
+        v1.commit({"tags": ct.encode(["a", "b"])})
 
         v2 = Versioned(store)
         v2.set_content_type("tags", ct)
 
-        v1.snapshot({"tags": ct.encode(["a", "b", "c"])})
-        v1.merge()
-        v2.snapshot({"tags": ct.encode(["a", "b", "d"])})
+        v1.commit({"tags": ct.encode(["a", "b", "c"])})
 
-        assert v2.merge()
+        assert v2.commit({"tags": ct.encode(["a", "b", "d"])})
         assert ct.decode(v2.get("tags")) == ["a", "b", "c", "d"]

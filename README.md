@@ -24,43 +24,35 @@ pip install vkv[disk]      # adds disk backend via diskcache
 ## Quick example
 
 ```python
-from vkv import Versioned, counter
+import vkv
 
-# Create a store and write some data
-v = Versioned()
-v.snapshot({"user": b"alice", "score": b"\x00" * 8})
-v.merge()
+# Create a store (Staged backed by in-memory Versioned)
+s = vkv.store()
 
-# Fork a branch
-branch = v.create_branch("feature")
-
-# Both branches update different keys
-v.snapshot({"user": b"bob"})
-v.merge()
-
-branch.snapshot({"score": b"\x00\x00\x00\x00\x00\x00\x00\x05"})
-
-# Merge auto-resolves (non-overlapping changes)
-result = branch.merge()
-print(result.strategy)  # "three_way"
-print(branch.get("user"))   # b"bob"
-print(branch.get("score"))  # b"\x00\x00\x00\x00\x00\x00\x00\x05"
+# Write and commit
+s.set("user", b"alice")
+s.set("score", b"\x00" * 8)
+s.commit()
 
 # Content types handle typed merge logic
+from vkv import counter
+
 ct = counter()
-v2 = Versioned()
-v2.snapshot({"hits": ct.encode(100)})
-v2.merge()
+s2 = vkv.store()
+s2.set("hits", ct.encode(100))
+s2.commit()
 
-fork = v2.create_branch("worker")
-fork.set_content_type("hits", ct)
+# Branching
+worker = s2.create_branch("worker")
+worker.set_content_type("hits", ct)
 
-v2.snapshot({"hits": ct.encode(115)})   # +15
-v2.merge()
-fork.snapshot({"hits": ct.encode(120)}) # +20
+s2.set("hits", ct.encode(115))       # +15 on main
+s2.commit()
 
-fork.merge()
-print(ct.decode(fork.get("hits")))  # 135 (115 + 120 - 100)
+worker.set("hits", ct.encode(120))   # +20 on worker
+worker.commit()
+
+print(ct.decode(worker.get("hits")))  # 135 (115 + 120 - 100)
 ```
 
 ## Documentation
@@ -70,4 +62,4 @@ See [`docs/`](docs/) for detailed API documentation:
 - [Core API (Versioned)](docs/versioned.md) -- commits, reads, writes, merging, branching, history
 - [Content Types](docs/content-types.md) -- typed values with automatic merge
 - [Garbage Collection](docs/gc.md) -- GCVersioned, rebase, orphan cleanup
-- [Backends & Namespaces](docs/backends.md) -- KVStore interface, Memory, Disk, Namespaced
+- [Backends & Namespaces](docs/backends.md) -- KVStore interface, Memory, Disk, Store, Staged, Live, Namespaced

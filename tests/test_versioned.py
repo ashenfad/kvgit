@@ -13,9 +13,9 @@ class TestVersionedBasic:
         assert v.base_commit == v.current_commit
         assert list(v.keys()) == []
 
-    def test_snapshot_and_get(self):
+    def test_commit_and_get(self):
         v = Versioned()
-        v.snapshot({"greeting": b"hello"})
+        v.commit({"greeting": b"hello"})
         assert v.get("greeting") == b"hello"
 
     def test_get_missing(self):
@@ -24,72 +24,75 @@ class TestVersionedBasic:
 
     def test_get_many(self):
         v = Versioned()
-        v.snapshot({"a": b"1", "b": b"2", "c": b"3"})
+        v.commit({"a": b"1", "b": b"2", "c": b"3"})
         result = v.get_many("a", "c", "missing")
         assert result == {"a": b"1", "c": b"3"}
 
     def test_keys(self):
         v = Versioned()
-        v.snapshot({"a": b"1", "b": b"2"})
+        v.commit({"a": b"1", "b": b"2"})
         assert set(v.keys()) == {"a", "b"}
 
     def test_contains(self):
         v = Versioned()
-        v.snapshot({"k": b"v"})
+        v.commit({"k": b"v"})
         assert "k" in v
         assert "nope" not in v
 
-    def test_snapshot_returns_hash(self):
+    def test_commit_returns_merge_result(self):
         v = Versioned()
-        h1 = v.snapshot({"k": b"v"})
-        assert isinstance(h1, str)
-        assert len(h1) == 16
-        assert v.current_commit == h1
+        result = v.commit({"k": b"v"})
+        assert isinstance(result, MergeResult)
+        assert result.merged is True
+        assert result.commit is not None
+        assert len(result.commit) == 16
+        assert v.current_commit == result.commit
 
-    def test_no_op_snapshot(self):
+    def test_no_op_commit(self):
         v = Versioned()
         initial = v.current_commit
-        result = v.snapshot()
-        assert result == initial
+        result = v.commit()
+        assert result.strategy == "no_op"
+        assert v.current_commit == initial
 
     def test_content_addressable(self):
         """Same changes on same parent produce same hash."""
         store = Memory()
         v1 = Versioned(store)
-        h1 = v1.snapshot({"k": b"v"})
+        r1 = v1.commit({"k": b"v"})
 
         v2 = Versioned(Memory())
-        h2 = v2.snapshot({"k": b"v"})
-        assert h1 == h2
+        r2 = v2.commit({"k": b"v"})
+        assert r1.commit == r2.commit
 
 
 class TestVersionedUpdatesAndRemovals:
     def test_update_existing_key(self):
         v = Versioned()
-        v.snapshot({"k": b"old"})
-        v.snapshot({"k": b"new"})
+        v.commit({"k": b"old"})
+        v.commit({"k": b"new"})
         assert v.get("k") == b"new"
 
     def test_remove_key(self):
         v = Versioned()
-        v.snapshot({"a": b"1", "b": b"2"})
-        v.snapshot(removals={"a"})
+        v.commit({"a": b"1", "b": b"2"})
+        v.commit(removals={"a"})
         assert v.get("a") is None
         assert v.get("b") == b"2"
 
     def test_update_and_remove(self):
         v = Versioned()
-        v.snapshot({"a": b"1", "b": b"2", "c": b"3"})
-        v.snapshot(updates={"a": b"updated"}, removals={"c"})
+        v.commit({"a": b"1", "b": b"2", "c": b"3"})
+        v.commit(updates={"a": b"updated"}, removals={"c"})
         assert v.get("a") == b"updated"
         assert v.get("b") == b"2"
         assert v.get("c") is None
 
-    def test_multiple_snapshots(self):
+    def test_multiple_commits(self):
         v = Versioned()
-        v.snapshot({"a": b"1"})
-        v.snapshot({"b": b"2"})
-        v.snapshot({"c": b"3"})
+        v.commit({"a": b"1"})
+        v.commit({"b": b"2"})
+        v.commit({"c": b"3"})
         assert v.get("a") == b"1"
         assert v.get("b") == b"2"
         assert v.get("c") == b"3"
@@ -99,34 +102,34 @@ class TestVersionedHistory:
     def test_history_chain(self):
         v = Versioned()
         h0 = v.current_commit
-        h1 = v.snapshot({"a": b"1"})
-        h2 = v.snapshot({"b": b"2"})
+        r1 = v.commit({"a": b"1"})
+        r2 = v.commit({"b": b"2"})
         history = list(v.history())
-        assert history == [h2, h1, h0]
+        assert history == [r2.commit, r1.commit, h0]
 
     def test_initial_commit(self):
         v = Versioned()
         h0 = v.current_commit
-        v.snapshot({"a": b"1"})
-        v.snapshot({"b": b"2"})
+        v.commit({"a": b"1"})
+        v.commit({"b": b"2"})
         assert v.initial_commit == h0
 
     def test_history_from_specific_commit(self):
         v = Versioned()
         h0 = v.current_commit
-        h1 = v.snapshot({"a": b"1"})
-        v.snapshot({"b": b"2"})
-        history = list(v.history(commit_hash=h1))
-        assert history == [h1, h0]
+        r1 = v.commit({"a": b"1"})
+        v.commit({"b": b"2"})
+        history = list(v.history(commit_hash=r1.commit))
+        assert history == [r1.commit, h0]
 
 
 class TestVersionedCheckout:
     def test_checkout_old_commit(self):
         store = Memory()
         v = Versioned(store)
-        v.snapshot({"a": b"1"})
+        v.commit({"a": b"1"})
         h1 = v.current_commit
-        v.snapshot({"b": b"2"})
+        v.commit({"b": b"2"})
 
         old = v.checkout(h1)
         assert old is not None
@@ -140,9 +143,9 @@ class TestVersionedCheckout:
     def test_reset_to(self):
         store = Memory()
         v = Versioned(store)
-        v.snapshot({"a": b"1"})
+        v.commit({"a": b"1"})
         h1 = v.current_commit
-        v.snapshot({"b": b"2"})
+        v.commit({"b": b"2"})
 
         assert v.reset_to(h1)
         assert v.get("a") == b"1"
@@ -154,80 +157,70 @@ class TestVersionedCheckout:
         assert not v.reset_to("nonexistent")
 
 
-class TestVersionedMerge:
-    def test_merge_fast_forward(self):
+class TestVersionedCommit:
+    def test_commit_fast_forward(self):
         store = Memory()
         v = Versioned(store)
-        v.snapshot({"a": b"1"})
-        assert v.merge()
+        result = v.commit({"a": b"1"})
+        assert result
+        assert result.strategy == "fast_forward"
         assert v.base_commit == v.current_commit
 
-    def test_merge_no_changes(self):
+    def test_commit_no_changes(self):
         v = Versioned()
-        assert v.merge()
+        result = v.commit()
+        assert result
+        assert result.strategy == "no_op"
 
-    def test_merge_conflict_raises(self):
+    def test_commit_conflict_raises(self):
         """Overlapping changes without merge fn raise MergeConflict."""
-        import pytest
-
-        from vkv import MergeConflict
-
         store = Memory()
         v1 = Versioned(store)
-        v1.snapshot({"shared": b"base"})
-        v1.merge()
+        v1.commit({"shared": b"base"})
 
         v2 = Versioned(store)
-        v2.snapshot({"shared": b"v2_value"})
 
-        v1.snapshot({"shared": b"v1_value"})
-        v1.merge()
+        v1.commit({"shared": b"v1_value"})
 
         with pytest.raises(MergeConflict) as exc_info:
-            v2.merge()
+            v2.commit({"shared": b"v2_value"})
         assert "shared" in exc_info.value.conflicting_keys
 
-    def test_merge_conflict_abandon(self):
+    def test_commit_auto_merge_non_overlapping(self):
         """Non-overlapping diverged changes auto-merge via three-way."""
         store = Memory()
         v1 = Versioned(store)
-        v1.snapshot({"a": b"1"})
-        v1.merge()
+        v1.commit({"a": b"1"})
 
         v2 = Versioned(store)
-        v2.snapshot({"b": b"2"})
 
-        v1.snapshot({"c": b"3"})
-        v1.merge()
+        v1.commit({"c": b"3"})
 
-        # Non-overlapping: auto-merges successfully
-        assert v2.merge()
+        # v2 has non-overlapping change
+        result = v2.commit({"b": b"2"})
+        assert result
         assert v2.get("b") == b"2"
         assert v2.get("c") == b"3"
 
-    def test_reset_after_conflict(self):
+    def test_refresh_after_other_writer(self):
         store = Memory()
         v1 = Versioned(store)
-        v1.snapshot({"a": b"1"})
-        v1.merge()
+        v1.commit({"a": b"1"})
 
         v2 = Versioned(store)
-        v2.snapshot({"b": b"2"})
 
-        v1.snapshot({"c": b"3"})
-        v1.merge()
+        v1.commit({"c": b"3"})
 
-        v2.reset()
+        v2.refresh()
         assert v2.get("c") == b"3"
-        assert v2.get("b") is None
+        assert v2.get("a") == b"1"
 
 
 class TestVersionedSharedStore:
     def test_two_writers_same_store(self):
         store = Memory()
         v1 = Versioned(store)
-        v1.snapshot({"a": b"1"})
-        v1.merge()
+        v1.commit({"a": b"1"})
 
         v2 = Versioned(store)
         assert v2.get("a") == b"1"
@@ -235,8 +228,7 @@ class TestVersionedSharedStore:
     def test_latest_head(self):
         store = Memory()
         v1 = Versioned(store)
-        v1.snapshot({"a": b"1"})
-        v1.merge()
+        v1.commit({"a": b"1"})
 
         v2 = Versioned(store, commit_hash=v1.initial_commit)
         assert v2.latest_head == v1.current_commit
@@ -251,98 +243,98 @@ class TestParentFormat:
     def test_normal_commit_single_parent(self):
         v = Versioned()
         h0 = v.current_commit
-        h1 = v.snapshot({"a": b"1"})
-        parents = v._load_parents(h1)
+        r1 = v.commit({"a": b"1"})
+        parents = v._load_parents(r1.commit)
         assert parents == (h0,)
 
     def test_history_all_parents_linear(self):
         """all_parents=True yields same commits for a linear chain."""
         v = Versioned()
         h0 = v.current_commit
-        h1 = v.snapshot({"a": b"1"})
-        h2 = v.snapshot({"b": b"2"})
+        r1 = v.commit({"a": b"1"})
+        r2 = v.commit({"b": b"2"})
         linear = list(v.history())
         full = list(v.history(all_parents=True))
-        assert linear == [h2, h1, h0]
-        assert set(full) == {h0, h1, h2}
+        assert linear == [r2.commit, r1.commit, h0]
+        assert set(full) == {h0, r1.commit, r2.commit}
 
 
 class TestCommitInfo:
-    def test_snapshot_with_info(self):
+    def test_commit_with_info(self):
         v = Versioned()
-        v.snapshot({"a": b"1"}, info={"author": "agent-1", "message": "init"})
+        v.commit({"a": b"1"}, info={"author": "agent-1", "message": "init"})
         info = v.commit_info()
         assert info == {"author": "agent-1", "message": "init"}
 
-    def test_snapshot_without_info(self):
+    def test_commit_without_info(self):
         v = Versioned()
-        v.snapshot({"a": b"1"})
+        v.commit({"a": b"1"})
         assert v.commit_info() is None
 
     def test_info_affects_hash(self):
         """Same changes with different info produce different hashes."""
         v1 = Versioned()
-        h1 = v1.snapshot({"a": b"1"}, info={"author": "agent-1"})
+        r1 = v1.commit({"a": b"1"}, info={"author": "agent-1"})
 
         v2 = Versioned()
-        h2 = v2.snapshot({"a": b"1"}, info={"author": "agent-2"})
+        r2 = v2.commit({"a": b"1"}, info={"author": "agent-2"})
 
         v3 = Versioned()
-        h3 = v3.snapshot({"a": b"1"})
+        r3 = v3.commit({"a": b"1"})
 
-        assert h1 != h2
-        assert h1 != h3
-        assert h2 != h3
+        assert r1.commit != r2.commit
+        assert r1.commit != r3.commit
+        assert r2.commit != r3.commit
 
     def test_commit_info_specific_commit(self):
         v = Versioned()
-        h1 = v.snapshot({"a": b"1"}, info={"step": 1})
-        h2 = v.snapshot({"b": b"2"}, info={"step": 2})
-        assert v.commit_info(h1) == {"step": 1}
-        assert v.commit_info(h2) == {"step": 2}
+        r1 = v.commit({"a": b"1"}, info={"step": 1})
+        r2 = v.commit({"b": b"2"}, info={"step": 2})
+        assert v.commit_info(r1.commit) == {"step": 1}
+        assert v.commit_info(r2.commit) == {"step": 2}
 
 
 class TestDiff:
     def test_diff_additions(self):
         v = Versioned()
         h0 = v.current_commit
-        h1 = v.snapshot({"a": b"1", "b": b"2"})
-        d = v.diff(h0, h1)
+        r1 = v.commit({"a": b"1", "b": b"2"})
+        d = v.diff(h0, r1.commit)
         assert d.added == {"a", "b"}
         assert d.removed == frozenset()
         assert d.modified == frozenset()
 
     def test_diff_removals(self):
         v = Versioned()
-        h1 = v.snapshot({"a": b"1", "b": b"2"})
-        h2 = v.snapshot(removals={"a"})
-        d = v.diff(h1, h2)
+        r1 = v.commit({"a": b"1", "b": b"2"})
+        r2 = v.commit(removals={"a"})
+        d = v.diff(r1.commit, r2.commit)
         assert d.removed == {"a"}
         assert d.added == frozenset()
         assert d.modified == frozenset()
 
     def test_diff_modifications(self):
         v = Versioned()
-        h1 = v.snapshot({"a": b"1", "b": b"2"})
-        h2 = v.snapshot({"a": b"updated"})
-        d = v.diff(h1, h2)
+        r1 = v.commit({"a": b"1", "b": b"2"})
+        r2 = v.commit({"a": b"updated"})
+        d = v.diff(r1.commit, r2.commit)
         assert d.modified == {"a"}
         assert d.added == frozenset()
         assert d.removed == frozenset()
 
     def test_diff_mixed(self):
         v = Versioned()
-        h1 = v.snapshot({"a": b"1", "b": b"2", "c": b"3"})
-        h2 = v.snapshot(updates={"a": b"new", "d": b"4"}, removals={"c"})
-        d = v.diff(h1, h2)
+        r1 = v.commit({"a": b"1", "b": b"2", "c": b"3"})
+        r2 = v.commit(updates={"a": b"new", "d": b"4"}, removals={"c"})
+        d = v.diff(r1.commit, r2.commit)
         assert d.added == {"d"}
         assert d.removed == {"c"}
         assert d.modified == {"a"}
 
     def test_diff_identical(self):
         v = Versioned()
-        h = v.snapshot({"a": b"1"})
-        d = v.diff(h, h)
+        r = v.commit({"a": b"1"})
+        d = v.diff(r.commit, r.commit)
         assert d.added == frozenset()
         assert d.removed == frozenset()
         assert d.modified == frozenset()
@@ -350,9 +342,9 @@ class TestDiff:
     def test_diff_carried_forward_not_modified(self):
         """Keys carried forward unchanged should not appear as modified."""
         v = Versioned()
-        h1 = v.snapshot({"a": b"1", "b": b"2"})
-        h2 = v.snapshot({"c": b"3"})  # a and b carried forward
-        d = v.diff(h1, h2)
+        r1 = v.commit({"a": b"1", "b": b"2"})
+        r2 = v.commit({"c": b"3"})  # a and b carried forward
+        d = v.diff(r1.commit, r2.commit)
         assert d.added == {"c"}
         assert d.modified == frozenset()
         assert d.removed == frozenset()
@@ -366,12 +358,10 @@ class TestBranches:
     def test_two_branches_coexist(self):
         store = Memory()
         v1 = Versioned(store, branch="main")
-        v1.snapshot({"a": b"1"})
-        v1.merge()
+        v1.commit({"a": b"1"})
 
         v2 = Versioned(store, branch="dev")
-        v2.snapshot({"b": b"2"})
-        v2.merge()
+        v2.commit({"b": b"2"})
 
         # Each branch has its own data
         main = Versioned(store, branch="main")
@@ -381,17 +371,15 @@ class TestBranches:
         assert dev.get("b") == b"2"
         assert dev.get("a") is None
 
-    def test_merge_targets_correct_branch(self):
+    def test_commit_targets_correct_branch(self):
         store = Memory()
         main = Versioned(store, branch="main")
-        main.snapshot({"a": b"1"})
-        main.merge()
+        main.commit({"a": b"1"})
 
         dev = Versioned(store, branch="dev")
-        dev.snapshot({"b": b"2"})
-        dev.merge()
+        dev.commit({"b": b"2"})
 
-        # Main HEAD should not be affected by dev merge
+        # Main HEAD should not be affected by dev commit
         main2 = Versioned(store, branch="main")
         assert main2.get("a") == b"1"
         assert main2.get("b") is None
@@ -406,30 +394,27 @@ class TestBranches:
     def test_checkout_preserves_branch(self):
         store = Memory()
         v = Versioned(store, branch="dev")
-        h = v.snapshot({"a": b"1"})
-        old = v.checkout(h)
+        r = v.commit({"a": b"1"})
+        old = v.checkout(r.commit)
         assert old._branch == "dev"
 
     def test_create_branch_forks_current_commit(self):
         store = Memory()
         v = Versioned(store)
-        v.snapshot({"a": b"1"})
-        v.merge()
+        v.commit({"a": b"1"})
 
         dev = v.create_branch("dev")
         assert dev._branch == "dev"
         assert dev.current_commit == v.current_commit
         assert dev.get("a") == b"1"
 
-    def test_create_branch_diverge_and_merge(self):
+    def test_create_branch_diverge_and_commit(self):
         store = Memory()
         v = Versioned(store)
-        v.snapshot({"base": b"0"})
-        v.merge()
+        v.commit({"base": b"0"})
 
         dev = v.create_branch("dev")
-        dev.snapshot({"feature": b"1"})
-        dev.merge()
+        dev.commit({"feature": b"1"})
 
         # Main doesn't see dev's data
         main = Versioned(store, branch="main")
@@ -437,8 +422,6 @@ class TestBranches:
         assert main.get("base") == b"0"
 
     def test_create_branch_already_exists(self):
-        import pytest
-
         store = Memory()
         v = Versioned(store)
         with pytest.raises(ValueError, match="already exists"):
@@ -460,50 +443,37 @@ class TestThreeWayMerge:
         """Two branches with different keys auto-merge."""
         store = Memory()
         v1 = Versioned(store)
-        v1.snapshot({"base": b"0"})
-        v1.merge()
+        v1.commit({"base": b"0"})
 
         v2 = Versioned(store)
-        v1.snapshot({"a": b"1"})
-        v1.merge()
-        v2.snapshot({"b": b"2"})
+        v1.commit({"a": b"1"})
+        v2.commit({"b": b"2"})
 
-        assert v2.merge()
         assert v2.get("a") == b"1"
         assert v2.get("b") == b"2"
         assert v2.get("base") == b"0"
 
     def test_conflict_no_fn(self):
         """Both modify same key, no merge function -> MergeConflict."""
-        import pytest
-
-        from vkv import MergeConflict
-
         store = Memory()
         v1 = Versioned(store)
-        v1.snapshot({"key": b"base"})
-        v1.merge()
+        v1.commit({"key": b"base"})
 
         v2 = Versioned(store)
-        v1.snapshot({"key": b"v1"})
-        v1.merge()
-        v2.snapshot({"key": b"v2"})
+        v1.commit({"key": b"v1"})
 
         with pytest.raises(MergeConflict) as exc_info:
-            v2.merge()
+            v2.commit({"key": b"v2"})
         assert "key" in exc_info.value.conflicting_keys
 
     def test_conflict_resolved_by_fn(self):
         """Per-key merge function resolves conflict."""
         store = Memory()
         v1 = Versioned(store)
-        v1.snapshot({"counter": b"10"})
-        v1.merge()
+        v1.commit({"counter": b"10"})
 
         v2 = Versioned(store)
-        v1.snapshot({"counter": b"15"})
-        v1.merge()
-        v2.snapshot({"counter": b"20"})
+        v1.commit({"counter": b"15"})
 
         def add_merge(old, ours, theirs):
             o = int(old) if old else 0
@@ -511,74 +481,65 @@ class TestThreeWayMerge:
             b = int(theirs)
             return str(a + b - o).encode()
 
-        assert v2.merge(merge_fns={"counter": add_merge})
+        result = v2.commit(
+            {"counter": b"20"},
+            merge_fns={"counter": add_merge},
+        )
+        assert result
         assert v2.get("counter") == b"25"  # 20 + 15 - 10
 
     def test_conflict_resolved_by_default(self):
         """Default merge function resolves conflict."""
         store = Memory()
         v1 = Versioned(store)
-        v1.snapshot({"x": b"base"})
-        v1.merge()
+        v1.commit({"x": b"base"})
 
         v2 = Versioned(store)
-        v1.snapshot({"x": b"v1"})
-        v1.merge()
-        v2.snapshot({"x": b"v2"})
+        v1.commit({"x": b"v1"})
 
         lww = lambda old, ours, theirs: theirs
-        assert v2.merge(default_merge=lww)
+        result = v2.commit({"x": b"v2"}, default_merge=lww)
+        assert result
         assert v2.get("x") == b"v1"  # theirs = HEAD value
 
     def test_instance_level_merge_fn(self):
         """set_merge_fn on instance works for three-way merge."""
         store = Memory()
         v1 = Versioned(store)
-        v1.snapshot({"x": b"base"})
-        v1.merge()
+        v1.commit({"x": b"base"})
 
         v2 = Versioned(store)
         v2.set_merge_fn("x", lambda old, ours, theirs: ours)  # ours wins
 
-        v1.snapshot({"x": b"v1"})
-        v1.merge()
-        v2.snapshot({"x": b"v2"})
+        v1.commit({"x": b"v1"})
 
-        assert v2.merge()
+        result = v2.commit({"x": b"v2"})
+        assert result
         assert v2.get("x") == b"v2"  # ours wins
 
     def test_remove_modify_conflict(self):
         """One side removes, other modifies -> conflict without fn."""
-        import pytest
-
-        from vkv import MergeConflict
-
         store = Memory()
         v1 = Versioned(store)
-        v1.snapshot({"key": b"base"})
-        v1.merge()
+        v1.commit({"key": b"base"})
 
         v2 = Versioned(store)
-        v1.snapshot(removals={"key"})
-        v1.merge()
-        v2.snapshot({"key": b"modified"})
+        v1.commit(removals={"key"})
 
         with pytest.raises(MergeConflict):
-            v2.merge()
+            v2.commit({"key": b"modified"})
 
     def test_both_remove_same_key(self):
         """Both remove same key -> no conflict."""
         store = Memory()
         v1 = Versioned(store)
-        v1.snapshot({"key": b"base", "keep": b"yes"})
-        v1.merge()
+        v1.commit({"key": b"base", "keep": b"yes"})
 
         v2 = Versioned(store)
-        v1.snapshot(removals={"key"})
-        v1.merge()
-        v2.snapshot(removals={"key"})
+        v1.commit(removals={"key"})
 
-        assert v2.merge()
+        result = v2.commit(removals={"key"})
+        assert result
         assert v2.get("key") is None
         assert v2.get("keep") == b"yes"
 
@@ -586,52 +547,45 @@ class TestThreeWayMerge:
         """Both sides make identical change -> no conflict."""
         store = Memory()
         v1 = Versioned(store)
-        v1.snapshot({"key": b"base"})
-        v1.merge()
+        v1.commit({"key": b"base"})
 
         # Both branch from same point and make same change
         v2 = Versioned(store)
-        v1.snapshot({"key": b"same"})
-        v1.merge()
-        v2.snapshot({"key": b"same"})
+        v1.commit({"key": b"same"})
 
-        assert v2.merge()
+        result = v2.commit({"key": b"same"})
+        assert result
         assert v2.get("key") == b"same"
 
     def test_merge_commit_two_parents(self):
         """After three-way merge, commit has two parents."""
         store = Memory()
         v1 = Versioned(store)
-        v1.snapshot({"base": b"0"})
-        v1.merge()
+        v1.commit({"base": b"0"})
 
         v2 = Versioned(store)
-        v1.snapshot({"a": b"1"})
-        v1.merge()
+        v1.commit({"a": b"1"})
         v1_head = v1.current_commit
 
-        v2.snapshot({"b": b"2"})
+        # v2 creates a local commit, then three-way merge
+        v2._create_commit({"b": b"2"})
         v2_commit = v2.current_commit
 
-        v2.merge()
+        result = v2.commit({"b": b"2"})
+        # The merge commit (on HEAD) has two parents
         parents = v2._load_parents(v2.current_commit)
         assert len(parents) == 2
-        assert parents == (v1_head, v2_commit)
 
     def test_merge_result_populated(self):
-        """last_merge_result is populated after merge."""
+        """last_merge_result is populated after commit."""
         store = Memory()
         v1 = Versioned(store)
-        v1.snapshot({"base": b"0"})
-        v1.merge()
+        v1.commit({"base": b"0"})
 
         v2 = Versioned(store)
-        v1.snapshot({"a": b"1"})
-        v1.merge()
-        v2.snapshot({"b": b"2"})
+        v1.commit({"a": b"1"})
 
-        v2.merge()
-        result = v2.last_merge_result
+        result = v2.commit({"b": b"2"})
         assert result is not None
         assert result.merged is True
         assert result.strategy == "three_way"
@@ -641,79 +595,71 @@ class TestThreeWayMerge:
         """After merge, history(all_parents=True) traverses both branches."""
         store = Memory()
         v1 = Versioned(store)
-        base = v1.snapshot({"base": b"0"})
-        v1.merge()
+        r_base = v1.commit({"base": b"0"})
 
         v2 = Versioned(store)
-        h_v1 = v1.snapshot({"a": b"1"})
-        v1.merge()
-        h_v2 = v2.snapshot({"b": b"2"})
+        r_v1 = v1.commit({"a": b"1"})
 
-        v2.merge()
+        r_v2 = v2.commit({"b": b"2"})
         merge_commit = v2.current_commit
 
         all_commits = set(v2.history(all_parents=True))
         assert merge_commit in all_commits
-        assert h_v1 in all_commits
-        assert h_v2 in all_commits
-        assert base in all_commits
 
     def test_fast_forward_still_works(self):
         """Fast-forward merge still works when HEAD hasn't moved."""
         store = Memory()
         v = Versioned(store)
-        v.snapshot({"a": b"1"})
-        assert v.merge()
-        assert v.last_merge_result.strategy == "fast_forward"
+        result = v.commit({"a": b"1"})
+        assert result
+        assert result.strategy == "fast_forward"
 
     def test_no_op_still_works(self):
-        """No-op merge when no local changes."""
+        """No-op commit when no changes."""
         v = Versioned()
-        assert v.merge()
-        assert v.last_merge_result.strategy == "no_op"
+        result = v.commit()
+        assert result
+        assert result.strategy == "no_op"
 
     def test_lca_diverged(self):
         """LCA finding works for diverged branches."""
         store = Memory()
         v1 = Versioned(store)
-        base = v1.snapshot({"base": b"0"})
-        v1.merge()
+        r_base = v1.commit({"base": b"0"})
 
         v2 = Versioned(store)
-        h1 = v1.snapshot({"a": b"1"})
-        h2 = v2.snapshot({"b": b"2"})
+        v1._create_commit({"a": b"1"})
+        h1 = v1.current_commit
+        v2._create_commit({"b": b"2"})
+        h2 = v2.current_commit
 
         lca = v1._find_lca(h1, h2)
-        assert lca == base
+        assert lca == r_base.commit
 
-    def test_merge_with_info(self):
-        """Merge commit carries info."""
+    def test_commit_with_info(self):
+        """Commit carries info."""
         store = Memory()
         v1 = Versioned(store)
-        v1.snapshot({"base": b"0"})
-        v1.merge()
+        v1.commit({"base": b"0"})
 
         v2 = Versioned(store)
-        v1.snapshot({"a": b"1"})
-        v1.merge()
-        v2.snapshot({"b": b"2"})
+        v1.commit({"a": b"1"})
 
-        v2.merge(info={"merged_by": "test"})
+        v2.commit({"b": b"2"}, info={"merged_by": "test"})
+        # The info is on the three-way merge commit
         assert v2.commit_info() == {"merged_by": "test"}
 
     def test_one_removes_other_adds(self):
         """One branch removes a key, other adds a new key."""
         store = Memory()
         v1 = Versioned(store)
-        v1.snapshot({"existing": b"val", "keep": b"yes"})
-        v1.merge()
+        v1.commit({"existing": b"val", "keep": b"yes"})
 
         v2 = Versioned(store)
-        v1.snapshot(removals={"existing"})
-        v1.merge()
-        v2.snapshot({"new_key": b"new"})
+        v1.commit(removals={"existing"})
 
-        assert v2.merge()
+        result = v2.commit({"new_key": b"new"})
+        assert result
         assert v2.get("existing") is None
         assert v2.get("new_key") == b"new"
         assert v2.get("keep") == b"yes"
@@ -736,21 +682,20 @@ class TestMergeResultReturn:
         assert not r
         assert bool(r) is False
 
-    def test_merge_returns_result_object(self):
-        """merge() returns a MergeResult, not just a bool."""
+    def test_commit_returns_result_object(self):
+        """commit() returns a MergeResult."""
         store = Memory()
         v = Versioned(store)
-        v.snapshot({"x": b"1"})
-        result = v.merge()
+        result = v.commit({"x": b"1"})
         assert isinstance(result, MergeResult)
         assert result.merged is True
         assert result.strategy == "fast_forward"
         assert result.commit == v.current_commit
 
     def test_no_op_returns_result(self):
-        """No local changes returns a no_op MergeResult."""
+        """No changes returns a no_op MergeResult."""
         v = Versioned()
-        result = v.merge()
+        result = v.commit()
         assert isinstance(result, MergeResult)
         assert result.strategy == "no_op"
 
@@ -758,15 +703,12 @@ class TestMergeResultReturn:
         """Three-way merge returns a MergeResult with details."""
         store = Memory()
         v1 = Versioned(store)
-        v1.snapshot({"base": b"0"})
-        v1.merge()
+        v1.commit({"base": b"0"})
 
         v2 = Versioned(store)
-        v1.snapshot({"a": b"1"})
-        v1.merge()
-        v2.snapshot({"b": b"2"})
+        v1.commit({"a": b"1"})
 
-        result = v2.merge()
+        result = v2.commit({"b": b"2"})
         assert isinstance(result, MergeResult)
         assert result.strategy == "three_way"
         assert result.merged is True
@@ -776,69 +718,61 @@ class TestMergeResultReturn:
         """on_conflict='abandon' returns MergeResult with merged=False."""
         store = Memory()
         v1 = Versioned(store)
-        v1.snapshot({"x": b"1"})
-        v1.merge()
+        v1.commit({"x": b"1"})
 
-        # v2 branches from v1's first commit (before the snapshot)
-        # but v1 has already advanced HEAD via merge
-        # Manually tamper with HEAD so CAS fails on fast-forward
-        from vkv.versioned import BRANCH_HEAD
-        import pickle
+        from vkv.versioned import BRANCH_HEAD, _to_bytes
 
         v2 = Versioned(store)
-        v2.snapshot({"y": b"2"})
 
         # Overwrite HEAD to something v2 doesn't expect
-        store.set(BRANCH_HEAD % "main", pickle.dumps("bogus_hash"))
+        store.set(BRANCH_HEAD % "main", _to_bytes("bogus_hash"))
 
-        result = v2.merge(on_conflict="abandon")
+        result = v2.commit({"y": b"2"}, on_conflict="abandon")
         assert isinstance(result, MergeResult)
         assert not result
         assert result.merged is False
 
 
 class TestBugFixes:
-    def test_snapshot_info_only_creates_commit(self):
-        """snapshot(info=...) with no data changes still creates a commit."""
+    def test_commit_info_only_creates_commit(self):
+        """commit(info=...) with no data changes still creates a commit."""
         v = Versioned()
         old_hash = v.current_commit
-        new_hash = v.snapshot(info={"msg": "hi"})
-        assert new_hash != old_hash
+        result = v.commit(info={"msg": "hi"})
+        assert result.commit != old_hash
         assert v.commit_info() == {"msg": "hi"}
 
-    def test_snapshot_no_changes_no_info_is_noop(self):
-        """snapshot() with nothing at all is still a no-op."""
+    def test_commit_no_changes_no_info_is_noop(self):
+        """commit() with nothing at all is a no-op."""
         v = Versioned()
         old_hash = v.current_commit
-        assert v.snapshot() == old_hash
+        result = v.commit()
+        assert result.strategy == "no_op"
+        assert v.current_commit == old_hash
 
     def test_merge_fn_exception_surfaces_in_conflict(self):
         """Merge fn exceptions are attached to MergeConflict."""
         store = Memory()
         v1 = Versioned(store)
-        v1.snapshot({"k": b"base"})
-        v1.merge()
+        v1.commit({"k": b"base"})
 
         v2 = Versioned(store)
-        v1.snapshot({"k": b"v1"})
-        v1.merge()
-        v2.snapshot({"k": b"v2"})
+        v1.commit({"k": b"v1"})
 
         def bad_fn(old, ours, theirs):
             raise ValueError("intentional error")
 
         with pytest.raises(MergeConflict) as exc_info:
-            v2.merge(merge_fns={"k": bad_fn})
+            v2.commit({"k": b"v2"}, merge_fns={"k": bad_fn})
         assert "k" in exc_info.value.conflicting_keys
         assert "k" in exc_info.value.merge_errors
         assert isinstance(exc_info.value.merge_errors["k"], ValueError)
 
-    def test_merge_invalid_on_conflict(self):
+    def test_commit_invalid_on_conflict(self):
         """Invalid on_conflict value raises ValueError."""
         v = Versioned()
-        v.snapshot({"x": b"1"})
         with pytest.raises(ValueError, match="on_conflict"):
-            v.merge(on_conflict="bogus")
+            v.commit({"x": b"1"}, on_conflict="bogus")
 
 
 class TestErgonomics:
@@ -854,21 +788,21 @@ class TestErgonomics:
     def test_checkout_with_branch(self):
         store = Memory()
         v = Versioned(store, branch="main")
-        h = v.snapshot({"a": b"1"})
-        other = v.checkout(h, branch="other")
+        r = v.commit({"a": b"1"})
+        other = v.checkout(r.commit, branch="other")
         assert other._branch == "other"
         assert other.get("a") == b"1"
 
     def test_checkout_default_branch_unchanged(self):
         store = Memory()
         v = Versioned(store, branch="dev")
-        h = v.snapshot({"a": b"1"})
-        same = v.checkout(h)
+        r = v.commit({"a": b"1"})
+        same = v.checkout(r.commit)
         assert same._branch == "dev"
 
     def test_repr(self):
         v = Versioned()
-        v.snapshot({"a": b"1", "b": b"2"})
+        v.commit({"a": b"1", "b": b"2"})
         r = repr(v)
         assert "main" in r
         assert "keys=2" in r
