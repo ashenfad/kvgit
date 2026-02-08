@@ -8,3 +8,16 @@ class ConcurrencyError(Exception):
     and when merge was attempted via CAS. The caller should reset
     and retry.
     """
+
+
+class MergeConflict(Exception):
+    """Raised when a three-way merge encounters unresolvable conflicts.
+
+    Attributes:
+        conflicting_keys: The set of keys that could not be auto-merged.
+    """
+
+    def __init__(self, conflicting_keys: set[str]) -> None:
+        self.conflicting_keys = conflicting_keys
+        keys_str = ", ".join(sorted(conflicting_keys))
+        super().__init__(f"Merge conflict on keys: {keys_str}")

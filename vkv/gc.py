@@ -6,8 +6,9 @@ from dataclasses import dataclass
 
 from .kv.base import KVStore
 from .versioned import (
+    BRANCH_HEAD,
     COMMIT_KEYSET,
-    HEAD_COMMIT,
+    INFO_KEY,
     META_KEY,
     PARENT_COMMIT,
     TOTAL_VAR_SIZE_KEY,
@@ -59,10 +60,11 @@ class GCVersioned(Versioned):
         store: KVStore | None = None,
         *,
         commit_hash: str | None = None,
+        branch: str = "main",
         high_water_bytes: int,
         low_water_bytes: int | None = None,
     ) -> None:
-        super().__init__(store, commit_hash=commit_hash)
+        super().__init__(store, commit_hash=commit_hash, branch=branch)
         if high_water_bytes <= 0:
             raise ValueError("high_water_bytes must be > 0")
         self.high_water = high_water_bytes
@@ -79,9 +81,11 @@ class GCVersioned(Versioned):
         self,
         updates: dict[str, bytes] | None = None,
         removals: set[str] | None = None,
+        *,
+        info: dict | None = None,
     ) -> str:
         """Commit changes, then run GC if above high water mark."""
-        commit_hash = super().snapshot(updates, removals)
+        commit_hash = super().snapshot(updates, removals, info=info)
         rebase_result = self.maybe_rebase()
         self.last_rebase_result = rebase_result
         if rebase_result.performed and rebase_result.new_commit:
@@ -102,12 +106,18 @@ class GCVersioned(Versioned):
             )
         return self.rebase()
 
-    def rebase(self, keep_keys: set[str] | None = None) -> RebaseResult:
+    def rebase(
+        self,
+        keep_keys: set[str] | None = None,
+        *,
+        info: dict | None = None,
+    ) -> RebaseResult:
         """Rebase: create a fresh root commit, dropping cold keys.
 
         Args:
             keep_keys: If provided, retain exactly these keys (plus system
                 keys). Otherwise, use the high/low water strategy.
+            info: Optional metadata for the rebase commit.
         """
         meta = self._meta
         total_before = self._load_total_size(
@@ -172,7 +182,7 @@ class GCVersioned(Versioned):
             preview_keys[key] = system_keys[key]
         for key in retained_data:
             preview_keys[key] = f"<pending:{key}>"
-        new_hash = _content_hash(None, preview_keys, retained_data)
+        new_hash = _content_hash((), preview_keys, retained_data, info=info)
 
         # Build the write batch
         diffs: dict[str, bytes] = {}
@@ -194,11 +204,13 @@ class GCVersioned(Versioned):
 
         # Commit metadata
         diffs[COMMIT_KEYSET % new_hash] = pickle.dumps(new_commit_keys)
-        diffs[PARENT_COMMIT % new_hash] = pickle.dumps(None)
-        diffs[HEAD_COMMIT] = pickle.dumps(new_hash)
+        diffs[PARENT_COMMIT % new_hash] = pickle.dumps(())
+        diffs[BRANCH_HEAD % self._branch] = pickle.dumps(new_hash)
         diffs[META_KEY % new_hash] = pickle.dumps(new_meta)
         total_after = sum(e.size or 0 for e in new_meta.values())
         diffs[TOTAL_VAR_SIZE_KEY % new_hash] = pickle.dumps(total_after)
+        if info is not None:
+            diffs[INFO_KEY % new_hash] = pickle.dumps(info)
 
         self.store.set_many(**diffs)
 
@@ -240,8 +252,19 @@ class GCVersioned(Versioned):
         Returns:
             Number of orphaned commits cleaned.
         """
-        # Mark phase: find all reachable commits
-        reachable = set(self.history())
+        # Mark phase: find all reachable commits across ALL branches
+        reachable: set[str] = set()
+        prefix = BRANCH_HEAD.replace("%s", "")
+        for key in self.store.keys():
+            if isinstance(key, str) and key.startswith(prefix):
+                head_bytes = self.store.get(key)
+                if head_bytes is None:
+                    continue
+                branch_head = pickle.loads(head_bytes)
+                for commit in self.history(
+                    commit_hash=branch_head, all_parents=True
+                ):
+                    reachable.add(commit)
 
         # Sweep phase: find orphaned commits by scanning for meta keys
         meta_prefix = META_KEY.replace("%s", "")
@@ -287,6 +310,7 @@ class GCVersioned(Versioned):
                 COMMIT_KEYSET % orphan_hash,
                 PARENT_COMMIT % orphan_hash,
                 TOTAL_VAR_SIZE_KEY % orphan_hash,
+                INFO_KEY % orphan_hash,
             )
 
         return len(orphans)
