@@ -99,7 +99,7 @@ def _content_hash(
         h.update(updates[key])
     if info is not None:
         h.update(json.dumps(info, sort_keys=True, separators=(",", ":")).encode())
-    return h.hexdigest()[:16]
+    return h.hexdigest()[:40]
 
 
 class Versioned:

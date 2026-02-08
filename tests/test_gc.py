@@ -19,7 +19,7 @@ class TestGCNoOp:
         result = v.commit({"k": b"data"})
         assert result.merged
         assert result.commit is not None
-        assert len(result.commit) == 16
+        assert len(result.commit) == 40
 
 
 class TestGCRebase:

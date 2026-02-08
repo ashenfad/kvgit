@@ -45,7 +45,7 @@ class TestVersionedBasic:
         assert isinstance(result, MergeResult)
         assert result.merged is True
         assert result.commit is not None
-        assert len(result.commit) == 16
+        assert len(result.commit) == 40
         assert v.current_commit == result.commit
 
     def test_no_op_commit(self):
