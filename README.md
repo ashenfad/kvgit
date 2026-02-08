@@ -55,6 +55,13 @@ worker.commit()
 print(ct.decode(worker.get("hits")))  # 135 (115 + 120 - 100)
 ```
 
+## Development
+
+```bash
+uv sync --extra dev
+uv run pytest
+```
+
 ## Documentation
 
 See [`docs/`](docs/) for detailed API documentation:
