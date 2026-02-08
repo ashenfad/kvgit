@@ -34,10 +34,10 @@ class Composite(KVStore):
                             try:
                                 self._stores[j].set(key, value)
                             except Exception:
-                                pass
+                                pass  # best-effort cache population
                     return value
             except Exception:
-                continue
+                continue  # tier unavailable, try next
         return None
 
     def get_many(self, *args: str) -> Mapping[str, bytes]:
@@ -85,7 +85,7 @@ class Composite(KVStore):
             try:
                 store.set(key, value)
             except Exception:
-                pass
+                pass  # best-effort cache population
 
     def set_many(self, **kwargs: bytes) -> None:
         self._stores[-1].set_many(**kwargs)
@@ -93,7 +93,7 @@ class Composite(KVStore):
             try:
                 store.set_many(**kwargs)
             except Exception:
-                pass
+                pass  # best-effort cache population
 
     def remove(self, key: str) -> None:
         self._stores[-1].remove(key)
@@ -101,7 +101,7 @@ class Composite(KVStore):
             try:
                 store.remove(key)
             except Exception:
-                pass
+                pass  # best-effort cache population
 
     def remove_many(self, *keys: str) -> None:
         self._stores[-1].remove_many(*keys)
@@ -109,7 +109,7 @@ class Composite(KVStore):
             try:
                 store.remove_many(*keys)
             except Exception:
-                pass
+                pass  # best-effort cache population
 
     def clear(self) -> None:
         self._stores[-1].clear()
@@ -117,7 +117,7 @@ class Composite(KVStore):
             try:
                 store.clear()
             except Exception:
-                pass
+                pass  # best-effort cache population
 
     def cas(self, key: str, value: bytes, expected: bytes | None) -> bool:
         success = self._stores[-1].cas(key, value, expected)
