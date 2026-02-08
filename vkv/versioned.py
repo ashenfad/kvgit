@@ -145,6 +145,7 @@ class Versioned:
 
         # Merge function registry
         self._merge_fns: dict[str, MergeFn] = {}
+        self._content_types: dict[str, object] = {}
         self._default_merge: MergeFn | None = None
         self.last_merge_result: MergeResult | None = None
 
@@ -155,6 +156,14 @@ class Versioned:
     @property
     def base_commit(self) -> str:
         return self._base_commit
+
+    def __repr__(self) -> str:
+        n_keys = len(self._commit_keys)
+        short_hash = self._current_commit[:8]
+        return (
+            f"Versioned(branch={self._branch!r}, "
+            f"commit={short_hash}..., keys={n_keys})"
+        )
 
     @property
     def latest_head(self) -> str | None:
@@ -208,7 +217,12 @@ class Versioned:
         Args:
             ct: A ContentType instance (from vkv.content_types).
         """
+        self._content_types[key] = ct
         self.set_merge_fn(key, ct.as_merge_fn())
+
+    def get_content_type(self, key: str):
+        """Retrieve the ContentType registered for a key, or None."""
+        return self._content_types.get(key)
 
     # -- Write operations --
 
@@ -605,12 +619,21 @@ class Versioned:
             )
         self._load_commit(pickle.loads(head_bytes), update_base=True)
 
-    def checkout(self, commit_hash: str) -> "Versioned | None":
-        """Return a new Versioned at a specific commit."""
+    def checkout(
+        self, commit_hash: str, *, branch: str | None = None
+    ) -> "Versioned | None":
+        """Return a new Versioned at a specific commit.
+
+        Args:
+            commit_hash: The commit to check out.
+            branch: Branch for the new instance (default: same as self).
+        """
         if self.store.get(COMMIT_KEYSET % commit_hash) is None:
             return None
         return Versioned(
-            self.store, commit_hash=commit_hash, branch=self._branch
+            self.store,
+            commit_hash=commit_hash,
+            branch=branch or self._branch,
         )
 
     def create_branch(self, name: str) -> "Versioned":
@@ -689,6 +712,10 @@ class Versioned:
                 if branch_name:
                     result.append(branch_name)
         return sorted(result)
+
+    def list_branches(self) -> list[str]:
+        """List all branch names in the store."""
+        return Versioned.branches(self.store)
 
     def commit_info(self, commit_hash: str | None = None) -> dict | None:
         """Retrieve the info dict for a commit, or None if none was stored."""
