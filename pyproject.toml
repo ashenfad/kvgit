@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "kvit"
 version = "0.1.0"
 description = "Versioned key-value store with git-like commit, branch, and merge semantics."
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 dependencies = []
 
 [project.optional-dependencies]

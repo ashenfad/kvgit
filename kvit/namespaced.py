@@ -1,7 +1,5 @@
 """Namespaced: key-prefixed view over a Store."""
 
-from __future__ import annotations
-
 from typing import Iterable
 
 from .store import Store

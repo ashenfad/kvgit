@@ -1,7 +1,5 @@
 """Live: immediate-write store with no versioning."""
 
-from __future__ import annotations
-
 from typing import Iterable
 
 from .kv.base import KVStore

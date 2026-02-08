@@ -1,7 +1,5 @@
 """Staged: buffered writes over a Versioned store."""
 
-from __future__ import annotations
-
 from typing import Iterable
 
 from .versioned import MergeFn, MergeResult, Versioned
