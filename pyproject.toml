@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vkv"
+version = "0.1.0"
+description = "Versioned key-value store with git-like commit, branch, and merge semantics."
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+disk = ["diskcache"]
+all = ["diskcache"]
+dev = ["pytest", "pytest-timeout", "diskcache"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
