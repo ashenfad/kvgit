@@ -1,7 +1,12 @@
 """Tests for GCVersioned garbage collection."""
 
-from vkv import GCVersioned
+import pickle
+
+import pytest
+
+from vkv import ConcurrencyError, GCVersioned
 from vkv.kv.memory import Memory
+from vkv.versioned import BRANCH_HEAD
 
 
 class TestGCNoOp:
@@ -146,3 +151,16 @@ class TestGCValidation:
     def test_invalid_low_water_falls_back(self):
         v = GCVersioned(high_water_bytes=1000, low_water_bytes=2000)
         assert v.low_water == 800  # falls back to 80%
+
+    def test_rebase_cas_failure(self):
+        """Rebase raises ConcurrencyError if HEAD was changed concurrently."""
+        store = Memory()
+        v = GCVersioned(store, high_water_bytes=10000)
+        v.snapshot({"a": b"data"})
+        v.merge()
+
+        # Advance HEAD behind v's back
+        store.set(BRANCH_HEAD % "main", pickle.dumps("bogus_hash"))
+
+        with pytest.raises(ConcurrencyError, match="HEAD changed during rebase"):
+            v.rebase()

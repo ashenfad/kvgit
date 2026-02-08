@@ -230,7 +230,7 @@ class Versioned:
         Returns:
             The new commit hash.
         """
-        if not updates and not removals:
+        if not updates and not removals and info is None:
             return self._current_commit
 
         updates = updates or {}
@@ -327,6 +327,11 @@ class Versioned:
             MergeConflict: If keys conflict and no merge function
                 resolves them.
         """
+        if on_conflict not in ("raise", "abandon"):
+            raise ValueError(
+                f"on_conflict must be 'raise' or 'abandon', got {on_conflict!r}"
+            )
+
         branch_key = BRANCH_HEAD % self._branch
 
         # Case 1: No local changes
@@ -432,6 +437,7 @@ class Versioned:
         merged_values: dict[str, bytes] = {}
         auto_merged: list[str] = []
         conflicts: set[str] = set()
+        merge_errors: dict[str, Exception] = {}
 
         # Keys unchanged by either side: carry from their keyset (HEAD)
         all_keys = set(our_keyset.keys()) | set(their_keyset.keys())
@@ -499,11 +505,12 @@ class Versioned:
                 result_val = fn(old_val, our_val, their_val)
                 merged_values[key] = result_val
                 auto_merged.append(key)
-            except Exception:
+            except Exception as e:
                 conflicts.add(key)
+                merge_errors[key] = e
 
         if conflicts:
-            raise MergeConflict(conflicts)
+            raise MergeConflict(conflicts, merge_errors)
 
         # Build merge commit
         parents = (their_head, self._current_commit)

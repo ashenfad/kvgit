@@ -4,6 +4,7 @@ import pickle
 import time
 from dataclasses import dataclass
 
+from .errors import ConcurrencyError
 from .kv.base import KVStore
 from .versioned import (
     BRANCH_HEAD,
@@ -205,7 +206,6 @@ class GCVersioned(Versioned):
         # Commit metadata
         diffs[COMMIT_KEYSET % new_hash] = pickle.dumps(new_commit_keys)
         diffs[PARENT_COMMIT % new_hash] = pickle.dumps(())
-        diffs[BRANCH_HEAD % self._branch] = pickle.dumps(new_hash)
         diffs[META_KEY % new_hash] = pickle.dumps(new_meta)
         total_after = sum(e.size or 0 for e in new_meta.values())
         diffs[TOTAL_VAR_SIZE_KEY % new_hash] = pickle.dumps(total_after)
@@ -213,6 +213,14 @@ class GCVersioned(Versioned):
             diffs[INFO_KEY % new_hash] = pickle.dumps(info)
 
         self.store.set_many(**diffs)
+
+        # CAS HEAD to the new rebase commit
+        branch_key = BRANCH_HEAD % self._branch
+        expected = pickle.dumps(self._base_commit)
+        if not self.store.cas(
+            branch_key, pickle.dumps(new_hash), expected=expected
+        ):
+            raise ConcurrencyError("HEAD changed during rebase.")
 
         # Delete dropped blobs
         to_delete = []

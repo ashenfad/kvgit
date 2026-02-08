@@ -1,6 +1,8 @@
 """Tests for the Versioned commit log."""
 
-from vkv import MergeResult, Versioned
+import pytest
+
+from vkv import MergeConflict, MergeResult, Versioned
 from vkv.kv.memory import Memory
 
 
@@ -793,3 +795,47 @@ class TestMergeResultReturn:
         assert isinstance(result, MergeResult)
         assert not result
         assert result.merged is False
+
+
+class TestBugFixes:
+    def test_snapshot_info_only_creates_commit(self):
+        """snapshot(info=...) with no data changes still creates a commit."""
+        v = Versioned()
+        old_hash = v.current_commit
+        new_hash = v.snapshot(info={"msg": "hi"})
+        assert new_hash != old_hash
+        assert v.commit_info() == {"msg": "hi"}
+
+    def test_snapshot_no_changes_no_info_is_noop(self):
+        """snapshot() with nothing at all is still a no-op."""
+        v = Versioned()
+        old_hash = v.current_commit
+        assert v.snapshot() == old_hash
+
+    def test_merge_fn_exception_surfaces_in_conflict(self):
+        """Merge fn exceptions are attached to MergeConflict."""
+        store = Memory()
+        v1 = Versioned(store)
+        v1.snapshot({"k": b"base"})
+        v1.merge()
+
+        v2 = Versioned(store)
+        v1.snapshot({"k": b"v1"})
+        v1.merge()
+        v2.snapshot({"k": b"v2"})
+
+        def bad_fn(old, ours, theirs):
+            raise ValueError("intentional error")
+
+        with pytest.raises(MergeConflict) as exc_info:
+            v2.merge(merge_fns={"k": bad_fn})
+        assert "k" in exc_info.value.conflicting_keys
+        assert "k" in exc_info.value.merge_errors
+        assert isinstance(exc_info.value.merge_errors["k"], ValueError)
+
+    def test_merge_invalid_on_conflict(self):
+        """Invalid on_conflict value raises ValueError."""
+        v = Versioned()
+        v.snapshot({"x": b"1"})
+        with pytest.raises(ValueError, match="on_conflict"):
+            v.merge(on_conflict="bogus")
