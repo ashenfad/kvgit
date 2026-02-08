@@ -1,6 +1,8 @@
 # Core API: Versioned
 
-`Versioned` is the central class. It provides a commit log over any `KVStore` backend, with reads, writes, branching, three-way merge, and history traversal.
+`Versioned` is the central class. It provides a commit log over any `KVStore` backend, with reads, atomic commit+merge, branching, and history traversal.
+
+Most users should use `Staged` (via `vkv.store()`) for the set/remove/commit pattern. `Versioned` is the lower-level engine that `Staged` wraps.
 
 ## Construction
 
@@ -66,48 +68,27 @@ if "config" in v:
 
 ## Writing
 
-### `snapshot(updates=None, removals=None, *, info=None) -> str`
+### `commit(updates=None, removals=None, *, on_conflict="raise", merge_fns=None, default_merge=None, info=None) -> MergeResult`
 
-Create a new commit with the given changes. Returns the new commit hash.
+Atomically commit changes and advance HEAD. This is the primary write operation.
 
-Values must be `bytes`. The commit is local until `merge()` is called.
+Values must be `bytes`. If HEAD has diverged since this instance was created, a three-way merge is performed automatically.
 
 ```python
 # Add/update keys
-h = v.snapshot({"name": b"alice", "age": b"30"})
+result = v.commit({"name": b"alice", "age": b"30"})
 
 # Remove keys
-v.snapshot(removals={"old_key"})
+v.commit(removals={"old_key"})
 
 # Both at once
-v.snapshot({"new": b"value"}, removals={"old"})
+v.commit({"new": b"value"}, removals={"old"})
 
 # Attach metadata to the commit
-v.snapshot({"k": b"v"}, info={"author": "alice", "message": "init"})
+v.commit({"k": b"v"}, info={"author": "alice", "message": "init"})
 
 # Info-only commit (no data changes)
-v.snapshot(info={"checkpoint": True})
-```
-
-## Merging
-
-### `merge(on_conflict="raise", *, merge_fns=None, default_merge=None, info=None) -> MergeResult`
-
-Atomically advance HEAD to this branch's tip. Three cases:
-
-1. **No local changes** -- no-op, returns immediately
-2. **HEAD unchanged** -- fast-forward via CAS
-3. **HEAD diverged** -- three-way merge using the lowest common ancestor (LCA)
-
-Returns a `MergeResult` (truthy when successful, falsy when abandoned).
-
-```python
-v.snapshot({"x": b"1"})
-
-result = v.merge()
-if result:
-    print(result.strategy)   # "fast_forward" or "three_way"
-    print(result.commit)     # new commit hash
+v.commit(info={"checkpoint": True})
 ```
 
 #### Three-way merge behavior
@@ -127,7 +108,7 @@ When HEAD has diverged, vkv computes the LCA and diffs both sides:
 v.set_merge_fn("counter", lambda old, ours, theirs: ours)
 
 # Per-call override
-v.merge(merge_fns={"counter": my_merge_fn})
+v.commit({"counter": b"5"}, merge_fns={"counter": my_merge_fn})
 
 # Default fallback for any unregistered key
 v.set_default_merge(lambda old, ours, theirs: theirs)
@@ -142,16 +123,17 @@ Merge functions receive `(old: bytes | None, ours: bytes | None, theirs: bytes |
 | `"raise"` (default) | Raises `ConcurrencyError` on CAS failure, `MergeConflict` on unresolvable keys |
 | `"abandon"` | Returns a falsy `MergeResult` instead of raising |
 
-### `reset() -> None`
+### `refresh() -> None`
 
-Abandon local changes and reload from HEAD.
+Reload state from HEAD. Use this to see changes made by other writers.
 
 ```python
-v.snapshot({"oops": b"mistake"})
-v.reset()  # back to HEAD
+v.refresh()  # now v reflects HEAD
 ```
 
 ## Branching
+
+These methods are also available on `Staged` (returning `Staged` instances) and on the `Store` protocol. Most users should use `Staged.create_branch()` / `Staged.checkout()` instead of calling these directly.
 
 ### `create_branch(name) -> Versioned`
 
@@ -159,8 +141,7 @@ Fork the current commit onto a new branch. Returns a new `Versioned` on that bra
 
 ```python
 dev = v.create_branch("dev")
-dev.snapshot({"feature": b"wip"})
-dev.merge()  # merges to "dev" HEAD, not "main"
+dev.commit({"feature": b"wip"})  # commits to "dev" HEAD, not "main"
 ```
 
 ### `checkout(commit_hash, *, branch=None) -> Versioned | None`
@@ -230,17 +211,17 @@ info = v.commit_info(some_hash)  # specific commit
 | `base_commit` | `str` | Commit hash at branch creation (merge base) |
 | `latest_head` | `str \| None` | HEAD from the store (reflects other writers) |
 | `initial_commit` | `str` | Root commit (oldest in linear history) |
-| `last_merge_result` | `MergeResult \| None` | Result of the last `merge()` call |
+| `last_merge_result` | `MergeResult \| None` | Result of the last `commit()` call |
 
 ## Types
 
 ### `MergeResult`
 
-Frozen dataclass returned by `merge()`. Truthy when merge succeeded.
+Frozen dataclass returned by `commit()`. Truthy when merge succeeded.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `merged` | `bool` | Whether the merge succeeded |
+| `merged` | `bool` | Whether the commit succeeded |
 | `commit` | `str \| None` | New commit hash (None if not merged) |
 | `strategy` | `str` | `"no_op"`, `"fast_forward"`, or `"three_way"` |
 | `auto_merged_keys` | `tuple[str, ...]` | Keys resolved by merge functions |

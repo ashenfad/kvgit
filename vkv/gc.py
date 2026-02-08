@@ -1,6 +1,5 @@
 """GCVersioned: Versioned state with automatic garbage collection."""
 
-import pickle
 import time
 from dataclasses import dataclass
 
@@ -15,6 +14,10 @@ from .versioned import (
     TOTAL_VAR_SIZE_KEY,
     MetaEntry,
     Versioned,
+    _from_bytes,
+    _meta_from_bytes,
+    _meta_to_bytes,
+    _to_bytes,
 )
 
 
@@ -53,7 +56,7 @@ class GCVersioned(Versioned):
     - Write a fresh root commit with only retained keys, then delete
       dropped blobs and orphaned commits.
 
-    Every ``snapshot()`` auto-runs the high/low check.
+    Every ``commit()`` auto-runs the high/low check.
     """
 
     def __init__(
@@ -78,20 +81,31 @@ class GCVersioned(Versioned):
             self.low_water = int(high_water_bytes * 0.8)
         self.last_rebase_result: RebaseResult | None = None
 
-    def snapshot(
+    def commit(
         self,
         updates: dict[str, bytes] | None = None,
         removals: set[str] | None = None,
         *,
+        on_conflict: str = "raise",
+        merge_fns=None,
+        default_merge=None,
         info: dict | None = None,
-    ) -> str:
+    ) -> "MergeResult":
         """Commit changes, then run GC if above high water mark."""
-        commit_hash = super().snapshot(updates, removals, info=info)
-        rebase_result = self.maybe_rebase()
-        self.last_rebase_result = rebase_result
-        if rebase_result.performed and rebase_result.new_commit:
-            return rebase_result.new_commit
-        return commit_hash
+        from .versioned import MergeResult
+
+        result = super().commit(
+            updates,
+            removals,
+            on_conflict=on_conflict,
+            merge_fns=merge_fns,
+            default_merge=default_merge,
+            info=info,
+        )
+        if result.merged:
+            rebase_result = self.maybe_rebase()
+            self.last_rebase_result = rebase_result
+        return result
 
     def maybe_rebase(self) -> RebaseResult:
         """Run rebase only if total size exceeds high water mark."""
@@ -204,21 +218,21 @@ class GCVersioned(Versioned):
             diffs[new_vk] = value
 
         # Commit metadata
-        diffs[COMMIT_KEYSET % new_hash] = pickle.dumps(new_commit_keys)
-        diffs[PARENT_COMMIT % new_hash] = pickle.dumps(())
-        diffs[META_KEY % new_hash] = pickle.dumps(new_meta)
+        diffs[COMMIT_KEYSET % new_hash] = _to_bytes(new_commit_keys)
+        diffs[PARENT_COMMIT % new_hash] = _to_bytes([])
+        diffs[META_KEY % new_hash] = _meta_to_bytes(new_meta)
         total_after = sum(e.size or 0 for e in new_meta.values())
-        diffs[TOTAL_VAR_SIZE_KEY % new_hash] = pickle.dumps(total_after)
+        diffs[TOTAL_VAR_SIZE_KEY % new_hash] = _to_bytes(total_after)
         if info is not None:
-            diffs[INFO_KEY % new_hash] = pickle.dumps(info)
+            diffs[INFO_KEY % new_hash] = _to_bytes(info)
 
         self.store.set_many(**diffs)
 
         # CAS HEAD to the new rebase commit
         branch_key = BRANCH_HEAD % self._branch
-        expected = pickle.dumps(self._base_commit)
+        expected = _to_bytes(self._base_commit)
         if not self.store.cas(
-            branch_key, pickle.dumps(new_hash), expected=expected
+            branch_key, _to_bytes(new_hash), expected=expected
         ):
             raise ConcurrencyError("HEAD changed during rebase.")
 
@@ -268,7 +282,7 @@ class GCVersioned(Versioned):
                 head_bytes = self.store.get(key)
                 if head_bytes is None:
                     continue
-                branch_head = pickle.loads(head_bytes)
+                branch_head = _from_bytes(head_bytes)
                 for commit in self.history(
                     commit_hash=branch_head, all_parents=True
                 ):
@@ -290,12 +304,11 @@ class GCVersioned(Versioned):
             if meta_bytes is None:
                 continue
             try:
-                meta = pickle.loads(meta_bytes)
+                meta = _meta_from_bytes(meta_bytes)
                 if meta:
                     first_entry = next(iter(meta.values()), None)
                     if (
                         first_entry
-                        and hasattr(first_entry, "created_at")
                         and first_entry.created_at < cutoff_time
                     ):
                         orphans.append(commit_hash)
@@ -307,7 +320,7 @@ class GCVersioned(Versioned):
             keyset_bytes = self.store.get(COMMIT_KEYSET % orphan_hash)
             if keyset_bytes:
                 try:
-                    keyset = pickle.loads(keyset_bytes)
+                    keyset = _from_bytes(keyset_bytes)
                     blob_keys = list(keyset.values())
                     if blob_keys:
                         self.store.remove_many(*blob_keys)
@@ -331,6 +344,6 @@ class GCVersioned(Versioned):
         if total_bytes is None:
             return default
         try:
-            return pickle.loads(total_bytes)
+            return _from_bytes(total_bytes)
         except Exception:
             return default

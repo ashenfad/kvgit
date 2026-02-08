@@ -47,22 +47,20 @@ Merge strategy: `ours + theirs - old`. Both sides' increments are preserved.
 
 ```python
 from vkv import Versioned, counter
+from vkv.kv.memory import Memory
 
 ct = counter()
 
 store = Memory()
 v1 = Versioned(store)
-v1.snapshot({"hits": ct.encode(100)})
-v1.merge()
+v1.commit({"hits": ct.encode(100)})
 
 v2 = Versioned(store)
 v2.set_content_type("hits", ct)
 
-v1.snapshot({"hits": ct.encode(115)})  # +15 on main
-v1.merge()
-v2.snapshot({"hits": ct.encode(120)})  # +20 on v2
+v1.commit({"hits": ct.encode(115)})    # +15 on main
+v2.commit({"hits": ct.encode(120)})    # +20 on v2, triggers three-way merge
 
-v2.merge()
 ct.decode(v2.get("hits"))  # 135 (115 + 120 - 100)
 ```
 

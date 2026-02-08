@@ -1,9 +1,9 @@
 """Versioned state: a commit log over a KV store."""
 
 import hashlib
-import pickle
+import json
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from collections import deque
 from typing import Callable, Iterable
 
@@ -17,6 +17,16 @@ BRANCH_HEAD = "__branch_head__%s"
 META_KEY = "__meta__%s"
 TOTAL_VAR_SIZE_KEY = "__total_var_size__%s"
 INFO_KEY = "__info__%s"
+
+
+def _to_bytes(obj) -> bytes:
+    """Encode a JSON-safe Python object to bytes."""
+    return json.dumps(obj, separators=(",", ":")).encode()
+
+
+def _from_bytes(raw: bytes):
+    """Decode bytes to a Python object."""
+    return json.loads(raw)
 
 
 MergeFn = Callable[
@@ -60,6 +70,16 @@ class MetaEntry:
     created_at: float
 
 
+def _meta_to_bytes(meta: dict[str, "MetaEntry"]) -> bytes:
+    """Serialize the per-key metadata dict to JSON bytes."""
+    return _to_bytes({k: asdict(v) for k, v in meta.items()})
+
+
+def _meta_from_bytes(raw: bytes) -> dict[str, "MetaEntry"]:
+    """Deserialize JSON bytes to a per-key metadata dict."""
+    return {k: MetaEntry(**v) for k, v in _from_bytes(raw).items()}
+
+
 def _content_hash(
     parents: tuple[str, ...],
     keyset: dict[str, str],
@@ -72,13 +92,13 @@ def _content_hash(
     optional info to produce a deterministic 16-hex-char commit hash.
     """
     h = hashlib.sha256()
-    h.update(pickle.dumps(parents))
-    h.update(pickle.dumps(sorted(keyset.items())))
+    h.update(json.dumps(list(parents), separators=(",", ":")).encode())
+    h.update(json.dumps(sorted(keyset.items()), separators=(",", ":")).encode())
     for key in sorted(updates):
         h.update(key.encode())
         h.update(updates[key])
     if info is not None:
-        h.update(pickle.dumps(sorted(info.items())))
+        h.update(json.dumps(info, sort_keys=True, separators=(",", ":")).encode())
     return h.hexdigest()[:16]
 
 
@@ -87,8 +107,8 @@ class Versioned:
 
     The caller owns the working state. Versioned provides:
     - ``get()`` / ``get_many()`` to read from the current commit
-    - ``snapshot()`` to commit a batch of changes (bytes-only)
-    - ``merge()`` / ``reset()`` for CAS-based concurrency
+    - ``commit()`` to atomically write changes and advance HEAD
+    - ``refresh()`` to reload from HEAD
     - ``checkout()`` / ``history()`` for navigating commits
     """
 
@@ -107,16 +127,16 @@ class Versioned:
         if commit_hash is None:
             head_bytes = store.get(BRANCH_HEAD % branch)
             if head_bytes is not None:
-                commit_hash = pickle.loads(head_bytes)
+                commit_hash = _from_bytes(head_bytes)
             else:
                 # Create initial empty commit
                 commit_hash = _content_hash((), {}, {})
                 initial = {
-                    COMMIT_KEYSET % commit_hash: pickle.dumps({}),
-                    PARENT_COMMIT % commit_hash: pickle.dumps(()),
-                    BRANCH_HEAD % branch: pickle.dumps(commit_hash),
-                    META_KEY % commit_hash: pickle.dumps({}),
-                    TOTAL_VAR_SIZE_KEY % commit_hash: pickle.dumps(0),
+                    COMMIT_KEYSET % commit_hash: _to_bytes({}),
+                    PARENT_COMMIT % commit_hash: _to_bytes([]),
+                    BRANCH_HEAD % branch: _to_bytes(commit_hash),
+                    META_KEY % commit_hash: _meta_to_bytes({}),
+                    TOTAL_VAR_SIZE_KEY % commit_hash: _to_bytes(0),
                 }
                 store.set_many(**initial)
 
@@ -127,14 +147,14 @@ class Versioned:
         self._commit_keys: dict[str, str] = {}
         keyset_bytes = self.store.get(COMMIT_KEYSET % self._current_commit)
         if keyset_bytes is not None:
-            self._commit_keys = pickle.loads(keyset_bytes)
+            self._commit_keys = _from_bytes(keyset_bytes)
 
         # Load metadata for GC
         self._meta: dict[str, MetaEntry] = {}
         meta_bytes = self.store.get(META_KEY % self._current_commit)
         if meta_bytes is not None:
             try:
-                self._meta = pickle.loads(meta_bytes)
+                self._meta = _meta_from_bytes(meta_bytes)
             except Exception:
                 self._meta = {}
         self._touch_counter = (
@@ -170,7 +190,7 @@ class Versioned:
         """Read HEAD directly from the KV store (reflects other writers)."""
         head_bytes = self.store.get(BRANCH_HEAD % self._branch)
         if head_bytes is not None:
-            return pickle.loads(head_bytes)
+            return _from_bytes(head_bytes)
         return None
 
     # -- Read operations --
@@ -226,27 +246,20 @@ class Versioned:
 
     # -- Write operations --
 
-    def snapshot(
+    def _create_commit(
         self,
         updates: dict[str, bytes] | None = None,
         removals: set[str] | None = None,
         *,
         info: dict | None = None,
     ) -> str:
-        """Create a new commit with the given changes.
+        """Create a new local commit with the given changes.
 
-        Args:
-            updates: Key-value pairs to add or update (bytes values).
-            removals: Keys to remove.
-            info: Optional metadata dict (e.g. author, message).
-                Included in content hash.
+        Does not advance HEAD. Use ``commit()`` for the public API.
 
         Returns:
             The new commit hash.
         """
-        if not updates and not removals and info is None:
-            return self._current_commit
-
         updates = updates or {}
         removals = removals or set()
 
@@ -292,15 +305,15 @@ class Versioned:
                 )
 
         # Store commit metadata
-        diffs[COMMIT_KEYSET % new_hash] = pickle.dumps(new_commit_keys)
-        diffs[PARENT_COMMIT % new_hash] = pickle.dumps((self._current_commit,))
-        diffs[META_KEY % new_hash] = pickle.dumps(new_meta)
+        diffs[COMMIT_KEYSET % new_hash] = _to_bytes(new_commit_keys)
+        diffs[PARENT_COMMIT % new_hash] = _to_bytes([self._current_commit])
+        diffs[META_KEY % new_hash] = _meta_to_bytes(new_meta)
         total_size = sum(
             e.size for e in new_meta.values() if e.size is not None
         )
-        diffs[TOTAL_VAR_SIZE_KEY % new_hash] = pickle.dumps(total_size)
+        diffs[TOTAL_VAR_SIZE_KEY % new_hash] = _to_bytes(total_size)
         if info is not None:
-            diffs[INFO_KEY % new_hash] = pickle.dumps(info)
+            diffs[INFO_KEY % new_hash] = _to_bytes(info)
 
         # Write everything
         self.store.set_many(**diffs)
@@ -314,42 +327,39 @@ class Versioned:
 
     # -- Branching / concurrency --
 
-    def merge(
+    def commit(
         self,
-        on_conflict: str = "raise",
+        updates: dict[str, bytes] | None = None,
+        removals: set[str] | None = None,
         *,
+        on_conflict: str = "raise",
         merge_fns: dict[str, MergeFn] | None = None,
         default_merge: MergeFn | None = None,
         info: dict | None = None,
     ) -> MergeResult:
-        """Atomically update HEAD to this branch's tip.
+        """Commit changes and atomically advance HEAD.
 
-        If HEAD has diverged, attempts a three-way merge using the
-        lowest common ancestor.
+        Creates a new commit with the given changes and advances the
+        branch HEAD. If HEAD has diverged, performs a three-way merge.
 
         Args:
+            updates: Key-value pairs to add or update (bytes values).
+            removals: Keys to remove.
             on_conflict: 'raise' (default) or 'abandon' for CAS failures.
             merge_fns: Per-key merge functions (override instance-level).
             default_merge: Default merge function (override instance-level).
-            info: Optional info dict for the merge commit.
+            info: Optional metadata dict for the commit.
 
         Returns:
-            A MergeResult (truthy when merged, falsy otherwise).
+            A MergeResult (truthy when committed, falsy if abandoned).
 
         Raises:
             ConcurrencyError: If on_conflict='raise' and CAS fails.
             MergeConflict: If keys conflict and no merge function
                 resolves them.
         """
-        if on_conflict not in ("raise", "abandon"):
-            raise ValueError(
-                f"on_conflict must be 'raise' or 'abandon', got {on_conflict!r}"
-            )
-
-        branch_key = BRANCH_HEAD % self._branch
-
-        # Case 1: No local changes
-        if self._current_commit == self._base_commit:
+        # No-op if no changes
+        if not updates and not removals and info is None:
             result = MergeResult(
                 merged=True,
                 commit=self._current_commit,
@@ -360,12 +370,20 @@ class Versioned:
             self.last_merge_result = result
             return result
 
+        if on_conflict not in ("raise", "abandon"):
+            raise ValueError(
+                f"on_conflict must be 'raise' or 'abandon', got {on_conflict!r}"
+            )
+
+        branch_key = BRANCH_HEAD % self._branch
         current_head = self.latest_head
 
-        # Case 2: Fast-forward (HEAD hasn't moved since we branched)
         if current_head == self._base_commit:
-            expected = pickle.dumps(self._base_commit)
-            new_head = pickle.dumps(self._current_commit)
+            # Fast-forward path: create commit with info, CAS HEAD
+            self._create_commit(updates, removals, info=info)
+
+            expected = _to_bytes(self._base_commit)
+            new_head = _to_bytes(self._current_commit)
             if self.store.cas(branch_key, new_head, expected=expected):
                 self._base_commit = self._current_commit
                 result = MergeResult(
@@ -388,10 +406,11 @@ class Versioned:
                 self.last_merge_result = result
                 return result
             raise ConcurrencyError(
-                f"HEAD changed from {self._base_commit}. Reset and retry."
+                f"HEAD changed from {self._base_commit}. Refresh and retry."
             )
 
-        # Case 3: Three-way merge (HEAD has diverged)
+        # Three-way path: create commit without info, merge with info
+        self._create_commit(updates, removals)
         return self._three_way_merge(
             current_head,
             on_conflict=on_conflict,
@@ -545,8 +564,8 @@ class Versioned:
         # Build meta for merge commit
         our_meta_bytes = self.store.get(META_KEY % self._current_commit)
         their_meta_bytes = self.store.get(META_KEY % their_head)
-        our_meta = pickle.loads(our_meta_bytes) if our_meta_bytes else {}
-        their_meta = pickle.loads(their_meta_bytes) if their_meta_bytes else {}
+        our_meta = _meta_from_bytes(our_meta_bytes) if our_meta_bytes else {}
+        their_meta = _meta_from_bytes(their_meta_bytes) if their_meta_bytes else {}
 
         merged_meta: dict[str, MetaEntry] = {}
         for key in merged_keyset:
@@ -562,21 +581,21 @@ class Versioned:
             elif key in their_meta:
                 merged_meta[key] = their_meta[key]
 
-        diffs[COMMIT_KEYSET % merge_hash] = pickle.dumps(merged_keyset)
-        diffs[PARENT_COMMIT % merge_hash] = pickle.dumps(parents)
-        diffs[META_KEY % merge_hash] = pickle.dumps(merged_meta)
+        diffs[COMMIT_KEYSET % merge_hash] = _to_bytes(merged_keyset)
+        diffs[PARENT_COMMIT % merge_hash] = _to_bytes(list(parents))
+        diffs[META_KEY % merge_hash] = _meta_to_bytes(merged_meta)
         total_size = sum(
             e.size for e in merged_meta.values() if e.size is not None
         )
-        diffs[TOTAL_VAR_SIZE_KEY % merge_hash] = pickle.dumps(total_size)
+        diffs[TOTAL_VAR_SIZE_KEY % merge_hash] = _to_bytes(total_size)
         if info is not None:
-            diffs[INFO_KEY % merge_hash] = pickle.dumps(info)
+            diffs[INFO_KEY % merge_hash] = _to_bytes(info)
 
         self.store.set_many(**diffs)
 
         # CAS HEAD from their_head to merge_hash
-        expected = pickle.dumps(their_head)
-        new_head_bytes = pickle.dumps(merge_hash)
+        expected = _to_bytes(their_head)
+        new_head_bytes = _to_bytes(merge_hash)
         if self.store.cas(branch_key, new_head_bytes, expected=expected):
             self._commit_keys = merged_keyset
             self._current_commit = merge_hash
@@ -607,17 +626,17 @@ class Versioned:
             self.last_merge_result = result
             return result
         raise ConcurrencyError(
-            "HEAD changed during three-way merge. Reset and retry."
+            "HEAD changed during three-way merge. Refresh and retry."
         )
 
-    def reset(self) -> None:
-        """Abandon local branch and reload from HEAD."""
+    def refresh(self) -> None:
+        """Reload state from HEAD."""
         head_bytes = self.store.get(BRANCH_HEAD % self._branch)
         if head_bytes is None:
             raise ValueError(
                 "No HEAD commit found for branch %s" % self._branch
             )
-        self._load_commit(pickle.loads(head_bytes), update_base=True)
+        self._load_commit(_from_bytes(head_bytes), update_base=True)
 
     def checkout(
         self, commit_hash: str, *, branch: str | None = None
@@ -647,7 +666,7 @@ class Versioned:
         branch_key = BRANCH_HEAD % name
         if self.store.get(branch_key) is not None:
             raise ValueError(f"Branch '{name}' already exists")
-        self.store.set(branch_key, pickle.dumps(self._current_commit))
+        self.store.set(branch_key, _to_bytes(self._current_commit))
         return Versioned(
             self.store, commit_hash=self._current_commit, branch=name
         )
@@ -656,7 +675,7 @@ class Versioned:
         """Reset HEAD to a specific commit."""
         if self.store.get(COMMIT_KEYSET % commit_hash) is None:
             return False
-        self.store.set(BRANCH_HEAD % self._branch, pickle.dumps(commit_hash))
+        self.store.set(BRANCH_HEAD % self._branch, _to_bytes(commit_hash))
         self._load_commit(commit_hash, update_base=True)
         return True
 
@@ -723,7 +742,7 @@ class Versioned:
         info_bytes = self.store.get(INFO_KEY % target)
         if info_bytes is None:
             return None
-        return pickle.loads(info_bytes)
+        return _from_bytes(info_bytes)
 
     def diff(self, commit_a: str, commit_b: str) -> DiffResult:
         """Compute key-level differences between two commits.
@@ -796,14 +815,14 @@ class Versioned:
         keyset_bytes = self.store.get(COMMIT_KEYSET % commit_hash)
         if keyset_bytes is None:
             return {}
-        return pickle.loads(keyset_bytes)
+        return _from_bytes(keyset_bytes)
 
     def _load_parents(self, commit_hash: str) -> tuple[str, ...]:
         """Load the parent tuple for a commit."""
         parent_bytes = self.store.get(PARENT_COMMIT % commit_hash)
         if parent_bytes is None:
             return ()
-        raw = pickle.loads(parent_bytes)
+        raw = _from_bytes(parent_bytes)
         if raw is None:
             return ()
         if isinstance(raw, str):
@@ -811,7 +830,7 @@ class Versioned:
         return tuple(raw)
 
     def _touch(self, key: str) -> None:
-        """Update last_touch for a key (in-memory only, persisted on snapshot)."""
+        """Update last_touch for a key (in-memory only, persisted on commit)."""
         if key in self._meta:
             self._touch_counter += 1
             entry = self._meta[key]
@@ -828,12 +847,12 @@ class Versioned:
             self._base_commit = commit_hash
 
         keyset_bytes = self.store.get(COMMIT_KEYSET % commit_hash)
-        self._commit_keys = pickle.loads(keyset_bytes) if keyset_bytes else {}
+        self._commit_keys = _from_bytes(keyset_bytes) if keyset_bytes else {}
 
         meta_bytes = self.store.get(META_KEY % commit_hash)
         if meta_bytes is not None:
             try:
-                self._meta = pickle.loads(meta_bytes)
+                self._meta = _meta_from_bytes(meta_bytes)
             except Exception:
                 self._meta = {}
         else:
