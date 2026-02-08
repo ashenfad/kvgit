@@ -2,7 +2,7 @@
 
 import pytest
 
-from vkv import MergeConflict, MergeResult, Versioned
+from vkv import MergeConflict, MergeResult, Versioned, counter
 from vkv.kv.memory import Memory
 
 
@@ -839,3 +839,53 @@ class TestBugFixes:
         v.snapshot({"x": b"1"})
         with pytest.raises(ValueError, match="on_conflict"):
             v.merge(on_conflict="bogus")
+
+
+class TestErgonomics:
+    def test_list_branches_instance_method(self):
+        store = Memory()
+        v = Versioned(store)
+        v.create_branch("dev")
+        v.create_branch("staging")
+        assert v.list_branches() == Versioned.branches(store)
+        assert "dev" in v.list_branches()
+        assert "staging" in v.list_branches()
+
+    def test_checkout_with_branch(self):
+        store = Memory()
+        v = Versioned(store, branch="main")
+        h = v.snapshot({"a": b"1"})
+        other = v.checkout(h, branch="other")
+        assert other._branch == "other"
+        assert other.get("a") == b"1"
+
+    def test_checkout_default_branch_unchanged(self):
+        store = Memory()
+        v = Versioned(store, branch="dev")
+        h = v.snapshot({"a": b"1"})
+        same = v.checkout(h)
+        assert same._branch == "dev"
+
+    def test_repr(self):
+        v = Versioned()
+        v.snapshot({"a": b"1", "b": b"2"})
+        r = repr(v)
+        assert "main" in r
+        assert "keys=2" in r
+        assert v.current_commit[:8] in r
+
+    def test_repr_different_branch(self):
+        store = Memory()
+        v = Versioned(store, branch="dev")
+        r = repr(v)
+        assert "dev" in r
+
+    def test_get_content_type(self):
+        v = Versioned()
+        ct = counter()
+        v.set_content_type("hits", ct)
+        assert v.get_content_type("hits") is ct
+
+    def test_get_content_type_missing(self):
+        v = Versioned()
+        assert v.get_content_type("nope") is None

@@ -126,9 +126,17 @@ class Namespaced:
         """Register a ContentType for a namespaced key."""
         self.base_store.set_content_type(self._prefixed(key), ct)
 
+    def get_content_type(self, key: str):
+        """Retrieve the ContentType registered for a namespaced key, or None."""
+        return self.base_store.get_content_type(self._prefixed(key))
+
     def set_default_merge(self, fn: MergeFn) -> None:
         """Register a default merge function (store-wide)."""
         self.base_store.set_default_merge(fn)
+
+    def list_branches(self) -> list[str]:
+        """List all branch names in the store."""
+        return self.base_store.list_branches()
 
     # -- Convenience properties --
 
