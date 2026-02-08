@@ -1,5 +1,6 @@
 """GCVersioned: Versioned state with automatic garbage collection."""
 
+import json
 import time
 from dataclasses import dataclass
 
@@ -311,7 +312,7 @@ class GCVersioned(Versioned):
                         and first_entry.created_at < cutoff_time
                     ):
                         orphans.append(commit_hash)
-            except Exception:
+            except (json.JSONDecodeError, TypeError, KeyError):
                 continue
 
         # Delete orphaned commits and their data
