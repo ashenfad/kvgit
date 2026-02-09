@@ -207,11 +207,22 @@ class Versioned:
 
     def get_many(self, *keys: str) -> dict[str, bytes]:
         """Get multiple values from the current commit."""
-        result: dict[str, bytes] = {}
+        # Map user keys -> versioned keys, skipping missing
+        vk_to_key: dict[str, str] = {}
         for key in keys:
-            value = self.get(key)
-            if value is not None:
-                result[key] = value
+            vk = self._commit_keys.get(key)
+            if vk is not None:
+                vk_to_key[vk] = key
+
+        if not vk_to_key:
+            return {}
+
+        raw = self.store.get_many(*vk_to_key.keys())
+        result: dict[str, bytes] = {}
+        for vk, value in raw.items():
+            key = vk_to_key[vk]
+            result[key] = value
+            self._touch(key)
         return result
 
     def keys(self) -> Iterable[str]:
