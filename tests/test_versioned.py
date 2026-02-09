@@ -497,7 +497,7 @@ class TestThreeWayMerge:
         v2 = Versioned(store)
         v1.commit({"x": b"v1"})
 
-        lww = lambda old, ours, theirs: theirs
+        def lww(old, ours, theirs): return theirs
         result = v2.commit({"x": b"v2"}, default_merge=lww)
         assert result
         assert v2.get("x") == b"v1"  # theirs = HEAD value
@@ -565,13 +565,10 @@ class TestThreeWayMerge:
 
         v2 = Versioned(store)
         v1.commit({"a": b"1"})
-        v1_head = v1.current_commit
-
         # v2 creates a local commit, then three-way merge
         v2._create_commit({"b": b"2"})
-        v2_commit = v2.current_commit
 
-        result = v2.commit({"b": b"2"})
+        v2.commit({"b": b"2"})
         # The merge commit (on HEAD) has two parents
         parents = v2._load_parents(v2.current_commit)
         assert len(parents) == 2
@@ -595,12 +592,12 @@ class TestThreeWayMerge:
         """After merge, history(all_parents=True) traverses both branches."""
         store = Memory()
         v1 = Versioned(store)
-        r_base = v1.commit({"base": b"0"})
+        v1.commit({"base": b"0"})
 
         v2 = Versioned(store)
-        r_v1 = v1.commit({"a": b"1"})
+        v1.commit({"a": b"1"})
 
-        r_v2 = v2.commit({"b": b"2"})
+        v2.commit({"b": b"2"})
         merge_commit = v2.current_commit
 
         all_commits = set(v2.history(all_parents=True))

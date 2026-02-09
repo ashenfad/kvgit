@@ -138,7 +138,7 @@ class TestNamespacedValidation:
 
     def test_invalid_store_type_rejected(self):
         with pytest.raises(TypeError, match="not dict"):
-            Namespaced({}, "ns")  # type: ignore
+            Namespaced({}, "ns")  # type: ignore[arg-type]
 
 
 class TestNamespacedWrite:

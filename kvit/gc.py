@@ -13,6 +13,7 @@ from .versioned import (
     META_KEY,
     PARENT_COMMIT,
     TOTAL_VAR_SIZE_KEY,
+    MergeResult,
     MetaEntry,
     Versioned,
     _from_bytes,

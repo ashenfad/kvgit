@@ -23,7 +23,7 @@ class Live(MutableMapping[str, Any]):
     def get_many(self, *keys: str) -> dict[str, Any]:
         return {k: self._data[k] for k in keys if k in self._data}
 
-    def keys(self) -> set[str]:
+    def keys(self) -> set[str]:  # type: ignore[override]
         return set(self._data.keys())
 
     def __contains__(self, key: object) -> bool:
