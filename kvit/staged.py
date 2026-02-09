@@ -16,7 +16,7 @@ class Staged(MutableMapping[str, Any]):
     single atomic commit + merge.
 
     Values are encoded to bytes on commit using the configured encoder.
-    Implements ``MutableMapping[str, Any]`` and the ``Store`` protocol.
+    Implements ``MutableMapping[str, Any]`` and the ``VersionedStore`` protocol.
     """
 
     def __init__(

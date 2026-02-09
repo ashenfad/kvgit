@@ -58,7 +58,7 @@ def store(
     high_water_bytes: int | None = None,
     low_water_bytes: int | None = None,
 ) -> Staged:
-    """Create a Store with sensible defaults.
+    """Create a Staged store with sensible defaults.
 
     Args:
         kind: ``"memory"`` (default) or ``"disk"``.
