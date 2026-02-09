@@ -10,10 +10,9 @@ from .staged import Staged
 from .versioned import MergeResult, Versioned
 
 
-
 @runtime_checkable
 class Store(Protocol):
-    """Protocol for key-value stores with commit semantics.
+    """Protocol for key-value stores.
 
     Implements ``MutableMapping[str, Any]`` semantics.
     Implementations: ``Staged``, ``Live``, ``Namespaced``.
@@ -30,12 +29,22 @@ class Store(Protocol):
     def __len__(self) -> int: ...
     def set(self, key: str, value: Any) -> None: ...
     def remove(self, key: str) -> None: ...
+
+
+@runtime_checkable
+class VersionedStore(Store, Protocol):
+    """Store with commit semantics.
+
+    Extends ``Store`` with versioning operations.
+    Implementations: ``Staged``.
+    """
+
     def commit(self, **kwargs: Any) -> "MergeResult": ...
     def reset(self) -> None: ...
-    def create_branch(self, name: str) -> "Store": ...
+    def create_branch(self, name: str) -> "VersionedStore": ...
     def checkout(
         self, commit_hash: str, *, branch: str | None = None
-    ) -> "Store | None": ...
+    ) -> "VersionedStore | None": ...
     def list_branches(self) -> list[str]: ...
 
 
@@ -48,7 +57,7 @@ def store(
     decoder: Callable[[bytes], Any] = pickle.loads,
     high_water_bytes: int | None = None,
     low_water_bytes: int | None = None,
-) -> "Staged":
+) -> Staged:
     """Create a Store with sensible defaults.
 
     Args:

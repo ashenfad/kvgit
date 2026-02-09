@@ -102,28 +102,13 @@ class TestLiveImmediateWrites:
         assert s.get("k") == "v2"
 
 
-class TestLiveUnsupported:
-    def test_commit_raises(self):
-        s = Live()
-        with pytest.raises(NotImplementedError, match="commit"):
-            s.commit()
+class TestLiveProtocol:
+    def test_satisfies_store(self):
+        from kvit import Store
 
-    def test_reset_raises(self):
-        s = Live()
-        with pytest.raises(NotImplementedError, match="reset"):
-            s.reset()
+        assert isinstance(Live(), Store)
 
-    def test_create_branch_raises(self):
-        s = Live()
-        with pytest.raises(NotImplementedError, match="branching"):
-            s.create_branch("dev")
+    def test_not_versioned_store(self):
+        from kvit import VersionedStore
 
-    def test_checkout_raises(self):
-        s = Live()
-        with pytest.raises(NotImplementedError, match="checkout"):
-            s.checkout("abc123")
-
-    def test_list_branches_raises(self):
-        s = Live()
-        with pytest.raises(NotImplementedError, match="branching"):
-            s.list_branches()
+        assert not isinstance(Live(), VersionedStore)

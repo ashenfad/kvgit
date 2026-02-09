@@ -2,7 +2,7 @@
 
 import pytest
 
-from kvit import MergeResult, Namespaced, Staged, Versioned, counter
+from kvit import Live, MergeResult, Namespaced, Staged, Versioned, counter
 from kvit.kv.memory import Memory
 
 
@@ -129,6 +129,23 @@ class TestNamespacedNested:
         ns.set("key", "deep")
         assert ns.get("key") == "deep"
 
+    def test_nested_keys_correct(self):
+        """Nested namespace keys() works correctly (unwrap fix)."""
+        s = _staged()
+        ns1 = Namespaced(s, "agent")
+        ns2 = Namespaced(ns1, "worker")
+
+        ns2.set("task", "data")
+        assert set(ns2.keys()) == {"task"}
+        assert s.get("agent/worker/task") == "data"
+
+    def test_nested_stores_at_root(self):
+        """Nested namespace stores keys at the correct path in root store."""
+        s = _staged()
+        ns = Namespaced(Namespaced(Namespaced(s, "a"), "b"), "c")
+        ns["key"] = "deep"
+        assert s.get("a/b/c/key") == "deep"
+
 
 class TestNamespacedValidation:
     def test_slash_in_namespace_rejected(self):
@@ -157,12 +174,13 @@ class TestNamespacedWrite:
         assert ns.get("x") is None
         assert ns.get("y") == 2
 
-    def test_commit_delegates(self):
+    def test_commit_through_store(self):
+        """Commit is done on the store, not the namespace."""
         store = Memory()
         s1 = _staged(store)
         ns1 = Namespaced(s1, "app")
         ns1.set("k", 1)
-        result = ns1.commit()
+        result = s1.commit()
         assert isinstance(result, MergeResult)
         assert result.merged
 
@@ -170,25 +188,26 @@ class TestNamespacedWrite:
         ns2 = Namespaced(s2, "app")
         assert ns2.get("k") == 1
 
-    def test_set_merge_fn_prefixed(self):
-        """set_merge_fn registers with the prefixed key."""
+    def test_merge_fn_with_namespace(self):
+        """Merge functions are registered on Staged with full prefixed key."""
         store = Memory()
 
         s1 = _staged(store)
         ns1 = Namespaced(s1, "stats")
         ns1.set("hits", 10)
-        ns1.commit()
+        s1.commit()
 
         s2 = _staged(store)
-        ns2 = Namespaced(s2, "stats")
-        ns2.set_merge_fn("hits", counter())
+        s2.set_merge_fn("stats/hits", counter())
 
         # Diverge: s1 writes 15, s2 writes 20
         ns1.set("hits", 15)
-        ns1.commit()
+        s1.commit()
+
+        ns2 = Namespaced(s2, "stats")
         ns2.set("hits", 20)
 
-        assert ns2.commit()
+        assert s2.commit()
         assert ns2.get("hits") == 25  # 15 + 20 - 10
 
     def test_two_namespaces_independent_writes(self):
@@ -201,25 +220,18 @@ class TestNamespacedWrite:
         assert ns2.get("k") == "from-two"
 
 
-class TestNamespacedProperties:
-    def test_current_commit_delegates(self):
+class TestNamespacedProtocol:
+    def test_satisfies_store(self):
+        from kvit import Store
+
         s = _staged()
         ns = Namespaced(s, "app")
-        assert ns.current_commit == s.current_commit
-        ns.set("k", "v")
-        ns.commit()
-        assert ns.current_commit == s.current_commit
+        assert isinstance(ns, Store)
 
-    def test_base_commit_delegates(self):
-        s = _staged()
-        ns = Namespaced(s, "app")
-        assert ns.base_commit == s.base_commit
-
-    def test_last_merge_result_delegates(self):
-        store = Memory()
-        s = _staged(store)
-        ns = Namespaced(s, "app")
-        ns.set("k", "v")
-        ns.commit()
-        assert ns.last_merge_result is s.last_merge_result
-        assert ns.last_merge_result.merged
+    def test_wraps_live(self):
+        """Namespaced can wrap a Live store."""
+        live = Live()
+        ns = Namespaced(live, "app")
+        ns["k"] = "v"
+        assert ns["k"] == "v"
+        assert live.get("app/k") == "v"

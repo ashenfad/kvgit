@@ -5,9 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterator, MutableMapping
 from typing import Any, Iterable
 
-from .content_types import MergeFn
 from .store import Store
-from .versioned import MergeResult
 
 
 class Namespaced(MutableMapping[str, Any]):
@@ -16,7 +14,9 @@ class Namespaced(MutableMapping[str, Any]):
     Keys are prefixed with ``namespace/``. Nested namespaces are
     supported by wrapping another Namespaced instance.
 
-    Implements ``MutableMapping[str, Any]`` and the ``Store`` protocol.
+    Satisfies the ``Store`` protocol. Versioning operations
+    (commit, reset, branching) are performed on the underlying
+    store directly, not through the namespace.
 
     Args:
         store: Any Store (Staged, Live, or another Namespaced).
@@ -32,12 +32,12 @@ class Namespaced(MutableMapping[str, Any]):
                 f"not {type(store).__name__}"
             )
 
-        self._store: Store = store
-
         if isinstance(store, Namespaced):
             self.namespace = f"{store.namespace}/{namespace}"
+            self._store: Store = store._store
         else:
             self.namespace = namespace
+            self._store = store
 
     def _prefixed(self, key: str) -> str:
         return f"{self.namespace}/{key}"
@@ -101,53 +101,3 @@ class Namespaced(MutableMapping[str, Any]):
     def remove(self, key: str) -> None:
         """Remove a key from the namespaced view."""
         self._store.remove(self._prefixed(key))
-
-    # -- Commit / reset --
-
-    def commit(self, **kwargs: Any) -> MergeResult:
-        """Commit changes (delegates to underlying store)."""
-        return self._store.commit(**kwargs)
-
-    def reset(self) -> None:
-        """Reset the underlying store."""
-        self._store.reset()
-
-    # -- Merge function registry --
-
-    def set_merge_fn(self, key: str, fn: MergeFn) -> None:
-        """Register a merge function for a namespaced key."""
-        delegate = getattr(self._store, "set_merge_fn", None)
-        if delegate is not None:
-            delegate(self._prefixed(key), fn)
-
-    def set_default_merge(self, fn: MergeFn) -> None:
-        """Register a default merge function (store-wide)."""
-        delegate = getattr(self._store, "set_default_merge", None)
-        if delegate is not None:
-            delegate(fn)
-
-    def create_branch(self, name: str):
-        """Create a branch (delegates to underlying store)."""
-        return self._store.create_branch(name)
-
-    def checkout(self, commit_hash: str, *, branch: str | None = None):
-        """Checkout a commit (delegates to underlying store)."""
-        return self._store.checkout(commit_hash, branch=branch)
-
-    def list_branches(self) -> list[str]:
-        """List all branch names in the store."""
-        return self._store.list_branches()
-
-    # -- Convenience properties --
-
-    @property
-    def current_commit(self) -> str | None:
-        return getattr(self._store, "current_commit", None)
-
-    @property
-    def base_commit(self) -> str | None:
-        return getattr(self._store, "base_commit", None)
-
-    @property
-    def last_merge_result(self) -> MergeResult | None:
-        return getattr(self._store, "last_merge_result", None)
