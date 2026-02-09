@@ -1,10 +1,14 @@
 """Store protocol and factory function."""
 
+import pickle
 from collections.abc import Iterator
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Protocol, runtime_checkable
+from typing import Any, Callable, Iterable, Literal, Protocol, runtime_checkable
 
-if TYPE_CHECKING:
-    from .versioned import MergeResult
+from .gc import GCVersioned
+from .kv.memory import Memory
+from .staged import Staged
+from .versioned import MergeResult, Versioned
+
 
 
 @runtime_checkable
@@ -29,25 +33,27 @@ class Store(Protocol):
     def commit(self, **kwargs) -> "MergeResult": ...
     def reset(self) -> None: ...
     def create_branch(self, name: str) -> "Store": ...
-    def checkout(self, commit_hash: str, *, branch: str | None = None) -> "Store | None": ...
+    def checkout(
+        self, commit_hash: str, *, branch: str | None = None
+    ) -> "Store | None": ...
     def list_branches(self) -> list[str]: ...
 
 
 def store(
-    storage: str = "memory",
+    kind: Literal["memory", "disk"] = "memory",
     *,
     path: str | None = None,
     branch: str = "main",
-    encoder: Callable[[Any], bytes] | None = None,
-    decoder: Callable[[bytes], Any] | None = None,
+    encoder: Callable[[Any], bytes] = pickle.dumps,
+    decoder: Callable[[bytes], Any] = pickle.loads,
     high_water_bytes: int | None = None,
     low_water_bytes: int | None = None,
-) -> Store:
+) -> "Staged":
     """Create a Store with sensible defaults.
 
     Args:
-        storage: ``"memory"`` (default) or ``"disk"``.
-        path: Required when ``storage="disk"``. Directory path for
+        kind: ``"memory"`` (default) or ``"disk"``.
+        path: Required when ``kind="disk"``. Directory path for
             the disk backend.
         branch: Branch name (default ``"main"``).
         encoder: Value encoder (default ``pickle.dumps``).
@@ -60,22 +66,18 @@ def store(
         A ``Staged`` store instance.
     """
     # Build backend
-    if storage == "memory":
-        from .kv.memory import Memory
-
+    if kind == "memory":
         backend = Memory()
-    elif storage == "disk":
+    elif kind == "disk":
         if path is None:
-            raise ValueError("path is required when storage='disk'")
+            raise ValueError("path is required when kind='disk'")
         from .kv.disk import Disk
 
         backend = Disk(path)
     else:
-        raise ValueError(f"Unknown storage: {storage!r}")
+        raise ValueError(f"Unknown kind: {kind!r}")
 
     if high_water_bytes is not None:
-        from .gc import GCVersioned
-
         versioned = GCVersioned(
             backend,
             branch=branch,
@@ -83,15 +85,6 @@ def store(
             low_water_bytes=low_water_bytes,
         )
     else:
-        from .versioned import Versioned
-
         versioned = Versioned(backend, branch=branch)
 
-    from .staged import Staged
-
-    kwargs: dict[str, Any] = {}
-    if encoder is not None:
-        kwargs["encoder"] = encoder
-    if decoder is not None:
-        kwargs["decoder"] = decoder
-    return Staged(versioned, **kwargs)
+    return Staged(versioned, encoder=encoder, decoder=decoder)

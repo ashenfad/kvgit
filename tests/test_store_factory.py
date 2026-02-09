@@ -10,13 +10,13 @@ class TestStoreFactory:
         s = store()
         assert isinstance(s, Staged)
 
-    def test_invalid_storage(self):
-        with pytest.raises(ValueError, match="Unknown storage"):
-            store(storage="redis")
+    def test_invalid_kind(self):
+        with pytest.raises(ValueError, match="Unknown kind"):
+            store(kind="redis")
 
     def test_disk_requires_path(self):
         with pytest.raises(ValueError, match="path is required"):
-            store(storage="disk")
+            store(kind="disk")
 
     def test_gc_versioned(self):
         from kvit import GCVersioned
