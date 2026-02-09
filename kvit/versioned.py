@@ -29,7 +29,7 @@ def _from_bytes(raw: bytes):
     return json.loads(raw)
 
 
-MergeFn = Callable[
+BytesMergeFn = Callable[
     [bytes | None, bytes | None, bytes | None], bytes
 ]
 """Merge function: (old_value, our_value, their_value) -> merged_value.
@@ -164,9 +164,8 @@ class Versioned:
         )
 
         # Merge function registry
-        self._merge_fns: dict[str, MergeFn] = {}
-        self._content_types: dict[str, object] = {}
-        self._default_merge: MergeFn | None = None
+        self._merge_fns: dict[str, BytesMergeFn] = {}
+        self._default_merge: BytesMergeFn | None = None
         self.last_merge_result: MergeResult | None = None
 
     @property
@@ -223,26 +222,13 @@ class Versioned:
 
     # -- Merge function registry --
 
-    def set_merge_fn(self, key: str, fn: MergeFn) -> None:
+    def set_merge_fn(self, key: str, fn: BytesMergeFn) -> None:
         """Register a merge function for a specific key."""
         self._merge_fns[key] = fn
 
-    def set_default_merge(self, fn: MergeFn) -> None:
+    def set_default_merge(self, fn: BytesMergeFn) -> None:
         """Register a default merge function for unregistered keys."""
         self._default_merge = fn
-
-    def set_content_type(self, key: str, ct) -> None:
-        """Register a ContentType for a key (sets its merge function).
-
-        Args:
-            ct: A ContentType instance (from kvit.content_types).
-        """
-        self._content_types[key] = ct
-        self.set_merge_fn(key, ct.as_merge_fn())
-
-    def get_content_type(self, key: str):
-        """Retrieve the ContentType registered for a key, or None."""
-        return self._content_types.get(key)
 
     # -- Write operations --
 
@@ -333,8 +319,8 @@ class Versioned:
         removals: set[str] | None = None,
         *,
         on_conflict: str = "raise",
-        merge_fns: dict[str, MergeFn] | None = None,
-        default_merge: MergeFn | None = None,
+        merge_fns: dict[str, BytesMergeFn] | None = None,
+        default_merge: BytesMergeFn | None = None,
         info: dict | None = None,
     ) -> MergeResult:
         """Commit changes and atomically advance HEAD.
@@ -424,8 +410,8 @@ class Versioned:
         their_head: str,
         *,
         on_conflict: str,
-        merge_fns: dict[str, MergeFn] | None,
-        default_merge: MergeFn | None,
+        merge_fns: dict[str, BytesMergeFn] | None,
+        default_merge: BytesMergeFn | None,
         info: dict | None,
     ) -> MergeResult:
         """Perform a three-way merge between our branch and their HEAD."""

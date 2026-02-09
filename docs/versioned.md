@@ -2,7 +2,7 @@
 
 `Versioned` is the central class. It provides a commit log over any `KVStore` backend, with reads, atomic commit+merge, branching, and history traversal.
 
-Most users should use `Staged` (via `kvit.store()`) for the set/remove/commit pattern. `Versioned` is the lower-level engine that `Staged` wraps.
+Most users should use `Staged` (via `kvit.store()`) for the `MutableMapping[str, Any]` interface. `Versioned` is the lower-level engine that `Staged` wraps -- it operates on raw bytes.
 
 ## Construction
 
@@ -104,7 +104,7 @@ When HEAD has diverged, kvit computes the LCA and diffs both sides:
 #### Per-key merge functions
 
 ```python
-# Instance-level registration
+# Instance-level registration (bytes-level)
 v.set_merge_fn("counter", lambda old, ours, theirs: ours)
 
 # Per-call override
@@ -114,7 +114,7 @@ v.commit({"counter": b"5"}, merge_fns={"counter": my_merge_fn})
 v.set_default_merge(lambda old, ours, theirs: theirs)
 ```
 
-Merge functions receive `(old: bytes | None, ours: bytes | None, theirs: bytes | None) -> bytes`. Any argument can be `None` (key absent or removed on that side).
+Merge functions on Versioned receive `(old: bytes | None, ours: bytes | None, theirs: bytes | None) -> bytes`. For decoded-value merge functions, use `Staged.set_merge_fn()` instead.
 
 #### `on_conflict`
 
@@ -237,12 +237,21 @@ Frozen dataclass returned by `diff()`.
 | `removed` | `frozenset[str]` | Keys in commit_a but not commit_b |
 | `modified` | `frozenset[str]` | Keys in both with different values |
 
-### `MergeFn`
+### `BytesMergeFn`
 
-Type alias for merge functions:
+Type alias for bytes-level merge functions used by `Versioned`:
 
 ```python
-MergeFn = Callable[[bytes | None, bytes | None, bytes | None], bytes]
+BytesMergeFn = Callable[[bytes | None, bytes | None, bytes | None], bytes]
+# (old_value, our_value, their_value) -> merged_value
+```
+
+### `MergeFn`
+
+Type alias for user-level merge functions used by `Staged`:
+
+```python
+MergeFn = Callable[[Any | None, Any, Any], Any]
 # (old_value, our_value, their_value) -> merged_value
 ```
 

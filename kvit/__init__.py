@@ -1,6 +1,6 @@
 """kvit: Versioned key-value store."""
 
-from .content_types import ContentType, counter, json_value, last_writer_wins
+from .content_types import MergeFn, counter, last_writer_wins
 from .errors import ConcurrencyError, MergeConflict
 from .gc import GCVersioned
 from .kv.base import KVStore
@@ -8,11 +8,11 @@ from .live import Live
 from .namespaced import Namespaced
 from .staged import Staged
 from .store import Store, store
-from .versioned import DiffResult, MergeFn, MergeResult, MetaEntry, Versioned
+from .versioned import BytesMergeFn, DiffResult, MergeResult, MetaEntry, Versioned
 
 __all__ = [
+    "BytesMergeFn",
     "ConcurrencyError",
-    "ContentType",
     "DiffResult",
     "GCVersioned",
     "KVStore",
@@ -26,7 +26,6 @@ __all__ = [
     "Store",
     "Versioned",
     "counter",
-    "json_value",
     "last_writer_wins",
     "store",
 ]

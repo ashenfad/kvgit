@@ -2,7 +2,7 @@
 
 import pytest
 
-from kvit import MergeConflict, MergeResult, Versioned, counter
+from kvit import MergeConflict, MergeResult, Versioned
 from kvit.kv.memory import Memory
 
 
@@ -814,12 +814,3 @@ class TestErgonomics:
         r = repr(v)
         assert "dev" in r
 
-    def test_get_content_type(self):
-        v = Versioned()
-        ct = counter()
-        v.set_content_type("hits", ct)
-        assert v.get_content_type("hits") is ct
-
-    def test_get_content_type_missing(self):
-        v = Versioned()
-        assert v.get_content_type("nope") is None

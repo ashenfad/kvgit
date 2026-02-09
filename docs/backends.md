@@ -2,7 +2,7 @@
 
 ## Store Protocol
 
-`Store` is the primary user-facing interface. It provides set/get/commit semantics. All high-level types implement it.
+`Store` is the primary user-facing interface. It implements `MutableMapping[str, Any]` with commit semantics.
 
 ```python
 from kvit import Store
@@ -10,11 +10,16 @@ from kvit import Store
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `get` | `(key: str) -> bytes \| None` | Get value or None |
-| `get_many` | `(*keys: str) -> dict[str, bytes]` | Get multiple, only existing keys |
+| `get` | `(key: str, default=None) -> Any` | Get value or default |
+| `get_many` | `(*keys: str) -> dict[str, Any]` | Get multiple, only existing keys |
 | `keys` | `() -> Iterable[str]` | Iterate over all keys |
-| `__contains__` | `(key: str) -> bool` | Check key existence |
-| `set` | `(key: str, value: bytes) -> None` | Set a value |
+| `__contains__` | `(key: object) -> bool` | Check key existence |
+| `__getitem__` | `(key: str) -> Any` | Get value, raise KeyError if missing |
+| `__setitem__` | `(key: str, value: Any) -> None` | Set a value |
+| `__delitem__` | `(key: str) -> None` | Remove a key, raise KeyError if missing |
+| `__iter__` | `() -> Iterator[str]` | Iterate over keys |
+| `__len__` | `() -> int` | Number of keys |
+| `set` | `(key: str, value: Any) -> None` | Set a value |
 | `remove` | `(key: str) -> None` | Remove a key |
 | `commit` | `(**kwargs) -> MergeResult` | Flush changes to storage |
 | `reset` | `() -> None` | Discard pending changes |
@@ -36,9 +41,6 @@ import kvit
 # Default: Staged backed by in-memory Versioned
 s = kvit.store()
 
-# Live store (immediate writes, no versioning)
-s = kvit.store(type="live")
-
 # With disk persistence
 s = kvit.store(storage="disk", path="/path/to/db")
 
@@ -47,43 +49,56 @@ s = kvit.store(high_water_bytes=10_000)
 
 # Custom branch
 s = kvit.store(branch="dev")
+
+# Custom encoder/decoder (default is pickle)
+import json
+s = kvit.store(
+    encoder=lambda v: json.dumps(v).encode(),
+    decoder=lambda b: json.loads(b),
+)
 ```
 
-### `kvit.store(type="versioned", storage="memory", *, path=None, branch="main", high_water_bytes=None, low_water_bytes=None)`
+### `kvit.store(storage="memory", *, path=None, branch="main", encoder=None, decoder=None, high_water_bytes=None, low_water_bytes=None)`
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `type` | `str` | `"versioned"` | `"versioned"` for Staged or `"live"` for Live |
 | `storage` | `str` | `"memory"` | `"memory"` or `"disk"` |
 | `path` | `str \| None` | `None` | Required when `storage="disk"` |
-| `branch` | `str` | `"main"` | Branch name (versioned only) |
-| `high_water_bytes` | `int \| None` | `None` | Enable GC (versioned only) |
+| `branch` | `str` | `"main"` | Branch name |
+| `encoder` | `Callable \| None` | `None` | Value encoder (default: `pickle.dumps`) |
+| `decoder` | `Callable \| None` | `None` | Value decoder (default: `pickle.loads`) |
+| `high_water_bytes` | `int \| None` | `None` | Enable GC |
 | `low_water_bytes` | `int \| None` | `None` | GC low-water (defaults to 80% of high) |
 
 ---
 
 ## Staged
 
-`Staged` wraps a `Versioned` instance. Individual `set()` / `remove()` calls are buffered in memory. `commit()` flushes them as a single atomic commit.
+`Staged` wraps a `Versioned` instance and implements `MutableMapping[str, Any]`. Individual `set()` / `__setitem__()` calls are buffered in memory. `commit()` encodes values to bytes and flushes them as a single atomic commit.
 
 ```python
 from kvit import Staged, Versioned
 
-v = Versioned()
-s = Staged(v)
+s = Staged(Versioned())
 
-s.set("name", b"alice")
-s.set("age", b"30")
+s["name"] = "alice"
+s["age"] = 30
 s.commit()
 
-s.get("name")  # b"alice"
+s["name"]  # "alice"
 ```
 
 ### Construction
 
 ```python
-Staged(versioned: Versioned)
+Staged(versioned: Versioned, *, encoder=pickle.dumps, decoder=pickle.loads)
 ```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `versioned` | `Versioned` | (required) | The underlying versioned store |
+| `encoder` | `Callable[[Any], bytes]` | `pickle.dumps` | Serializes values to bytes on commit |
+| `decoder` | `Callable[[bytes], Any]` | `pickle.loads` | Deserializes bytes to values on read |
 
 ### Methods
 
@@ -91,7 +106,7 @@ Staged(versioned: Versioned)
 |--------|-------------|
 | `set(key, value)` | Stage a key-value pair |
 | `remove(key)` | Stage a removal |
-| `get(key)` | Check staged first, then committed |
+| `get(key, default=None)` | Check staged first, then committed |
 | `commit(**kwargs)` | Flush to Versioned, returns MergeResult |
 | `reset()` | Discard staged changes |
 | `refresh()` | Reload from HEAD and discard staged changes |
@@ -109,42 +124,46 @@ Staged(versioned: Versioned)
 | `base_commit` | Delegates to Versioned |
 | `last_merge_result` | Delegates to Versioned |
 
-### Merge & Content Types
+### Merge Functions
+
+Merge functions on Staged operate on **decoded values** (not bytes):
 
 ```python
-s.set_merge_fn("counter", fn)        # delegates to Versioned
-s.set_content_type("hits", ct)       # delegates to Versioned
-s.get_content_type("hits")           # delegates to Versioned
-s.set_default_merge(fn)              # delegates to Versioned
+s.set_merge_fn("counter", fn)        # user-level MergeFn
+s.set_default_merge(fn)              # fallback for unregistered keys
 ```
+
+At commit time, Staged wraps these into bytes-level merge functions automatically.
 
 ---
 
 ## Live
 
-`Live` wraps a `KVStore` directly. Writes take effect immediately. Versioning operations (`commit`, `reset`, `create_branch`, `checkout`, `list_branches`) raise `NotImplementedError`.
+`Live` is an in-memory store with no versioning. Writes take effect immediately. Backed by a plain `dict[str, Any]`.
+
+Versioning operations (`commit`, `reset`, `create_branch`, `checkout`, `list_branches`) raise `NotImplementedError`.
 
 ```python
 from kvit import Live
 
 s = Live()
-s.set("k", b"v")
-s.get("k")  # b"v" (immediately available)
+s["k"] = "v"
+s["k"]  # "v" (immediately available)
 ```
 
 ### Construction
 
 ```python
-Live(backend: KVStore | None = None)
+Live()
 ```
 
-Creates an in-memory backend if None.
+No parameters. Memory-only.
 
 ---
 
 ## Namespaced
 
-`Namespaced` provides a key-prefixed view over any `Store`. All keys are transparently prefixed with `namespace/`.
+`Namespaced` provides a key-prefixed view over any `Store`. All keys are transparently prefixed with `namespace/`. Implements `MutableMapping[str, Any]`.
 
 ```python
 from kvit import Namespaced
@@ -154,12 +173,12 @@ s = kvit.store()
 agent = Namespaced(s, "agent")
 config = Namespaced(s, "config")
 
-agent.set("state", b"running")
-config.set("timeout", b"30")
+agent["state"] = "running"
+config["timeout"] = 30
 
-agent.get("state")   # b"running"
+agent["state"]       # "running"
 config.get("state")  # None (isolated)
-s.get("agent/state") # b"running" (prefixed in base store)
+s.get("agent/state") # "running" (prefixed in base store)
 ```
 
 ### Construction
@@ -181,7 +200,7 @@ ns2.get("task")  # reads "agent/worker/task" from base store
 
 | Method | Description |
 |--------|-------------|
-| `get(key)` | Get from namespaced view |
+| `get(key, default=None)` | Get from namespaced view |
 | `get_many(*keys)` | Batch get, returns unprefixed keys |
 | `keys()` | Direct child keys only (not nested) |
 | `descendant_keys()` | All keys including nested paths |
@@ -192,17 +211,16 @@ ns2.get("task")  # reads "agent/worker/task" from base store
 All write methods auto-prefix keys:
 
 ```python
-ns.set("k", b"v")              # writes "myns/k" in base store
+ns["k"] = "v"                  # writes "myns/k" in base store
+ns.set("k", "v")               # same as above
 ns.remove("k")                 # removes "myns/k"
 result = ns.commit()           # delegates to underlying store
 ```
 
-### Merge & Content Types
+### Merge Functions
 
 ```python
 ns.set_merge_fn("counter", fn)        # registers for "myns/counter"
-ns.set_content_type("hits", ct)       # registers for "myns/hits"
-ns.get_content_type("hits")           # retrieves the ContentType
 ns.set_default_merge(fn)              # store-wide default (not prefixed)
 ```
 
@@ -229,7 +247,7 @@ ns.list_branches()        # delegates to underlying store
 
 ## KVStore Interface
 
-All backends implement the `KVStore` abstract base class. Values are bytes-only; serialization is handled by higher layers.
+All backends implement the `KVStore` abstract base class. Values are bytes-only; serialization is handled by higher layers (Staged).
 
 ```python
 from kvit import KVStore
@@ -313,9 +331,9 @@ Raised when a CAS operation fails during `commit()` or `rebase()`. Another write
 from kvit import ConcurrencyError
 
 try:
-    v.commit({"k": b"v"})
+    s.commit()
 except ConcurrencyError:
-    v.refresh()
+    s.refresh()
     # re-apply changes and retry
 ```
 
@@ -327,7 +345,7 @@ Raised when a three-way merge encounters keys that both sides changed and no mer
 from kvit import MergeConflict
 
 try:
-    v.commit({"k": b"v"})
+    s.commit()
 except MergeConflict as e:
     print(e.conflicting_keys)  # {"key_a", "key_b"}
     print(e.merge_errors)      # {"key_a": ValueError("...")} if a merge fn raised

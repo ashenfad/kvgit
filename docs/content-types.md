@@ -1,128 +1,94 @@
-# Content Types
+# Merge Functions
 
-Content types bundle encode, decode, and merge logic for typed values. They sit on top of the bytes-only `Versioned` layer -- kvit never interprets your data; you bring your own types.
+Merge functions resolve conflicts when two branches modify the same key. They operate on **decoded values** (not bytes) -- Staged handles encoding/decoding automatically.
 
-## ContentType
+## MergeFn
 
 ```python
-from dataclasses import dataclass
-from typing import Any, Callable
-
-@dataclass
-class ContentType:
-    encode: Callable[[Any], bytes]
-    decode: Callable[[bytes], Any]
-    merge: Callable[[Any | None, Any, Any], Any]
+MergeFn = Callable[[Any | None, Any, Any], Any]
+# (old_value | None, our_value, their_value) -> merged_value
 ```
 
-The `merge` function operates on **decoded** values: `(old_value | None, our_value, their_value) -> merged_value`.
-
-### `as_merge_fn() -> MergeFn`
-
-Converts the content type into a bytes-level merge function suitable for `Versioned.set_merge_fn()`. Handles encoding/decoding automatically.
+Any argument can be `None` (key absent or removed on that side).
 
 ### Registration
 
+Register merge functions on `Staged` (or `Namespaced`):
+
 ```python
-from kvit import Versioned, counter
+from kvit import counter
 
-v = Versioned()
-ct = counter()
-
-# Register -- sets the merge function and stores the ContentType
-v.set_content_type("hits", ct)
-
-# Retrieve later
-ct = v.get_content_type("hits")
-ct.decode(v.get("hits"))
+s = kvit.store()
+s.set_merge_fn("hits", counter())
 ```
 
-## Built-in Content Types
-
-### `counter(encoding="big", byte_length=8)`
-
-An integer counter. Values are stored as signed big-endian (default) or little-endian integers.
-
-Merge strategy: `ours + theirs - old`. Both sides' increments are preserved.
+Per-commit overrides and a default fallback are also available:
 
 ```python
-from kvit import Versioned, counter
+s.commit(merge_fns={"hits": counter()})
+s.set_default_merge(last_writer_wins())
+```
+
+## Built-in Merge Functions
+
+### `counter()`
+
+An integer counter. Merge strategy: `ours + theirs - old`. Both sides' increments are preserved.
+
+```python
+from kvit import counter
 from kvit.kv.memory import Memory
 
-ct = counter()
-
 store = Memory()
-v1 = Versioned(store)
-v1.commit({"hits": ct.encode(100)})
 
-v2 = Versioned(store)
-v2.set_content_type("hits", ct)
+import kvit
+s1 = kvit.store()
+s1["hits"] = 100
+s1.commit()
 
-v1.commit({"hits": ct.encode(115)})    # +15 on main
-v2.commit({"hits": ct.encode(120)})    # +20 on v2, triggers three-way merge
+s2 = kvit.store()
+s2.set_merge_fn("hits", counter())
 
-ct.decode(v2.get("hits"))  # 135 (115 + 120 - 100)
+s1["hits"] = 115         # +15 on main
+s1.commit()
+
+s2["hits"] = 120         # +20 on s2, triggers three-way merge
+s2.commit()
+
+print(s2["hits"])        # 135 (115 + 120 - 100)
 ```
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `encoding` | `str` | `"big"` | Byte order: `"big"` or `"little"` |
-| `byte_length` | `int` | `8` | Number of bytes for the integer |
 
 ### `last_writer_wins()`
 
-Identity encode/decode (values must already be bytes). Merge always returns `theirs`.
+Merge always returns `theirs` (the HEAD value).
 
 ```python
 from kvit import last_writer_wins
 
-ct = last_writer_wins()
-ct.merge(b"old", b"ours", b"theirs")  # b"theirs"
+fn = last_writer_wins()
+fn("old", "ours", "theirs")  # "theirs"
 ```
 
-### `json_value(merge_fn=None)`
+## Custom Merge Functions
 
-JSON-encoded values. Defaults to last-writer-wins on decoded values. Pass a custom `merge_fn` for smarter merging.
+Any callable matching the `MergeFn` signature works:
 
 ```python
-from kvit import json_value
-
-# Default: LWW on decoded JSON
-ct = json_value()
-data = {"key": "value", "nested": [1, 2, 3]}
-assert ct.decode(ct.encode(data)) == data
-
-# Custom merge: union of lists
 def merge_lists(old, ours, theirs):
     base = set(old or [])
     return sorted(base | set(ours or []) | set(theirs or []))
 
-ct = json_value(merge_fn=merge_lists)
+s.set_merge_fn("tags", merge_lists)
 ```
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `merge_fn` | `Callable \| None` | `None` | Custom merge for decoded JSON values. Defaults to LWW. |
+## BytesMergeFn (advanced)
 
-## Custom Content Types
-
-Build your own by providing encode, decode, and merge functions:
+For power users working directly with `Versioned` (bytes-level API):
 
 ```python
-from kvit import ContentType
+from kvit import BytesMergeFn
 
-def encode_set(s: set) -> bytes:
-    import json
-    return json.dumps(sorted(s)).encode()
-
-def decode_set(raw: bytes) -> set:
-    import json
-    return set(json.loads(raw))
-
-def merge_sets(old, ours, theirs):
-    base = old or set()
-    return (base | ours | theirs) - (base - ours) - (base - theirs)
-
-set_type = ContentType(encode=encode_set, decode=decode_set, merge=merge_sets)
-v.set_content_type("tags", set_type)
+BytesMergeFn = Callable[[bytes | None, bytes | None, bytes | None], bytes]
 ```
+
+`Versioned.set_merge_fn()` and `Versioned.commit(merge_fns=...)` accept `BytesMergeFn`. Staged wraps user-level `MergeFn` into `BytesMergeFn` automatically at commit time.
