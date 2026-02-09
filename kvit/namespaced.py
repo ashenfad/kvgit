@@ -1,5 +1,7 @@
 """Namespaced: key-prefixed view over a Store."""
 
+from __future__ import annotations
+
 from collections.abc import Iterator, MutableMapping
 from typing import Any, Iterable
 
@@ -30,7 +32,7 @@ class Namespaced(MutableMapping[str, Any]):
                 f"not {type(store).__name__}"
             )
 
-        self._store = store
+        self._store: Store = store
 
         if isinstance(store, Namespaced):
             self.namespace = f"{store.namespace}/{namespace}"
@@ -52,7 +54,7 @@ class Namespaced(MutableMapping[str, Any]):
         result = self._store.get_many(*prefixed.keys())
         return {prefixed[pk]: v for pk, v in result.items()}
 
-    def keys(self) -> set[str]:
+    def keys(self) -> set[str]:  # type: ignore[override]
         """Direct child keys in this namespace (not nested)."""
         prefix = f"{self.namespace}/"
         result: set[str] = set()
@@ -71,6 +73,8 @@ class Namespaced(MutableMapping[str, Any]):
                 yield key[len(prefix):]
 
     def __contains__(self, key: object) -> bool:
+        if not isinstance(key, str):
+            return False
         return self._prefixed(key) in self._store
 
     def __getitem__(self, key: str) -> Any:
@@ -100,7 +104,7 @@ class Namespaced(MutableMapping[str, Any]):
 
     # -- Commit / reset --
 
-    def commit(self, **kwargs) -> MergeResult:
+    def commit(self, **kwargs: Any) -> MergeResult:
         """Commit changes (delegates to underlying store)."""
         return self._store.commit(**kwargs)
 
@@ -112,13 +116,15 @@ class Namespaced(MutableMapping[str, Any]):
 
     def set_merge_fn(self, key: str, fn: MergeFn) -> None:
         """Register a merge function for a namespaced key."""
-        if hasattr(self._store, "set_merge_fn"):
-            self._store.set_merge_fn(self._prefixed(key), fn)
+        delegate = getattr(self._store, "set_merge_fn", None)
+        if delegate is not None:
+            delegate(self._prefixed(key), fn)
 
     def set_default_merge(self, fn: MergeFn) -> None:
         """Register a default merge function (store-wide)."""
-        if hasattr(self._store, "set_default_merge"):
-            self._store.set_default_merge(fn)
+        delegate = getattr(self._store, "set_default_merge", None)
+        if delegate is not None:
+            delegate(fn)
 
     def create_branch(self, name: str):
         """Create a branch (delegates to underlying store)."""
@@ -136,18 +142,12 @@ class Namespaced(MutableMapping[str, Any]):
 
     @property
     def current_commit(self) -> str | None:
-        if hasattr(self._store, "current_commit"):
-            return self._store.current_commit
-        return None
+        return getattr(self._store, "current_commit", None)
 
     @property
     def base_commit(self) -> str | None:
-        if hasattr(self._store, "base_commit"):
-            return self._store.base_commit
-        return None
+        return getattr(self._store, "base_commit", None)
 
     @property
     def last_merge_result(self) -> MergeResult | None:
-        if hasattr(self._store, "last_merge_result"):
-            return self._store.last_merge_result
-        return None
+        return getattr(self._store, "last_merge_result", None)

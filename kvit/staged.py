@@ -60,7 +60,7 @@ class Staged(MutableMapping[str, Any]):
                 result[key] = self.get(key)
         return result
 
-    def keys(self) -> set[str]:
+    def keys(self) -> set[str]:  # type: ignore[override]
         """All keys visible in the current state (committed + staged)."""
         seen: set[str] = set()
         for key in self._versioned.keys():
@@ -70,6 +70,8 @@ class Staged(MutableMapping[str, Any]):
         return seen
 
     def __contains__(self, key: object) -> bool:
+        if not isinstance(key, str):
+            return False
         if key in self._removals:
             return False
         if key in self._updates:

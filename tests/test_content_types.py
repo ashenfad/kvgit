@@ -1,6 +1,5 @@
 """Tests for merge functions."""
 
-import pickle
 
 from kvit import Staged, Versioned, counter, last_writer_wins
 from kvit.kv.memory import Memory

@@ -140,8 +140,9 @@ class Versioned:
                 }
                 store.set_many(**initial)
 
-        self._current_commit = commit_hash
-        self._base_commit = commit_hash
+        assert isinstance(commit_hash, str)
+        self._current_commit: str = commit_hash
+        self._base_commit: str = commit_hash
 
         # Load commit keyset
         self._commit_keys: dict[str, str] = {}
@@ -396,6 +397,7 @@ class Versioned:
             )
 
         # Three-way path: create commit without info, merge with info
+        assert current_head is not None
         self._create_commit(updates, removals)
         return self._three_way_merge(
             current_head,
