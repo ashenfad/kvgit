@@ -133,7 +133,7 @@ v.refresh()  # now v reflects HEAD
 
 ## Branching
 
-These methods are also available on `Staged` (returning `Staged` instances) and on the `Store` protocol. Most users should use `Staged.create_branch()` / `Staged.checkout()` instead of calling these directly.
+These methods are also available on `Staged` (returning `Staged` instances) via the `VersionedStore` protocol. Most users should use `Staged.create_branch()` / `Staged.checkout()` instead of calling these directly.
 
 ### `create_branch(name) -> Versioned`
 

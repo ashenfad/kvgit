@@ -250,7 +250,7 @@ s.set_merge_fn("myns/counter", fn)   # register on the store, not the namespace
 All backends implement the `KVStore` abstract base class. Values are bytes-only; serialization is handled by higher layers (Staged).
 
 ```python
-from kvit import KVStore
+from kvit.kv.base import KVStore
 ```
 
 ### Methods
@@ -306,7 +306,7 @@ store = Disk("/path/to/db")
 Implement `KVStore` to use any storage:
 
 ```python
-from kvit import KVStore
+from kvit.kv.base import KVStore
 
 class RedisStore(KVStore):
     def get(self, key):

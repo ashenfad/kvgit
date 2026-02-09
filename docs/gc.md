@@ -1,11 +1,66 @@
-# Garbage Collection: GCVersioned
+# Garbage Collection
 
-`GCVersioned` extends `Versioned` with automatic garbage collection via rebase. It tracks total persisted size and drops cold (least-recently-accessed) keys when a threshold is exceeded.
+Automatic garbage collection drops cold (least-recently-accessed) keys when total persisted size exceeds a threshold.
 
-## Construction
+## Quick Start
+
+The easiest way to enable GC is through the `kvit.store()` factory:
 
 ```python
-from kvit import GCVersioned
+import kvit
+
+s = kvit.store(high_water_bytes=10_000)
+
+s["key"] = "value"
+s.commit()  # GC runs automatically if above high water
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `high_water_bytes` | `int \| None` | `None` | Enable GC with this threshold. |
+| `low_water_bytes` | `int \| None` | `None` | GC drops keys until total is at or below this. Defaults to 80% of high water. |
+
+## How It Works
+
+1. Every `commit()` call checks total persisted user-data size
+2. If total exceeds `high_water_bytes`, a rebase is triggered
+3. Rebase sorts user keys by access recency (coldest first, then largest)
+4. Keys are dropped until total is at or below `low_water_bytes`
+5. A fresh root commit is created with only the retained keys
+6. Orphaned commits are cleaned up
+
+System keys (prefixed with `__`) are always retained.
+
+## Example
+
+```python
+import kvit
+
+s = kvit.store(high_water_bytes=200, low_water_bytes=100)
+
+s["a"] = "x" * 40
+s.commit()
+
+s["b"] = "y" * 40
+s.commit()
+
+# This commit pushes total above 200 bytes, triggers rebase
+# Oldest key ("a") gets dropped
+s["c"] = "z" * 40
+s.commit()
+
+print(s.get("a"))  # None (dropped)
+print(s.get("c"))  # "zzz..." (retained)
+```
+
+---
+
+## Advanced: GCVersioned
+
+For direct composition (custom backends, shared stores, bytes-level API), use `GCVersioned` directly. It extends `Versioned` with automatic garbage collection via rebase.
+
+```python
+from kvit.gc import GCVersioned
 
 v = GCVersioned(high_water_bytes=10_000)
 
@@ -28,24 +83,23 @@ v = GCVersioned(store, branch="main", high_water_bytes=50_000)
 | `high_water_bytes` | `int` | (required) | Rebase triggers when total size exceeds this. |
 | `low_water_bytes` | `int \| None` | `None` | Rebase drops keys until total is at or below this. Defaults to 80% of high water. |
 
-## How It Works
+Wrap in `Staged` for the `MutableMapping[str, Any]` interface:
 
-1. Every `commit()` call checks total persisted user-data size
-2. If total exceeds `high_water_bytes`, a rebase is triggered
-3. Rebase sorts user keys by access recency (coldest first, then largest)
-4. Keys are dropped until total is at or below `low_water_bytes`
-5. A fresh root commit is created with only the retained keys
-6. Orphaned commits are cleaned up
+```python
+from kvit.gc import GCVersioned
+from kvit import Staged
 
-System keys (prefixed with `__`) are always retained.
+v = GCVersioned(high_water_bytes=10_000)
+s = Staged(v)
+```
 
-## Methods
+### Methods
 
-### `commit(updates=None, removals=None, *, on_conflict="raise", merge_fns=None, default_merge=None, info=None) -> MergeResult`
+#### `commit(updates=None, removals=None, *, on_conflict="raise", merge_fns=None, default_merge=None, info=None) -> MergeResult`
 
 Same as `Versioned.commit()`, but automatically runs GC afterward if above high water.
 
-### `maybe_rebase() -> RebaseResult`
+#### `maybe_rebase() -> RebaseResult`
 
 Check if total size exceeds high water. If so, run rebase. Otherwise return a no-op result.
 
@@ -55,7 +109,7 @@ if result.performed:
     print(f"Dropped {len(result.dropped_keys)} keys")
 ```
 
-### `rebase(keep_keys=None, *, info=None) -> RebaseResult`
+#### `rebase(keep_keys=None, *, info=None) -> RebaseResult`
 
 Force a rebase. Creates a fresh root commit with retained keys.
 
@@ -77,7 +131,7 @@ result = v.rebase(info={"reason": "manual gc"})
 
 Raises `ConcurrencyError` if another writer advanced HEAD during the rebase.
 
-### `clean_orphans(min_age=3600) -> int`
+#### `clean_orphans(min_age=3600) -> int`
 
 Remove orphaned commits unreachable from any branch HEAD. Only deletes commits older than `min_age` seconds (default: 1 hour). Returns the number of cleaned orphans.
 
@@ -87,7 +141,7 @@ Walks all branch histories to build the reachable set, so orphans from any branc
 cleaned = v.clean_orphans(min_age=0)  # clean all orphans regardless of age
 ```
 
-## RebaseResult
+### RebaseResult
 
 Frozen dataclass returned by `rebase()` and `maybe_rebase()`.
 
@@ -101,54 +155,10 @@ Frozen dataclass returned by `rebase()` and `maybe_rebase()`.
 | `total_size_after` | `int` | Total user-data size after rebase |
 | `orphans_cleaned` | `int` | Number of orphaned commits deleted |
 
-## Attributes
+### Attributes
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
 | `high_water` | `int` | High water threshold in bytes |
 | `low_water` | `int` | Low water threshold in bytes |
 | `last_rebase_result` | `RebaseResult \| None` | Result of the last rebase |
-
-## Example
-
-```python
-from kvit import GCVersioned
-
-v = GCVersioned(high_water_bytes=200, low_water_bytes=100)
-
-# Write some data
-v.commit({"a": b"x" * 40})
-v.commit({"b": b"y" * 40})
-
-# This commit pushes total to 120 bytes, triggers rebase
-# Oldest key ("a") gets dropped
-v.commit({"c": b"z" * 40})
-
-result = v.last_rebase_result
-print(result.performed)       # True
-print(result.dropped_keys)    # ("a",)
-print(v.get("a"))             # None (dropped)
-print(v.get("c"))             # b"zzz..." (retained)
-```
-
-## Using with Staged
-
-For the `MutableMapping[str, Any]` interface, wrap GCVersioned in Staged:
-
-```python
-from kvit import GCVersioned, Staged
-
-v = GCVersioned(high_water_bytes=10_000)
-s = Staged(v)
-
-s["key"] = "value"
-s.commit()
-```
-
-Or use the factory:
-
-```python
-import kvit
-
-s = kvit.store(high_water_bytes=10_000)
-```
