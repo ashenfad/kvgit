@@ -3,6 +3,7 @@
 import json
 import time
 from dataclasses import dataclass
+from typing import Callable
 
 from .errors import ConcurrencyError
 from .kv.base import KVStore
@@ -24,10 +25,12 @@ from .versioned import (
 
 
 def _is_system_key(key: str) -> bool:
-    """Check if a key is a system key (starts with __).
+    """Check if a key is a system/protected key (starts with ``__``).
 
-    Handles both direct keys ("__foo__") and namespaced keys
-    ("ns/__foo__") by extracting the base key name.
+    Handles both direct keys (``"__foo__"``) and namespaced keys
+    (``"ns/__foo__"``) by extracting the base key name.
+
+    This is the default ``is_protected`` policy for ``GCVersioned``.
     """
     base_key = key.split("/")[-1] if "/" in key else key
     return base_key.startswith("__")
@@ -54,7 +57,7 @@ class GCVersioned(Versioned):
     - If total <= high_water_bytes: no-op.
     - If total > high_water_bytes: drop coldest user keys (oldest touch,
       then largest) until total <= low_water_bytes (default 80% of high).
-    - System keys (``__*``) are always retained.
+    - Protected keys (as determined by ``is_protected``) are always retained.
     - Write a fresh root commit with only retained keys, then delete
       dropped blobs and orphaned commits.
 
@@ -69,6 +72,7 @@ class GCVersioned(Versioned):
         branch: str = "main",
         high_water_bytes: int,
         low_water_bytes: int | None = None,
+        is_protected: Callable[[str], bool] = _is_system_key,
     ) -> None:
         super().__init__(store, commit_hash=commit_hash, branch=branch)
         if high_water_bytes <= 0:
@@ -81,6 +85,7 @@ class GCVersioned(Versioned):
         )
         if self.low_water <= 0 or self.low_water > self.high_water:
             self.low_water = int(high_water_bytes * 0.8)
+        self._is_protected = is_protected
         self.last_rebase_result: RebaseResult | None = None
 
     def commit(
@@ -131,7 +136,7 @@ class GCVersioned(Versioned):
         """Rebase: create a fresh root commit, dropping cold keys.
 
         Args:
-            keep_keys: If provided, retain exactly these keys (plus system
+            keep_keys: If provided, retain exactly these keys (plus protected
                 keys). Otherwise, use the high/low water strategy.
             info: Optional metadata for the rebase commit.
         """
@@ -140,20 +145,20 @@ class GCVersioned(Versioned):
             default=sum(e.size or 0 for e in meta.values())
         )
 
-        # Identify system and user keys
-        system_keys = {
-            k: v for k, v in self._commit_keys.items() if _is_system_key(k)
+        # Identify protected and user keys
+        protected_keys = {
+            k: v for k, v in self._commit_keys.items() if self._is_protected(k)
         }
-        user_meta = {k: v for k, v in meta.items() if not _is_system_key(k)}
+        user_meta = {k: v for k, v in meta.items() if not self._is_protected(k)}
 
-        retained_keys = set(system_keys.keys()) | set(user_meta.keys())
+        retained_keys = set(protected_keys.keys()) | set(user_meta.keys())
         total = sum(e.size or 0 for e in user_meta.values())
         dropped: list[str] = []
 
         if keep_keys is not None:
-            # Explicit keep set — drop everything not in it (except system keys)
+            # Explicit keep set — drop everything not in it (except protected keys)
             for key in list(retained_keys):
-                if _is_system_key(key):
+                if self._is_protected(key):
                     continue
                 if key not in keep_keys:
                     retained_keys.discard(key)
@@ -187,15 +192,15 @@ class GCVersioned(Versioned):
             value = self.store.get(versioned_key)
             if value is None:
                 continue
-            if not _is_system_key(key):
+            if not self._is_protected(key):
                 retained_data[key] = value
                 if key in meta:
                     new_meta[key] = meta[key]
 
         # Content-addressable hash for the rebase commit (parent=None, fresh root)
         preview_keys: dict[str, str] = {}
-        for key in system_keys:
-            preview_keys[key] = system_keys[key]
+        for key in protected_keys:
+            preview_keys[key] = protected_keys[key]
         for key in retained_data:
             preview_keys[key] = f"<pending:{key}>"
         new_hash = _content_hash((), preview_keys, retained_data, info=info)
@@ -203,8 +208,8 @@ class GCVersioned(Versioned):
         # Build the write batch
         diffs: dict[str, bytes] = {}
 
-        # System keys — copy blobs with new versioned keys
-        for key, old_vk in system_keys.items():
+        # Protected keys — copy blobs with new versioned keys
+        for key, old_vk in protected_keys.items():
             value = self.store.get(old_vk)
             if value is None:
                 continue
