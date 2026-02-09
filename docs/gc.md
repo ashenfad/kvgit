@@ -133,7 +133,7 @@ print(v.get("c"))             # b"zzz..." (retained)
 
 ## Using with Staged
 
-For the set/commit pattern, wrap GCVersioned in Staged:
+For the `MutableMapping[str, Any]` interface, wrap GCVersioned in Staged:
 
 ```python
 from kvit import GCVersioned, Staged
@@ -141,7 +141,7 @@ from kvit import GCVersioned, Staged
 v = GCVersioned(high_water_bytes=10_000)
 s = Staged(v)
 
-s.set("key", b"value")
+s["key"] = "value"
 s.commit()
 ```
 

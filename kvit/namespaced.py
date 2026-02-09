@@ -1,18 +1,20 @@
 """Namespaced: key-prefixed view over a Store."""
 
-from typing import Iterable
+from collections.abc import Iterator, MutableMapping
+from typing import Any, Iterable
 
+from .content_types import MergeFn
 from .store import Store
-from .versioned import MergeFn, MergeResult
+from .versioned import MergeResult
 
 
-class Namespaced:
+class Namespaced(MutableMapping[str, Any]):
     """A namespaced view over a Store.
 
     Keys are prefixed with ``namespace/``. Nested namespaces are
     supported by wrapping another Namespaced instance.
 
-    Implements the ``Store`` protocol.
+    Implements ``MutableMapping[str, Any]`` and the ``Store`` protocol.
 
     Args:
         store: Any Store (Staged, Live, or another Namespaced).
@@ -40,24 +42,26 @@ class Namespaced:
 
     # -- Read operations --
 
-    def get(self, key: str) -> bytes | None:
+    def get(self, key: str, default: Any = None) -> Any:
         """Get a value from the namespaced view."""
-        return self._store.get(self._prefixed(key))
+        return self._store.get(self._prefixed(key), default)
 
-    def get_many(self, *keys: str) -> dict[str, bytes]:
+    def get_many(self, *keys: str) -> dict[str, Any]:
         """Get multiple values from the namespaced view."""
         prefixed = {self._prefixed(k): k for k in keys}
         result = self._store.get_many(*prefixed.keys())
         return {prefixed[pk]: v for pk, v in result.items()}
 
-    def keys(self) -> Iterable[str]:
+    def keys(self) -> set[str]:
         """Direct child keys in this namespace (not nested)."""
         prefix = f"{self.namespace}/"
+        result: set[str] = set()
         for key in self._store.keys():
             if key.startswith(prefix):
                 remainder = key[len(prefix):]
                 if remainder and "/" not in remainder:
-                    yield remainder
+                    result.add(remainder)
+        return result
 
     def descendant_keys(self) -> Iterable[str]:
         """All keys under this namespace, including nested."""
@@ -66,12 +70,27 @@ class Namespaced:
             if key.startswith(prefix):
                 yield key[len(prefix):]
 
-    def __contains__(self, key: str) -> bool:
+    def __contains__(self, key: object) -> bool:
         return self._prefixed(key) in self._store
+
+    def __getitem__(self, key: str) -> Any:
+        return self._store[self._prefixed(key)]
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        self._store[self._prefixed(key)] = value
+
+    def __delitem__(self, key: str) -> None:
+        del self._store[self._prefixed(key)]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.keys())
+
+    def __len__(self) -> int:
+        return len(self.keys())
 
     # -- Write operations --
 
-    def set(self, key: str, value: bytes) -> None:
+    def set(self, key: str, value: Any) -> None:
         """Set a value in the namespaced view."""
         self._store.set(self._prefixed(key), value)
 
@@ -95,17 +114,6 @@ class Namespaced:
         """Register a merge function for a namespaced key."""
         if hasattr(self._store, "set_merge_fn"):
             self._store.set_merge_fn(self._prefixed(key), fn)
-
-    def set_content_type(self, key: str, ct) -> None:
-        """Register a ContentType for a namespaced key."""
-        if hasattr(self._store, "set_content_type"):
-            self._store.set_content_type(self._prefixed(key), ct)
-
-    def get_content_type(self, key: str):
-        """Retrieve the ContentType registered for a namespaced key, or None."""
-        if hasattr(self._store, "get_content_type"):
-            return self._store.get_content_type(self._prefixed(key))
-        return None
 
     def set_default_merge(self, fn: MergeFn) -> None:
         """Register a default merge function (store-wide)."""
