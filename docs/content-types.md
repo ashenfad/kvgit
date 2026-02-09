@@ -13,7 +13,7 @@ Any argument can be `None` (key absent or removed on that side).
 
 ### Registration
 
-Register merge functions on `Staged` (or `Namespaced`):
+Register merge functions on `Staged`:
 
 ```python
 from kvit import counter
@@ -36,23 +36,20 @@ s.set_default_merge(last_writer_wins())
 An integer counter. Merge strategy: `ours + theirs - old`. Both sides' increments are preserved.
 
 ```python
-from kvit import counter
-from kvit.kv.memory import Memory
-
-store = Memory()
-
 import kvit
+from kvit import counter
+
 s1 = kvit.store()
 s1["hits"] = 100
 s1.commit()
 
-s2 = kvit.store()
+s2 = s1.create_branch("writer2")
 s2.set_merge_fn("hits", counter())
 
 s1["hits"] = 115         # +15 on main
 s1.commit()
 
-s2["hits"] = 120         # +20 on s2, triggers three-way merge
+s2["hits"] = 120         # +20 on writer2, triggers three-way merge
 s2.commit()
 
 print(s2["hits"])        # 135 (115 + 120 - 100)
@@ -86,7 +83,7 @@ s.set_merge_fn("tags", merge_lists)
 For power users working directly with `Versioned` (bytes-level API):
 
 ```python
-from kvit import BytesMergeFn
+from kvit.versioned import BytesMergeFn
 
 BytesMergeFn = Callable[[bytes | None, bytes | None, bytes | None], bytes]
 ```
