@@ -91,11 +91,11 @@ def store(
         raise ValueError(f"Unknown kind: {kind!r}")
 
     if high_water_bytes is not None:
-        gc_kwargs: dict = dict(
-            branch=branch,
-            high_water_bytes=high_water_bytes,
-            low_water_bytes=low_water_bytes,
-        )
+        gc_kwargs: dict[str, Any] = {
+            "branch": branch,
+            "high_water_bytes": high_water_bytes,
+            "low_water_bytes": low_water_bytes,
+        }
         if is_protected is not None:
             gc_kwargs["is_protected"] = is_protected
         versioned = GCVersioned(backend, **gc_kwargs)
