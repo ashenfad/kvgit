@@ -7,7 +7,7 @@ from .kv.base import KVStore
 from .live import Live
 from .namespaced import Namespaced
 from .staged import Staged
-from .store import Store, store
+from .store import Store, VersionedStore, store
 from .versioned import BytesMergeFn, DiffResult, MergeResult, MetaEntry, Versioned
 
 __all__ = [
@@ -25,6 +25,7 @@ __all__ = [
     "Staged",
     "Store",
     "Versioned",
+    "VersionedStore",
     "counter",
     "last_writer_wins",
     "store",

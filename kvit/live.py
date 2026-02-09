@@ -7,9 +7,8 @@ from typing import Any
 class Live(MutableMapping[str, Any]):
     """Immediate-write in-memory store.
 
-    Writes take effect immediately. Versioning operations
-    (``commit``, ``create_branch``, ``checkout``, ``reset``)
-    raise ``NotImplementedError``.
+    Writes take effect immediately. No versioning support.
+    Satisfies the ``Store`` protocol.
     """
 
     def __init__(self) -> None:
@@ -51,25 +50,3 @@ class Live(MutableMapping[str, Any]):
 
     def __delitem__(self, key: str) -> None:
         del self._data[key]
-
-    # -- Versioning operations (not supported) --
-
-    def commit(self, **kwargs):
-        """Not supported. Live writes are immediate."""
-        raise NotImplementedError("Live store does not support commit")
-
-    def reset(self) -> None:
-        """Not supported. Live has no staging buffer."""
-        raise NotImplementedError("Live store does not support reset")
-
-    def create_branch(self, name: str):
-        """Not supported. Live has no versioning."""
-        raise NotImplementedError("Live store does not support branching")
-
-    def checkout(self, commit_hash: str, *, branch: str | None = None):
-        """Not supported. Live has no versioning."""
-        raise NotImplementedError("Live store does not support checkout")
-
-    def list_branches(self) -> list[str]:
-        """Not supported. Live has no versioning."""
-        raise NotImplementedError("Live store does not support branching")

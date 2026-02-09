@@ -2,7 +2,7 @@
 
 ## Store Protocol
 
-`Store` is the primary user-facing interface. It implements `MutableMapping[str, Any]` with commit semantics.
+`Store` is the base key-value interface. It implements `MutableMapping[str, Any]` semantics.
 
 ```python
 from kvit import Store
@@ -21,19 +21,30 @@ from kvit import Store
 | `__len__` | `() -> int` | Number of keys |
 | `set` | `(key: str, value: Any) -> None` | Set a value |
 | `remove` | `(key: str) -> None` | Remove a key |
-| `commit` | `(**kwargs) -> MergeResult` | Flush changes to storage |
-| `reset` | `() -> None` | Discard pending changes |
-| `create_branch` | `(name: str) -> Store` | Fork current commit onto a new branch |
-| `checkout` | `(commit_hash: str, *, branch=None) -> Store \| None` | Open a specific commit |
-| `list_branches` | `() -> list[str]` | List all branch names |
 
 **Implementations:** `Staged`, `Live`, `Namespaced`
 
-`Live` raises `NotImplementedError` for `commit`, `reset`, `create_branch`, `checkout`, and `list_branches`.
+## VersionedStore Protocol
+
+`VersionedStore` extends `Store` with commit semantics and branching.
+
+```python
+from kvit import VersionedStore
+```
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `commit` | `(**kwargs) -> MergeResult` | Flush changes to storage |
+| `reset` | `() -> None` | Discard pending changes |
+| `create_branch` | `(name: str) -> VersionedStore` | Fork current commit onto a new branch |
+| `checkout` | `(commit_hash: str, *, branch=None) -> VersionedStore \| None` | Open a specific commit |
+| `list_branches` | `() -> list[str]` | List all branch names |
+
+**Implementations:** `Staged`
 
 ## Factory: `kvit.store()`
 
-The simplest way to create a Store:
+The simplest way to create a store:
 
 ```python
 import kvit
@@ -42,7 +53,7 @@ import kvit
 s = kvit.store()
 
 # With disk persistence
-s = kvit.store(storage="disk", path="/path/to/db")
+s = kvit.store(kind="disk", path="/path/to/db")
 
 # With garbage collection
 s = kvit.store(high_water_bytes=10_000)
@@ -58,15 +69,15 @@ s = kvit.store(
 )
 ```
 
-### `kvit.store(storage="memory", *, path=None, branch="main", encoder=None, decoder=None, high_water_bytes=None, low_water_bytes=None)`
+### `kvit.store(kind="memory", *, path=None, branch="main", encoder=pickle.dumps, decoder=pickle.loads, high_water_bytes=None, low_water_bytes=None)`
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `storage` | `str` | `"memory"` | `"memory"` or `"disk"` |
-| `path` | `str \| None` | `None` | Required when `storage="disk"` |
+| `kind` | `Literal["memory", "disk"]` | `"memory"` | Backend type |
+| `path` | `str \| None` | `None` | Required when `kind="disk"` |
 | `branch` | `str` | `"main"` | Branch name |
-| `encoder` | `Callable \| None` | `None` | Value encoder (default: `pickle.dumps`) |
-| `decoder` | `Callable \| None` | `None` | Value decoder (default: `pickle.loads`) |
+| `encoder` | `Callable[[Any], bytes]` | `pickle.dumps` | Value encoder |
+| `decoder` | `Callable[[bytes], Any]` | `pickle.loads` | Value decoder |
 | `high_water_bytes` | `int \| None` | `None` | Enable GC |
 | `low_water_bytes` | `int \| None` | `None` | GC low-water (defaults to 80% of high) |
 
@@ -139,9 +150,7 @@ At commit time, Staged wraps these into bytes-level merge functions automaticall
 
 ## Live
 
-`Live` is an in-memory store with no versioning. Writes take effect immediately. Backed by a plain `dict[str, Any]`.
-
-Versioning operations (`commit`, `reset`, `create_branch`, `checkout`, `list_branches`) raise `NotImplementedError`.
+`Live` is an in-memory store with no versioning. Writes take effect immediately. Backed by a plain `dict[str, Any]`. Satisfies the `Store` protocol (not `VersionedStore`).
 
 ```python
 from kvit import Live
@@ -163,7 +172,9 @@ No parameters. Memory-only.
 
 ## Namespaced
 
-`Namespaced` provides a key-prefixed view over any `Store`. All keys are transparently prefixed with `namespace/`. Implements `MutableMapping[str, Any]`.
+`Namespaced` provides a key-prefixed view over any `Store`. All keys are transparently prefixed with `namespace/`. Implements `MutableMapping[str, Any]` and satisfies the `Store` protocol.
+
+Versioning operations (commit, reset, branching) are performed on the underlying store directly:
 
 ```python
 from kvit import Namespaced
@@ -179,6 +190,8 @@ config["timeout"] = 30
 agent["state"]       # "running"
 config.get("state")  # None (isolated)
 s.get("agent/state") # "running" (prefixed in base store)
+
+s.commit()           # commit is a store-level operation
 ```
 
 ### Construction
@@ -214,14 +227,14 @@ All write methods auto-prefix keys:
 ns["k"] = "v"                  # writes "myns/k" in base store
 ns.set("k", "v")               # same as above
 ns.remove("k")                 # removes "myns/k"
-result = ns.commit()           # delegates to underlying store
 ```
 
 ### Merge Functions
 
+Register merge functions on the underlying store with the full prefixed key:
+
 ```python
-ns.set_merge_fn("counter", fn)        # registers for "myns/counter"
-ns.set_default_merge(fn)              # store-wide default (not prefixed)
+s.set_merge_fn("myns/counter", fn)   # register on the store, not the namespace
 ```
 
 ### Properties
@@ -229,19 +242,6 @@ ns.set_default_merge(fn)              # store-wide default (not prefixed)
 | Property | Description |
 |----------|-------------|
 | `namespace` | Full namespace path (e.g., `"agent/worker"`) |
-| `current_commit` | Delegates to underlying store |
-| `base_commit` | Delegates to underlying store |
-| `last_merge_result` | Delegates to underlying store |
-
-### Branching
-
-All branching methods delegate to the underlying store:
-
-```python
-ns.create_branch("dev")   # delegates to underlying store
-ns.checkout(some_hash)    # delegates to underlying store
-ns.list_branches()        # delegates to underlying store
-```
 
 ---
 
