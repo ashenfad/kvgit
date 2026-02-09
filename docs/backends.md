@@ -112,6 +112,8 @@ Staged(versioned: Versioned, *, encoder=pickle.dumps, decoder=pickle.loads)
 | `encoder` | `Callable[[Any], bytes]` | `pickle.dumps` | Serializes values to bytes on commit |
 | `decoder` | `Callable[[bytes], Any]` | `pickle.loads` | Deserializes bytes to values on read |
 
+> **Note:** The default encoder/decoder uses `pickle`, which can execute arbitrary code during deserialization. This is safe when the store backend is local and under your control (memory, local disk). If your backend crosses a trust boundary (e.g., a shared remote store), switch to a safe serializer like JSON.
+
 ### Methods
 
 | Method | Description |
@@ -301,6 +303,8 @@ from kvit.kv.disk import Disk
 
 store = Disk("/path/to/db")
 ```
+
+CAS and transactional operations are safe across multiple processes sharing the same directory, backed by SQLite's file-level locking. This makes Disk suitable for multi-process agent coordination.
 
 ## Custom Backends
 
