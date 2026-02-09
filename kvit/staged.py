@@ -55,9 +55,21 @@ class Staged(MutableMapping[str, Any]):
     def get_many(self, *keys: str) -> dict[str, Any]:
         """Get multiple values, respecting staged state."""
         result: dict[str, Any] = {}
+        fetch: list[str] = []
         for key in keys:
-            if key in self:
-                result[key] = self.get(key)
+            if key in self._removals:
+                continue
+            if key in self._updates:
+                result[key] = self._updates[key]
+            elif key in self._cache:
+                result[key] = self._cache[key]
+            else:
+                fetch.append(key)
+        if fetch:
+            for key, raw in self._versioned.get_many(*fetch).items():
+                value = self._decoder(raw)
+                self._cache[key] = value
+                result[key] = value
         return result
 
     def keys(self) -> set[str]:  # type: ignore[override]
