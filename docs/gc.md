@@ -29,7 +29,7 @@ s.commit()  # GC runs automatically if above high water
 5. A fresh root commit is created with only the retained keys
 6. Orphaned commits are cleaned up
 
-System keys (prefixed with `__`) are always retained.
+Protected keys are always retained. By default, keys starting with `__` (including namespaced keys like `ns/__foo__`) are protected. This policy is configurable via the `is_protected` parameter.
 
 ## Example
 
@@ -73,7 +73,7 @@ store = Memory()
 v = GCVersioned(store, branch="main", high_water_bytes=50_000)
 ```
 
-### `GCVersioned(store=None, *, commit_hash=None, branch="main", high_water_bytes, low_water_bytes=None)`
+### `GCVersioned(store=None, *, commit_hash=None, branch="main", high_water_bytes, low_water_bytes=None, is_protected=_is_system_key)`
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -82,6 +82,7 @@ v = GCVersioned(store, branch="main", high_water_bytes=50_000)
 | `branch` | `str` | `"main"` | Branch name. |
 | `high_water_bytes` | `int` | (required) | Rebase triggers when total size exceeds this. |
 | `low_water_bytes` | `int \| None` | `None` | Rebase drops keys until total is at or below this. Defaults to 80% of high water. |
+| `is_protected` | `Callable[[str], bool]` | `_is_system_key` | Returns `True` for keys GC should never drop. Default protects keys starting with `__`. |
 
 Wrap in `Staged` for the `MutableMapping[str, Any]` interface:
 
@@ -117,7 +118,7 @@ Force a rebase. Creates a fresh root commit with retained keys.
 # Use high/low water strategy
 result = v.rebase()
 
-# Explicit keep set (plus system keys)
+# Explicit keep set (plus protected keys)
 result = v.rebase(keep_keys={"important_key", "config"})
 
 # With commit info
@@ -126,7 +127,7 @@ result = v.rebase(info={"reason": "manual gc"})
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `keep_keys` | `set[str] \| None` | `None` | If provided, retain exactly these keys (plus system keys). Otherwise use high/low water strategy. |
+| `keep_keys` | `set[str] \| None` | `None` | If provided, retain exactly these keys (plus protected keys). Otherwise use high/low water strategy. |
 | `info` | `dict \| None` | `None` | Metadata for the rebase commit. |
 
 Raises `ConcurrencyError` if another writer advanced HEAD during the rebase.

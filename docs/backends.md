@@ -69,7 +69,7 @@ s = kvit.store(
 )
 ```
 
-### `kvit.store(kind="memory", *, path=None, branch="main", encoder=pickle.dumps, decoder=pickle.loads, high_water_bytes=None, low_water_bytes=None)`
+### `kvit.store(kind="memory", *, path=None, branch="main", encoder=pickle.dumps, decoder=pickle.loads, high_water_bytes=None, low_water_bytes=None, is_protected=None)`
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -80,6 +80,7 @@ s = kvit.store(
 | `decoder` | `Callable[[bytes], Any]` | `pickle.loads` | Value decoder |
 | `high_water_bytes` | `int \| None` | `None` | Enable GC |
 | `low_water_bytes` | `int \| None` | `None` | GC low-water (defaults to 80% of high) |
+| `is_protected` | `Callable[[str], bool] \| None` | `None` | Keys GC should never drop. Only used when `high_water_bytes` is set. Defaults to protecting keys starting with `__`. |
 
 ---
 
@@ -283,7 +284,7 @@ from kvit.kv.memory import Memory
 store = Memory()
 ```
 
-CAS operations are thread-safe (locked). Other operations are not synchronized -- use a single writer or external locking for concurrent access.
+All operations are thread-safe (locked), including under free-threaded Python 3.14+.
 
 The underlying dict is accessible as `store.memory` for debugging.
 

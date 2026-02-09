@@ -57,6 +57,7 @@ def store(
     decoder: Callable[[bytes], Any] = pickle.loads,
     high_water_bytes: int | None = None,
     low_water_bytes: int | None = None,
+    is_protected: Callable[[str], bool] | None = None,
 ) -> Staged:
     """Create a Staged store with sensible defaults.
 
@@ -70,6 +71,9 @@ def store(
         high_water_bytes: Enable GC with this high-water threshold.
         low_water_bytes: GC low-water threshold (defaults to 80%
             of high_water).
+        is_protected: Callable that returns True for keys GC should
+            never drop. Only used when ``high_water_bytes`` is set.
+            Defaults to protecting keys starting with ``__``.
 
     Returns:
         A ``Staged`` store instance.
@@ -87,12 +91,14 @@ def store(
         raise ValueError(f"Unknown kind: {kind!r}")
 
     if high_water_bytes is not None:
-        versioned = GCVersioned(
-            backend,
+        gc_kwargs: dict = dict(
             branch=branch,
             high_water_bytes=high_water_bytes,
             low_water_bytes=low_water_bytes,
         )
+        if is_protected is not None:
+            gc_kwargs["is_protected"] = is_protected
+        versioned = GCVersioned(backend, **gc_kwargs)
     else:
         versioned = Versioned(backend, branch=branch)
 
