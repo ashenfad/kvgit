@@ -82,7 +82,7 @@ def store(
             raise ValueError("path is required when kind='disk'")
         from .kv.disk import Disk
 
-        backend = Disk(path)
+        backend = Disk(path, size_limit=0)
     else:
         raise ValueError(f"Unknown kind: {kind!r}")
 
