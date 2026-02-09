@@ -2,7 +2,8 @@
 
 import pytest
 
-from kvit import ConcurrencyError, GCVersioned
+from kvit import ConcurrencyError
+from kvit.gc import GCVersioned
 from kvit.kv.memory import Memory
 from kvit.versioned import BRANCH_HEAD, _to_bytes
 

@@ -19,7 +19,7 @@ class TestStoreFactory:
             store(kind="disk")
 
     def test_gc_versioned(self):
-        from kvit import GCVersioned
+        from kvit.gc import GCVersioned
 
         s = store(high_water_bytes=5000)
         assert isinstance(s, Staged)
