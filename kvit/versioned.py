@@ -140,7 +140,8 @@ class Versioned:
                 }
                 store.set_many(**initial)
 
-        assert isinstance(commit_hash, str)
+        if not isinstance(commit_hash, str):
+            raise TypeError(f"commit_hash must be str, got {type(commit_hash).__name__}")
         self._current_commit: str = commit_hash
         self._base_commit: str = commit_hash
 
