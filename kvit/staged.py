@@ -217,6 +217,10 @@ class Staged(MutableMapping[str, Any]):
         """Whether there are staged changes."""
         return bool(self._updates or self._removals)
 
+    def is_staged(self, key: str) -> bool:
+        """Whether a specific key has a pending staged update or removal."""
+        return key in self._updates or key in self._removals
+
     # -- Versioned pass-through --
 
     @property
