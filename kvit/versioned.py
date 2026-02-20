@@ -769,6 +769,19 @@ class Versioned:
             modified=modified,
         )
 
+    def parents(self, commit_hash: str | None = None) -> tuple[str, ...]:
+        """Get the direct parent commit(s) of a commit.
+
+        Args:
+            commit_hash: The commit to query (default: current).
+
+        Returns:
+            Tuple of parent commit hashes (empty for the initial commit,
+            one element for normal commits, two for merge commits).
+        """
+        target = commit_hash or self._current_commit
+        return self._load_parents(target)
+
     # -- Internal --
 
     def _find_lca(self, commit_a: str, commit_b: str) -> str | None:
