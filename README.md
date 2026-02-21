@@ -1,4 +1,4 @@
-# gitkv
+# gitkv 🔀
 
 Versioned key-value store with git-like commit, branch, and merge semantics.
 
