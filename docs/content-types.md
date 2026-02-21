@@ -16,9 +16,9 @@ Any argument can be `None` (key absent or removed on that side).
 Register merge functions on `Staged`:
 
 ```python
-from kvit import counter
+from gitkv import counter
 
-s = kvit.store()
+s = gitkv.store()
 s.set_merge_fn("hits", counter())
 ```
 
@@ -36,10 +36,10 @@ s.set_default_merge(last_writer_wins())
 An integer counter. Merge strategy: `ours + theirs - old`. Both sides' increments are preserved.
 
 ```python
-import kvit
-from kvit import counter
+import gitkv
+from gitkv import counter
 
-s1 = kvit.store()
+s1 = gitkv.store()
 s1["hits"] = 100
 s1.commit()
 
@@ -60,7 +60,7 @@ print(s2["hits"])        # 135 (115 + 120 - 100)
 Merge always returns `theirs` (the HEAD value).
 
 ```python
-from kvit import last_writer_wins
+from gitkv import last_writer_wins
 
 fn = last_writer_wins()
 fn("old", "ours", "theirs")  # "theirs"
@@ -83,7 +83,7 @@ s.set_merge_fn("tags", merge_lists)
 For power users working directly with `Versioned` (bytes-level API):
 
 ```python
-from kvit.versioned import BytesMergeFn
+from gitkv.versioned import BytesMergeFn
 
 BytesMergeFn = Callable[[bytes | None, bytes | None, bytes | None], bytes]
 ```

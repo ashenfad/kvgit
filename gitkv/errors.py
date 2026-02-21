@@ -1,4 +1,4 @@
-"""kvit error types."""
+"""gitkv error types."""
 
 
 class ConcurrencyError(Exception):

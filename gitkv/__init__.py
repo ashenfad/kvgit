@@ -1,4 +1,4 @@
-"""kvit: Versioned key-value store."""
+"""gitkv: Versioned key-value store."""
 
 from .content_types import MergeFn, counter, last_writer_wins
 from .errors import ConcurrencyError, MergeConflict

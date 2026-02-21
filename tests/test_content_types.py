@@ -1,8 +1,8 @@
 """Tests for merge functions."""
 
 
-from kvit import Staged, Versioned, counter, last_writer_wins
-from kvit.kv.memory import Memory
+from gitkv import Staged, Versioned, counter, last_writer_wins
+from gitkv.kv.memory import Memory
 
 
 class TestCounter:
