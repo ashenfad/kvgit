@@ -3,7 +3,7 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "kvit"
+name = "gitkv"
 version = "0.1.0"
 description = "Versioned key-value store with git-like commit, branch, and merge semantics."
 requires-python = ">=3.10"

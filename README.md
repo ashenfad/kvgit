@@ -1,4 +1,4 @@
-# kvit
+# gitkv
 
 Versioned key-value store with git-like commit, branch, and merge semantics.
 
@@ -17,17 +17,17 @@ Values are `Any` (serialized via pickle by default). Commits are content-address
 ## Install
 
 ```bash
-pip install kvit            # in-memory only
-pip install kvit[disk]      # adds disk backend via diskcache
+pip install gitkv            # in-memory only
+pip install gitkv[disk]      # adds disk backend via diskcache
 ```
 
 ## Quick example
 
 ```python
-import kvit
+import gitkv
 
 # Create a store (Staged backed by in-memory Versioned)
-s = kvit.store()
+s = gitkv.store()
 
 # Write and commit -- values are Any (pickle-serialized by default)
 s["user"] = "alice"
@@ -35,9 +35,9 @@ s["score"] = 0
 s.commit()
 
 # Merge functions handle conflict resolution
-from kvit import counter
+from gitkv import counter
 
-s2 = kvit.store()
+s2 = gitkv.store()
 s2["hits"] = 100
 s2.commit()
 

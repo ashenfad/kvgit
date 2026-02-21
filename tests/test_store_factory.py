@@ -1,8 +1,8 @@
-"""Tests for the kvit.store() factory function."""
+"""Tests for the gitkv.store() factory function."""
 
 import pytest
 
-from kvit import Staged, store
+from gitkv import Staged, store
 
 
 class TestStoreFactory:
@@ -19,7 +19,7 @@ class TestStoreFactory:
             store(kind="disk")
 
     def test_gc_versioned(self):
-        from kvit.gc import GCVersioned
+        from gitkv.gc import GCVersioned
 
         s = store(high_water_bytes=5000)
         assert isinstance(s, Staged)

@@ -2,8 +2,8 @@
 
 import pytest
 
-from kvit.kv.composite import Composite
-from kvit.kv.memory import Memory
+from gitkv.kv.composite import Composite
+from gitkv.kv.memory import Memory
 
 
 class TestCompositeBasic:

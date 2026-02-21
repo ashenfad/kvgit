@@ -4,12 +4,12 @@ Automatic garbage collection drops cold (least-recently-accessed) keys when tota
 
 ## Quick Start
 
-The easiest way to enable GC is through the `kvit.store()` factory:
+The easiest way to enable GC is through the `gitkv.store()` factory:
 
 ```python
-import kvit
+import gitkv
 
-s = kvit.store(high_water_bytes=10_000)
+s = gitkv.store(high_water_bytes=10_000)
 
 s["key"] = "value"
 s.commit()  # GC runs automatically if above high water
@@ -34,9 +34,9 @@ Protected keys are always retained. By default, keys starting with `__` (includi
 ## Example
 
 ```python
-import kvit
+import gitkv
 
-s = kvit.store(high_water_bytes=200, low_water_bytes=100)
+s = gitkv.store(high_water_bytes=200, low_water_bytes=100)
 
 s["a"] = "x" * 40
 s.commit()
@@ -60,7 +60,7 @@ print(s.get("c"))  # "zzz..." (retained)
 For direct composition (custom backends, shared stores, bytes-level API), use `GCVersioned` directly. It extends `Versioned` with automatic garbage collection via rebase.
 
 ```python
-from kvit.gc import GCVersioned
+from gitkv.gc import GCVersioned
 
 v = GCVersioned(high_water_bytes=10_000)
 
@@ -68,7 +68,7 @@ v = GCVersioned(high_water_bytes=10_000)
 v = GCVersioned(high_water_bytes=10_000, low_water_bytes=5_000)
 
 # With a shared store and branch
-from kvit.kv.memory import Memory
+from gitkv.kv.memory import Memory
 store = Memory()
 v = GCVersioned(store, branch="main", high_water_bytes=50_000)
 ```
@@ -87,8 +87,8 @@ v = GCVersioned(store, branch="main", high_water_bytes=50_000)
 Wrap in `Staged` for the `MutableMapping[str, Any]` interface:
 
 ```python
-from kvit.gc import GCVersioned
-from kvit import Staged
+from gitkv.gc import GCVersioned
+from gitkv import Staged
 
 v = GCVersioned(high_water_bytes=10_000)
 s = Staged(v)

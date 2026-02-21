@@ -2,7 +2,7 @@
 
 import pytest
 
-from kvit import Live
+from gitkv import Live
 
 
 class TestLiveBasic:
@@ -104,11 +104,11 @@ class TestLiveImmediateWrites:
 
 class TestLiveProtocol:
     def test_satisfies_store(self):
-        from kvit import Store
+        from gitkv import Store
 
         assert isinstance(Live(), Store)
 
     def test_not_versioned_store(self):
-        from kvit import VersionedStore
+        from gitkv import VersionedStore
 
         assert not isinstance(Live(), VersionedStore)

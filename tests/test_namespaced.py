@@ -2,8 +2,8 @@
 
 import pytest
 
-from kvit import Live, MergeResult, Namespaced, Staged, Versioned, counter
-from kvit.kv.memory import Memory
+from gitkv import Live, MergeResult, Namespaced, Staged, Versioned, counter
+from gitkv.kv.memory import Memory
 
 
 def _staged(store=None, **kwargs):
@@ -222,7 +222,7 @@ class TestNamespacedWrite:
 
 class TestNamespacedProtocol:
     def test_satisfies_store(self):
-        from kvit import Store
+        from gitkv import Store
 
         s = _staged()
         ns = Namespaced(s, "app")
