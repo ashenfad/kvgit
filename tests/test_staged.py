@@ -2,8 +2,8 @@
 
 import pytest
 
-from gitkv import MergeResult, Staged, Versioned
-from gitkv.kv.memory import Memory
+from kvgit import MergeResult, Staged, Versioned
+from kvgit.kv.memory import Memory
 
 
 class TestStagedBasic:

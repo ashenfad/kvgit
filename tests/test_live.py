@@ -4,7 +4,7 @@ from collections.abc import MutableMapping
 
 import pytest
 
-from gitkv import Live
+from kvgit import Live
 
 
 class TestLiveBasic:

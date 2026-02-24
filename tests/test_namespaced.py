@@ -4,8 +4,8 @@ from collections.abc import MutableMapping
 
 import pytest
 
-from gitkv import Live, MergeResult, Namespaced, Staged, Versioned, counter
-from gitkv.kv.memory import Memory
+from kvgit import Live, MergeResult, Namespaced, Staged, Versioned, counter
+from kvgit.kv.memory import Memory
 
 
 def _staged(store=None, **kwargs):

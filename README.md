@@ -1,4 +1,4 @@
-# gitkv 🔀
+# kvgit 🔀
 
 Versioned key-value store with git-like commit, branch, and merge semantics.
 
@@ -17,17 +17,17 @@ Values are `Any` (serialized via pickle by default). Commits are content-address
 ## Install
 
 ```bash
-pip install gitkv            # in-memory only
-pip install gitkv[disk]      # adds disk backend via diskcache
+pip install kvgit            # in-memory only
+pip install kvgit[disk]      # adds disk backend via diskcache
 ```
 
 ## Quick example
 
 ```python
-import gitkv
+import kvgit
 
 # Create a store -- values are Any (pickle-serialized by default)
-s = gitkv.store()
+s = kvgit.store()
 
 s["user"] = "alice"
 s["score"] = 0
