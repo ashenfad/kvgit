@@ -3,6 +3,7 @@
 import pytest
 
 from kvgit import Staged, store
+from kvgit.gc import GCVersioned
 
 
 class TestStoreFactory:
@@ -19,8 +20,6 @@ class TestStoreFactory:
             store(kind="disk")
 
     def test_gc_versioned(self):
-        from kvgit.gc import GCVersioned
-
         s = store(high_water_bytes=5000)
         assert isinstance(s, Staged)
         assert isinstance(s.versioned, GCVersioned)
