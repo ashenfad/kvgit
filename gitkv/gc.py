@@ -237,9 +237,7 @@ class GCVersioned(Versioned):
         # CAS HEAD to the new rebase commit
         branch_key = BRANCH_HEAD % self._branch
         expected = _to_bytes(self._base_commit)
-        if not self.store.cas(
-            branch_key, _to_bytes(new_hash), expected=expected
-        ):
+        if not self.store.cas(branch_key, _to_bytes(new_hash), expected=expected):
             raise ConcurrencyError("HEAD changed during rebase.")
 
         # Delete dropped blobs
@@ -289,9 +287,7 @@ class GCVersioned(Versioned):
                 if head_bytes is None:
                     continue
                 branch_head = _from_bytes(head_bytes)
-                for commit in self.history(
-                    commit_hash=branch_head, all_parents=True
-                ):
+                for commit in self.history(commit_hash=branch_head, all_parents=True):
                     reachable.add(commit)
 
         # Sweep phase: find orphaned commits by scanning for meta keys
@@ -302,7 +298,7 @@ class GCVersioned(Versioned):
         for key in self.store.keys():
             if not isinstance(key, str) or not key.startswith(meta_prefix):
                 continue
-            commit_hash = key[len(meta_prefix):]
+            commit_hash = key[len(meta_prefix) :]
             if not commit_hash or commit_hash in reachable:
                 continue
             # Check age
@@ -313,10 +309,7 @@ class GCVersioned(Versioned):
                 meta = _meta_from_bytes(meta_bytes)
                 if meta:
                     first_entry = next(iter(meta.values()), None)
-                    if (
-                        first_entry
-                        and first_entry.created_at < cutoff_time
-                    ):
+                    if first_entry and first_entry.created_at < cutoff_time:
                         orphans.append(commit_hash)
             except (json.JSONDecodeError, TypeError, KeyError):
                 continue
@@ -344,9 +337,7 @@ class GCVersioned(Versioned):
 
     def _load_total_size(self, default: int = 0) -> int:
         """Load the total variable size for the current commit."""
-        total_bytes = self.store.get(
-            TOTAL_VAR_SIZE_KEY % self._current_commit
-        )
+        total_bytes = self.store.get(TOTAL_VAR_SIZE_KEY % self._current_commit)
         if total_bytes is None:
             return default
         try:

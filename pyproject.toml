@@ -37,7 +37,7 @@ dependencies = []
 [project.optional-dependencies]
 disk = ["diskcache"]
 all = ["diskcache"]
-dev = ["pytest", "pytest-timeout", "diskcache"]
+dev = ["pytest", "pytest-timeout", "diskcache", "ruff"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

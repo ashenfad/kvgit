@@ -22,8 +22,7 @@ class Namespaced(MutableMapping[str, Any]):
             raise ValueError("Namespace names cannot contain '/'")
         if not isinstance(store, MutableMapping):
             raise TypeError(
-                f"Namespaced requires a MutableMapping, "
-                f"not {type(store).__name__}"
+                f"Namespaced requires a MutableMapping, not {type(store).__name__}"
             )
 
         if isinstance(store, Namespaced):
@@ -57,7 +56,7 @@ class Namespaced(MutableMapping[str, Any]):
         result: set[str] = set()
         for key in self._store.keys():
             if key.startswith(prefix):
-                remainder = key[len(prefix):]
+                remainder = key[len(prefix) :]
                 if remainder and "/" not in remainder:
                     result.add(remainder)
         return result
@@ -67,7 +66,7 @@ class Namespaced(MutableMapping[str, Any]):
         prefix = f"{self.namespace}/"
         for key in self._store.keys():
             if key.startswith(prefix):
-                yield key[len(prefix):]
+                yield key[len(prefix) :]
 
     def __contains__(self, key: object) -> bool:
         if not isinstance(key, str):

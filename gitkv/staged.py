@@ -158,8 +158,7 @@ class Staged(MutableMapping[str, Any]):
         encoded_updates: dict[str, bytes] | None = None
         if self._updates:
             encoded_updates = {
-                key: self._encoder(value)
-                for key, value in self._updates.items()
+                key: self._encoder(value) for key, value in self._updates.items()
             }
 
         removals = self._removals if self._removals else None
@@ -173,8 +172,7 @@ class Staged(MutableMapping[str, Any]):
         bytes_merge_fns: dict[str, BytesMergeFn] | None = None
         if effective_fns:
             bytes_merge_fns = {
-                key: self._wrap_merge_fn(fn)
-                for key, fn in effective_fns.items()
+                key: self._wrap_merge_fn(fn) for key, fn in effective_fns.items()
             }
 
         bytes_default: BytesMergeFn | None = None
