@@ -47,7 +47,12 @@ class Namespaced(MutableMapping[str, Any]):
         if hasattr(self._store, "get_many"):
             result = self._store.get_many(*prefixed.keys())
         else:
-            result = {k: self._store[k] for k in prefixed if k in self._store}
+            result = {}
+            for k in prefixed:
+                try:
+                    result[k] = self._store[k]
+                except KeyError:
+                    pass
         return {prefixed[pk]: v for pk, v in result.items()}
 
     def keys(self) -> set[str]:  # type: ignore[override]
