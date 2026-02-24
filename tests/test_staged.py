@@ -9,7 +9,7 @@ from gitkv.kv.memory import Memory
 class TestStagedBasic:
     def test_set_and_get(self):
         s = Staged(Versioned())
-        s.set("k", "v")
+        s["k"] = "v"
         assert s.get("k") == "v"
 
     def test_get_missing(self):
@@ -22,22 +22,22 @@ class TestStagedBasic:
 
     def test_get_many(self):
         s = Staged(Versioned())
-        s.set("a", 1)
-        s.set("b", 2)
+        s["a"] = 1
+        s["b"] = 2
         result = s.get_many("a", "b", "c")
         assert result == {"a": 1, "b": 2}
 
     def test_contains(self):
         s = Staged(Versioned())
-        s.set("k", "v")
+        s["k"] = "v"
         assert "k" in s
         assert "nope" not in s
 
     def test_keys_includes_staged(self):
         s = Staged(Versioned())
-        s.set("a", 1)
+        s["a"] = 1
         s.commit()
-        s.set("b", 2)
+        s["b"] = 2
         assert set(s.keys()) == {"a", "b"}
 
 
@@ -83,8 +83,8 @@ class TestStagedMutableMapping:
 
     def test_len_with_committed(self):
         s = Staged(Versioned())
-        s.set("a", 1)
-        s.set("b", 2)
+        s["a"] = 1
+        s["b"] = 2
         s.commit()
         s["c"] = 3
         assert len(s) == 3
@@ -93,33 +93,33 @@ class TestStagedMutableMapping:
 class TestStagedRemove:
     def test_remove_shadows_committed(self):
         s = Staged(Versioned())
-        s.set("a", 1)
-        s.set("b", 2)
+        s["a"] = 1
+        s["b"] = 2
         s.commit()
-        s.remove("a")
+        del s["a"]
         assert s.get("a") is None
         assert s.get("b") is not None
         assert "a" not in s
 
     def test_remove_staged_key(self):
         s = Staged(Versioned())
-        s.set("k", "v")
-        s.remove("k")
+        s["k"] = "v"
+        del s["k"]
         assert s.get("k") is None
 
     def test_keys_excludes_removed(self):
         s = Staged(Versioned())
-        s.set("a", 1)
-        s.set("b", 2)
+        s["a"] = 1
+        s["b"] = 2
         s.commit()
-        s.remove("a")
+        del s["a"]
         assert set(s.keys()) == {"b"}
 
     def test_set_after_remove(self):
         s = Staged(Versioned())
-        s.set("k", "v1")
-        s.remove("k")
-        s.set("k", "v2")
+        s["k"] = "v1"
+        del s["k"]
+        s["k"] = "v2"
         assert s.get("k") == "v2"
 
 
@@ -128,8 +128,8 @@ class TestStagedCommit:
         store = Memory()
         v = Versioned(store)
         s = Staged(v)
-        s.set("a", 1)
-        s.set("b", 2)
+        s["a"] = 1
+        s["b"] = 2
         result = s.commit()
         assert isinstance(result, MergeResult)
         assert result.merged
@@ -141,19 +141,19 @@ class TestStagedCommit:
 
     def test_commit_clears_staging(self):
         s = Staged(Versioned())
-        s.set("a", 1)
+        s["a"] = 1
         assert s.has_changes
         s.commit()
         assert not s.has_changes
 
     def test_commit_with_removals(self):
         s = Staged(Versioned())
-        s.set("a", 1)
-        s.set("b", 2)
-        s.set("c", 3)
+        s["a"] = 1
+        s["b"] = 2
+        s["c"] = 3
         s.commit()
-        s.remove("a")
-        s.set("d", 4)
+        del s["a"]
+        s["d"] = 4
         result = s.commit()
         assert result.merged
         assert s.get("a") is None
@@ -167,7 +167,7 @@ class TestStagedCommit:
 
     def test_commit_with_info(self):
         s = Staged(Versioned())
-        s.set("k", "v")
+        s["k"] = "v"
         result = s.commit(info={"author": "test"})
         assert result.merged
         assert s.versioned.commit_info() == {"author": "test"}
@@ -176,17 +176,18 @@ class TestStagedCommit:
 class TestStagedReset:
     def test_reset_clears_staging(self):
         s = Staged(Versioned())
-        s.set("a", 1)
-        s.remove("b")
+        s["a"] = 1
+        s["b"] = 2
+        del s["b"]
         s.reset()
         assert not s.has_changes
         assert s.get("a") is None
 
     def test_reset_does_not_affect_committed(self):
         s = Staged(Versioned())
-        s.set("a", 1)
+        s["a"] = 1
         s.commit()
-        s.set("b", 2)
+        s["b"] = 2
         s.reset()
         assert s.get("a") == 1
         assert s.get("b") is None
@@ -199,12 +200,14 @@ class TestStagedHasChanges:
 
     def test_set_marks_has_changes(self):
         s = Staged(Versioned())
-        s.set("k", "v")
+        s["k"] = "v"
         assert s.has_changes
 
     def test_remove_marks_has_changes(self):
         s = Staged(Versioned())
-        s.remove("k")
+        s["k"] = "v"
+        s.commit()
+        del s["k"]
         assert s.has_changes
 
 
@@ -226,7 +229,7 @@ class TestStagedProperties:
 
     def test_last_merge_result(self):
         s = Staged(Versioned())
-        s.set("k", "v")
+        s["k"] = "v"
         s.commit()
         assert s.last_merge_result is not None
         assert s.last_merge_result.merged
@@ -235,7 +238,7 @@ class TestStagedProperties:
 class TestStagedBranching:
     def test_create_branch_returns_staged(self):
         s = Staged(Versioned())
-        s.set("k", "v")
+        s["k"] = "v"
         s.commit()
         worker = s.create_branch("worker")
         assert isinstance(worker, Staged)
@@ -243,11 +246,11 @@ class TestStagedBranching:
 
     def test_create_branch_independent_commits(self):
         s = Staged(Versioned())
-        s.set("base", 1)
+        s["base"] = 1
         s.commit()
 
         worker = s.create_branch("worker")
-        worker.set("from_worker", 2)
+        worker["from_worker"] = 2
         worker.commit()
 
         s.refresh()
@@ -256,11 +259,11 @@ class TestStagedBranching:
 
     def test_checkout_returns_staged(self):
         s = Staged(Versioned())
-        s.set("k", "v1")
+        s["k"] = "v1"
         s.commit()
         old_hash = s.current_commit
 
-        s.set("k", "v2")
+        s["k"] = "v2"
         s.commit()
 
         old = s.checkout(old_hash)
@@ -273,7 +276,7 @@ class TestStagedBranching:
 
     def test_checkout_with_branch(self):
         s = Staged(Versioned())
-        s.set("k", "v")
+        s["k"] = "v"
         s.commit()
         old = s.checkout(s.current_commit, branch="review")
         assert isinstance(old, Staged)
@@ -286,6 +289,85 @@ class TestStagedBranching:
         assert "main" in s.list_branches()
 
 
+class TestStagedResetTo:
+    def test_reset_to_restores_state(self):
+        s = Staged(Versioned())
+        s["k"] = "v1"
+        s.commit()
+        first = s.current_commit
+
+        s["k"] = "v2"
+        s.commit()
+        assert s["k"] == "v2"
+
+        assert s.reset_to(first)
+        assert s["k"] == "v1"
+
+    def test_reset_to_clears_staged_changes(self):
+        s = Staged(Versioned())
+        s["k"] = "v1"
+        s.commit()
+        first = s.current_commit
+
+        s["k"] = "v2"
+        s.commit()
+        s["k"] = "pending"
+        assert s.has_changes
+
+        s.reset_to(first)
+        assert not s.has_changes
+        assert s["k"] == "v1"
+
+    def test_reset_to_invalid_returns_false(self):
+        s = Staged(Versioned())
+        s["k"] = "v"
+        s.commit()
+
+        assert not s.reset_to("nonexistent")
+        assert s["k"] == "v"  # unchanged
+
+    def test_reset_to_invalid_preserves_staged(self):
+        s = Staged(Versioned())
+        s["k"] = "v1"
+        s.commit()
+        s["k"] = "pending"
+
+        s.reset_to("nonexistent")
+        assert s.has_changes
+        assert s.get("k") == "pending"
+
+
+class TestStagedHistory:
+    def test_history_returns_commits(self):
+        s = Staged(Versioned())
+        s["k"] = "v1"
+        s.commit()
+        c1 = s.current_commit
+
+        s["k"] = "v2"
+        s.commit()
+        c2 = s.current_commit
+
+        history = list(s.history())
+        assert history[0] == c2
+        assert history[1] == c1
+
+    def test_history_from_specific_commit(self):
+        s = Staged(Versioned())
+        s["k"] = "v1"
+        s.commit()
+        c1 = s.current_commit
+
+        s["k"] = "v2"
+        s.commit()
+
+        s["k"] = "v3"
+        s.commit()
+
+        history = list(s.history(c1))
+        assert history[0] == c1
+
+
 class TestStagedRefresh:
     def test_refresh_reloads_from_head(self):
         store = Memory()
@@ -294,7 +376,7 @@ class TestStagedRefresh:
 
         # Another Staged writer advances HEAD
         s2 = Staged(Versioned(store))
-        s2.set("from_other", "data")
+        s2["from_other"] = "data"
         s2.commit()
 
         # Staged doesn't see it yet
@@ -306,7 +388,7 @@ class TestStagedRefresh:
 
     def test_refresh_clears_staging(self):
         s = Staged(Versioned())
-        s.set("k", "v")
+        s["k"] = "v"
         s.refresh()
         assert not s.has_changes
 
@@ -322,7 +404,7 @@ class TestStagedEncoder:
             return json.loads(b)
 
         s = Staged(Versioned(), encoder=encode, decoder=decode)
-        s.set("k", {"hello": "world"})
+        s["k"] = {"hello": "world"}
         s.commit()
         assert s.get("k") == {"hello": "world"}
 
@@ -336,7 +418,7 @@ class TestStagedEncoder:
             return json.loads(b)
 
         s = Staged(Versioned(), encoder=encode, decoder=decode)
-        s.set("k", "v")
+        s["k"] = "v"
         s.commit()
         worker = s.create_branch("worker")
         assert worker._encoder is encode

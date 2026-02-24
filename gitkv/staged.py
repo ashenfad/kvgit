@@ -1,7 +1,7 @@
 """Staged: buffered writes over a Versioned store."""
 
 import pickle
-from collections.abc import Iterator, MutableMapping
+from collections.abc import Iterable, Iterator, MutableMapping
 from typing import Any, Callable
 
 from .content_types import MergeFn
@@ -11,12 +11,11 @@ from .versioned import BytesMergeFn, MergeResult, Versioned
 class Staged(MutableMapping[str, Any]):
     """Buffered write layer over a ``Versioned`` store.
 
-    Individual ``set()`` / ``remove()`` calls are staged in memory.
-    ``commit()`` flushes them to the underlying ``Versioned`` as a
-    single atomic commit + merge.
+    Writes are staged in memory. ``commit()`` flushes them to the
+    underlying ``Versioned`` as a single atomic commit + merge.
 
     Values are encoded to bytes on commit using the configured encoder.
-    Implements ``MutableMapping[str, Any]`` and the ``VersionedStore`` protocol.
+    Implements ``MutableMapping[str, Any]``.
     """
 
     def __init__(
@@ -96,30 +95,20 @@ class Staged(MutableMapping[str, Any]):
         return self.get(key)
 
     def __setitem__(self, key: str, value: Any) -> None:
-        self.set(key, value)
+        self._removals.discard(key)
+        self._updates[key] = value
 
     def __delitem__(self, key: str) -> None:
         if key not in self:
             raise KeyError(key)
-        self.remove(key)
+        self._updates.pop(key, None)
+        self._removals.add(key)
 
     def __iter__(self) -> Iterator[str]:
         return iter(self.keys())
 
     def __len__(self) -> int:
         return len(self.keys())
-
-    # -- Write operations --
-
-    def set(self, key: str, value: Any) -> None:
-        """Stage a key-value pair for the next commit."""
-        self._removals.discard(key)
-        self._updates[key] = value
-
-    def remove(self, key: str) -> None:
-        """Stage a key removal for the next commit."""
-        self._updates.pop(key, None)
-        self._removals.add(key)
 
     # -- Merge function registry --
 
@@ -260,6 +249,27 @@ class Staged(MutableMapping[str, Any]):
     def list_branches(self) -> list[str]:
         """List all branch names in the store."""
         return self._versioned.list_branches()
+
+    def reset_to(self, commit_hash: str) -> bool:
+        """Reset HEAD to a specific commit and clear staged changes.
+
+        Returns True if the commit exists and reset succeeded.
+        """
+        ok = self._versioned.reset_to(commit_hash)
+        if ok:
+            self._updates.clear()
+            self._removals.clear()
+            self._cache.clear()
+        return ok
+
+    def history(
+        self,
+        commit_hash: str | None = None,
+        *,
+        all_parents: bool = False,
+    ) -> "Iterable[str]":
+        """Yield the commit chain from newest to oldest."""
+        return self._versioned.history(commit_hash, all_parents=all_parents)
 
     def refresh(self) -> None:
         """Reload from HEAD and discard staged changes."""
