@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kvgit"
-version = "0.1.0"
+version = "0.1.2"
 description = "Versioned key-value store with git-like commit, branch, and merge semantics."
 authors = [{ name = "ashenfad" }]
 requires-python = ">=3.10"
