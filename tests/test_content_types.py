@@ -29,19 +29,19 @@ class TestMergeFnIntegration:
         store = Memory()
 
         s1 = Staged(Versioned(store))
-        s1.set("hits", 10)
+        s1["hits"] = 10
         s1.commit()
 
         s2 = Staged(Versioned(store))
         s2.set_merge_fn("hits", counter())
 
         # s1 increments to 15
-        s1.set("hits", 15)
+        s1["hits"] = 15
         s1.commit()
 
         # s2 increments to 20
         # Three-way merge: 15 + 20 - 10 = 25
-        s2.set("hits", 20)
+        s2["hits"] = 20
         assert s2.commit()
         assert s2.get("hits") == 25
 
@@ -50,17 +50,17 @@ class TestMergeFnIntegration:
         store = Memory()
 
         s1 = Staged(Versioned(store))
-        s1.set("x", 0)
+        s1["x"] = 0
         s1.commit()
 
         s2 = Staged(Versioned(store))
         s2.set_merge_fn("x", counter())
 
-        s1.set("x", 5)
+        s1["x"] = 5
         s1.commit()
 
         # Without merge fn this would be a MergeConflict
-        s2.set("x", 3)
+        s2["x"] = 3
         assert s2.commit()
         assert s2.get("x") == 8  # 5 + 3 - 0
 
@@ -74,15 +74,15 @@ class TestMergeFnIntegration:
         store = Memory()
 
         s1 = Staged(Versioned(store))
-        s1.set("tags", ["a", "b"])
+        s1["tags"] = ["a", "b"]
         s1.commit()
 
         s2 = Staged(Versioned(store))
         s2.set_merge_fn("tags", merge_lists)
 
-        s1.set("tags", ["a", "b", "c"])
+        s1["tags"] = ["a", "b", "c"]
         s1.commit()
 
-        s2.set("tags", ["a", "b", "d"])
+        s2["tags"] = ["a", "b", "d"]
         assert s2.commit()
         assert s2.get("tags") == ["a", "b", "c", "d"]

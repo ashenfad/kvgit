@@ -8,7 +8,6 @@ class Live(MutableMapping[str, Any]):
     """Immediate-write in-memory store.
 
     Writes take effect immediately. No versioning support.
-    Satisfies the ``Store`` protocol.
     """
 
     def __init__(self) -> None:
@@ -39,14 +38,8 @@ class Live(MutableMapping[str, Any]):
 
     # -- Write operations --
 
-    def set(self, key: str, value: Any) -> None:
-        self._data[key] = value
-
     def __setitem__(self, key: str, value: Any) -> None:
         self._data[key] = value
-
-    def remove(self, key: str) -> None:
-        self._data.pop(key, None)
 
     def __delitem__(self, key: str) -> None:
         del self._data[key]

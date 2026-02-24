@@ -1,51 +1,12 @@
-"""Store protocol and factory function."""
+"""Store factory function."""
 
 import pickle
-from collections.abc import Iterator
-from typing import Any, Callable, Iterable, Literal, Protocol, runtime_checkable
+from typing import Any, Callable, Literal
 
 from .gc import GCVersioned
 from .kv.memory import Memory
 from .staged import Staged
 from .versioned import MergeResult, Versioned
-
-
-@runtime_checkable
-class Store(Protocol):
-    """Protocol for key-value stores.
-
-    Implements ``MutableMapping[str, Any]`` semantics.
-    Implementations: ``Staged``, ``Live``, ``Namespaced``.
-    """
-
-    def get(self, key: str, default: Any = None) -> Any: ...
-    def get_many(self, *keys: str) -> dict[str, Any]: ...
-    def keys(self) -> Iterable[str]: ...
-    def __contains__(self, key: object) -> bool: ...
-    def __getitem__(self, key: str) -> Any: ...
-    def __setitem__(self, key: str, value: Any) -> None: ...
-    def __delitem__(self, key: str) -> None: ...
-    def __iter__(self) -> Iterator[str]: ...
-    def __len__(self) -> int: ...
-    def set(self, key: str, value: Any) -> None: ...
-    def remove(self, key: str) -> None: ...
-
-
-@runtime_checkable
-class VersionedStore(Store, Protocol):
-    """Store with commit semantics.
-
-    Extends ``Store`` with versioning operations.
-    Implementations: ``Staged``.
-    """
-
-    def commit(self, **kwargs: Any) -> "MergeResult": ...
-    def reset(self) -> None: ...
-    def create_branch(self, name: str) -> "VersionedStore": ...
-    def checkout(
-        self, commit_hash: str, *, branch: str | None = None
-    ) -> "VersionedStore | None": ...
-    def list_branches(self) -> list[str]: ...
 
 
 def store(

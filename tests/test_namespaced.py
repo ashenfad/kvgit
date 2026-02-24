@@ -1,5 +1,7 @@
 """Tests for the Namespaced wrapper."""
 
+from collections.abc import MutableMapping
+
 import pytest
 
 from gitkv import Live, MergeResult, Namespaced, Staged, Versioned, counter
@@ -15,7 +17,7 @@ class TestNamespacedBasic:
     def test_get_set(self):
         s = _staged()
         ns = Namespaced(s, "app")
-        ns.set("greeting", "hello")
+        ns["greeting"] = "hello"
         assert ns.get("greeting") == "hello"
 
     def test_get_missing(self):
@@ -31,16 +33,16 @@ class TestNamespacedBasic:
     def test_contains(self):
         s = _staged()
         ns = Namespaced(s, "app")
-        ns.set("k", "v")
+        ns["k"] = "v"
         assert "k" in ns
         assert "nope" not in ns
 
     def test_get_many(self):
         s = _staged()
         ns = Namespaced(s, "app")
-        ns.set("a", 1)
-        ns.set("b", 2)
-        s.set("other/c", 3)
+        ns["a"] = 1
+        ns["b"] = 2
+        s["other/c"] = 3
         result = ns.get_many("a", "b", "c")
         assert result == {"a": 1, "b": 2}
 
@@ -85,28 +87,28 @@ class TestNamespacedIsolation:
         s = _staged()
         ns1 = Namespaced(s, "one")
         ns2 = Namespaced(s, "two")
-        ns1.set("k", "from-one")
-        ns2.set("k", "from-two")
+        ns1["k"] = "from-one"
+        ns2["k"] = "from-two"
         assert ns1.get("k") == "from-one"
         assert ns2.get("k") == "from-two"
 
     def test_keys_only_direct_children(self):
         s = _staged()
         ns = Namespaced(s, "app")
-        ns.set("a", 1)
-        ns.set("b", 2)
-        s.set("app/sub/c", 3)  # nested — not a direct child
-        s.set("other/d", 4)  # different namespace
+        ns["a"] = 1
+        ns["b"] = 2
+        s["app/sub/c"] = 3  # nested — not a direct child
+        s["other/d"] = 4  # different namespace
         keys = set(ns.keys())
         assert keys == {"a", "b"}
 
     def test_descendant_keys(self):
         s = _staged()
         ns = Namespaced(s, "app")
-        ns.set("a", 1)
-        s.set("app/sub/b", 2)
-        s.set("app/sub/deep/c", 3)
-        s.set("other/d", 4)
+        ns["a"] = 1
+        s["app/sub/b"] = 2
+        s["app/sub/deep/c"] = 3
+        s["other/d"] = 4
         descendants = set(ns.descendant_keys())
         assert descendants == {"a", "sub/b", "sub/deep/c"}
 
@@ -118,7 +120,7 @@ class TestNamespacedNested:
         ns2 = Namespaced(ns1, "worker")
         assert ns2.namespace == "agent/worker"
 
-        ns2.set("task", "data")
+        ns2["task"] = "data"
         assert ns2.get("task") == "data"
 
     def test_deeply_nested(self):
@@ -126,7 +128,7 @@ class TestNamespacedNested:
         ns = Namespaced(Namespaced(Namespaced(s, "a"), "b"), "c")
         assert ns.namespace == "a/b/c"
 
-        ns.set("key", "deep")
+        ns["key"] = "deep"
         assert ns.get("key") == "deep"
 
     def test_nested_keys_correct(self):
@@ -135,7 +137,7 @@ class TestNamespacedNested:
         ns1 = Namespaced(s, "agent")
         ns2 = Namespaced(ns1, "worker")
 
-        ns2.set("task", "data")
+        ns2["task"] = "data"
         assert set(ns2.keys()) == {"task"}
         assert s.get("agent/worker/task") == "data"
 
@@ -154,23 +156,23 @@ class TestNamespacedValidation:
             Namespaced(s, "bad/name")
 
     def test_invalid_store_type_rejected(self):
-        with pytest.raises(TypeError, match="not dict"):
-            Namespaced({}, "ns")  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="not int"):
+            Namespaced(42, "ns")  # type: ignore[arg-type]
 
 
 class TestNamespacedWrite:
     def test_set_prefixes_key(self):
         s = _staged()
         ns = Namespaced(s, "myns")
-        ns.set("k", "v")
+        ns["k"] = "v"
         assert s.get("myns/k") == "v"
 
     def test_remove_prefixed(self):
         s = _staged()
         ns = Namespaced(s, "app")
-        ns.set("x", 1)
-        ns.set("y", 2)
-        ns.remove("x")
+        ns["x"] = 1
+        ns["y"] = 2
+        del ns["x"]
         assert ns.get("x") is None
         assert ns.get("y") == 2
 
@@ -179,7 +181,7 @@ class TestNamespacedWrite:
         store = Memory()
         s1 = _staged(store)
         ns1 = Namespaced(s1, "app")
-        ns1.set("k", 1)
+        ns1["k"] = 1
         result = s1.commit()
         assert isinstance(result, MergeResult)
         assert result.merged
@@ -194,18 +196,18 @@ class TestNamespacedWrite:
 
         s1 = _staged(store)
         ns1 = Namespaced(s1, "stats")
-        ns1.set("hits", 10)
+        ns1["hits"] = 10
         s1.commit()
 
         s2 = _staged(store)
         s2.set_merge_fn("stats/hits", counter())
 
         # Diverge: s1 writes 15, s2 writes 20
-        ns1.set("hits", 15)
+        ns1["hits"] = 15
         s1.commit()
 
         ns2 = Namespaced(s2, "stats")
-        ns2.set("hits", 20)
+        ns2["hits"] = 20
 
         assert s2.commit()
         assert ns2.get("hits") == 25  # 15 + 20 - 10
@@ -214,19 +216,17 @@ class TestNamespacedWrite:
         s = _staged()
         ns1 = Namespaced(s, "one")
         ns2 = Namespaced(s, "two")
-        ns1.set("k", "from-one")
-        ns2.set("k", "from-two")
+        ns1["k"] = "from-one"
+        ns2["k"] = "from-two"
         assert ns1.get("k") == "from-one"
         assert ns2.get("k") == "from-two"
 
 
 class TestNamespacedProtocol:
-    def test_satisfies_store(self):
-        from gitkv import Store
-
+    def test_is_mutable_mapping(self):
         s = _staged()
         ns = Namespaced(s, "app")
-        assert isinstance(ns, Store)
+        assert isinstance(ns, MutableMapping)
 
     def test_wraps_live(self):
         """Namespaced can wrap a Live store."""

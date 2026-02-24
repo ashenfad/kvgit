@@ -1,5 +1,7 @@
 """Tests for the Live immediate-write store."""
 
+from collections.abc import MutableMapping
+
 import pytest
 
 from gitkv import Live
@@ -8,7 +10,7 @@ from gitkv import Live
 class TestLiveBasic:
     def test_set_and_get(self):
         s = Live()
-        s.set("k", "v")
+        s["k"] = "v"
         assert s.get("k") == "v"
 
     def test_get_missing(self):
@@ -21,21 +23,21 @@ class TestLiveBasic:
 
     def test_get_many(self):
         s = Live()
-        s.set("a", 1)
-        s.set("b", 2)
+        s["a"] = 1
+        s["b"] = 2
         result = s.get_many("a", "b", "c")
         assert result == {"a": 1, "b": 2}
 
     def test_contains(self):
         s = Live()
-        s.set("k", "v")
+        s["k"] = "v"
         assert "k" in s
         assert "nope" not in s
 
     def test_keys(self):
         s = Live()
-        s.set("a", 1)
-        s.set("b", 2)
+        s["a"] = 1
+        s["b"] = 2
         assert set(s.keys()) == {"a", "b"}
 
 
@@ -83,32 +85,25 @@ class TestLiveMutableMapping:
 class TestLiveRemove:
     def test_remove_key(self):
         s = Live()
-        s.set("k", "v")
-        s.remove("k")
+        s["k"] = "v"
+        del s["k"]
         assert s.get("k") is None
         assert "k" not in s
 
-    def test_remove_missing_key(self):
+    def test_pop_missing_key(self):
         s = Live()
-        s.remove("nope")  # should not raise
+        s.pop("nope", None)  # should not raise
 
 
 class TestLiveImmediateWrites:
     def test_writes_are_immediately_visible(self):
         s = Live()
-        s.set("k", "v1")
+        s["k"] = "v1"
         assert s.get("k") == "v1"
-        s.set("k", "v2")
+        s["k"] = "v2"
         assert s.get("k") == "v2"
 
 
 class TestLiveProtocol:
-    def test_satisfies_store(self):
-        from gitkv import Store
-
-        assert isinstance(Live(), Store)
-
-    def test_not_versioned_store(self):
-        from gitkv import VersionedStore
-
-        assert not isinstance(Live(), VersionedStore)
+    def test_is_mutable_mapping(self):
+        assert isinstance(Live(), MutableMapping)
