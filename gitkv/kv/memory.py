@@ -30,7 +30,9 @@ class Memory(KVStore):
 
     def get_many(self, *args: str) -> Mapping[str, bytes]:
         with self._lock:
-            return {key: val for key in args if (val := self.memory.get(key)) is not None}
+            return {
+                key: val for key in args if (val := self.memory.get(key)) is not None
+            }
 
     def set_many(self, **kwargs: bytes) -> None:
         for key, value in kwargs.items():

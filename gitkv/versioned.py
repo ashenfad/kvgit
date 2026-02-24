@@ -29,9 +29,7 @@ def _from_bytes(raw: bytes):
     return json.loads(raw)
 
 
-BytesMergeFn = Callable[
-    [bytes | None, bytes | None, bytes | None], bytes
-]
+BytesMergeFn = Callable[[bytes | None, bytes | None, bytes | None], bytes]
 """Merge function: (old_value, our_value, their_value) -> merged_value.
 
 Any argument can be None (key absent or removed on that side).
@@ -141,7 +139,9 @@ class Versioned:
                 store.set_many(**initial)
 
         if not isinstance(commit_hash, str):
-            raise TypeError(f"commit_hash must be str, got {type(commit_hash).__name__}")
+            raise TypeError(
+                f"commit_hash must be str, got {type(commit_hash).__name__}"
+            )
         self._current_commit: str = commit_hash
         self._base_commit: str = commit_hash
 
@@ -182,8 +182,7 @@ class Versioned:
         n_keys = len(self._commit_keys)
         short_hash = self._current_commit[:8]
         return (
-            f"Versioned(branch={self._branch!r}, "
-            f"commit={short_hash}..., keys={n_keys})"
+            f"Versioned(branch={self._branch!r}, commit={short_hash}..., keys={n_keys})"
         )
 
     @property
@@ -307,9 +306,7 @@ class Versioned:
         diffs[COMMIT_KEYSET % new_hash] = _to_bytes(new_commit_keys)
         diffs[PARENT_COMMIT % new_hash] = _to_bytes([self._current_commit])
         diffs[META_KEY % new_hash] = _meta_to_bytes(new_meta)
-        total_size = sum(
-            e.size for e in new_meta.values() if e.size is not None
-        )
+        total_size = sum(e.size for e in new_meta.values() if e.size is not None)
         diffs[TOTAL_VAR_SIZE_KEY % new_hash] = _to_bytes(total_size)
         if info is not None:
             diffs[INFO_KEY % new_hash] = _to_bytes(info)
@@ -461,9 +458,7 @@ class Versioned:
         their_keyset = self._load_keyset(their_head)
 
         our_changed = our_diff.added | our_diff.removed | our_diff.modified
-        their_changed = (
-            their_diff.added | their_diff.removed | their_diff.modified
-        )
+        their_changed = their_diff.added | their_diff.removed | their_diff.modified
         all_changed = our_changed | their_changed
 
         merged_keyset: dict[str, str] = {}
@@ -519,21 +514,9 @@ class Versioned:
                 conflicts.add(key)
                 continue
 
-            old_val = (
-                self.store.get(lca_keyset[key])
-                if key in lca_keyset
-                else None
-            )
-            our_val = (
-                None
-                if our_removed
-                else self.store.get(our_keyset[key])
-            )
-            their_val = (
-                None
-                if their_removed
-                else self.store.get(their_keyset[key])
-            )
+            old_val = self.store.get(lca_keyset[key]) if key in lca_keyset else None
+            our_val = None if our_removed else self.store.get(our_keyset[key])
+            their_val = None if their_removed else self.store.get(their_keyset[key])
             try:
                 result_val = fn(old_val, our_val, their_val)
                 merged_values[key] = result_val
@@ -584,9 +567,7 @@ class Versioned:
         diffs[COMMIT_KEYSET % merge_hash] = _to_bytes(merged_keyset)
         diffs[PARENT_COMMIT % merge_hash] = _to_bytes(list(parents))
         diffs[META_KEY % merge_hash] = _meta_to_bytes(merged_meta)
-        total_size = sum(
-            e.size for e in merged_meta.values() if e.size is not None
-        )
+        total_size = sum(e.size for e in merged_meta.values() if e.size is not None)
         diffs[TOTAL_VAR_SIZE_KEY % merge_hash] = _to_bytes(total_size)
         if info is not None:
             diffs[INFO_KEY % merge_hash] = _to_bytes(info)
@@ -633,9 +614,7 @@ class Versioned:
         """Reload state from HEAD."""
         head_bytes = self.store.get(BRANCH_HEAD % self._branch)
         if head_bytes is None:
-            raise ValueError(
-                "No HEAD commit found for branch %s" % self._branch
-            )
+            raise ValueError("No HEAD commit found for branch %s" % self._branch)
         self._load_commit(_from_bytes(head_bytes), update_base=True)
 
     def checkout(
@@ -667,9 +646,7 @@ class Versioned:
         if self.store.get(branch_key) is not None:
             raise ValueError(f"Branch '{name}' already exists")
         self.store.set(branch_key, _to_bytes(self._current_commit))
-        return Versioned(
-            self.store, commit_hash=self._current_commit, branch=name
-        )
+        return Versioned(self.store, commit_hash=self._current_commit, branch=name)
 
     def reset_to(self, commit_hash: str) -> bool:
         """Reset HEAD to a specific commit."""
@@ -727,7 +704,7 @@ class Versioned:
         result = []
         for key in store.keys():
             if isinstance(key, str) and key.startswith(prefix):
-                branch_name = key[len(prefix):]
+                branch_name = key[len(prefix) :]
                 if branch_name:
                     result.append(branch_name)
         return sorted(result)
@@ -759,9 +736,7 @@ class Versioned:
         added = keys_b - keys_a
         removed = keys_a - keys_b
         common = keys_a & keys_b
-        modified = frozenset(
-            k for k in common if keyset_a[k] != keyset_b[k]
-        )
+        modified = frozenset(k for k in common if keyset_a[k] != keyset_b[k])
 
         return DiffResult(
             added=frozenset(added),

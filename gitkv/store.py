@@ -6,7 +6,7 @@ from typing import Any, Callable, Literal
 from .gc import GCVersioned
 from .kv.memory import Memory
 from .staged import Staged
-from .versioned import MergeResult, Versioned
+from .versioned import Versioned
 
 
 def store(
