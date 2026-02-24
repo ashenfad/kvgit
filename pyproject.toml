@@ -6,8 +6,33 @@ build-backend = "setuptools.build_meta"
 name = "gitkv"
 version = "0.1.0"
 description = "Versioned key-value store with git-like commit, branch, and merge semantics."
+authors = [{ name = "ashenfad" }]
 requires-python = ">=3.10"
+readme = "README.md"
+license = { text = "MIT" }
+keywords = ["versioning", "git", "key-value", "branching", "merge"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Typing :: Typed",
+]
 dependencies = []
+
+[project.urls]
+"Homepage" = "https://github.com/ashenfad/gitkv"
+"Bug Tracker" = "https://github.com/ashenfad/gitkv/issues"
+"Documentation" = "https://github.com/ashenfad/gitkv#readme"
+"Source" = "https://github.com/ashenfad/gitkv"
 
 [project.optional-dependencies]
 disk = ["diskcache"]

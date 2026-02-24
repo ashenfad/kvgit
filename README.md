@@ -26,32 +26,34 @@ pip install gitkv[disk]      # adds disk backend via diskcache
 ```python
 import gitkv
 
-# Create a store (Staged backed by in-memory Versioned)
+# Create a store -- values are Any (pickle-serialized by default)
 s = gitkv.store()
 
-# Write and commit -- values are Any (pickle-serialized by default)
 s["user"] = "alice"
 s["score"] = 0
 s.commit()
 
-# Merge functions handle conflict resolution
-from gitkv import counter
+first = s.current_commit
 
-s2 = gitkv.store()
-s2["hits"] = 100
-s2.commit()
+# Update and commit again
+s["score"] = 100
+s.commit()
+print(s["score"])              # 100
+
+# Rollback to the first commit
+s.reset_to(first)
+print(s["score"])              # 0
 
 # Branching
-worker = s2.create_branch("worker")
-worker.set_merge_fn("hits", counter())
+s["score"] = 50
+s.commit()
 
-s2["hits"] = 115               # +15 on main
-s2.commit()
+dev = s.create_branch("dev")
+dev["score"] = 999
+dev.commit()
 
-worker["hits"] = 120           # +20 on worker
-worker.commit()
-
-print(worker["hits"])          # 135 (115 + 120 - 100)
+print(s["score"])              # 50  (main unchanged)
+print(dev["score"])            # 999 (dev branch)
 ```
 
 ## Development
