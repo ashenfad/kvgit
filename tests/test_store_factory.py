@@ -34,14 +34,14 @@ class TestStoreFactory:
 class TestStoreFactoryRoundTrip:
     def test_set_commit_get(self):
         s = store()
-        s.set("greeting", "hello")
+        s["greeting"] = "hello"
         result = s.commit()
         assert result.merged
         assert s.get("greeting") == "hello"
 
     def test_create_branch(self):
         s = store()
-        s.set("k", "v")
+        s["k"] = "v"
         s.commit()
         worker = s.create_branch("worker")
         assert isinstance(worker, Staged)

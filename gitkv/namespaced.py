@@ -1,40 +1,34 @@
-"""Namespaced: key-prefixed view over a Store."""
+"""Namespaced: key-prefixed view over a MutableMapping."""
 
 from __future__ import annotations
 
 from collections.abc import Iterator, MutableMapping
 from typing import Any, Iterable
 
-from .store import Store
-
 
 class Namespaced(MutableMapping[str, Any]):
-    """A namespaced view over a Store.
+    """A namespaced view over a MutableMapping.
 
     Keys are prefixed with ``namespace/``. Nested namespaces are
     supported by wrapping another Namespaced instance.
 
-    Satisfies the ``Store`` protocol. Versioning operations
-    (commit, reset, branching) are performed on the underlying
-    store directly, not through the namespace.
-
     Args:
-        store: Any Store (Staged, Live, or another Namespaced).
+        store: Any MutableMapping (Staged, Live, or another Namespaced).
         namespace: The namespace name (must not contain ``/``).
     """
 
-    def __init__(self, store: Store, namespace: str) -> None:
+    def __init__(self, store: MutableMapping[str, Any], namespace: str) -> None:
         if "/" in namespace:
             raise ValueError("Namespace names cannot contain '/'")
-        if not isinstance(store, Store):
+        if not isinstance(store, MutableMapping):
             raise TypeError(
-                f"Namespaced requires a Store, "
+                f"Namespaced requires a MutableMapping, "
                 f"not {type(store).__name__}"
             )
 
         if isinstance(store, Namespaced):
             self.namespace = f"{store.namespace}/{namespace}"
-            self._store: Store = store._store
+            self._store: MutableMapping[str, Any] = store._store
         else:
             self.namespace = namespace
             self._store = store
@@ -51,7 +45,10 @@ class Namespaced(MutableMapping[str, Any]):
     def get_many(self, *keys: str) -> dict[str, Any]:
         """Get multiple values from the namespaced view."""
         prefixed = {self._prefixed(k): k for k in keys}
-        result = self._store.get_many(*prefixed.keys())
+        if hasattr(self._store, "get_many"):
+            result = self._store.get_many(*prefixed.keys())
+        else:
+            result = {k: self._store[k] for k in prefixed if k in self._store}
         return {prefixed[pk]: v for pk, v in result.items()}
 
     def keys(self) -> set[str]:  # type: ignore[override]
@@ -91,13 +88,3 @@ class Namespaced(MutableMapping[str, Any]):
 
     def __len__(self) -> int:
         return len(self.keys())
-
-    # -- Write operations --
-
-    def set(self, key: str, value: Any) -> None:
-        """Set a value in the namespaced view."""
-        self._store.set(self._prefixed(key), value)
-
-    def remove(self, key: str) -> None:
-        """Remove a key from the namespaced view."""
-        self._store.remove(self._prefixed(key))
