@@ -32,8 +32,8 @@ jobs:
 
     - name: Run linter
       run: |
-        ruff check gitkv/
+        ruff check kvgit/
 
     - name: Check formatting
       run: |
-        ruff format --check gitkv/
+        ruff format --check kvgit/

@@ -2,8 +2,8 @@
 
 import pytest
 
-from gitkv import MergeConflict, MergeResult, Versioned
-from gitkv.kv.memory import Memory
+from kvgit import MergeConflict, MergeResult, Versioned
+from kvgit.kv.memory import Memory
 
 
 class TestVersionedBasic:
@@ -717,7 +717,7 @@ class TestMergeResultReturn:
         v1 = Versioned(store)
         v1.commit({"x": b"1"})
 
-        from gitkv.versioned import BRANCH_HEAD, _to_bytes
+        from kvgit.versioned import BRANCH_HEAD, _to_bytes
 
         v2 = Versioned(store)
 

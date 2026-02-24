@@ -5,7 +5,7 @@ import tempfile
 
 import pytest
 
-from gitkv.kv.disk import Disk
+from kvgit.kv.disk import Disk
 
 
 @pytest.fixture

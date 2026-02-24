@@ -1,4 +1,4 @@
-"""gitkv error types."""
+"""kvgit error types."""
 
 
 class ConcurrencyError(Exception):

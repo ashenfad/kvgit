@@ -5,7 +5,7 @@
 `Store` is the base key-value interface. It implements `MutableMapping[str, Any]` semantics.
 
 ```python
-from gitkv import Store
+from kvgit import Store
 ```
 
 | Method | Signature | Description |
@@ -29,7 +29,7 @@ from gitkv import Store
 `VersionedStore` extends `Store` with commit semantics and branching.
 
 ```python
-from gitkv import VersionedStore
+from kvgit import VersionedStore
 ```
 
 | Method | Signature | Description |
@@ -42,34 +42,34 @@ from gitkv import VersionedStore
 
 **Implementations:** `Staged`
 
-## Factory: `gitkv.store()`
+## Factory: `kvgit.store()`
 
 The simplest way to create a store:
 
 ```python
-import gitkv
+import kvgit
 
 # Default: Staged backed by in-memory Versioned
-s = gitkv.store()
+s = kvgit.store()
 
 # With disk persistence
-s = gitkv.store(kind="disk", path="/path/to/db")
+s = kvgit.store(kind="disk", path="/path/to/db")
 
 # With garbage collection
-s = gitkv.store(high_water_bytes=10_000)
+s = kvgit.store(high_water_bytes=10_000)
 
 # Custom branch
-s = gitkv.store(branch="dev")
+s = kvgit.store(branch="dev")
 
 # Custom encoder/decoder (default is pickle)
 import json
-s = gitkv.store(
+s = kvgit.store(
     encoder=lambda v: json.dumps(v).encode(),
     decoder=lambda b: json.loads(b),
 )
 ```
 
-### `gitkv.store(kind="memory", *, path=None, branch="main", encoder=pickle.dumps, decoder=pickle.loads, high_water_bytes=None, low_water_bytes=None, is_protected=None)`
+### `kvgit.store(kind="memory", *, path=None, branch="main", encoder=pickle.dumps, decoder=pickle.loads, high_water_bytes=None, low_water_bytes=None, is_protected=None)`
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -89,7 +89,7 @@ s = gitkv.store(
 `Staged` wraps a `Versioned` instance and implements `MutableMapping[str, Any]`. Individual `set()` / `__setitem__()` calls are buffered in memory. `commit()` encodes values to bytes and flushes them as a single atomic commit.
 
 ```python
-from gitkv import Staged, Versioned
+from kvgit import Staged, Versioned
 
 s = Staged(Versioned())
 
@@ -156,7 +156,7 @@ At commit time, Staged wraps these into bytes-level merge functions automaticall
 `Live` is an in-memory store with no versioning. Writes take effect immediately. Backed by a plain `dict[str, Any]`. Satisfies the `Store` protocol (not `VersionedStore`).
 
 ```python
-from gitkv import Live
+from kvgit import Live
 
 s = Live()
 s["k"] = "v"
@@ -180,10 +180,10 @@ No parameters. Memory-only.
 Versioning operations (commit, reset, branching) are performed on the underlying store directly:
 
 ```python
-from gitkv import Namespaced
-import gitkv
+from kvgit import Namespaced
+import kvgit
 
-s = gitkv.store()
+s = kvgit.store()
 agent = Namespaced(s, "agent")
 config = Namespaced(s, "config")
 
@@ -253,7 +253,7 @@ s.set_merge_fn("myns/counter", fn)   # register on the store, not the namespace
 All backends implement the `KVStore` abstract base class. Values are bytes-only; serialization is handled by higher layers (Staged).
 
 ```python
-from gitkv.kv.base import KVStore
+from kvgit.kv.base import KVStore
 ```
 
 ### Methods
@@ -274,14 +274,14 @@ from gitkv.kv.base import KVStore
 
 ### Compare-and-Swap (CAS)
 
-`cas(key, value, expected)` sets `key` to `value` only if the current value equals `expected`. Pass `expected=None` to require the key not exist. Returns `True` on success. This is the foundation of gitkv's optimistic concurrency.
+`cas(key, value, expected)` sets `key` to `value` only if the current value equals `expected`. Pass `expected=None` to require the key not exist. Returns `True` on success. This is the foundation of kvgit's optimistic concurrency.
 
 ## Memory
 
 In-memory backend. Fast, no dependencies, no persistence.
 
 ```python
-from gitkv.kv.memory import Memory
+from kvgit.kv.memory import Memory
 
 store = Memory()
 ```
@@ -295,11 +295,11 @@ The underlying dict is accessible as `store.memory` for debugging.
 Persistent backend via [diskcache](https://pypi.org/project/diskcache/). Requires the `disk` extra.
 
 ```bash
-pip install gitkv[disk]
+pip install kvgit[disk]
 ```
 
 ```python
-from gitkv.kv.disk import Disk
+from kvgit.kv.disk import Disk
 
 store = Disk("/path/to/db")
 ```
@@ -311,7 +311,7 @@ CAS and transactional operations are safe across multiple processes sharing the 
 Implement `KVStore` to use any storage:
 
 ```python
-from gitkv.kv.base import KVStore
+from kvgit.kv.base import KVStore
 
 class RedisStore(KVStore):
     def get(self, key):
@@ -333,7 +333,7 @@ class RedisStore(KVStore):
 Raised when a CAS operation fails during `commit()` or `rebase()`. Another writer updated HEAD between when this branch started and when the commit was attempted.
 
 ```python
-from gitkv import ConcurrencyError
+from kvgit import ConcurrencyError
 
 try:
     s.commit()
@@ -347,7 +347,7 @@ except ConcurrencyError:
 Raised when a three-way merge encounters keys that both sides changed and no merge function resolves them.
 
 ```python
-from gitkv import MergeConflict
+from kvgit import MergeConflict
 
 try:
     s.commit()

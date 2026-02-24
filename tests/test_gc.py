@@ -2,10 +2,10 @@
 
 import pytest
 
-from gitkv import ConcurrencyError
-from gitkv.gc import GCVersioned
-from gitkv.kv.memory import Memory
-from gitkv.versioned import BRANCH_HEAD, _to_bytes
+from kvgit import ConcurrencyError
+from kvgit.gc import GCVersioned
+from kvgit.kv.memory import Memory
+from kvgit.versioned import BRANCH_HEAD, _to_bytes
 
 
 class TestGCNoOp:
