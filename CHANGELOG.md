@@ -1,0 +1,16 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Fixed
+- **ConcurrencyError state recovery**: Store state is now restored after CAS failures during commit, preventing stale in-memory state
+- **Bare assert in versioned.py**: Replaced with proper ValueError guard
+
+### Changed
+- **GC docs**: Clarified that size tracking covers serialized value bytes only
+- **backends.md**: Updated to reference concrete classes instead of removed protocol types
