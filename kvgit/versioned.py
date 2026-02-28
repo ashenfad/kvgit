@@ -423,7 +423,8 @@ class Versioned:
             )
 
         # Three-way path: create commit without info, merge with info
-        assert current_head is not None
+        if current_head is None:
+            raise ValueError(f"Branch '{self._branch}' has no HEAD")
         saved = self._snapshot_state()
         self._create_commit(updates, removals)
         return self._three_way_merge(
