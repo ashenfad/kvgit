@@ -22,7 +22,7 @@ s.commit()  # GC runs automatically if above high water
 
 ## How It Works
 
-1. Every `commit()` call checks total persisted user-data size
+1. Every `commit()` call checks total persisted user-data size (sum of serialized value bytes; does not include keys, metadata, or commit structure overhead)
 2. If total exceeds `high_water_bytes`, a rebase is triggered
 3. Rebase sorts user keys by access recency (coldest first, then largest)
 4. Keys are dropped until total is at or below `low_water_bytes`
