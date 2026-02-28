@@ -255,9 +255,7 @@ class Versioned:
 
     def _restore_state(self, saved: tuple) -> None:
         """Restore in-memory state after a failed commit attempt."""
-        self._current_commit, self._commit_keys, self._meta, self._touch_counter = (
-            saved
-        )
+        self._current_commit, self._commit_keys, self._meta, self._touch_counter = saved
 
     def _create_commit(
         self,
