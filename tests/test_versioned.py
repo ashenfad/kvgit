@@ -2,7 +2,7 @@
 
 import pytest
 
-from kvgit import MergeConflict, MergeResult, Versioned
+from kvgit import ConcurrencyError, MergeConflict, MergeResult, Versioned
 from kvgit.kv.memory import Memory
 from kvgit.versioned import BRANCH_HEAD, _to_bytes
 
@@ -769,6 +769,65 @@ class TestBugFixes:
         v = Versioned()
         with pytest.raises(ValueError, match="on_conflict"):
             v.commit({"x": b"1"}, on_conflict="bogus")
+
+    def test_state_clean_after_concurrency_error(self):
+        """Object state is restored after ConcurrencyError on fast-forward."""
+        store = Memory()
+        v = Versioned(store)
+        v.commit({"x": b"1"})
+
+        original_commit = v.current_commit
+        original_base = v.base_commit
+
+        # Simulate concurrent HEAD change
+        store.set(BRANCH_HEAD % "main", _to_bytes("bogus_hash"))
+
+        with pytest.raises(ConcurrencyError):
+            v.commit({"y": b"2"})
+
+        # State should be unchanged
+        assert v.current_commit == original_commit
+        assert v.base_commit == original_base
+        assert v.get("x") == b"1"
+        assert v.get("y") is None
+
+    def test_state_clean_after_abandon_on_fast_forward(self):
+        """Object state is restored after abandon on fast-forward CAS failure."""
+        store = Memory()
+        v = Versioned(store)
+        v.commit({"x": b"1"})
+
+        original_commit = v.current_commit
+
+        store.set(BRANCH_HEAD % "main", _to_bytes("bogus_hash"))
+
+        result = v.commit({"y": b"2"}, on_conflict="abandon")
+        assert result.merged is False
+        assert v.current_commit == original_commit
+        assert v.get("y") is None
+
+    def test_state_clean_after_concurrency_error_three_way(self):
+        """Object state is restored after ConcurrencyError on three-way merge."""
+        store = Memory()
+        v1 = Versioned(store)
+        v1.commit({"x": b"1"})
+
+        v2 = Versioned(store)
+        v1.commit({"x": b"v1"})
+
+        original_commit = v2.current_commit
+
+        # Sabotage HEAD so the three-way merge CAS fails.
+        # v2 already read latest_head (v1's commit) which differs from
+        # v2._base_commit, triggering the three-way path. Overwriting
+        # HEAD means the CAS expected value won't match.
+        store.set(BRANCH_HEAD % "main", _to_bytes("sabotaged"))
+
+        with pytest.raises(ConcurrencyError):
+            v2.commit({"x": b"v2"}, default_merge=lambda o, a, b: a or b"")
+
+        assert v2.current_commit == original_commit
+        assert v2.get("x") == b"1"
 
 
 class TestErgonomics:

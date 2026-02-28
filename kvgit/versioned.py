@@ -244,6 +244,21 @@ class Versioned:
 
     # -- Write operations --
 
+    def _snapshot_state(self) -> tuple:
+        """Capture in-memory state before a commit attempt."""
+        return (
+            self._current_commit,
+            dict(self._commit_keys),
+            dict(self._meta),
+            self._touch_counter,
+        )
+
+    def _restore_state(self, saved: tuple) -> None:
+        """Restore in-memory state after a failed commit attempt."""
+        self._current_commit, self._commit_keys, self._meta, self._touch_counter = (
+            saved
+        )
+
     def _create_commit(
         self,
         updates: dict[str, bytes] | None = None,
@@ -376,6 +391,7 @@ class Versioned:
 
         if current_head == self._base_commit:
             # Fast-forward path: create commit with info, CAS HEAD
+            saved = self._snapshot_state()
             self._create_commit(updates, removals, info=info)
 
             expected = _to_bytes(self._base_commit)
@@ -391,6 +407,7 @@ class Versioned:
                 )
                 self.last_merge_result = result
                 return result
+            self._restore_state(saved)
             if on_conflict == "abandon":
                 result = MergeResult(
                     merged=False,
@@ -407,6 +424,7 @@ class Versioned:
 
         # Three-way path: create commit without info, merge with info
         assert current_head is not None
+        saved = self._snapshot_state()
         self._create_commit(updates, removals)
         return self._three_way_merge(
             current_head,
@@ -414,6 +432,7 @@ class Versioned:
             merge_fns=merge_fns,
             default_merge=default_merge,
             info=info,
+            saved_state=saved,
         )
 
     def _three_way_merge(
@@ -424,11 +443,14 @@ class Versioned:
         merge_fns: dict[str, BytesMergeFn] | None,
         default_merge: BytesMergeFn | None,
         info: dict | None,
+        saved_state: tuple | None = None,
     ) -> MergeResult:
         """Perform a three-way merge between our branch and their HEAD."""
         branch_key = BRANCH_HEAD % self._branch
         lca = self._find_lca(self._current_commit, their_head)
         if lca is None:
+            if saved_state is not None:
+                self._restore_state(saved_state)
             if on_conflict == "abandon":
                 result = MergeResult(
                     merged=False,
@@ -596,6 +618,8 @@ class Versioned:
             self.last_merge_result = result
             return result
 
+        if saved_state is not None:
+            self._restore_state(saved_state)
         if on_conflict == "abandon":
             result = MergeResult(
                 merged=False,
