@@ -1,12 +1,8 @@
 # Storage Backends, Store Protocol & Namespaces
 
-## Store Protocol
+## Store Interface
 
-`Store` is the base key-value interface. It implements `MutableMapping[str, Any]` semantics.
-
-```python
-from kvgit import Store
-```
+The store interface implements `MutableMapping[str, Any]` semantics. `Staged`, `Live`, and `Namespaced` all support these methods:
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
@@ -22,25 +18,17 @@ from kvgit import Store
 | `set` | `(key: str, value: Any) -> None` | Set a value |
 | `remove` | `(key: str) -> None` | Remove a key |
 
-**Implementations:** `Staged`, `Live`, `Namespaced`
+## Versioned Store Interface
 
-## VersionedStore Protocol
-
-`VersionedStore` extends `Store` with commit semantics and branching.
-
-```python
-from kvgit import VersionedStore
-```
+`Staged` extends the store interface with commit semantics and branching:
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
 | `commit` | `(**kwargs) -> MergeResult` | Flush changes to storage |
 | `reset` | `() -> None` | Discard pending changes |
-| `create_branch` | `(name: str) -> VersionedStore` | Fork current commit onto a new branch |
-| `checkout` | `(commit_hash: str, *, branch=None) -> VersionedStore \| None` | Open a specific commit |
+| `create_branch` | `(name: str) -> Staged` | Fork current commit onto a new branch |
+| `checkout` | `(commit_hash: str, *, branch=None) -> Staged \| None` | Open a specific commit |
 | `list_branches` | `() -> list[str]` | List all branch names |
-
-**Implementations:** `Staged`
 
 ## Factory: `kvgit.store()`
 
