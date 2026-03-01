@@ -671,6 +671,22 @@ class Versioned:
         self.store.set(branch_key, _to_bytes(self._current_commit))
         return Versioned(self.store, commit_hash=self._current_commit, branch=name)
 
+    def delete_branch(self, name: str) -> None:
+        """Delete a branch by name.
+
+        Removes the branch HEAD pointer. Commits are not removed
+        and may be collected by GC if unreachable.
+
+        Raises ValueError if the branch is the current branch or
+        does not exist.
+        """
+        if name == self._branch:
+            raise ValueError("Cannot delete the current branch")
+        branch_key = BRANCH_HEAD % name
+        if self.store.get(branch_key) is None:
+            raise ValueError(f"Branch '{name}' does not exist")
+        self.store.remove(branch_key)
+
     def reset_to(self, commit_hash: str) -> bool:
         """Reset HEAD to a specific commit."""
         if self.store.get(COMMIT_KEYSET % commit_hash) is None:

@@ -248,6 +248,10 @@ class Staged(MutableMapping[str, Any]):
         """List all branch names in the store."""
         return self._versioned.list_branches()
 
+    def delete_branch(self, name: str) -> None:
+        """Delete a branch by name. Cannot delete the current branch."""
+        self._versioned.delete_branch(name)
+
     def reset_to(self, commit_hash: str) -> bool:
         """Reset HEAD to a specific commit and clear staged changes.
 
