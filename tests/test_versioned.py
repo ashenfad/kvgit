@@ -438,6 +438,24 @@ class TestBranches:
         assert "staging" in branches
         assert "main" in branches
 
+    def test_delete_branch(self):
+        store = Memory()
+        v = Versioned(store)
+        v.create_branch("dev")
+        assert "dev" in Versioned.branches(store)
+        v.delete_branch("dev")
+        assert "dev" not in Versioned.branches(store)
+
+    def test_delete_current_branch_raises(self):
+        v = Versioned()
+        with pytest.raises(ValueError, match="Cannot delete the current branch"):
+            v.delete_branch("main")
+
+    def test_delete_nonexistent_branch_raises(self):
+        v = Versioned()
+        with pytest.raises(ValueError, match="does not exist"):
+            v.delete_branch("nope")
+
 
 class TestThreeWayMerge:
     def test_auto_merge_non_overlapping(self):
@@ -498,7 +516,9 @@ class TestThreeWayMerge:
         v2 = Versioned(store)
         v1.commit({"x": b"v1"})
 
-        def lww(old, ours, theirs): return theirs
+        def lww(old, ours, theirs):
+            return theirs
+
         result = v2.commit({"x": b"v2"}, default_merge=lww)
         assert result
         assert v2.get("x") == b"v1"  # theirs = HEAD value
@@ -666,16 +686,22 @@ class TestThreeWayMerge:
 class TestMergeResultReturn:
     def test_merge_result_truthy(self):
         r = MergeResult(
-            merged=True, commit="abc", strategy="no_op",
-            auto_merged_keys=(), carried_keys=(),
+            merged=True,
+            commit="abc",
+            strategy="no_op",
+            auto_merged_keys=(),
+            carried_keys=(),
         )
         assert r
         assert bool(r) is True
 
     def test_merge_result_falsy(self):
         r = MergeResult(
-            merged=False, commit=None, strategy="fast_forward",
-            auto_merged_keys=(), carried_keys=(),
+            merged=False,
+            commit=None,
+            strategy="fast_forward",
+            auto_merged_keys=(),
+            carried_keys=(),
         )
         assert not r
         assert bool(r) is False
@@ -868,4 +894,3 @@ class TestErgonomics:
         v = Versioned(store, branch="dev")
         r = repr(v)
         assert "dev" in r
-
