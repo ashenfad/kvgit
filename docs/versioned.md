@@ -135,13 +135,18 @@ v.refresh()  # now v reflects HEAD
 
 These methods are also available on `Staged` (returning `Staged` instances) via the `VersionedStore` protocol. Most users should use `Staged.create_branch()` / `Staged.checkout()` instead of calling these directly.
 
-### `create_branch(name) -> Versioned`
+### `create_branch(name, *, at=None) -> Versioned`
 
-Fork the current commit onto a new branch. Returns a new `Versioned` on that branch. Raises `ValueError` if the branch already exists.
+Fork a commit onto a new branch. Returns a new `Versioned` on that branch. Raises `ValueError` if the branch already exists or if `at` refers to a nonexistent commit.
+
+By default, forks from the current commit. Pass `at` to fork from a specific commit (e.g., `initial_commit` for a clean branch).
 
 ```python
 dev = v.create_branch("dev")
 dev.commit({"feature": b"wip"})  # commits to "dev" HEAD, not "main"
+
+# Fork from the root commit (empty state)
+clean = v.create_branch("clean", at=v.initial_commit)
 ```
 
 ### `checkout(commit_hash, *, branch=None) -> Versioned | None`
@@ -151,6 +156,33 @@ Create a new `Versioned` at a specific commit. Returns `None` if the commit does
 ```python
 old = v.checkout(some_hash)
 old = v.checkout(some_hash, branch="review")
+```
+
+### `switch_branch(name) -> None`
+
+Switch this instance to an existing branch, loading its HEAD commit. Raises `ValueError` if the branch doesn't exist.
+
+```python
+v.switch_branch("dev")
+print(v.current_branch)  # "dev"
+print(v.get("feature"))  # reads from dev HEAD
+```
+
+### `delete_branch(name) -> None`
+
+Delete a branch. Raises `ValueError` if the branch doesn't exist or if attempting to delete the current branch.
+
+```python
+v.delete_branch("old-feature")
+```
+
+### `peek(key, *, branch) -> bytes | None`
+
+Read a value from another branch's HEAD without switching. Returns `None` if the branch or key doesn't exist. Does not update touch metadata.
+
+```python
+# Read a key from "dev" while staying on "main"
+value = v.peek("config", branch="dev")
 ```
 
 ### `reset_to(commit_hash) -> bool`
@@ -210,6 +242,7 @@ info = v.commit_info(some_hash)  # specific commit
 | `current_commit` | `str` | Current commit hash |
 | `base_commit` | `str` | Commit hash at branch creation (merge base) |
 | `latest_head` | `str \| None` | HEAD from the store (reflects other writers) |
+| `current_branch` | `str` | Name of the current branch |
 | `initial_commit` | `str` | Root commit (oldest in linear history) |
 | `last_merge_result` | `MergeResult \| None` | Result of the last `commit()` call |
 

@@ -26,9 +26,12 @@ The store interface implements `MutableMapping[str, Any]` semantics. `Staged`, `
 |--------|-----------|-------------|
 | `commit` | `(**kwargs) -> MergeResult` | Flush changes to storage |
 | `reset` | `() -> None` | Discard pending changes |
-| `create_branch` | `(name: str) -> Staged` | Fork current commit onto a new branch |
+| `create_branch` | `(name: str, *, at=None) -> Staged` | Fork a commit onto a new branch |
+| `switch_branch` | `(name: str) -> None` | Switch to an existing branch |
+| `delete_branch` | `(name: str) -> None` | Delete a branch |
 | `checkout` | `(commit_hash: str, *, branch=None) -> Staged \| None` | Open a specific commit |
 | `list_branches` | `() -> list[str]` | List all branch names |
+| `peek` | `(key: str, *, branch: str) -> Any \| None` | Read a key from another branch without switching |
 
 ## Factory: `kvgit.store()`
 
@@ -112,9 +115,12 @@ Staged(versioned: Versioned, *, encoder=pickle.dumps, decoder=pickle.loads)
 | `commit(**kwargs)` | Flush to Versioned, returns MergeResult |
 | `reset()` | Discard staged changes |
 | `refresh()` | Reload from HEAD and discard staged changes |
-| `create_branch(name)` | Fork current commit, returns a new `Staged` |
+| `create_branch(name, *, at=None)` | Fork a commit onto a new branch, returns a new `Staged` |
+| `switch_branch(name)` | Switch to an existing branch (clears staging buffer) |
+| `delete_branch(name)` | Delete a branch |
 | `checkout(hash, *, branch=None)` | Open a specific commit, returns `Staged` or `None` |
 | `list_branches()` | List all branch names |
+| `peek(key, *, branch)` | Read a decoded value from another branch without switching |
 | `has_changes` | Property: whether staging buffer is non-empty |
 
 ### Properties
@@ -123,7 +129,9 @@ Staged(versioned: Versioned, *, encoder=pickle.dumps, decoder=pickle.loads)
 |----------|-------------|
 | `versioned` | The underlying Versioned instance |
 | `current_commit` | Delegates to Versioned |
+| `current_branch` | Delegates to Versioned |
 | `base_commit` | Delegates to Versioned |
+| `initial_commit` | Delegates to Versioned |
 | `last_merge_result` | Delegates to Versioned |
 
 ### Merge Functions
