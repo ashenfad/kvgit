@@ -224,13 +224,18 @@ class Staged(MutableMapping[str, Any]):
         return self._versioned.base_commit
 
     @property
+    def current_branch(self) -> str:
+        """The name of the current branch."""
+        return self._versioned.current_branch
+
+    @property
     def last_merge_result(self) -> MergeResult | None:
         return self._versioned.last_merge_result
 
-    def create_branch(self, name: str) -> "Staged":
-        """Fork the current commit onto a new branch. Returns a new Staged."""
+    def create_branch(self, name: str, *, at: str | None = None) -> "Staged":
+        """Fork a commit onto a new branch. Returns a new Staged."""
         return Staged(
-            self._versioned.create_branch(name),
+            self._versioned.create_branch(name, at=at),
             encoder=self._encoder,
             decoder=self._decoder,
         )
@@ -251,6 +256,20 @@ class Staged(MutableMapping[str, Any]):
     def delete_branch(self, name: str) -> None:
         """Delete a branch by name. Cannot delete the current branch."""
         self._versioned.delete_branch(name)
+
+    def switch_branch(self, name: str) -> None:
+        """Switch to a different branch in-place. Discards staged changes."""
+        self._versioned.switch_branch(name)
+        self._updates.clear()
+        self._removals.clear()
+        self._cache.clear()
+
+    def peek(self, key: str, *, branch: str) -> Any:
+        """Read a key from another branch without switching. Returns None if not found."""
+        raw = self._versioned.peek(key, branch=branch)
+        if raw is None:
+            return None
+        return self._decoder(raw)
 
     def reset_to(self, commit_hash: str) -> bool:
         """Reset HEAD to a specific commit and clear staged changes.

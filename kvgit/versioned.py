@@ -178,6 +178,11 @@ class Versioned:
     def base_commit(self) -> str:
         return self._base_commit
 
+    @property
+    def current_branch(self) -> str:
+        """The name of the current branch."""
+        return self._branch
+
     def __repr__(self) -> str:
         n_keys = len(self._commit_keys)
         short_hash = self._current_commit[:8]
@@ -657,19 +662,26 @@ class Versioned:
             branch=branch or self._branch,
         )
 
-    def create_branch(self, name: str) -> "Versioned":
-        """Fork the current commit onto a new branch.
+    def create_branch(self, name: str, *, at: str | None = None) -> "Versioned":
+        """Fork a commit onto a new branch.
 
-        Returns a new Versioned instance on the new branch, pointing
-        at the same commit as self.
+        Args:
+            name: Branch name.
+            at: Commit hash to fork from. Defaults to current commit.
 
-        Raises ValueError if the branch already exists.
+        Returns a new Versioned instance on the new branch.
+
+        Raises ValueError if the branch already exists or the commit
+        does not exist.
         """
         branch_key = BRANCH_HEAD % name
         if self.store.get(branch_key) is not None:
             raise ValueError(f"Branch '{name}' already exists")
-        self.store.set(branch_key, _to_bytes(self._current_commit))
-        return Versioned(self.store, commit_hash=self._current_commit, branch=name)
+        target = at or self._current_commit
+        if at is not None and self.store.get(COMMIT_KEYSET % at) is None:
+            raise ValueError(f"Commit '{at}' does not exist")
+        self.store.set(branch_key, _to_bytes(target))
+        return Versioned(self.store, commit_hash=target, branch=name)
 
     def delete_branch(self, name: str) -> None:
         """Delete a branch by name.
@@ -686,6 +698,38 @@ class Versioned:
         if self.store.get(branch_key) is None:
             raise ValueError(f"Branch '{name}' does not exist")
         self.store.remove(branch_key)
+
+    def switch_branch(self, name: str) -> None:
+        """Switch this instance to a different branch in-place.
+
+        Loads the HEAD commit of the target branch.
+
+        Raises ValueError if the branch does not exist.
+        """
+        branch_key = BRANCH_HEAD % name
+        head_bytes = self.store.get(branch_key)
+        if head_bytes is None:
+            raise ValueError(f"Branch '{name}' does not exist")
+        self._branch = name
+        self._load_commit(_from_bytes(head_bytes), update_base=True)
+
+    def peek(self, key: str, *, branch: str) -> bytes | None:
+        """Read a key from another branch's HEAD without switching.
+
+        Returns None if the branch doesn't exist or the key isn't present.
+        """
+        head_bytes = self.store.get(BRANCH_HEAD % branch)
+        if head_bytes is None:
+            return None
+        commit_hash = _from_bytes(head_bytes)
+        keyset_bytes = self.store.get(COMMIT_KEYSET % commit_hash)
+        if keyset_bytes is None:
+            return None
+        keyset = _from_bytes(keyset_bytes)
+        content_hash = keyset.get(key)
+        if content_hash is None:
+            return None
+        return self.store.get(content_hash)
 
     def reset_to(self, commit_hash: str) -> bool:
         """Reset HEAD to a specific commit."""
