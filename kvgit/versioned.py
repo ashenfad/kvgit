@@ -675,12 +675,11 @@ class Versioned:
         does not exist.
         """
         branch_key = BRANCH_HEAD % name
-        if self.store.get(branch_key) is not None:
-            raise ValueError(f"Branch '{name}' already exists")
         target = at or self._current_commit
         if at is not None and self.store.get(COMMIT_KEYSET % at) is None:
             raise ValueError(f"Commit '{at}' does not exist")
-        self.store.set(branch_key, _to_bytes(target))
+        if not self.store.cas(branch_key, _to_bytes(target), expected=None):
+            raise ValueError(f"Branch '{name}' already exists")
         return Versioned(self.store, commit_hash=target, branch=name)
 
     def delete_branch(self, name: str) -> None:
