@@ -2,9 +2,10 @@
 
 import pytest
 
-from kvgit import ConcurrencyError, MergeConflict, MergeResult, Versioned
+from kvgit import ConcurrencyError, MergeConflict, MergeResult, VersionedKV as Versioned
 from kvgit.kv.memory import Memory
-from kvgit.versioned import BRANCH_HEAD, _to_bytes
+from kvgit.versioned_kv import BRANCH_HEAD
+from kvgit.protocol import _to_bytes
 
 
 class TestVersionedBasic:

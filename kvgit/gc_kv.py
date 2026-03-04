@@ -1,4 +1,4 @@
-"""GCVersioned: Versioned state with automatic garbage collection."""
+"""GCVersionedKV: VersionedKV with automatic garbage collection."""
 
 import json
 import time
@@ -7,20 +7,23 @@ from typing import Callable
 
 from .errors import ConcurrencyError
 from .kv.base import KVStore
-from .versioned import (
+from .protocol import (
+    MergeResult,
+    MetaEntry,
+    _from_bytes,
+    _meta_from_bytes,
+    _meta_to_bytes,
+    _to_bytes,
+)
+from .versioned_kv import (
     BRANCH_HEAD,
     COMMIT_KEYSET,
     INFO_KEY,
     META_KEY,
     PARENT_COMMIT,
     TOTAL_VAR_SIZE_KEY,
-    MergeResult,
-    MetaEntry,
-    Versioned,
-    _from_bytes,
-    _meta_from_bytes,
-    _meta_to_bytes,
-    _to_bytes,
+    VersionedKV,
+    _content_hash,
 )
 
 
@@ -30,7 +33,7 @@ def _is_system_key(key: str) -> bool:
     Handles both direct keys (``"__foo__"``) and namespaced keys
     (``"ns/__foo__"``) by extracting the base key name.
 
-    This is the default ``is_protected`` policy for ``GCVersioned``.
+    This is the default ``is_protected`` policy for ``GCVersionedKV``.
     """
     base_key = key.split("/")[-1] if "/" in key else key
     return base_key.startswith("__")
@@ -49,8 +52,8 @@ class RebaseResult:
     orphans_cleaned: int = 0
 
 
-class GCVersioned(Versioned):
-    """Versioned state with built-in garbage collection via rebase.
+class GCVersionedKV(VersionedKV):
+    """VersionedKV with built-in garbage collection via rebase.
 
     Rebase strategy (high/low water):
     - Track total persisted user-var size from commit metadata.
@@ -133,13 +136,7 @@ class GCVersioned(Versioned):
         *,
         info: dict | None = None,
     ) -> RebaseResult:
-        """Rebase: create a fresh root commit, dropping cold keys.
-
-        Args:
-            keep_keys: If provided, retain exactly these keys (plus protected
-                keys). Otherwise, use the high/low water strategy.
-            info: Optional metadata for the rebase commit.
-        """
+        """Rebase: create a fresh root commit, dropping cold keys."""
         meta = self._meta
         total_before = self._load_total_size(
             default=sum(e.size or 0 for e in meta.values())
@@ -178,7 +175,6 @@ class GCVersioned(Versioned):
                 total -= entry.size or 0
 
         # Build new commit with retained keys
-        from .versioned import _content_hash
 
         # Collect retained data
         new_commit_keys: dict[str, str] = {}
@@ -269,15 +265,7 @@ class GCVersioned(Versioned):
         )
 
     def clean_orphans(self, min_age: float = 3600) -> int:
-        """Remove orphaned commits unreachable from HEAD.
-
-        Args:
-            min_age: Only delete orphans older than this many seconds
-                (default 1 hour).
-
-        Returns:
-            Number of orphaned commits cleaned.
-        """
+        """Remove orphaned commits unreachable from HEAD."""
         # Mark phase: find all reachable commits across ALL branches
         reachable: set[str] = set()
         prefix = BRANCH_HEAD.replace("%s", "")

@@ -4,7 +4,14 @@ from collections.abc import MutableMapping
 
 import pytest
 
-from kvgit import Live, MergeResult, Namespaced, Staged, Versioned, counter
+from kvgit import (
+    Live,
+    MergeResult,
+    Namespaced,
+    Staged,
+    VersionedKV as Versioned,
+    counter,
+)
 from kvgit.kv.memory import Memory
 
 

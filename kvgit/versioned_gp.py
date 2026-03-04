@@ -1,4 +1,4 @@
-"""Git-backed Versioned store."""
+"""GitPython-backed versioned store."""
 
 import binascii
 import io
@@ -9,7 +9,7 @@ from collections import deque
 from typing import Iterable
 
 from .errors import ConcurrencyError, MergeConflict
-from .versioned import BytesMergeFn, DiffResult, MergeResult
+from .protocol import BytesMergeFn, DiffResult, MergeResult
 
 try:
     import git
@@ -28,7 +28,7 @@ def _unquote(quoted: str) -> str:
     return urllib.parse.unquote_plus(quoted)
 
 
-class GitVersioned:
+class VersionedGP:
     """A commit log backed by a Git repository."""
 
     def __init__(
@@ -101,7 +101,7 @@ class GitVersioned:
     def __repr__(self) -> str:
         n_keys = len(self._commit_keys)
         short_hash = self._current_commit[:8]
-        return f"GitVersioned(branch={self._branch!r}, commit={short_hash}..., keys={n_keys})"
+        return f"VersionedGP(branch={self._branch!r}, commit={short_hash}..., keys={n_keys})"
 
     @property
     def latest_head(self) -> str | None:
@@ -398,8 +398,6 @@ class GitVersioned:
             - set(merged_keyset.keys())
             - set(merged_values.keys())
         )
-        # We need to create a commit with merged_keyset exactly.
-        # So we can just clear our current state and set it to merged_keyset, then call _create_commit with updates.
         self._commit_keys = merged_keyset
         merge_hash = self._create_commit(updates, removals, info=info, parents=parents)
 
@@ -446,16 +444,16 @@ class GitVersioned:
 
     def checkout(
         self, commit_hash: str, *, branch: str | None = None
-    ) -> "GitVersioned | None":
+    ) -> "VersionedGP | None":
         try:
             Commit(self.repo, binascii.unhexlify(commit_hash))
-            return GitVersioned(
+            return VersionedGP(
                 self.repo_path, commit_hash=commit_hash, branch=branch or self._branch
             )
         except (BadObject, ValueError):
             return None
 
-    def create_branch(self, name: str, *, at: str | None = None) -> "GitVersioned":
+    def create_branch(self, name: str, *, at: str | None = None) -> "VersionedGP":
         target = at or self._current_commit
         if at is not None:
             try:
@@ -467,7 +465,7 @@ class GitVersioned:
             raise ValueError(f"Branch '{name}' already exists")
 
         self.repo.create_head(name, Commit(self.repo, binascii.unhexlify(target)))
-        return GitVersioned(self.repo_path, commit_hash=target, branch=name)
+        return VersionedGP(self.repo_path, commit_hash=target, branch=name)
 
     def delete_branch(self, name: str) -> None:
         if name == self._branch:

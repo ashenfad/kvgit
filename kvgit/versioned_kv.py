@@ -1,15 +1,24 @@
-"""Versioned state: a commit log over a KV store."""
+"""KVStore-backed versioned state."""
 
 import hashlib
 import json
 import time
-from dataclasses import asdict, dataclass
 from collections import deque
-from typing import Callable, Iterable
+from typing import Iterable
 
 from .errors import ConcurrencyError, MergeConflict
 from .kv.base import KVStore
 from .kv.memory import Memory
+from .protocol import (
+    BytesMergeFn,
+    DiffResult,
+    MergeResult,
+    MetaEntry,
+    _from_bytes,
+    _meta_from_bytes,
+    _meta_to_bytes,
+    _to_bytes,
+)
 
 PARENT_COMMIT = "__parent_commit__%s"
 COMMIT_KEYSET = "__commit_keyset__%s"
@@ -17,65 +26,6 @@ BRANCH_HEAD = "__branch_head__%s"
 META_KEY = "__meta__%s"
 TOTAL_VAR_SIZE_KEY = "__total_var_size__%s"
 INFO_KEY = "__info__%s"
-
-
-def _to_bytes(obj) -> bytes:
-    """Encode a JSON-safe Python object to bytes."""
-    return json.dumps(obj, separators=(",", ":")).encode()
-
-
-def _from_bytes(raw: bytes):
-    """Decode bytes to a Python object."""
-    return json.loads(raw)
-
-
-BytesMergeFn = Callable[[bytes | None, bytes | None, bytes | None], bytes]
-"""Merge function: (old_value, our_value, their_value) -> merged_value.
-
-Any argument can be None (key absent or removed on that side).
-"""
-
-
-@dataclass(frozen=True)
-class DiffResult:
-    """Key-level differences between two commits."""
-
-    added: frozenset[str]
-    removed: frozenset[str]
-    modified: frozenset[str]
-
-
-@dataclass(frozen=True)
-class MergeResult:
-    """Result of a merge operation."""
-
-    merged: bool
-    commit: str | None
-    strategy: str  # "no_op", "fast_forward", "three_way"
-    auto_merged_keys: tuple[str, ...]
-    carried_keys: tuple[str, ...]
-
-    def __bool__(self) -> bool:
-        return self.merged
-
-
-@dataclass
-class MetaEntry:
-    """Metadata for a single key in versioned state."""
-
-    last_touch: int
-    size: int | None
-    created_at: float
-
-
-def _meta_to_bytes(meta: dict[str, "MetaEntry"]) -> bytes:
-    """Serialize the per-key metadata dict to JSON bytes."""
-    return _to_bytes({k: asdict(v) for k, v in meta.items()})
-
-
-def _meta_from_bytes(raw: bytes) -> dict[str, "MetaEntry"]:
-    """Deserialize JSON bytes to a per-key metadata dict."""
-    return {k: MetaEntry(**v) for k, v in _from_bytes(raw).items()}
 
 
 def _content_hash(
@@ -87,7 +37,7 @@ def _content_hash(
     """Compute a content-addressable commit hash.
 
     Hashes the parent pointers, keyset, update blob digests, and
-    optional info to produce a deterministic 16-hex-char commit hash.
+    optional info to produce a deterministic 40-hex-char commit hash.
     """
     h = hashlib.sha256()
     h.update(json.dumps(list(parents), separators=(",", ":")).encode())
@@ -100,10 +50,10 @@ def _content_hash(
     return h.hexdigest()[:40]
 
 
-class Versioned:
+class VersionedKV:
     """A commit log over a KV store.
 
-    The caller owns the working state. Versioned provides:
+    The caller owns the working state. VersionedKV provides:
     - ``get()`` / ``get_many()`` to read from the current commit
     - ``commit()`` to atomically write changes and advance HEAD
     - ``refresh()`` to reload from HEAD
@@ -186,9 +136,7 @@ class Versioned:
     def __repr__(self) -> str:
         n_keys = len(self._commit_keys)
         short_hash = self._current_commit[:8]
-        return (
-            f"Versioned(branch={self._branch!r}, commit={short_hash}..., keys={n_keys})"
-        )
+        return f"VersionedKV(branch={self._branch!r}, commit={short_hash}..., keys={n_keys})"
 
     @property
     def latest_head(self) -> str | None:
@@ -647,32 +595,20 @@ class Versioned:
 
     def checkout(
         self, commit_hash: str, *, branch: str | None = None
-    ) -> "Versioned | None":
-        """Return a new Versioned at a specific commit.
-
-        Args:
-            commit_hash: The commit to check out.
-            branch: Branch for the new instance (default: same as self).
-        """
+    ) -> "VersionedKV | None":
+        """Return a new VersionedKV at a specific commit."""
         if self.store.get(COMMIT_KEYSET % commit_hash) is None:
             return None
-        return Versioned(
+        return VersionedKV(
             self.store,
             commit_hash=commit_hash,
             branch=branch or self._branch,
         )
 
-    def create_branch(self, name: str, *, at: str | None = None) -> "Versioned":
+    def create_branch(self, name: str, *, at: str | None = None) -> "VersionedKV":
         """Fork a commit onto a new branch.
 
-        Args:
-            name: Branch name.
-            at: Commit hash to fork from. Defaults to current commit.
-
-        Returns a new Versioned instance on the new branch.
-
-        Raises ValueError if the branch already exists or the commit
-        does not exist.
+        Returns a new VersionedKV instance on the new branch.
         """
         branch_key = BRANCH_HEAD % name
         target = at or self._current_commit
@@ -680,17 +616,10 @@ class Versioned:
             raise ValueError(f"Commit '{at}' does not exist")
         if not self.store.cas(branch_key, _to_bytes(target), expected=None):
             raise ValueError(f"Branch '{name}' already exists")
-        return Versioned(self.store, commit_hash=target, branch=name)
+        return VersionedKV(self.store, commit_hash=target, branch=name)
 
     def delete_branch(self, name: str) -> None:
-        """Delete a branch by name.
-
-        Removes the branch HEAD pointer. Commits are not removed
-        and may be collected by GC if unreachable.
-
-        Raises ValueError if the branch is the current branch or
-        does not exist.
-        """
+        """Delete a branch by name."""
         if name == self._branch:
             raise ValueError("Cannot delete the current branch")
         branch_key = BRANCH_HEAD % name
@@ -699,12 +628,7 @@ class Versioned:
         self.store.remove(branch_key)
 
     def switch_branch(self, name: str) -> None:
-        """Switch this instance to a different branch in-place.
-
-        Loads the HEAD commit of the target branch.
-
-        Raises ValueError if the branch does not exist.
-        """
+        """Switch this instance to a different branch in-place."""
         branch_key = BRANCH_HEAD % name
         head_bytes = self.store.get(branch_key)
         if head_bytes is None:
@@ -713,10 +637,7 @@ class Versioned:
         self._load_commit(_from_bytes(head_bytes), update_base=True)
 
     def peek(self, key: str, *, branch: str) -> bytes | None:
-        """Read a key from another branch's HEAD without switching.
-
-        Returns None if the branch doesn't exist or the key isn't present.
-        """
+        """Read a key from another branch's HEAD without switching."""
         head_bytes = self.store.get(BRANCH_HEAD % branch)
         if head_bytes is None:
             return None
@@ -746,13 +667,7 @@ class Versioned:
         *,
         all_parents: bool = False,
     ) -> Iterable[str]:
-        """Yield the commit chain from newest to oldest.
-
-        Args:
-            commit_hash: Starting commit (default: current).
-            all_parents: If True, BFS over all parents (full DAG).
-                If False, follow first parent only (linear).
-        """
+        """Yield the commit chain from newest to oldest."""
         start = commit_hash or self._current_commit
         if not all_parents:
             current = start
@@ -793,7 +708,7 @@ class Versioned:
 
     def list_branches(self) -> list[str]:
         """List all branch names in the store."""
-        return Versioned.branches(self.store)
+        return VersionedKV.branches(self.store)
 
     def commit_info(self, commit_hash: str | None = None) -> dict | None:
         """Retrieve the info dict for a commit, or None if none was stored."""
@@ -804,11 +719,7 @@ class Versioned:
         return _from_bytes(info_bytes)
 
     def diff(self, commit_a: str, commit_b: str) -> DiffResult:
-        """Compute key-level differences between two commits.
-
-        Returns which keys were added, removed, or modified going
-        from commit_a to commit_b.
-        """
+        """Compute key-level differences between two commits."""
         keyset_a = self._load_keyset(commit_a)
         keyset_b = self._load_keyset(commit_b)
 
@@ -827,26 +738,14 @@ class Versioned:
         )
 
     def parents(self, commit_hash: str | None = None) -> tuple[str, ...]:
-        """Get the direct parent commit(s) of a commit.
-
-        Args:
-            commit_hash: The commit to query (default: current).
-
-        Returns:
-            Tuple of parent commit hashes (empty for the initial commit,
-            one element for normal commits, two for merge commits).
-        """
+        """Get the direct parent commit(s) of a commit."""
         target = commit_hash or self._current_commit
         return self._load_parents(target)
 
     # -- Internal --
 
     def _find_lca(self, commit_a: str, commit_b: str) -> str | None:
-        """Find the lowest common ancestor of two commits.
-
-        Uses interleaved BFS from both commits. Returns the first
-        commit reachable from both, or None if no common ancestor.
-        """
+        """Find the lowest common ancestor of two commits."""
         if commit_a == commit_b:
             return commit_a
 

@@ -2,7 +2,7 @@
 
 import pytest
 
-from kvgit import MergeResult, Staged, Versioned
+from kvgit import MergeResult, Staged, VersionedKV as Versioned
 from kvgit.kv.memory import Memory
 
 
