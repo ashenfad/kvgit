@@ -110,6 +110,12 @@ class VersionedGP:
         except (IndexError, AttributeError):
             return None
 
+    @property
+    def initial_commit(self) -> str:
+        """The root commit hash."""
+        commits = list(self.history())
+        return commits[-1]
+
     # -- Read operations --
 
     def get(self, key: str) -> bytes | None:

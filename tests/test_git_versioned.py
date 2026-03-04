@@ -90,6 +90,16 @@ def test_merge_conflict(repo_path):
         v2.commit({"a": b"3"})
 
 
+def test_initial_commit(repo_path):
+    v = GitVersioned(repo_path)
+    init = v.initial_commit
+    assert init == v.current_commit  # only one commit so far
+
+    v.commit({"a": b"1"})
+    v.commit({"b": b"2"})
+    assert v.initial_commit == init  # root unchanged after more commits
+
+
 def test_staged_wrapper(repo_path):
     from kvgit.staged import Staged
 
