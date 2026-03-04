@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **`Versioned` protocol** in `kvgit.protocol` -- shared interface for all versioned backends
+- **`VersionedGP`** (`kvgit.versioned_gp`) -- GitPython-backed versioned store
+- **`kind="git"`** option in `kvgit.store()` factory
+
+### Changed
+- **`Versioned`** (class) renamed to **`VersionedKV`** and moved to `kvgit.versioned_kv`
+- **`GCVersioned`** renamed to **`GCVersionedKV`** and moved to `kvgit.gc_kv`
+- **`GitVersioned`** renamed to **`VersionedGP`** and moved to `kvgit.versioned_gp`
+- **`Staged`** now typed against the `Versioned` protocol, accepting any implementation
+- Shared types (`MergeResult`, `DiffResult`, `BytesMergeFn`, `MetaEntry`) moved to `kvgit.protocol`
+
+### Removed
+- Old modules: `kvgit.versioned`, `kvgit.git_versioned`, `kvgit.gc`
+
 ## [0.1.4] - 2026-03-01
 
 ### Added

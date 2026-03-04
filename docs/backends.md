@@ -40,13 +40,16 @@ The simplest way to create a store:
 ```python
 import kvgit
 
-# Default: Staged backed by in-memory Versioned
+# Default: Staged backed by in-memory VersionedKV
 s = kvgit.store()
 
 # With disk persistence
 s = kvgit.store(kind="disk", path="/path/to/db")
 
-# With garbage collection
+# With git backend (requires gitpython extra)
+s = kvgit.store(kind="git", path="/path/to/repo")
+
+# With garbage collection (memory/disk only)
 s = kvgit.store(high_water_bytes=10_000)
 
 # Custom branch
@@ -64,25 +67,25 @@ s = kvgit.store(
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `kind` | `Literal["memory", "disk"]` | `"memory"` | Backend type |
-| `path` | `str \| None` | `None` | Required when `kind="disk"` |
+| `kind` | `Literal["memory", "disk", "git"]` | `"memory"` | Backend type |
+| `path` | `str \| None` | `None` | Required when `kind="disk"` or `kind="git"` |
 | `branch` | `str` | `"main"` | Branch name |
 | `encoder` | `Callable[[Any], bytes]` | `pickle.dumps` | Value encoder |
 | `decoder` | `Callable[[bytes], Any]` | `pickle.loads` | Value decoder |
-| `high_water_bytes` | `int \| None` | `None` | Enable GC |
-| `low_water_bytes` | `int \| None` | `None` | GC low-water (defaults to 80% of high) |
-| `is_protected` | `Callable[[str], bool] \| None` | `None` | Keys GC should never drop. Only used when `high_water_bytes` is set. Defaults to protecting keys starting with `__`. |
+| `high_water_bytes` | `int \| None` | `None` | Enable GC (not supported with `kind="git"`) |
+| `low_water_bytes` | `int \| None` | `None` | GC low-water (defaults to 80% of high). Not supported with `kind="git"`. |
+| `is_protected` | `Callable[[str], bool] \| None` | `None` | Keys GC should never drop. Only used when `high_water_bytes` is set. Defaults to protecting keys starting with `__`. Not supported with `kind="git"`. |
 
 ---
 
 ## Staged
 
-`Staged` wraps a `Versioned` instance and implements `MutableMapping[str, Any]`. Individual `set()` / `__setitem__()` calls are buffered in memory. `commit()` encodes values to bytes and flushes them as a single atomic commit.
+`Staged` wraps any `Versioned` implementation (`VersionedKV`, `VersionedGP`, or `GCVersionedKV`) and provides `MutableMapping[str, Any]`. Individual `set()` / `__setitem__()` calls are buffered in memory. `commit()` encodes values to bytes and flushes them as a single atomic commit.
 
 ```python
-from kvgit import Staged, Versioned
+from kvgit import Staged, VersionedKV
 
-s = Staged(Versioned())
+s = Staged(VersionedKV())
 
 s["name"] = "alice"
 s["age"] = 30
@@ -99,7 +102,7 @@ Staged(versioned: Versioned, *, encoder=pickle.dumps, decoder=pickle.loads)
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `versioned` | `Versioned` | (required) | The underlying versioned store |
+| `versioned` | `Versioned` | (required) | Any `Versioned` implementation (`VersionedKV`, `VersionedGP`, `GCVersionedKV`) |
 | `encoder` | `Callable[[Any], bytes]` | `pickle.dumps` | Serializes values to bytes on commit |
 | `decoder` | `Callable[[bytes], Any]` | `pickle.loads` | Deserializes bytes to values on read |
 

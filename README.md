@@ -69,5 +69,5 @@ See [`docs/`](docs/) for detailed API documentation:
 
 - [Core API (Versioned)](docs/versioned.md) -- commits, reads, writes, merging, branching, history
 - [Merge Functions](docs/content-types.md) -- per-key merge logic for conflict resolution
-- [Garbage Collection](docs/gc.md) -- GCVersioned, rebase, orphan cleanup
+- [Garbage Collection](docs/gc.md) -- GCVersionedKV, rebase, orphan cleanup
 - [Backends & Namespaces](docs/backends.md) -- KVStore interface, Memory, Disk, Store, Staged, Live, Namespaced
