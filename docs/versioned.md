@@ -1,34 +1,45 @@
-# Core API: Versioned
+# Core API
 
-`Versioned` is the central class. It provides a commit log over any `KVStore` backend, with reads, atomic commit+merge, branching, and history traversal.
-
-Most users should use `Staged` (via `kvgit.store()`) for the `MutableMapping[str, Any]` interface. `Versioned` is the lower-level engine that `Staged` wraps -- it operates on raw bytes.
-
-## Construction
+Most users should start with `kvgit.store()`:
 
 ```python
-from kvgit import Versioned
+import kvgit
 
-# Default: in-memory store, "main" branch, new empty commit
-v = Versioned()
+s = kvgit.store()                                   # in-memory
+s = kvgit.store(kind="disk", path="/path/to/db")    # persistent
+s = kvgit.store(kind="git", path="/path/to/repo")   # git-backed
 
-# Shared store, specific branch
-from kvgit.kv.memory import Memory
-store = Memory()
-v1 = Versioned(store, branch="main")
-v2 = Versioned(store, branch="dev")
-
-# Resume from a specific commit
-v = Versioned(store, commit_hash="a1b2c3d4e5f67890")
+s["user"] = "alice"
+s.commit()
 ```
 
-### `Versioned(store=None, *, commit_hash=None, branch="main")`
+`kvgit.store()` returns a `Staged` instance -- a `MutableMapping[str, Any]` with commit, branch, and merge support. See [Backends & Namespaces](backends.md) for full `store()` parameters.
+
+The rest of this page documents the shared API available on `Staged` (and the lower-level `VersionedKV` / `VersionedGP` bytes engines it wraps).
+
+---
+
+## Advanced: VersionedKV construction
+
+`VersionedKV` is the KV-backed implementation of the `Versioned` protocol. It operates on raw bytes -- most users don't need it directly.
+
+```python
+from kvgit import VersionedKV
+
+v = VersionedKV()                                         # in-memory
+v = VersionedKV(store, branch="dev")                      # shared store
+v = VersionedKV(store, commit_hash="a1b2c3d4e5f67890")   # resume
+```
+
+### `VersionedKV(store=None, *, commit_hash=None, branch="main")`
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `store` | `KVStore \| None` | `None` | Backend store. Creates an in-memory store if None. |
 | `commit_hash` | `str \| None` | `None` | Resume from this commit. Reads HEAD if None. |
 | `branch` | `str` | `"main"` | Branch name for this instance. |
+
+---
 
 ## Reading
 
@@ -114,7 +125,7 @@ v.commit({"counter": b"5"}, merge_fns={"counter": my_merge_fn})
 v.set_default_merge(lambda old, ours, theirs: theirs)
 ```
 
-Merge functions on Versioned receive `(old: bytes | None, ours: bytes | None, theirs: bytes | None) -> bytes`. For decoded-value merge functions, use `Staged.set_merge_fn()` instead.
+Merge functions on VersionedKV receive `(old: bytes | None, ours: bytes | None, theirs: bytes | None) -> bytes`. For decoded-value merge functions, use `Staged.set_merge_fn()` instead.
 
 #### `on_conflict`
 
@@ -135,9 +146,9 @@ v.refresh()  # now v reflects HEAD
 
 These methods are also available on `Staged` (returning `Staged` instances) via the `VersionedStore` protocol. Most users should use `Staged.create_branch()` / `Staged.checkout()` instead of calling these directly.
 
-### `create_branch(name, *, at=None) -> Versioned`
+### `create_branch(name, *, at=None) -> VersionedKV`
 
-Fork a commit onto a new branch. Returns a new `Versioned` on that branch. Raises `ValueError` if the branch already exists or if `at` refers to a nonexistent commit.
+Fork a commit onto a new branch. Returns a new `VersionedKV` on that branch. Raises `ValueError` if the branch already exists or if `at` refers to a nonexistent commit.
 
 By default, forks from the current commit. Pass `at` to fork from a specific commit (e.g., `initial_commit` for a clean branch).
 
@@ -149,9 +160,9 @@ dev.commit({"feature": b"wip"})  # commits to "dev" HEAD, not "main"
 clean = v.create_branch("clean", at=v.initial_commit)
 ```
 
-### `checkout(commit_hash, *, branch=None) -> Versioned | None`
+### `checkout(commit_hash, *, branch=None) -> VersionedKV | None`
 
-Create a new `Versioned` at a specific commit. Returns `None` if the commit doesn't exist. Defaults to the same branch unless `branch` is specified.
+Create a new `VersionedKV` at a specific commit. Returns `None` if the commit doesn't exist. Defaults to the same branch unless `branch` is specified.
 
 ```python
 old = v.checkout(some_hash)
@@ -197,7 +208,7 @@ List all branch names in the store.
 v.list_branches()  # ["dev", "main", "staging"]
 ```
 
-Also available as a static method: `Versioned.branches(store)`.
+Also available as a static method: `VersionedKV.branches(store)`.
 
 ## History
 
@@ -272,7 +283,7 @@ Frozen dataclass returned by `diff()`.
 
 ### `BytesMergeFn`
 
-Type alias for bytes-level merge functions used by `Versioned`:
+Type alias for bytes-level merge functions used by `VersionedKV`:
 
 ```python
 BytesMergeFn = Callable[[bytes | None, bytes | None, bytes | None], bytes]

@@ -1,10 +1,8 @@
 # Garbage Collection
 
-Automatic garbage collection drops cold (least-recently-accessed) keys when total persisted size exceeds a threshold.
+Automatic garbage collection drops cold (least-recently-accessed) keys when total persisted size exceeds a threshold. Just pass `high_water_bytes` to `kvgit.store()` -- no extra setup needed.
 
 ## Quick Start
-
-The easiest way to enable GC is through the `kvgit.store()` factory:
 
 ```python
 import kvgit
@@ -55,25 +53,25 @@ print(s.get("c"))  # "zzz..." (retained)
 
 ---
 
-## Advanced: GCVersioned
+## Advanced: GCVersionedKV
 
-For direct composition (custom backends, shared stores, bytes-level API), use `GCVersioned` directly. It extends `Versioned` with automatic garbage collection via rebase.
+For direct composition (custom backends, shared stores, bytes-level API), use `GCVersionedKV` directly. It extends `VersionedKV` with automatic garbage collection via rebase.
 
 ```python
-from kvgit.gc import GCVersioned
+from kvgit.gc_kv import GCVersionedKV
 
-v = GCVersioned(high_water_bytes=10_000)
+v = GCVersionedKV(high_water_bytes=10_000)
 
 # Custom low water (default: 80% of high)
-v = GCVersioned(high_water_bytes=10_000, low_water_bytes=5_000)
+v = GCVersionedKV(high_water_bytes=10_000, low_water_bytes=5_000)
 
 # With a shared store and branch
 from kvgit.kv.memory import Memory
 store = Memory()
-v = GCVersioned(store, branch="main", high_water_bytes=50_000)
+v = GCVersionedKV(store, branch="main", high_water_bytes=50_000)
 ```
 
-### `GCVersioned(store=None, *, commit_hash=None, branch="main", high_water_bytes, low_water_bytes=None, is_protected=_is_system_key)`
+### `GCVersionedKV(store=None, *, commit_hash=None, branch="main", high_water_bytes, low_water_bytes=None, is_protected=_is_system_key)`
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -87,10 +85,10 @@ v = GCVersioned(store, branch="main", high_water_bytes=50_000)
 Wrap in `Staged` for the `MutableMapping[str, Any]` interface:
 
 ```python
-from kvgit.gc import GCVersioned
+from kvgit.gc_kv import GCVersionedKV
 from kvgit import Staged
 
-v = GCVersioned(high_water_bytes=10_000)
+v = GCVersionedKV(high_water_bytes=10_000)
 s = Staged(v)
 ```
 
@@ -98,7 +96,7 @@ s = Staged(v)
 
 #### `commit(updates=None, removals=None, *, on_conflict="raise", merge_fns=None, default_merge=None, info=None) -> MergeResult`
 
-Same as `Versioned.commit()`, but automatically runs GC afterward if above high water.
+Same as `VersionedKV.commit()`, but automatically runs GC afterward if above high water.
 
 #### `maybe_rebase() -> RebaseResult`
 

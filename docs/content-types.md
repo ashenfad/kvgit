@@ -80,12 +80,12 @@ s.set_merge_fn("tags", merge_lists)
 
 ## BytesMergeFn (advanced)
 
-For power users working directly with `Versioned` (bytes-level API):
+For power users working directly with `VersionedKV` (bytes-level API):
 
 ```python
-from kvgit.versioned import BytesMergeFn
+from kvgit.protocol import BytesMergeFn
 
 BytesMergeFn = Callable[[bytes | None, bytes | None, bytes | None], bytes]
 ```
 
-`Versioned.set_merge_fn()` and `Versioned.commit(merge_fns=...)` accept `BytesMergeFn`. Staged wraps user-level `MergeFn` into `BytesMergeFn` automatically at commit time.
+`VersionedKV.set_merge_fn()` and `VersionedKV.commit(merge_fns=...)` accept `BytesMergeFn`. Staged wraps user-level `MergeFn` into `BytesMergeFn` automatically at commit time.
