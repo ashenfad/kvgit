@@ -119,11 +119,8 @@ class GitVersioned:
         return self._read_blob(hexsha)
 
     def _read_blob(self, hexsha: str) -> bytes:
-        try:
-            blob = Blob(self.repo, binascii.unhexlify(hexsha))
-            return blob.data_stream.read()
-        except Exception:
-            return b""
+        blob = Blob(self.repo, binascii.unhexlify(hexsha))
+        return blob.data_stream.read()
 
     def get_many(self, *keys: str) -> dict[str, bytes]:
         result = {}
