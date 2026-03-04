@@ -86,6 +86,9 @@ class Versioned(Protocol):
     @property
     def latest_head(self) -> str | None: ...
 
+    @property
+    def initial_commit(self) -> str: ...
+
     # -- Read operations --
 
     def get(self, key: str) -> bytes | None: ...

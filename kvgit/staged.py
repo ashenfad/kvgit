@@ -229,6 +229,10 @@ class Staged(MutableMapping[str, Any]):
         return self._versioned.current_branch
 
     @property
+    def initial_commit(self) -> str:
+        return self._versioned.initial_commit
+
+    @property
     def last_merge_result(self) -> MergeResult | None:
         return self._versioned.last_merge_result
 
