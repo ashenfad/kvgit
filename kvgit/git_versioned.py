@@ -452,7 +452,7 @@ class GitVersioned:
             return GitVersioned(
                 self.repo_path, commit_hash=commit_hash, branch=branch or self._branch
             )
-        except (BadObject, Exception):
+        except (BadObject, ValueError):
             return None
 
     def create_branch(self, name: str, *, at: str | None = None) -> "GitVersioned":
@@ -460,7 +460,7 @@ class GitVersioned:
         if at is not None:
             try:
                 Commit(self.repo, binascii.unhexlify(at))
-            except Exception:
+            except (BadObject, ValueError):
                 raise ValueError(f"Commit '{at}' does not exist")
 
         if name in self.repo.heads:
@@ -496,7 +496,7 @@ class GitVersioned:
     def reset_to(self, commit_hash: str) -> bool:
         try:
             Commit(self.repo, binascii.unhexlify(commit_hash))
-        except Exception:
+        except (BadObject, ValueError):
             return False
         self.repo.git.update_ref(f"refs/heads/{self._branch}", commit_hash)
         self._load_commit(commit_hash, update_base=True)
@@ -532,14 +532,15 @@ class GitVersioned:
         target = commit_hash or self._current_commit
         try:
             c = Commit(self.repo, binascii.unhexlify(target))
-            msg = c.message
-            if "\n\n" in msg:
-                info_part = msg.split("\n\n", 1)[1]
-                if info_part.strip():
-                    return json.loads(info_part)
-        except Exception:
-            pass
-        return None
+        except (BadObject, ValueError):
+            return None
+        msg = c.message
+        if "\n\n" not in msg:
+            return None
+        info_part = msg.split("\n\n", 1)[1].strip()
+        if not info_part:
+            return None
+        return json.loads(info_part)
 
     def diff(self, commit_a: str, commit_b: str) -> DiffResult:
         keyset_a = self._load_keyset(commit_a)
@@ -568,28 +569,19 @@ class GitVersioned:
     def _find_lca(self, commit_a: str, commit_b: str) -> str | None:
         try:
             bases = self.repo.merge_base(commit_a, commit_b)
-            if bases:
-                return bases[0].hexsha
-        except Exception:
-            pass
+        except GitCommandError:
+            return None
+        if bases:
+            return bases[0].hexsha
         return None
 
     def _load_keyset(self, commit_hash: str) -> dict[str, str]:
-        keyset = {}
-        try:
-            c = Commit(self.repo, binascii.unhexlify(commit_hash))
-            for blob in c.tree.blobs:
-                keyset[_unquote(blob.name)] = blob.hexsha
-        except Exception:
-            pass
-        return keyset
+        c = Commit(self.repo, binascii.unhexlify(commit_hash))
+        return {_unquote(blob.name): blob.hexsha for blob in c.tree.blobs}
 
     def _load_parents(self, commit_hash: str) -> tuple[str, ...]:
-        try:
-            c = Commit(self.repo, binascii.unhexlify(commit_hash))
-            return tuple(p.hexsha for p in c.parents)
-        except Exception:
-            return ()
+        c = Commit(self.repo, binascii.unhexlify(commit_hash))
+        return tuple(p.hexsha for p in c.parents)
 
     def _load_commit(self, commit_hash: str, *, update_base: bool) -> None:
         self._current_commit = commit_hash
