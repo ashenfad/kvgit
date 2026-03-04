@@ -3,14 +3,14 @@
 import pickle
 from typing import Any, Callable, Literal
 
-from .gc import GCVersioned
+from .gc_kv import GCVersionedKV
 from .kv.memory import Memory
 from .staged import Staged
-from .versioned import Versioned
+from .versioned_kv import VersionedKV
 
 
 def store(
-    kind: Literal["memory", "disk"] = "memory",
+    kind: Literal["memory", "disk", "git"] = "memory",
     *,
     path: str | None = None,
     branch: str = "main",
@@ -23,23 +23,39 @@ def store(
     """Create a Staged store with sensible defaults.
 
     Args:
-        kind: ``"memory"`` (default) or ``"disk"``.
-        path: Required when ``kind="disk"``. Directory path for
-            the disk backend.
+        kind: ``"memory"`` (default), ``"disk"``, or ``"git"``.
+        path: Required when ``kind="disk"`` or ``kind="git"``.
+            Directory path for the disk backend or repo path for git.
         branch: Branch name (default ``"main"``).
         encoder: Value encoder (default ``pickle.dumps``).
         decoder: Value decoder (default ``pickle.loads``).
         high_water_bytes: Enable GC with this high-water threshold.
+            Not supported with ``kind="git"``.
         low_water_bytes: GC low-water threshold (defaults to 80%
-            of high_water).
+            of high_water). Not supported with ``kind="git"``.
         is_protected: Callable that returns True for keys GC should
             never drop. Only used when ``high_water_bytes`` is set.
             Defaults to protecting keys starting with ``__``.
+            Not supported with ``kind="git"``.
 
     Returns:
         A ``Staged`` store instance.
     """
-    # Build backend
+    if kind == "git":
+        if (
+            high_water_bytes is not None
+            or low_water_bytes is not None
+            or is_protected is not None
+        ):
+            raise ValueError("GC parameters are not supported with kind='git'")
+        if path is None:
+            raise ValueError("path is required when kind='git'")
+        from .versioned_gp import VersionedGP
+
+        versioned = VersionedGP(path, branch=branch)
+        return Staged(versioned, encoder=encoder, decoder=decoder)
+
+    # Build KV backend
     if kind == "memory":
         backend = Memory()
     elif kind == "disk":
@@ -59,8 +75,8 @@ def store(
         }
         if is_protected is not None:
             gc_kwargs["is_protected"] = is_protected
-        versioned = GCVersioned(backend, **gc_kwargs)
+        versioned = GCVersionedKV(backend, **gc_kwargs)
     else:
-        versioned = Versioned(backend, branch=branch)
+        versioned = VersionedKV(backend, branch=branch)
 
     return Staged(versioned, encoder=encoder, decoder=decoder)

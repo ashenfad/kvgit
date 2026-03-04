@@ -3,9 +3,10 @@
 import pytest
 
 from kvgit import ConcurrencyError
-from kvgit.gc import GCVersioned
+from kvgit.gc_kv import GCVersionedKV as GCVersioned
 from kvgit.kv.memory import Memory
-from kvgit.versioned import BRANCH_HEAD, _to_bytes
+from kvgit.versioned_kv import BRANCH_HEAD
+from kvgit.protocol import _to_bytes
 
 
 class TestGCNoOp:

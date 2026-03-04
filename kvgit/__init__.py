@@ -4,12 +4,13 @@ from .content_types import MergeFn, counter, last_writer_wins
 from .errors import ConcurrencyError, MergeConflict
 from .live import Live
 from .namespaced import Namespaced
+from .protocol import MergeResult, Versioned
 from .staged import Staged
 from .store import store
-from .versioned import MergeResult, Versioned
+from .versioned_kv import VersionedKV
 
 try:
-    from .git_versioned import GitVersioned
+    from .versioned_gp import VersionedGP
 except ImportError:
     pass
 
@@ -22,8 +23,9 @@ __all__ = [
     "Namespaced",
     "Staged",
     "Versioned",
+    "VersionedGP",
+    "VersionedKV",
     "counter",
     "last_writer_wins",
     "store",
-    "GitVersioned",
 ]

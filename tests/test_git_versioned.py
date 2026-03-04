@@ -4,7 +4,7 @@ import pytest
 import os
 import shutil
 
-from kvgit.git_versioned import GitVersioned
+from kvgit.versioned_gp import VersionedGP as GitVersioned
 from kvgit.errors import MergeConflict
 
 

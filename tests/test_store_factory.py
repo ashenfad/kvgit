@@ -3,7 +3,7 @@
 import pytest
 
 from kvgit import Staged, store
-from kvgit.gc import GCVersioned
+from kvgit.gc_kv import GCVersionedKV as GCVersioned
 
 
 class TestStoreFactory:

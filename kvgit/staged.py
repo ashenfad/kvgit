@@ -5,7 +5,7 @@ from collections.abc import Iterable, Iterator, MutableMapping
 from typing import Any, Callable
 
 from .content_types import MergeFn
-from .versioned import BytesMergeFn, MergeResult, Versioned
+from .protocol import BytesMergeFn, MergeResult, Versioned
 
 
 class Staged(MutableMapping[str, Any]):
