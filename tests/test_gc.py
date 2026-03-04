@@ -102,10 +102,12 @@ class TestGCDropOrder:
 class TestGCNamespaced:
     def test_system_keys_in_namespaces_retained(self):
         v = GCVersioned(high_water_bytes=100, low_water_bytes=50)
-        v.commit({
-            "ns/__system__": b"x" * 60,
-            "ns/user_var": b"y" * 60,
-        })
+        v.commit(
+            {
+                "ns/__system__": b"x" * 60,
+                "ns/user_var": b"y" * 60,
+            }
+        )
         v.commit({"trigger": b"z" * 20})
 
         # Namespaced system key should survive

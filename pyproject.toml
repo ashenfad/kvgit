@@ -36,8 +36,9 @@ dependencies = []
 
 [project.optional-dependencies]
 disk = ["diskcache"]
-all = ["diskcache"]
-dev = ["pytest", "diskcache", "ruff"]
+git = ["gitpython>=3.1"]
+all = ["diskcache", "gitpython>=3.1"]
+dev = ["pytest", "diskcache", "gitpython>=3.1", "ruff"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

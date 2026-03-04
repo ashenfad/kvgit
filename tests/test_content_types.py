@@ -1,6 +1,5 @@
 """Tests for merge functions."""
 
-
 from kvgit import Staged, Versioned, counter, last_writer_wins
 from kvgit.kv.memory import Memory
 
