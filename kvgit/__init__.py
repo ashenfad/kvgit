@@ -8,6 +8,11 @@ from .staged import Staged
 from .store import store
 from .versioned import MergeResult, Versioned
 
+try:
+    from .git_versioned import GitVersioned
+except ImportError:
+    pass
+
 __all__ = [
     "ConcurrencyError",
     "Live",
@@ -20,4 +25,5 @@ __all__ = [
     "counter",
     "last_writer_wins",
     "store",
+    "GitVersioned",
 ]
