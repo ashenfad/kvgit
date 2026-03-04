@@ -12,13 +12,14 @@ Values are `Any` (serialized via pickle by default). Commits are content-address
 - **Merge functions** -- counters, last-writer-wins, or custom per-key merge logic
 - **Garbage collection** -- high/low water rebase drops cold keys automatically
 - **Namespaces** -- key-prefixed views with full read/write support
-- **Pluggable backends** -- in-memory, disk (via diskcache), or bring your own `KVStore`
+- **Pluggable backends** -- in-memory, disk (via diskcache), git (via GitPython), or bring your own `KVStore`
 
 ## Install
 
 ```bash
 pip install kvgit            # in-memory only
 pip install kvgit[disk]      # adds disk backend via diskcache
+pip install kvgit[git]       # adds git backend via GitPython
 ```
 
 ## Quick example
