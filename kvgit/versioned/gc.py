@@ -182,10 +182,10 @@ class GCVersionedKV(VersionedKV):
             value = self.store.get(versioned_key)
             if value is None:
                 continue
+            if key in meta:
+                new_meta[key] = meta[key]
             if not self._is_protected(key):
                 retained_data[key] = value
-                if key in meta:
-                    new_meta[key] = meta[key]
 
         # Content-addressable hash for the rebase commit (parent=None, fresh root)
         preview_keys: dict[str, str] = {}
