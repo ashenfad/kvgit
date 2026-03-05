@@ -3,10 +3,10 @@
 import pickle
 from typing import Any, Callable, Literal
 
-from .gc_kv import GCVersionedKV
 from .kv.memory import Memory
 from .staged import Staged
-from .versioned_kv import VersionedKV
+from .versioned.gc import GCVersionedKV
+from .versioned.kv import VersionedKV
 
 
 def store(
@@ -50,7 +50,7 @@ def store(
             raise ValueError("GC parameters are not supported with kind='git'")
         if path is None:
             raise ValueError("path is required when kind='git'")
-        from .versioned_gp import VersionedGP
+        from .versioned.gp import VersionedGP
 
         versioned = VersionedGP(path, branch=branch)
         return Staged(versioned, encoder=encoder, decoder=decoder)

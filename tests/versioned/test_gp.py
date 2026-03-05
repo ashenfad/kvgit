@@ -6,7 +6,7 @@ import shutil
 import pytest
 
 from kvgit.errors import MergeConflict
-from kvgit.versioned_gp import VersionedGP as GitVersioned
+from kvgit.versioned.gp import VersionedGP as GitVersioned
 
 
 @pytest.fixture

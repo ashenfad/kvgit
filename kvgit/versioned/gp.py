@@ -5,11 +5,12 @@ import io
 import json
 import os
 import urllib.parse
-from collections import deque
 from typing import Iterable
 
-from .errors import ConcurrencyError, MergeConflict
+from ..errors import ConcurrencyError, MergeConflict
 from .protocol import BytesMergeFn, DiffResult, MergeResult
+from .helpers import diff_keysets, walk_history
+from .merge import resolve_merge
 
 try:
     import git
@@ -356,73 +357,19 @@ class VersionedGP:
             effective_fns.update(merge_fns)
         effective_default = default_merge or self._default_merge
 
-        lca_keyset = self._load_keyset(lca)
-        our_keyset = self._load_keyset(self._current_commit)
-        their_keyset = self._load_keyset(their_head)
-
-        our_changed = our_diff.added | our_diff.removed | our_diff.modified
-        their_changed = their_diff.added | their_diff.removed | their_diff.modified
-        all_changed = our_changed | their_changed
-
-        merged_keyset: dict[str, str] = {}
-        merged_values: dict[str, bytes] = {}
-        auto_merged: list[str] = []
-        conflicts: set[str] = set()
-        merge_errors: dict[str, Exception] = {}
-
-        all_keys = set(our_keyset.keys()) | set(their_keyset.keys())
-        for key in all_keys - all_changed:
-            if key in their_keyset:
-                merged_keyset[key] = their_keyset[key]
-            elif key in our_keyset:
-                merged_keyset[key] = our_keyset[key]
-
-        for key in our_changed - their_changed:
-            if key in our_diff.removed:
-                pass
-            else:
-                merged_keyset[key] = our_keyset[key]
-                auto_merged.append(key)
-
-        for key in their_changed - our_changed:
-            if key in their_diff.removed:
-                pass
-            else:
-                merged_keyset[key] = their_keyset[key]
-
-        contested = our_changed & their_changed
-        for key in contested:
-            our_removed = key in our_diff.removed
-            their_removed = key in their_diff.removed
-
-            if our_removed and their_removed:
-                continue
-
-            if (
-                not our_removed
-                and not their_removed
-                and our_keyset.get(key) == their_keyset.get(key)
-            ):
-                merged_keyset[key] = their_keyset[key]
-                continue
-
-            fn = effective_fns.get(key, effective_default)
-            if fn is None:
-                conflicts.add(key)
-                continue
-
-            old_val = self._read_blob(lca_keyset[key]) if key in lca_keyset else None
-            our_val = None if our_removed else self._read_blob(our_keyset[key])
-            their_val = None if their_removed else self._read_blob(their_keyset[key])
-            try:
-                result_val = fn(old_val, our_val, their_val)
-                merged_values[key] = result_val
-                auto_merged.append(key)
-            except Exception as e:
-                conflicts.add(key)
-                merge_errors[key] = e
-
-        if conflicts:
+        # Resolve the merge
+        try:
+            resolution = resolve_merge(
+                lca_keyset=self._load_keyset(lca),
+                our_keyset=self._load_keyset(self._current_commit),
+                their_keyset=self._load_keyset(their_head),
+                our_diff=our_diff,
+                their_diff=their_diff,
+                blob_reader=self._read_blob,
+                merge_fns=effective_fns,
+                default_merge=effective_default,
+            )
+        except MergeConflict:
             if saved_state is not None:
                 self._restore_state(saved_state)
             if on_conflict == "abandon":
@@ -435,7 +382,11 @@ class VersionedGP:
                 )
                 self.last_merge_result = result
                 return result
-            raise MergeConflict(conflicts, merge_errors)
+            raise
+
+        merged_keyset = resolution.merged_keyset
+        merged_values = resolution.merged_values
+        auto_merged = resolution.auto_merged_keys
 
         parents = [their_head, self._current_commit]
 
@@ -564,24 +515,7 @@ class VersionedGP:
     ) -> Iterable[str]:
         """Yield the commit chain from newest to oldest."""
         start = commit_hash or self._current_commit
-        if not all_parents:
-            current = start
-            while current is not None:
-                yield current
-                parents = self._load_parents(current)
-                current = parents[0] if parents else None
-        else:
-            visited: set[str] = set()
-            queue: deque[str] = deque([start])
-            while queue:
-                current = queue.popleft()
-                if current in visited:
-                    continue
-                visited.add(current)
-                yield current
-                for p in self._load_parents(current):
-                    if p not in visited:
-                        queue.append(p)
+        yield from walk_history(start, self._load_parents, all_parents=all_parents)
 
     def list_branches(self) -> list[str]:
         """List all branch names."""
@@ -604,22 +538,7 @@ class VersionedGP:
 
     def diff(self, commit_a: str, commit_b: str) -> DiffResult:
         """Compute key-level differences between two commits."""
-        keyset_a = self._load_keyset(commit_a)
-        keyset_b = self._load_keyset(commit_b)
-
-        keys_a = set(keyset_a.keys())
-        keys_b = set(keyset_b.keys())
-
-        added = keys_b - keys_a
-        removed = keys_a - keys_b
-        common = keys_a & keys_b
-        modified = frozenset(k for k in common if keyset_a[k] != keyset_b[k])
-
-        return DiffResult(
-            added=frozenset(added),
-            removed=frozenset(removed),
-            modified=modified,
-        )
+        return diff_keysets(self._load_keyset(commit_a), self._load_keyset(commit_b))
 
     def parents(self, commit_hash: str | None = None) -> tuple[str, ...]:
         """Get the direct parent commit(s) of a commit."""

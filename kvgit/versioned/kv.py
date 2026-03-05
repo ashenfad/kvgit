@@ -6,19 +6,13 @@ import time
 from collections import deque
 from typing import Iterable
 
-from .errors import ConcurrencyError, MergeConflict
-from .kv.base import KVStore
-from .kv.memory import Memory
-from .protocol import (
-    BytesMergeFn,
-    DiffResult,
-    MergeResult,
-    MetaEntry,
-    _from_bytes,
-    _meta_from_bytes,
-    _meta_to_bytes,
-    _to_bytes,
-)
+from ..encoding import MetaEntry, from_bytes, meta_from_bytes, meta_to_bytes, to_bytes
+from ..errors import ConcurrencyError
+from ..kv.base import KVStore
+from ..kv.memory import Memory
+from .protocol import BytesMergeFn, DiffResult, MergeResult
+from .helpers import diff_keysets, walk_history
+from .merge import resolve_merge
 
 PARENT_COMMIT = "__parent_commit__%s"
 COMMIT_KEYSET = "__commit_keyset__%s"
@@ -28,7 +22,7 @@ TOTAL_VAR_SIZE_KEY = "__total_var_size__%s"
 INFO_KEY = "__info__%s"
 
 
-def _content_hash(
+def content_hash(
     parents: tuple[str, ...],
     keyset: dict[str, str],
     updates: dict[str, bytes],
@@ -75,16 +69,16 @@ class VersionedKV:
         if commit_hash is None:
             head_bytes = store.get(BRANCH_HEAD % branch)
             if head_bytes is not None:
-                commit_hash = _from_bytes(head_bytes)
+                commit_hash = from_bytes(head_bytes)
             else:
                 # Create initial empty commit
-                commit_hash = _content_hash((), {}, {})
+                commit_hash = content_hash((), {}, {})
                 initial = {
-                    COMMIT_KEYSET % commit_hash: _to_bytes({}),
-                    PARENT_COMMIT % commit_hash: _to_bytes([]),
-                    BRANCH_HEAD % branch: _to_bytes(commit_hash),
-                    META_KEY % commit_hash: _meta_to_bytes({}),
-                    TOTAL_VAR_SIZE_KEY % commit_hash: _to_bytes(0),
+                    COMMIT_KEYSET % commit_hash: to_bytes({}),
+                    PARENT_COMMIT % commit_hash: to_bytes([]),
+                    BRANCH_HEAD % branch: to_bytes(commit_hash),
+                    META_KEY % commit_hash: meta_to_bytes({}),
+                    TOTAL_VAR_SIZE_KEY % commit_hash: to_bytes(0),
                 }
                 store.set_many(**initial)
 
@@ -99,14 +93,14 @@ class VersionedKV:
         self._commit_keys: dict[str, str] = {}
         keyset_bytes = self.store.get(COMMIT_KEYSET % self._current_commit)
         if keyset_bytes is not None:
-            self._commit_keys = _from_bytes(keyset_bytes)
+            self._commit_keys = from_bytes(keyset_bytes)
 
         # Load metadata for GC
         self._meta: dict[str, MetaEntry] = {}
         meta_bytes = self.store.get(META_KEY % self._current_commit)
         if meta_bytes is not None:
             try:
-                self._meta = _meta_from_bytes(meta_bytes)
+                self._meta = meta_from_bytes(meta_bytes)
             except Exception:
                 self._meta = {}
         self._touch_counter = (
@@ -143,7 +137,7 @@ class VersionedKV:
         """Read HEAD directly from the KV store (reflects other writers)."""
         head_bytes = self.store.get(BRANCH_HEAD % self._branch)
         if head_bytes is not None:
-            return _from_bytes(head_bytes)
+            return from_bytes(head_bytes)
         return None
 
     # -- Read operations --
@@ -243,7 +237,7 @@ class VersionedKV:
         preview_keys = dict(new_commit_keys)
         for key in updates:
             preview_keys[key] = f"<pending:{key}>"
-        new_hash = _content_hash(
+        new_hash = content_hash(
             (self._current_commit,), preview_keys, updates, info=info
         )
 
@@ -269,13 +263,13 @@ class VersionedKV:
                 )
 
         # Store commit metadata
-        diffs[COMMIT_KEYSET % new_hash] = _to_bytes(new_commit_keys)
-        diffs[PARENT_COMMIT % new_hash] = _to_bytes([self._current_commit])
-        diffs[META_KEY % new_hash] = _meta_to_bytes(new_meta)
+        diffs[COMMIT_KEYSET % new_hash] = to_bytes(new_commit_keys)
+        diffs[PARENT_COMMIT % new_hash] = to_bytes([self._current_commit])
+        diffs[META_KEY % new_hash] = meta_to_bytes(new_meta)
         total_size = sum(e.size for e in new_meta.values() if e.size is not None)
-        diffs[TOTAL_VAR_SIZE_KEY % new_hash] = _to_bytes(total_size)
+        diffs[TOTAL_VAR_SIZE_KEY % new_hash] = to_bytes(total_size)
         if info is not None:
-            diffs[INFO_KEY % new_hash] = _to_bytes(info)
+            diffs[INFO_KEY % new_hash] = to_bytes(info)
 
         # Write everything
         self.store.set_many(**diffs)
@@ -345,8 +339,8 @@ class VersionedKV:
             saved = self._snapshot_state()
             self._create_commit(updates, removals, info=info)
 
-            expected = _to_bytes(self._base_commit)
-            new_head = _to_bytes(self._current_commit)
+            expected = to_bytes(self._base_commit)
+            new_head = to_bytes(self._current_commit)
             if self.store.cas(branch_key, new_head, expected=expected):
                 self._base_commit = self._current_commit
                 result = MergeResult(
@@ -426,81 +420,20 @@ class VersionedKV:
             effective_fns.update(merge_fns)
         effective_default = default_merge or self._default_merge
 
-        # Load keysets
-        lca_keyset = self._load_keyset(lca)
-        our_keyset = self._load_keyset(self._current_commit)
-        their_keyset = self._load_keyset(their_head)
-
-        our_changed = our_diff.added | our_diff.removed | our_diff.modified
-        their_changed = their_diff.added | their_diff.removed | their_diff.modified
-        all_changed = our_changed | their_changed
-
-        merged_keyset: dict[str, str] = {}
-        merged_values: dict[str, bytes] = {}
-        auto_merged: list[str] = []
-        conflicts: set[str] = set()
-        merge_errors: dict[str, Exception] = {}
-
-        # Keys unchanged by either side: carry from their keyset (HEAD)
-        all_keys = set(our_keyset.keys()) | set(their_keyset.keys())
-        for key in all_keys - all_changed:
-            if key in their_keyset:
-                merged_keyset[key] = their_keyset[key]
-            elif key in our_keyset:
-                merged_keyset[key] = our_keyset[key]
-
-        # Keys changed only by us
-        for key in our_changed - their_changed:
-            if key in our_diff.removed:
-                pass  # removed by us, not touched by them
-            else:
-                merged_keyset[key] = our_keyset[key]
-                auto_merged.append(key)
-
-        # Keys changed only by them
-        for key in their_changed - our_changed:
-            if key in their_diff.removed:
-                pass  # removed by them, not touched by us
-            else:
-                merged_keyset[key] = their_keyset[key]
-
-        # Contested keys: changed by both sides
-        contested = our_changed & their_changed
-        for key in contested:
-            our_removed = key in our_diff.removed
-            their_removed = key in their_diff.removed
-
-            if our_removed and their_removed:
-                continue  # both removed, key is gone
-
-            # Check if both sides made the same change
-            if (
-                not our_removed
-                and not their_removed
-                and our_keyset.get(key) == their_keyset.get(key)
-            ):
-                merged_keyset[key] = their_keyset[key]
-                continue
-
-            # Try merge function
-            fn = effective_fns.get(key, effective_default)
-            if fn is None:
-                conflicts.add(key)
-                continue
-
-            old_val = self.store.get(lca_keyset[key]) if key in lca_keyset else None
-            our_val = None if our_removed else self.store.get(our_keyset[key])
-            their_val = None if their_removed else self.store.get(their_keyset[key])
-            try:
-                result_val = fn(old_val, our_val, their_val)
-                merged_values[key] = result_val
-                auto_merged.append(key)
-            except Exception as e:
-                conflicts.add(key)
-                merge_errors[key] = e
-
-        if conflicts:
-            raise MergeConflict(conflicts, merge_errors)
+        # Resolve the merge
+        resolution = resolve_merge(
+            lca_keyset=self._load_keyset(lca),
+            our_keyset=self._load_keyset(self._current_commit),
+            their_keyset=self._load_keyset(their_head),
+            our_diff=our_diff,
+            their_diff=their_diff,
+            blob_reader=lambda cid: self.store.get(cid),
+            merge_fns=effective_fns,
+            default_merge=effective_default,
+        )
+        merged_keyset = resolution.merged_keyset
+        merged_values = resolution.merged_values
+        auto_merged = resolution.auto_merged_keys
 
         # Build merge commit
         parents = (their_head, self._current_commit)
@@ -509,7 +442,7 @@ class VersionedKV:
         for key in merged_values:
             preview_keys[key] = f"<pending:{key}>"
 
-        merge_hash = _content_hash(parents, preview_keys, merged_values, info)
+        merge_hash = content_hash(parents, preview_keys, merged_values, info)
 
         # Build write batch
         diffs: dict[str, bytes] = {}
@@ -521,8 +454,8 @@ class VersionedKV:
         # Build meta for merge commit
         our_meta_bytes = self.store.get(META_KEY % self._current_commit)
         their_meta_bytes = self.store.get(META_KEY % their_head)
-        our_meta = _meta_from_bytes(our_meta_bytes) if our_meta_bytes else {}
-        their_meta = _meta_from_bytes(their_meta_bytes) if their_meta_bytes else {}
+        our_meta = meta_from_bytes(our_meta_bytes) if our_meta_bytes else {}
+        their_meta = meta_from_bytes(their_meta_bytes) if their_meta_bytes else {}
 
         merged_meta: dict[str, MetaEntry] = {}
         for key in merged_keyset:
@@ -538,19 +471,19 @@ class VersionedKV:
             elif key in their_meta:
                 merged_meta[key] = their_meta[key]
 
-        diffs[COMMIT_KEYSET % merge_hash] = _to_bytes(merged_keyset)
-        diffs[PARENT_COMMIT % merge_hash] = _to_bytes(list(parents))
-        diffs[META_KEY % merge_hash] = _meta_to_bytes(merged_meta)
+        diffs[COMMIT_KEYSET % merge_hash] = to_bytes(merged_keyset)
+        diffs[PARENT_COMMIT % merge_hash] = to_bytes(list(parents))
+        diffs[META_KEY % merge_hash] = meta_to_bytes(merged_meta)
         total_size = sum(e.size for e in merged_meta.values() if e.size is not None)
-        diffs[TOTAL_VAR_SIZE_KEY % merge_hash] = _to_bytes(total_size)
+        diffs[TOTAL_VAR_SIZE_KEY % merge_hash] = to_bytes(total_size)
         if info is not None:
-            diffs[INFO_KEY % merge_hash] = _to_bytes(info)
+            diffs[INFO_KEY % merge_hash] = to_bytes(info)
 
         self.store.set_many(**diffs)
 
         # CAS HEAD from their_head to merge_hash
-        expected = _to_bytes(their_head)
-        new_head_bytes = _to_bytes(merge_hash)
+        expected = to_bytes(their_head)
+        new_head_bytes = to_bytes(merge_hash)
         if self.store.cas(branch_key, new_head_bytes, expected=expected):
             self._commit_keys = merged_keyset
             self._current_commit = merge_hash
@@ -591,7 +524,7 @@ class VersionedKV:
         head_bytes = self.store.get(BRANCH_HEAD % self._branch)
         if head_bytes is None:
             raise ValueError("No HEAD commit found for branch %s" % self._branch)
-        self._load_commit(_from_bytes(head_bytes), update_base=True)
+        self._load_commit(from_bytes(head_bytes), update_base=True)
 
     def checkout(
         self, commit_hash: str, *, branch: str | None = None
@@ -614,7 +547,7 @@ class VersionedKV:
         target = at or self._current_commit
         if at is not None and self.store.get(COMMIT_KEYSET % at) is None:
             raise ValueError(f"Commit '{at}' does not exist")
-        if not self.store.cas(branch_key, _to_bytes(target), expected=None):
+        if not self.store.cas(branch_key, to_bytes(target), expected=None):
             raise ValueError(f"Branch '{name}' already exists")
         return VersionedKV(self.store, commit_hash=target, branch=name)
 
@@ -634,18 +567,18 @@ class VersionedKV:
         if head_bytes is None:
             raise ValueError(f"Branch '{name}' does not exist")
         self._branch = name
-        self._load_commit(_from_bytes(head_bytes), update_base=True)
+        self._load_commit(from_bytes(head_bytes), update_base=True)
 
     def peek(self, key: str, *, branch: str) -> bytes | None:
         """Read a key from another branch's HEAD without switching."""
         head_bytes = self.store.get(BRANCH_HEAD % branch)
         if head_bytes is None:
             return None
-        commit_hash = _from_bytes(head_bytes)
+        commit_hash = from_bytes(head_bytes)
         keyset_bytes = self.store.get(COMMIT_KEYSET % commit_hash)
         if keyset_bytes is None:
             return None
-        keyset = _from_bytes(keyset_bytes)
+        keyset = from_bytes(keyset_bytes)
         content_hash = keyset.get(key)
         if content_hash is None:
             return None
@@ -655,7 +588,7 @@ class VersionedKV:
         """Reset HEAD to a specific commit."""
         if self.store.get(COMMIT_KEYSET % commit_hash) is None:
             return False
-        self.store.set(BRANCH_HEAD % self._branch, _to_bytes(commit_hash))
+        self.store.set(BRANCH_HEAD % self._branch, to_bytes(commit_hash))
         self._load_commit(commit_hash, update_base=True)
         return True
 
@@ -669,24 +602,7 @@ class VersionedKV:
     ) -> Iterable[str]:
         """Yield the commit chain from newest to oldest."""
         start = commit_hash or self._current_commit
-        if not all_parents:
-            current = start
-            while current is not None:
-                yield current
-                parents = self._load_parents(current)
-                current = parents[0] if parents else None
-        else:
-            visited: set[str] = set()
-            queue: deque[str] = deque([start])
-            while queue:
-                current = queue.popleft()
-                if current in visited:
-                    continue
-                visited.add(current)
-                yield current
-                for p in self._load_parents(current):
-                    if p not in visited:
-                        queue.append(p)
+        yield from walk_history(start, self._load_parents, all_parents=all_parents)
 
     @property
     def initial_commit(self) -> str:
@@ -718,26 +634,11 @@ class VersionedKV:
         info_bytes = self.store.get(INFO_KEY % target)
         if info_bytes is None:
             return None
-        return _from_bytes(info_bytes)
+        return from_bytes(info_bytes)
 
     def diff(self, commit_a: str, commit_b: str) -> DiffResult:
         """Compute key-level differences between two commits."""
-        keyset_a = self._load_keyset(commit_a)
-        keyset_b = self._load_keyset(commit_b)
-
-        keys_a = set(keyset_a.keys())
-        keys_b = set(keyset_b.keys())
-
-        added = keys_b - keys_a
-        removed = keys_a - keys_b
-        common = keys_a & keys_b
-        modified = frozenset(k for k in common if keyset_a[k] != keyset_b[k])
-
-        return DiffResult(
-            added=frozenset(added),
-            removed=frozenset(removed),
-            modified=modified,
-        )
+        return diff_keysets(self._load_keyset(commit_a), self._load_keyset(commit_b))
 
     def parents(self, commit_hash: str | None = None) -> tuple[str, ...]:
         """Get the direct parent commit(s) of a commit."""
@@ -786,14 +687,14 @@ class VersionedKV:
         keyset_bytes = self.store.get(COMMIT_KEYSET % commit_hash)
         if keyset_bytes is None:
             return {}
-        return _from_bytes(keyset_bytes)
+        return from_bytes(keyset_bytes)
 
     def _load_parents(self, commit_hash: str) -> tuple[str, ...]:
         """Load the parent tuple for a commit."""
         parent_bytes = self.store.get(PARENT_COMMIT % commit_hash)
         if parent_bytes is None:
             return ()
-        raw = _from_bytes(parent_bytes)
+        raw = from_bytes(parent_bytes)
         if raw is None:
             return ()
         if isinstance(raw, str):
@@ -818,12 +719,12 @@ class VersionedKV:
             self._base_commit = commit_hash
 
         keyset_bytes = self.store.get(COMMIT_KEYSET % commit_hash)
-        self._commit_keys = _from_bytes(keyset_bytes) if keyset_bytes else {}
+        self._commit_keys = from_bytes(keyset_bytes) if keyset_bytes else {}
 
         meta_bytes = self.store.get(META_KEY % commit_hash)
         if meta_bytes is not None:
             try:
-                self._meta = _meta_from_bytes(meta_bytes)
+                self._meta = meta_from_bytes(meta_bytes)
             except Exception:
                 self._meta = {}
         else:

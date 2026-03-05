@@ -1,18 +1,7 @@
-"""Versioned protocol and shared types."""
+"""Versioned protocol and types."""
 
-import json
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import Callable, Iterable, Protocol, runtime_checkable
-
-
-def _to_bytes(obj) -> bytes:
-    """Encode a JSON-safe Python object to bytes."""
-    return json.dumps(obj, separators=(",", ":")).encode()
-
-
-def _from_bytes(raw: bytes):
-    """Decode bytes to a Python object."""
-    return json.loads(raw)
 
 
 BytesMergeFn = Callable[[bytes | None, bytes | None, bytes | None], bytes]
@@ -43,25 +32,6 @@ class MergeResult:
 
     def __bool__(self) -> bool:
         return self.merged
-
-
-@dataclass
-class MetaEntry:
-    """Metadata for a single key in versioned state."""
-
-    last_touch: int
-    size: int | None
-    created_at: float
-
-
-def _meta_to_bytes(meta: dict[str, "MetaEntry"]) -> bytes:
-    """Serialize the per-key metadata dict to JSON bytes."""
-    return _to_bytes({k: asdict(v) for k, v in meta.items()})
-
-
-def _meta_from_bytes(raw: bytes) -> dict[str, "MetaEntry"]:
-    """Deserialize JSON bytes to a per-key metadata dict."""
-    return {k: MetaEntry(**v) for k, v in _from_bytes(raw).items()}
 
 
 @runtime_checkable

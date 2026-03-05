@@ -5,17 +5,11 @@ import time
 from dataclasses import dataclass
 from typing import Callable
 
-from .errors import ConcurrencyError
-from .kv.base import KVStore
-from .protocol import (
-    MergeResult,
-    MetaEntry,
-    _from_bytes,
-    _meta_from_bytes,
-    _meta_to_bytes,
-    _to_bytes,
-)
-from .versioned_kv import (
+from ..errors import ConcurrencyError
+from ..kv.base import KVStore
+from ..encoding import MetaEntry, from_bytes, meta_from_bytes, meta_to_bytes, to_bytes
+from .protocol import MergeResult
+from .kv import (
     BRANCH_HEAD,
     COMMIT_KEYSET,
     INFO_KEY,
@@ -23,11 +17,11 @@ from .versioned_kv import (
     PARENT_COMMIT,
     TOTAL_VAR_SIZE_KEY,
     VersionedKV,
-    _content_hash,
+    content_hash,
 )
 
 
-def _is_system_key(key: str) -> bool:
+def is_system_key(key: str) -> bool:
     """Check if a key is a system/protected key (starts with ``__``).
 
     Handles both direct keys (``"__foo__"``) and namespaced keys
@@ -75,7 +69,7 @@ class GCVersionedKV(VersionedKV):
         branch: str = "main",
         high_water_bytes: int,
         low_water_bytes: int | None = None,
-        is_protected: Callable[[str], bool] = _is_system_key,
+        is_protected: Callable[[str], bool] = is_system_key,
     ) -> None:
         super().__init__(store, commit_hash=commit_hash, branch=branch)
         if high_water_bytes <= 0:
@@ -199,7 +193,7 @@ class GCVersionedKV(VersionedKV):
             preview_keys[key] = protected_keys[key]
         for key in retained_data:
             preview_keys[key] = f"<pending:{key}>"
-        new_hash = _content_hash((), preview_keys, retained_data, info=info)
+        new_hash = content_hash((), preview_keys, retained_data, info=info)
 
         # Build the write batch
         diffs: dict[str, bytes] = {}
@@ -220,20 +214,20 @@ class GCVersionedKV(VersionedKV):
             diffs[new_vk] = value
 
         # Commit metadata
-        diffs[COMMIT_KEYSET % new_hash] = _to_bytes(new_commit_keys)
-        diffs[PARENT_COMMIT % new_hash] = _to_bytes([])
-        diffs[META_KEY % new_hash] = _meta_to_bytes(new_meta)
+        diffs[COMMIT_KEYSET % new_hash] = to_bytes(new_commit_keys)
+        diffs[PARENT_COMMIT % new_hash] = to_bytes([])
+        diffs[META_KEY % new_hash] = meta_to_bytes(new_meta)
         total_after = sum(e.size or 0 for e in new_meta.values())
-        diffs[TOTAL_VAR_SIZE_KEY % new_hash] = _to_bytes(total_after)
+        diffs[TOTAL_VAR_SIZE_KEY % new_hash] = to_bytes(total_after)
         if info is not None:
-            diffs[INFO_KEY % new_hash] = _to_bytes(info)
+            diffs[INFO_KEY % new_hash] = to_bytes(info)
 
         self.store.set_many(**diffs)
 
         # CAS HEAD to the new rebase commit
         branch_key = BRANCH_HEAD % self._branch
-        expected = _to_bytes(self._base_commit)
-        if not self.store.cas(branch_key, _to_bytes(new_hash), expected=expected):
+        expected = to_bytes(self._base_commit)
+        if not self.store.cas(branch_key, to_bytes(new_hash), expected=expected):
             raise ConcurrencyError("HEAD changed during rebase.")
 
         # Delete dropped blobs
@@ -274,7 +268,7 @@ class GCVersionedKV(VersionedKV):
                 head_bytes = self.store.get(key)
                 if head_bytes is None:
                     continue
-                branch_head = _from_bytes(head_bytes)
+                branch_head = from_bytes(head_bytes)
                 for commit in self.history(commit_hash=branch_head, all_parents=True):
                     reachable.add(commit)
 
@@ -294,7 +288,7 @@ class GCVersionedKV(VersionedKV):
             if meta_bytes is None:
                 continue
             try:
-                meta = _meta_from_bytes(meta_bytes)
+                meta = meta_from_bytes(meta_bytes)
                 if meta:
                     first_entry = next(iter(meta.values()), None)
                     if first_entry and first_entry.created_at < cutoff_time:
@@ -307,7 +301,7 @@ class GCVersionedKV(VersionedKV):
             keyset_bytes = self.store.get(COMMIT_KEYSET % orphan_hash)
             if keyset_bytes:
                 try:
-                    keyset = _from_bytes(keyset_bytes)
+                    keyset = from_bytes(keyset_bytes)
                     blob_keys = list(keyset.values())
                     if blob_keys:
                         self.store.remove_many(*blob_keys)
@@ -329,6 +323,6 @@ class GCVersionedKV(VersionedKV):
         if total_bytes is None:
             return default
         try:
-            return _from_bytes(total_bytes)
+            return from_bytes(total_bytes)
         except Exception:
             return default
