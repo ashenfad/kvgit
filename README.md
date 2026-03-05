@@ -1,17 +1,17 @@
 # kvgit 🔀
 
-Versioned key-value store with git-like commit, branch, and merge semantics.
+Git-like versioning for your data. Commits, branches, and three-way merges -- backed by a `MutableMapping[str, Any]` you can use like a dict.
 
-Values are `Any` (serialized via pickle by default). Commits are content-addressable. Branches are cheap. Merges are three-way with pluggable per-key conflict resolution.
+Built for applications that need rollback, branching, or multi-writer coordination on shared state -- from agent orchestration to stateful workflows.
 
 ## Features
 
-- **Commits** -- immutable, content-addressable snapshots
-- **Branches** -- named branch heads with CAS-based concurrency
-- **Three-way merge** -- auto-merges non-overlapping changes, pluggable merge functions for conflicts
-- **Merge functions** -- counters, last-writer-wins, or custom per-key merge logic
+- **Dict interface** -- `MutableMapping[str, Any]`, reads and writes work like a dict
+- **Commits** -- immutable, content-addressable snapshots with rollback
+- **Branches** -- cheap forks with CAS-based optimistic concurrency
+- **Three-way merge** -- auto-merges non-overlapping changes; pluggable per-key merge functions (counters, last-writer-wins, or custom) for conflicts
 - **Garbage collection** -- high/low water rebase drops cold keys automatically
-- **Namespaces** -- key-prefixed views with full read/write support
+- **Namespaces** -- key-prefixed views for isolating state across components
 - **Pluggable backends** -- in-memory, disk (via diskcache), git (via GitPython), or bring your own `KVStore`
 
 ## Install
@@ -27,34 +27,19 @@ pip install kvgit[git]       # adds git backend via GitPython (requires git on P
 ```python
 import kvgit
 
-# Create a store -- values are Any (pickle-serialized by default)
-s = kvgit.store()
+main = kvgit.store()
 
-s["user"] = "alice"
-s["score"] = 0
-s.commit()
+main["user"] = "alice"
+main["score"] = 0
+main.commit()
 
-first = s.current_commit
-
-# Update and commit again
-s["score"] = 100
-s.commit()
-print(s["score"])              # 100
-
-# Rollback to the first commit
-s.reset_to(first)
-print(s["score"])              # 0
-
-# Branching
-s["score"] = 50
-s.commit()
-
-dev = s.create_branch("dev")
+# Branch and diverge
+dev = main.create_branch("dev")
 dev["score"] = 999
 dev.commit()
 
-print(s["score"])              # 50  (main unchanged)
-print(dev["score"])            # 999 (dev branch)
+print(main["score"])  # 0   (main unchanged)
+print(dev["score"])   # 999 (dev branch)
 ```
 
 ## Development
