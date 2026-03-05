@@ -8,6 +8,7 @@ from .kv.memory import Memory
 from .staged import Staged
 from .versioned.gc import GCVersionedKV
 from .versioned.kv import VersionedKV
+from .versioned.protocol import Versioned
 
 
 def store(
@@ -42,7 +43,7 @@ def store(
     Returns:
         A ``Staged`` store instance.
     """
-    versioned: VersionedKV
+    versioned: Versioned
 
     if kind == "git":
         if (
@@ -55,7 +56,7 @@ def store(
             raise ValueError("path is required when kind='git'")
         from .versioned.gp import VersionedGP
 
-        versioned = VersionedGP(path, branch=branch)  # type: ignore[assignment]
+        versioned = VersionedGP(path, branch=branch)
     else:
         # Build KV backend
         backend: KVStore
