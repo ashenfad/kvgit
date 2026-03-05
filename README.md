@@ -19,7 +19,7 @@ Values are `Any` (serialized via pickle by default). Commits are content-address
 ```bash
 pip install kvgit            # in-memory only
 pip install kvgit[disk]      # adds disk backend via diskcache
-pip install kvgit[git]       # adds git backend via GitPython
+pip install kvgit[git]       # adds git backend via GitPython (requires git on PATH)
 ```
 
 ## Quick example
