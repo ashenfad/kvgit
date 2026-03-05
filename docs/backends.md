@@ -46,7 +46,7 @@ s = kvgit.store()
 # With disk persistence
 s = kvgit.store(kind="disk", path="/path/to/db")
 
-# With git backend (requires gitpython extra)
+# With git backend (requires gitpython extra and git on PATH)
 s = kvgit.store(kind="git", path="/path/to/repo")
 
 # With garbage collection (memory/disk only)
