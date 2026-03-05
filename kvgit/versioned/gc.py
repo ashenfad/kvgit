@@ -259,7 +259,13 @@ class GCVersionedKV(VersionedKV):
         )
 
     def clean_orphans(self, min_age: float = 3600) -> int:
-        """Remove orphaned commits unreachable from HEAD."""
+        """Remove orphaned commits unreachable from any branch HEAD.
+
+        Advisory: this is not atomic. Concurrent writers may create
+        commits between the mark and sweep phases. The ``min_age``
+        guard (default 1 hour) prevents recently created commits from
+        being falsely swept.
+        """
         # Mark phase: find all reachable commits across ALL branches
         reachable: set[str] = set()
         prefix = BRANCH_HEAD.replace("%s", "")
