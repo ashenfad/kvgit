@@ -1,19 +1,14 @@
 # kvgit 🔀
 
-Git-like versioning for your data. Commits, branches, and three-way merges -- backed by a `MutableMapping[str, Any]` you can use like a dict.
+Git-style versioning for your data. Commits, branches, and merges -- backed by a dict-like `MutableMapping`.
 
-Built for applications that need rollback, branching, or multi-writer coordination on shared state -- from agent orchestration to stateful workflows.
-
-## Features
-
-| | |
+| Features | Description |
 |---|---|
 | **Dict interface** | `MutableMapping[str, Any]` -- reads and writes work like a dict |
 | **Commits** | Immutable, content-addressable snapshots with rollback |
 | **Branches** | Cheap forks with CAS-based optimistic concurrency |
-| **Three-way merge** | Auto-merges non-overlapping changes; pluggable per-key merge functions for conflicts |
+| **Three-way merge** | Auto-merges non-overlapping changes; pluggable merge fns for conflicts |
 | **Garbage collection** | High/low water rebase drops cold keys automatically |
-| **Namespaces** | Key-prefixed views for isolating state across components |
 | **Pluggable backends** | In-memory, disk (diskcache), git (GitPython), or bring your own `KVStore` |
 
 ## Install
