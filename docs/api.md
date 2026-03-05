@@ -25,9 +25,9 @@ kvgit.store(
 | `branch` | `str` | `"main"` | Branch name |
 | `encoder` | `Callable[[Any], bytes]` | `pickle.dumps` | Value encoder |
 | `decoder` | `Callable[[bytes], Any]` | `pickle.loads` | Value decoder |
-| `high_water_bytes` | `int \| None` | `None` | Enable GC. Not supported with `"git"`. |
-| `low_water_bytes` | `int \| None` | `None` | GC low-water target. Defaults to 80% of high water. Not supported with `"git"`. |
-| `is_protected` | `Callable[[str], bool] \| None` | `None` | Keys GC should never drop. Defaults to keys starting with `__`. Only used when `high_water_bytes` is set. Not supported with `"git"`. |
+| `high_water_bytes` | `int \| None` | `None` | Enable eviction. Not supported with `"git"`. |
+| `low_water_bytes` | `int \| None` | `None` | Eviction low-water target. Defaults to 80% of high water. Not supported with `"git"`. |
+| `is_protected` | `Callable[[str], bool] \| None` | `None` | Keys that should never be evicted. Defaults to keys starting with `__`. Only used when `high_water_bytes` is set. Not supported with `"git"`. |
 
 ---
 
@@ -241,7 +241,7 @@ BytesMergeFn = Callable[[bytes | None, bytes | None, bytes | None], bytes]
 
 ### MetaEntry
 
-Per-key metadata used by GC.
+Per-key metadata used for eviction.
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -251,7 +251,7 @@ Per-key metadata used by GC.
 
 ### RebaseResult
 
-Frozen dataclass returned by GC rebase operations.
+Frozen dataclass returned by eviction rebase operations.
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -335,7 +335,7 @@ All methods from the `Versioned` protocol are implemented. Additional:
 
 ## GCVersionedKV
 
-Extends `VersionedKV` with automatic garbage collection via rebase.
+Extends `VersionedKV` with automatic eviction via rebase. When total serialized value size exceeds the high-water threshold, the least-recently-accessed keys are evicted until the size drops to the low-water mark.
 
 ```python
 from kvgit.versioned.gc import GCVersionedKV
@@ -349,19 +349,19 @@ v = GCVersionedKV(high_water_bytes=10_000, low_water_bytes=5_000)
 | `store` | `KVStore \| None` | `None` | Backend. |
 | `commit_hash` | `str \| None` | `None` | Resume from this commit. |
 | `branch` | `str` | `"main"` | Branch name. |
-| `high_water_bytes` | `int` | (required) | Rebase triggers above this. |
-| `low_water_bytes` | `int \| None` | `None` | Drop keys until at or below this. Defaults to 80% of high water. |
-| `is_protected` | `Callable[[str], bool]` | `is_system_key` | Returns `True` for keys GC should never drop. Default protects `__`-prefixed keys. |
+| `high_water_bytes` | `int` | (required) | Eviction triggers above this. |
+| `low_water_bytes` | `int \| None` | `None` | Evict keys until at or below this. Defaults to 80% of high water. |
+| `is_protected` | `Callable[[str], bool]` | `is_system_key` | Returns `True` for keys that should never be evicted. Default protects `__`-prefixed keys. |
 
 ### Methods
 
 #### `commit(...) -> MergeResult`
 
-Same as `VersionedKV.commit()`, but automatically runs GC afterward if above high water.
+Same as `VersionedKV.commit()`, but automatically runs eviction afterward if above high water.
 
 #### `maybe_rebase() -> RebaseResult`
 
-Check size and rebase if above high water. Returns a no-op result if below.
+Check size and evict if above high water. Returns a no-op result if below.
 
 #### `rebase(keep_keys=None, *, info=None) -> RebaseResult`
 
@@ -369,7 +369,7 @@ Force a rebase. Creates a fresh root commit with retained keys.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `keep_keys` | `set[str] \| None` | `None` | Retain exactly these keys (plus protected). Otherwise uses high/low water strategy. |
+| `keep_keys` | `set[str] \| None` | `None` | Retain exactly these keys (plus protected). Otherwise uses high/low water eviction strategy. |
 | `info` | `dict \| None` | `None` | Metadata for the rebase commit. |
 
 #### `clean_orphans(min_age=3600) -> int`

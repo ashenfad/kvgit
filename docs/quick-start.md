@@ -275,14 +275,14 @@ s.get("agent/worker/task")  # "fetch"
 
 ---
 
-## Garbage collection
+## Eviction
 
-Bound the store's size with high/low water marks. When total serialized value size exceeds the threshold, the coldest (least-recently-accessed) keys are dropped automatically.
+Bound the store's size with high/low water marks. When total serialized value size exceeds the high-water threshold, the least-recently-accessed keys are evicted automatically until the size drops to the low-water mark.
 
 ```python
 s = kvgit.store(high_water_bytes=10_000)
 
-# GC runs automatically on commit() when above high water
+# Eviction runs automatically on commit() when above high water
 s["big"] = "x" * 5000
 s.commit()
 ```
@@ -293,7 +293,7 @@ Customize the low-water target (defaults to 80% of high water):
 s = kvgit.store(high_water_bytes=10_000, low_water_bytes=5_000)
 ```
 
-Keys starting with `__` are protected from GC by default. Customize with `is_protected`:
+Keys starting with `__` are protected from eviction by default. Customize with `is_protected`:
 
 ```python
 s = kvgit.store(
@@ -302,7 +302,7 @@ s = kvgit.store(
 )
 ```
 
-GC is not supported with the git backend.
+Eviction is not supported with the git backend.
 
 ---
 
