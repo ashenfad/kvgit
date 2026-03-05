@@ -418,6 +418,18 @@ class VersionedGP:
                 merge_errors[key] = e
 
         if conflicts:
+            if saved_state is not None:
+                self._restore_state(saved_state)
+            if on_conflict == "abandon":
+                result = MergeResult(
+                    merged=False,
+                    commit=None,
+                    strategy="three_way",
+                    auto_merged_keys=(),
+                    carried_keys=(),
+                )
+                self.last_merge_result = result
+                return result
             raise MergeConflict(conflicts, merge_errors)
 
         parents = [their_head, self._current_commit]
@@ -493,7 +505,8 @@ class VersionedGP:
         target = at or self._current_commit
         if at is not None:
             try:
-                Commit(self.repo, binascii.unhexlify(at))
+                c = Commit(self.repo, binascii.unhexlify(at))
+                c.tree  # force load to verify commit exists
             except (BadObject, ValueError):
                 raise ValueError(f"Commit '{at}' does not exist")
 
@@ -533,7 +546,8 @@ class VersionedGP:
     def reset_to(self, commit_hash: str) -> bool:
         """Reset HEAD to a specific commit."""
         try:
-            Commit(self.repo, binascii.unhexlify(commit_hash))
+            c = Commit(self.repo, binascii.unhexlify(commit_hash))
+            c.tree  # force load to verify commit exists
         except (BadObject, ValueError):
             return False
         self.repo.git.update_ref(f"refs/heads/{self._branch}", commit_hash)
@@ -573,9 +587,9 @@ class VersionedGP:
         target = commit_hash or self._current_commit
         try:
             c = Commit(self.repo, binascii.unhexlify(target))
+            msg = c.message
         except (BadObject, ValueError):
             return None
-        msg = c.message
         if "\n\n" not in msg:
             return None
         info_part = msg.split("\n\n", 1)[1].strip()
