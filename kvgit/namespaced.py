@@ -25,6 +25,7 @@ class Namespaced(MutableMapping[str, Any]):
                 f"Namespaced requires a MutableMapping, not {type(store).__name__}"
             )
 
+        self.namespace: str
         if isinstance(store, Namespaced):
             self.namespace = f"{store.namespace}/{namespace}"
             self._store: MutableMapping[str, Any] = store._store
