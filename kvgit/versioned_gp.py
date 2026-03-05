@@ -528,7 +528,7 @@ class VersionedGP:
         if name not in self.repo.heads:
             raise ValueError(f"Branch '{name}' does not exist")
 
-        git.Head.delete(self.repo, self.repo.heads[name])
+        git.Head.delete(self.repo, self.repo.heads[name], force=True)
 
     def switch_branch(self, name: str) -> None:
         """Switch this instance to a different branch in-place."""
