@@ -2,7 +2,7 @@
 
 ## Store Interface
 
-The store interface implements `MutableMapping[str, Any]` semantics. `Staged`, `Live`, and `Namespaced` all support these methods:
+The store interface implements `MutableMapping[str, Any]` semantics. `Staged` and `Namespaced` both support these methods:
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
@@ -150,31 +150,9 @@ At commit time, Staged wraps these into bytes-level merge functions automaticall
 
 ---
 
-## Live
-
-`Live` is an in-memory store with no versioning. Writes take effect immediately. Backed by a plain `dict[str, Any]`. Satisfies the `Store` protocol (not `VersionedStore`).
-
-```python
-from kvgit import Live
-
-s = Live()
-s["k"] = "v"
-s["k"]  # "v" (immediately available)
-```
-
-### Construction
-
-```python
-Live()
-```
-
-No parameters. Memory-only.
-
----
-
 ## Namespaced
 
-`Namespaced` provides a key-prefixed view over any `Store`. All keys are transparently prefixed with `namespace/`. Implements `MutableMapping[str, Any]` and satisfies the `Store` protocol.
+`Namespaced` provides a key-prefixed view over any `MutableMapping[str, Any]`. All keys are transparently prefixed with `namespace/`.
 
 Versioning operations (commit, reset, branching) are performed on the underlying store directly:
 
@@ -199,7 +177,7 @@ s.commit()           # commit is a store-level operation
 ### Construction
 
 ```python
-Namespaced(store: Store, namespace: str)
+Namespaced(store: MutableMapping[str, Any], namespace: str)
 ```
 
 Namespace names must not contain `/`. Nesting is supported by wrapping another `Namespaced`:
