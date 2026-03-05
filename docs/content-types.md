@@ -83,7 +83,7 @@ s.set_merge_fn("tags", merge_lists)
 For power users working directly with `VersionedKV` (bytes-level API):
 
 ```python
-from kvgit.protocol import BytesMergeFn
+from kvgit.versioned.protocol import BytesMergeFn
 
 BytesMergeFn = Callable[[bytes | None, bytes | None, bytes | None], bytes]
 ```
