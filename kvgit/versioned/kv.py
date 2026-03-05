@@ -7,7 +7,7 @@ from collections import deque
 from typing import Iterable
 
 from ..encoding import MetaEntry, from_bytes, meta_from_bytes, meta_to_bytes, to_bytes
-from ..errors import ConcurrencyError
+from ..errors import ConcurrencyError, MergeConflict
 from ..kv.base import KVStore
 from ..kv.memory import Memory
 from .protocol import BytesMergeFn, DiffResult, MergeResult
@@ -421,16 +421,31 @@ class VersionedKV:
         effective_default = default_merge or self._default_merge
 
         # Resolve the merge
-        resolution = resolve_merge(
-            lca_keyset=self._load_keyset(lca),
-            our_keyset=self._load_keyset(self._current_commit),
-            their_keyset=self._load_keyset(their_head),
-            our_diff=our_diff,
-            their_diff=their_diff,
-            blob_reader=lambda cid: self.store.get(cid),
-            merge_fns=effective_fns,
-            default_merge=effective_default,
-        )
+        try:
+            resolution = resolve_merge(
+                lca_keyset=self._load_keyset(lca),
+                our_keyset=self._load_keyset(self._current_commit),
+                their_keyset=self._load_keyset(their_head),
+                our_diff=our_diff,
+                their_diff=their_diff,
+                blob_reader=lambda cid: self.store.get(cid),
+                merge_fns=effective_fns,
+                default_merge=effective_default,
+            )
+        except MergeConflict:
+            if saved_state is not None:
+                self._restore_state(saved_state)
+            if on_conflict == "abandon":
+                result = MergeResult(
+                    merged=False,
+                    commit=None,
+                    strategy="three_way",
+                    auto_merged_keys=(),
+                    carried_keys=(),
+                )
+                self.last_merge_result = result
+                return result
+            raise
         merged_keyset = resolution.merged_keyset
         merged_values = resolution.merged_values
         auto_merged = resolution.auto_merged_keys
