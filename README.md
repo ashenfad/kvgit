@@ -6,13 +6,15 @@ Built for applications that need rollback, branching, or multi-writer coordinati
 
 ## Features
 
-- **Dict interface** -- `MutableMapping[str, Any]`, reads and writes work like a dict
-- **Commits** -- immutable, content-addressable snapshots with rollback
-- **Branches** -- cheap forks with CAS-based optimistic concurrency
-- **Three-way merge** -- auto-merges non-overlapping changes; pluggable per-key merge functions (counters, last-writer-wins, or custom) for conflicts
-- **Garbage collection** -- high/low water rebase drops cold keys automatically
-- **Namespaces** -- key-prefixed views for isolating state across components
-- **Pluggable backends** -- in-memory, disk (via diskcache), git (via GitPython), or bring your own `KVStore`
+| | |
+|---|---|
+| **Dict interface** | `MutableMapping[str, Any]` -- reads and writes work like a dict |
+| **Commits** | Immutable, content-addressable snapshots with rollback |
+| **Branches** | Cheap forks with CAS-based optimistic concurrency |
+| **Three-way merge** | Auto-merges non-overlapping changes; pluggable per-key merge functions for conflicts |
+| **Garbage collection** | High/low water rebase drops cold keys automatically |
+| **Namespaces** | Key-prefixed views for isolating state across components |
+| **Pluggable backends** | In-memory, disk (diskcache), git (GitPython), or bring your own `KVStore` |
 
 ## Install
 
