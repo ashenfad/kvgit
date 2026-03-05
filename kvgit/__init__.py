@@ -4,15 +4,10 @@ from .content_types import MergeFn, counter, last_writer_wins
 from .errors import ConcurrencyError, MergeConflict
 from .live import Live
 from .namespaced import Namespaced
-from .protocol import MergeResult, Versioned
+from .versioned.protocol import MergeResult, Versioned
 from .staged import Staged
 from .store import store
-from .versioned_kv import VersionedKV
-
-try:
-    from .versioned_gp import VersionedGP
-except ImportError:
-    pass
+from .versioned.kv import VersionedKV
 
 __all__ = [
     "ConcurrencyError",
@@ -23,9 +18,15 @@ __all__ = [
     "Namespaced",
     "Staged",
     "Versioned",
-    "VersionedGP",
     "VersionedKV",
     "counter",
     "last_writer_wins",
     "store",
 ]
+
+try:
+    from .versioned.gp import VersionedGP
+
+    __all__ += ["VersionedGP"]
+except ImportError:
+    pass

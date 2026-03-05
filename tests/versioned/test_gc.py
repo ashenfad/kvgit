@@ -3,10 +3,10 @@
 import pytest
 
 from kvgit import ConcurrencyError
-from kvgit.gc_kv import GCVersionedKV as GCVersioned
+from kvgit.versioned.gc import GCVersionedKV as GCVersioned
 from kvgit.kv.memory import Memory
-from kvgit.versioned_kv import BRANCH_HEAD
-from kvgit.protocol import _to_bytes
+from kvgit.versioned.kv import BRANCH_HEAD
+from kvgit.encoding import to_bytes
 
 
 class TestGCNoOp:
@@ -151,7 +151,7 @@ class TestGCValidation:
         v.commit({"a": b"data"})
 
         # Advance HEAD behind v's back
-        store.set(BRANCH_HEAD % "main", _to_bytes("bogus_hash"))
+        store.set(BRANCH_HEAD % "main", to_bytes("bogus_hash"))
 
         with pytest.raises(ConcurrencyError, match="HEAD changed during rebase"):
             v.rebase()
