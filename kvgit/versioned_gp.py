@@ -112,9 +112,11 @@ class VersionedGP:
 
     @property
     def initial_commit(self) -> str:
-        """The root commit hash."""
-        commits = list(self.history())
-        return commits[-1]
+        """The root commit hash (cached after first access)."""
+        if not hasattr(self, "_initial_commit"):
+            commits = list(self.history())
+            self._initial_commit = commits[-1]
+        return self._initial_commit
 
     # -- Read operations --
 
