@@ -40,5 +40,12 @@ git = ["gitpython>=3.1"]
 all = ["diskcache", "gitpython>=3.1"]
 dev = ["pytest", "diskcache", "gitpython>=3.1", "ruff"]
 
+[tool.mypy]
+warn_unused_configs = true
+
+[[tool.mypy.overrides]]
+module = ["diskcache", "git", "git.*", "gitdb"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
