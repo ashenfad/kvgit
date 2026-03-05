@@ -66,9 +66,7 @@ uv run pytest
 
 ## Documentation
 
-See [`docs/`](docs/) for detailed API documentation:
+See [`docs/`](docs/) for detailed documentation:
 
-- [Core API (Versioned)](docs/versioned.md) -- commits, reads, writes, merging, branching, history
-- [Merge Functions](docs/content-types.md) -- per-key merge logic for conflict resolution
-- [Garbage Collection](docs/gc.md) -- GCVersionedKV, rebase, orphan cleanup
-- [Backends & Namespaces](docs/backends.md) -- KVStore interface, Memory, Disk, Store, Staged, Live, Namespaced
+- [Quick Start](docs/quick-start.md) -- common patterns with runnable examples
+- [API Reference](docs/api.md) -- full reference for all classes, methods, and types
