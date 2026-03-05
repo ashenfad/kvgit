@@ -58,7 +58,7 @@ print(s.get("c"))  # "zzz..." (retained)
 For direct composition (custom backends, shared stores, bytes-level API), use `GCVersionedKV` directly. It extends `VersionedKV` with automatic garbage collection via rebase.
 
 ```python
-from kvgit.gc_kv import GCVersionedKV
+from kvgit.versioned.gc import GCVersionedKV
 
 v = GCVersionedKV(high_water_bytes=10_000)
 
@@ -71,7 +71,7 @@ store = Memory()
 v = GCVersionedKV(store, branch="main", high_water_bytes=50_000)
 ```
 
-### `GCVersionedKV(store=None, *, commit_hash=None, branch="main", high_water_bytes, low_water_bytes=None, is_protected=_is_system_key)`
+### `GCVersionedKV(store=None, *, commit_hash=None, branch="main", high_water_bytes, low_water_bytes=None, is_protected=is_system_key)`
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -80,12 +80,12 @@ v = GCVersionedKV(store, branch="main", high_water_bytes=50_000)
 | `branch` | `str` | `"main"` | Branch name. |
 | `high_water_bytes` | `int` | (required) | Rebase triggers when total size exceeds this. |
 | `low_water_bytes` | `int \| None` | `None` | Rebase drops keys until total is at or below this. Defaults to 80% of high water. |
-| `is_protected` | `Callable[[str], bool]` | `_is_system_key` | Returns `True` for keys GC should never drop. Default protects keys starting with `__`. |
+| `is_protected` | `Callable[[str], bool]` | `is_system_key` | Returns `True` for keys GC should never drop. Default protects keys starting with `__`. |
 
 Wrap in `Staged` for the `MutableMapping[str, Any]` interface:
 
 ```python
-from kvgit.gc_kv import GCVersionedKV
+from kvgit.versioned.gc import GCVersionedKV
 from kvgit import Staged
 
 v = GCVersionedKV(high_water_bytes=10_000)
