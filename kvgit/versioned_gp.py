@@ -168,6 +168,9 @@ class VersionedGP:
         return istream.hexsha
 
     def _create_tree(self, keyset: dict[str, str]) -> str:
+        # Git tree objects are a sequence of entries sorted by name.
+        # Each entry is: "<mode> <name>\0<20-byte binary SHA>"
+        # We use mode 100644 (regular file) for all entries.
         tree_data = bytearray()
         entries = []
         for key, hexsha in keyset.items():
