@@ -5,7 +5,6 @@ from collections.abc import MutableMapping
 import pytest
 
 from kvgit import (
-    Live,
     MergeResult,
     Namespaced,
     Staged,
@@ -235,10 +234,10 @@ class TestNamespacedProtocol:
         ns = Namespaced(s, "app")
         assert isinstance(ns, MutableMapping)
 
-    def test_wraps_live(self):
-        """Namespaced can wrap a Live store."""
-        live = Live()
-        ns = Namespaced(live, "app")
+    def test_wraps_dict(self):
+        """Namespaced can wrap a plain dict."""
+        d: dict = {}
+        ns = Namespaced(d, "app")
         ns["k"] = "v"
         assert ns["k"] == "v"
-        assert live.get("app/k") == "v"
+        assert d["app/k"] == "v"
