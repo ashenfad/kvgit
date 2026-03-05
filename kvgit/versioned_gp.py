@@ -119,6 +119,7 @@ class VersionedGP:
     # -- Read operations --
 
     def get(self, key: str) -> bytes | None:
+        """Get a value from the current commit."""
         hexsha = self._commit_keys.get(key)
         if hexsha is None:
             return None
@@ -129,6 +130,7 @@ class VersionedGP:
         return blob.data_stream.read()
 
     def get_many(self, *keys: str) -> dict[str, bytes]:
+        """Get multiple values from the current commit."""
         result = {}
         for key in keys:
             val = self.get(key)
@@ -137,6 +139,7 @@ class VersionedGP:
         return result
 
     def keys(self) -> Iterable[str]:
+        """All keys in the current commit."""
         return self._commit_keys.keys()
 
     def __contains__(self, key: str) -> bool:
@@ -145,9 +148,11 @@ class VersionedGP:
     # -- Merge function registry --
 
     def set_merge_fn(self, key: str, fn: BytesMergeFn) -> None:
+        """Register a merge function for a specific key."""
         self._merge_fns[key] = fn
 
     def set_default_merge(self, fn: BytesMergeFn) -> None:
+        """Register a default merge function for unregistered keys."""
         self._default_merge = fn
 
     # -- Write operations --
@@ -225,6 +230,25 @@ class VersionedGP:
         default_merge: BytesMergeFn | None = None,
         info: dict | None = None,
     ) -> MergeResult:
+        """Commit changes and atomically advance HEAD.
+
+        If HEAD has diverged, performs a three-way merge.
+
+        Args:
+            updates: Key-value pairs to add or update (bytes values).
+            removals: Keys to remove.
+            on_conflict: ``'raise'`` (default) or ``'abandon'``.
+            merge_fns: Per-key merge functions (override instance-level).
+            default_merge: Default merge function (override instance-level).
+            info: Optional metadata dict for the commit.
+
+        Returns:
+            A ``MergeResult`` (truthy when committed, falsy if abandoned).
+
+        Raises:
+            ConcurrencyError: If ``on_conflict='raise'`` and CAS fails.
+            MergeConflict: If keys conflict with no merge function.
+        """
         if not updates and not removals and info is None:
             result = MergeResult(
                 merged=True,
@@ -443,6 +467,7 @@ class VersionedGP:
             )
 
     def refresh(self) -> None:
+        """Reload state from HEAD."""
         head = self.latest_head
         if head is None:
             raise ValueError(f"No HEAD commit found for branch {self._branch}")
@@ -451,6 +476,7 @@ class VersionedGP:
     def checkout(
         self, commit_hash: str, *, branch: str | None = None
     ) -> "VersionedGP | None":
+        """Return a new VersionedGP at a specific commit, or None if missing."""
         try:
             Commit(self.repo, binascii.unhexlify(commit_hash))
             return VersionedGP(
@@ -460,6 +486,10 @@ class VersionedGP:
             return None
 
     def create_branch(self, name: str, *, at: str | None = None) -> "VersionedGP":
+        """Fork a commit onto a new branch.
+
+        Returns a new ``VersionedGP`` on the new branch.
+        """
         target = at or self._current_commit
         if at is not None:
             try:
@@ -474,6 +504,7 @@ class VersionedGP:
         return VersionedGP(self.repo_path, commit_hash=target, branch=name)
 
     def delete_branch(self, name: str) -> None:
+        """Delete a branch by name."""
         if name == self._branch:
             raise ValueError("Cannot delete the current branch")
         if name not in self.repo.heads:
@@ -482,12 +513,14 @@ class VersionedGP:
         git.Head.delete(self.repo, self.repo.heads[name])
 
     def switch_branch(self, name: str) -> None:
+        """Switch this instance to a different branch in-place."""
         if name not in self.repo.heads:
             raise ValueError(f"Branch '{name}' does not exist")
         self._branch = name
         self._load_commit(self.repo.heads[name].commit.hexsha, update_base=True)
 
     def peek(self, key: str, *, branch: str) -> bytes | None:
+        """Read a key from another branch's HEAD without switching."""
         if branch not in self.repo.heads:
             return None
         commit_hash = self.repo.heads[branch].commit.hexsha
@@ -498,6 +531,7 @@ class VersionedGP:
         return self._read_blob(hexsha)
 
     def reset_to(self, commit_hash: str) -> bool:
+        """Reset HEAD to a specific commit."""
         try:
             Commit(self.repo, binascii.unhexlify(commit_hash))
         except (BadObject, ValueError):
@@ -509,6 +543,7 @@ class VersionedGP:
     def history(
         self, commit_hash: str | None = None, *, all_parents: bool = False
     ) -> Iterable[str]:
+        """Yield the commit chain from newest to oldest."""
         start = commit_hash or self._current_commit
         if not all_parents:
             current = start
@@ -530,9 +565,11 @@ class VersionedGP:
                         queue.append(p)
 
     def list_branches(self) -> list[str]:
+        """List all branch names."""
         return [h.name for h in self.repo.heads]
 
     def commit_info(self, commit_hash: str | None = None) -> dict | None:
+        """Retrieve the info dict for a commit, or None if none was stored."""
         target = commit_hash or self._current_commit
         try:
             c = Commit(self.repo, binascii.unhexlify(target))
@@ -547,6 +584,7 @@ class VersionedGP:
         return json.loads(info_part)
 
     def diff(self, commit_a: str, commit_b: str) -> DiffResult:
+        """Compute key-level differences between two commits."""
         keyset_a = self._load_keyset(commit_a)
         keyset_b = self._load_keyset(commit_b)
 
@@ -565,6 +603,7 @@ class VersionedGP:
         )
 
     def parents(self, commit_hash: str | None = None) -> tuple[str, ...]:
+        """Get the direct parent commit(s) of a commit."""
         target = commit_hash or self._current_commit
         return self._load_parents(target)
 
