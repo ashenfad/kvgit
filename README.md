@@ -39,6 +39,10 @@ print(main["score"])  # 0   (main unchanged)
 print(dev["score"])   # 999 (dev branch)
 ```
 
+## Part of the agex stack
+
+kvgit provides versioned agent memory in [agex](https://github.com/ashenfad/agex) with branching and rollback. It also works as a versioned backing store for [monkeyfs](https://github.com/ashenfad/monkeyfs) virtual filesystems -- pass a `Staged` instance anywhere a dict is expected.
+
 ## Development
 
 ```bash
