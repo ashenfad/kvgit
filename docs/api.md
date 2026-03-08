@@ -487,4 +487,4 @@ store = IndexedDB(db_name="myapp", store_name="state")
 | `db_name` | `str` | `"kvgit"` | IndexedDB database name. Each name is an independent store, persisted across page reloads. |
 | `store_name` | `str` | `"kv"` | Object store name within the database. |
 
-Requires JSPI (JavaScript Promise Integration) -- Chrome 133+, Firefox and Node with flags. CAS is atomic across Web Workers sharing the same database.
+Requires JSPI (JavaScript Promise Integration). CAS is atomic across Web Workers sharing the same database.

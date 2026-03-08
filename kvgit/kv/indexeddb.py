@@ -12,9 +12,8 @@ Pyodide runtime (the import is guarded in ``kvgit.kv.__init__``).
 Within Pyodide, two conditions must hold:
 
 1. **JSPI enabled** — The browser must support JavaScript Promise
-   Integration (Chrome 133+, Firefox with flag, Node with flag).
-   JSPI allows ``run_sync()`` to block on JS promises without blocking
-   the browser event loop.
+   Integration. JSPI allows ``run_sync()`` to block on JS promises
+   without blocking the browser event loop.
 
 2. **Async entry point** — The Python call stack must have been entered
    via ``pyodide.runPythonAsync()``, an async Python function, or
@@ -49,9 +48,18 @@ the handler is set, causing a deadlock.
 from typing import Iterable, Mapping
 
 from pyodide.ffi import create_proxy, run_sync, to_js  # type: ignore[import-not-found]
-from js import Promise, indexedDB  # type: ignore[import-not-found]
+from js import Promise, indexedDB, undefined  # type: ignore[import-not-found]
 
 from .base import KVStore
+
+
+def _promise(executor):
+    """Create a JS Promise, destroying the executor proxy after use."""
+    proxy = create_proxy(executor)
+    try:
+        return Promise.new(proxy)
+    finally:
+        proxy.destroy()
 
 
 async def _idb_open(db_name: str, store_name: str):
@@ -75,7 +83,7 @@ async def _idb_open(db_name: str, store_name: str):
         request.onsuccess = on_success
         request.onerror = on_error
 
-    return await Promise.new(create_proxy(_executor))
+    return await _promise(_executor)
 
 
 def _idb_request_promise(request):
@@ -89,7 +97,7 @@ def _idb_request_promise(request):
         request.onsuccess = lambda e: resolve(e.target.result)
         request.onerror = lambda e: reject(e.target.error)
 
-    return Promise.new(create_proxy(_executor))
+    return _promise(_executor)
 
 
 async def _idb_request(request):
@@ -105,17 +113,12 @@ async def _idb_tx_complete(tx):
         tx.onerror = lambda e: reject(e.target.error)
         tx.onabort = lambda e: reject(e.target.error)
 
-    await Promise.new(create_proxy(_executor))
+    await _promise(_executor)
 
 
 def _to_bytes(js_value) -> bytes | None:
     """Convert a JS result to bytes, or None if absent."""
-    if js_value is None:
-        return None
-    try:
-        if js_value.constructor.name == "undefined":
-            return None
-    except AttributeError:
+    if js_value is None or js_value is undefined:
         return None
     return bytes(js_value)
 
@@ -214,7 +217,7 @@ class IndexedDB(KVStore):
                 cursor_request.onsuccess = on_success
                 cursor_request.onerror = on_error
 
-            await Promise.new(create_proxy(_executor))
+            await _promise(_executor)
 
         run_sync(_op())
         return results
@@ -285,7 +288,7 @@ class IndexedDB(KVStore):
                 tx.onerror = lambda e: reject(e.target.error)
                 tx.onabort = lambda e: reject(e.target.error)
 
-            await Promise.new(create_proxy(_executor))
+            await _promise(_executor)
 
         run_sync(_op())
         return cas_result[0]
