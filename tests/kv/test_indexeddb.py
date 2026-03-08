@@ -21,7 +21,7 @@ from the default ``uv run pytest`` run. To execute them:
 
 Requires:
     - pytest-pyodide (``uv pip install pytest-pyodide``)
-    - Chrome with JSPI support (Chrome 133+)
+    - Chrome with JSPI support
     - A matching chromedriver on PATH (Selenium will auto-download one if needed)
 """
 
@@ -36,8 +36,11 @@ except ImportError:
 @run_in_pyodide(packages=["micropip"])
 async def test_set_get(selenium_jspi):
     import micropip
+    from pyodide.http import pyfetch
 
-    await micropip.install("./kvgit-0.1.5-py3-none-any.whl", deps=False)
+    resp = await pyfetch("./_kvgit_whl.txt")
+    whl = (await resp.string()).strip()
+    await micropip.install(f"./{whl}", deps=False)
 
     from kvgit.kv.indexeddb import IndexedDB
 
@@ -49,8 +52,11 @@ async def test_set_get(selenium_jspi):
 @run_in_pyodide(packages=["micropip"])
 async def test_get_missing(selenium_jspi):
     import micropip
+    from pyodide.http import pyfetch
 
-    await micropip.install("./kvgit-0.1.5-py3-none-any.whl", deps=False)
+    resp = await pyfetch("./_kvgit_whl.txt")
+    whl = (await resp.string()).strip()
+    await micropip.install(f"./{whl}", deps=False)
 
     from kvgit.kv.indexeddb import IndexedDB
 
@@ -61,8 +67,11 @@ async def test_get_missing(selenium_jspi):
 @run_in_pyodide(packages=["micropip"])
 async def test_contains(selenium_jspi):
     import micropip
+    from pyodide.http import pyfetch
 
-    await micropip.install("./kvgit-0.1.5-py3-none-any.whl", deps=False)
+    resp = await pyfetch("./_kvgit_whl.txt")
+    whl = (await resp.string()).strip()
+    await micropip.install(f"./{whl}", deps=False)
 
     from kvgit.kv.indexeddb import IndexedDB
 
@@ -75,8 +84,11 @@ async def test_contains(selenium_jspi):
 @run_in_pyodide(packages=["micropip"])
 async def test_keys(selenium_jspi):
     import micropip
+    from pyodide.http import pyfetch
 
-    await micropip.install("./kvgit-0.1.5-py3-none-any.whl", deps=False)
+    resp = await pyfetch("./_kvgit_whl.txt")
+    whl = (await resp.string()).strip()
+    await micropip.install(f"./{whl}", deps=False)
 
     from kvgit.kv.indexeddb import IndexedDB
 
@@ -89,8 +101,11 @@ async def test_keys(selenium_jspi):
 @run_in_pyodide(packages=["micropip"])
 async def test_items(selenium_jspi):
     import micropip
+    from pyodide.http import pyfetch
 
-    await micropip.install("./kvgit-0.1.5-py3-none-any.whl", deps=False)
+    resp = await pyfetch("./_kvgit_whl.txt")
+    whl = (await resp.string()).strip()
+    await micropip.install(f"./{whl}", deps=False)
 
     from kvgit.kv.indexeddb import IndexedDB
 
@@ -103,8 +118,11 @@ async def test_items(selenium_jspi):
 @run_in_pyodide(packages=["micropip"])
 async def test_set_many_get_many(selenium_jspi):
     import micropip
+    from pyodide.http import pyfetch
 
-    await micropip.install("./kvgit-0.1.5-py3-none-any.whl", deps=False)
+    resp = await pyfetch("./_kvgit_whl.txt")
+    whl = (await resp.string()).strip()
+    await micropip.install(f"./{whl}", deps=False)
 
     from kvgit.kv.indexeddb import IndexedDB
 
@@ -117,8 +135,11 @@ async def test_set_many_get_many(selenium_jspi):
 @run_in_pyodide(packages=["micropip"])
 async def test_overwrite(selenium_jspi):
     import micropip
+    from pyodide.http import pyfetch
 
-    await micropip.install("./kvgit-0.1.5-py3-none-any.whl", deps=False)
+    resp = await pyfetch("./_kvgit_whl.txt")
+    whl = (await resp.string()).strip()
+    await micropip.install(f"./{whl}", deps=False)
 
     from kvgit.kv.indexeddb import IndexedDB
 
@@ -131,8 +152,11 @@ async def test_overwrite(selenium_jspi):
 @run_in_pyodide(packages=["micropip"])
 async def test_remove(selenium_jspi):
     import micropip
+    from pyodide.http import pyfetch
 
-    await micropip.install("./kvgit-0.1.5-py3-none-any.whl", deps=False)
+    resp = await pyfetch("./_kvgit_whl.txt")
+    whl = (await resp.string()).strip()
+    await micropip.install(f"./{whl}", deps=False)
 
     from kvgit.kv.indexeddb import IndexedDB
 
@@ -145,8 +169,11 @@ async def test_remove(selenium_jspi):
 @run_in_pyodide(packages=["micropip"])
 async def test_remove_missing(selenium_jspi):
     import micropip
+    from pyodide.http import pyfetch
 
-    await micropip.install("./kvgit-0.1.5-py3-none-any.whl", deps=False)
+    resp = await pyfetch("./_kvgit_whl.txt")
+    whl = (await resp.string()).strip()
+    await micropip.install(f"./{whl}", deps=False)
 
     from kvgit.kv.indexeddb import IndexedDB
 
@@ -157,8 +184,11 @@ async def test_remove_missing(selenium_jspi):
 @run_in_pyodide(packages=["micropip"])
 async def test_remove_many(selenium_jspi):
     import micropip
+    from pyodide.http import pyfetch
 
-    await micropip.install("./kvgit-0.1.5-py3-none-any.whl", deps=False)
+    resp = await pyfetch("./_kvgit_whl.txt")
+    whl = (await resp.string()).strip()
+    await micropip.install(f"./{whl}", deps=False)
 
     from kvgit.kv.indexeddb import IndexedDB
 
@@ -173,8 +203,11 @@ async def test_remove_many(selenium_jspi):
 @run_in_pyodide(packages=["micropip"])
 async def test_cas_success(selenium_jspi):
     import micropip
+    from pyodide.http import pyfetch
 
-    await micropip.install("./kvgit-0.1.5-py3-none-any.whl", deps=False)
+    resp = await pyfetch("./_kvgit_whl.txt")
+    whl = (await resp.string()).strip()
+    await micropip.install(f"./{whl}", deps=False)
 
     from kvgit.kv.indexeddb import IndexedDB
 
@@ -187,8 +220,11 @@ async def test_cas_success(selenium_jspi):
 @run_in_pyodide(packages=["micropip"])
 async def test_cas_failure(selenium_jspi):
     import micropip
+    from pyodide.http import pyfetch
 
-    await micropip.install("./kvgit-0.1.5-py3-none-any.whl", deps=False)
+    resp = await pyfetch("./_kvgit_whl.txt")
+    whl = (await resp.string()).strip()
+    await micropip.install(f"./{whl}", deps=False)
 
     from kvgit.kv.indexeddb import IndexedDB
 
@@ -201,8 +237,11 @@ async def test_cas_failure(selenium_jspi):
 @run_in_pyodide(packages=["micropip"])
 async def test_cas_create(selenium_jspi):
     import micropip
+    from pyodide.http import pyfetch
 
-    await micropip.install("./kvgit-0.1.5-py3-none-any.whl", deps=False)
+    resp = await pyfetch("./_kvgit_whl.txt")
+    whl = (await resp.string()).strip()
+    await micropip.install(f"./{whl}", deps=False)
 
     from kvgit.kv.indexeddb import IndexedDB
 
@@ -214,8 +253,11 @@ async def test_cas_create(selenium_jspi):
 @run_in_pyodide(packages=["micropip"])
 async def test_cas_create_fails_if_exists(selenium_jspi):
     import micropip
+    from pyodide.http import pyfetch
 
-    await micropip.install("./kvgit-0.1.5-py3-none-any.whl", deps=False)
+    resp = await pyfetch("./_kvgit_whl.txt")
+    whl = (await resp.string()).strip()
+    await micropip.install(f"./{whl}", deps=False)
 
     from kvgit.kv.indexeddb import IndexedDB
 
@@ -228,8 +270,11 @@ async def test_cas_create_fails_if_exists(selenium_jspi):
 @run_in_pyodide(packages=["micropip"])
 async def test_clear(selenium_jspi):
     import micropip
+    from pyodide.http import pyfetch
 
-    await micropip.install("./kvgit-0.1.5-py3-none-any.whl", deps=False)
+    resp = await pyfetch("./_kvgit_whl.txt")
+    whl = (await resp.string()).strip()
+    await micropip.install(f"./{whl}", deps=False)
 
     from kvgit.kv.indexeddb import IndexedDB
 
@@ -243,8 +288,11 @@ async def test_clear(selenium_jspi):
 @run_in_pyodide(packages=["micropip"])
 async def test_type_error_on_non_bytes(selenium_jspi):
     import micropip
+    from pyodide.http import pyfetch
 
-    await micropip.install("./kvgit-0.1.5-py3-none-any.whl", deps=False)
+    resp = await pyfetch("./_kvgit_whl.txt")
+    whl = (await resp.string()).strip()
+    await micropip.install(f"./{whl}", deps=False)
 
     from kvgit.kv.indexeddb import IndexedDB
 
@@ -260,8 +308,11 @@ async def test_type_error_on_non_bytes(selenium_jspi):
 async def test_versioned_integration(selenium_jspi):
     """Full integration: Staged -> VersionedKV -> IndexedDB."""
     import micropip
+    from pyodide.http import pyfetch
 
-    await micropip.install("./kvgit-0.1.5-py3-none-any.whl", deps=False)
+    resp = await pyfetch("./_kvgit_whl.txt")
+    whl = (await resp.string()).strip()
+    await micropip.install(f"./{whl}", deps=False)
 
     from kvgit.kv.indexeddb import IndexedDB
     from kvgit.staged import Staged
