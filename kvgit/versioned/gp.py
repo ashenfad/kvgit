@@ -112,8 +112,11 @@ class VersionedGP(VersionedBase):
 
     def _read_blob(self, content_id: str) -> bytes | None:
         """Read a blob by its git hex SHA."""
-        blob = Blob(self.repo, binascii.unhexlify(content_id))
-        return blob.data_stream.read()
+        try:
+            blob = Blob(self.repo, binascii.unhexlify(content_id))
+            return blob.data_stream.read()
+        except (BadObject, ValueError):
+            return None
 
     def _write_blob(self, data: bytes) -> str:
         istream = self.repo.odb.store(IStream(Blob.type, len(data), io.BytesIO(data)))

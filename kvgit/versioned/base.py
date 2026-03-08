@@ -46,8 +46,10 @@ class VersionedBase(ABC):
     def initial_commit(self) -> str:
         """The root commit hash (cached after first access)."""
         if not hasattr(self, "_initial_commit"):
-            commits = list(self.history())
-            self._initial_commit = commits[-1]
+            last = self._current_commit
+            for commit in self.history():
+                last = commit
+            self._initial_commit = last
         return self._initial_commit
 
     def __repr__(self) -> str:
