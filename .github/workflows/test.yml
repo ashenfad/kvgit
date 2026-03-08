@@ -37,3 +37,42 @@ jobs:
     - name: Check formatting
       run: |
         ruff format --check kvgit/
+
+  test-pyodide:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Set up Chrome
+      uses: browser-actions/setup-chrome@v1
+      with:
+        chrome-version: stable
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e ".[dev]"
+        pip install pytest-pyodide
+
+    - name: Download Pyodide distribution
+      run: |
+        mkdir -p pyodide
+        curl -sL https://github.com/pyodide/pyodide/releases/download/0.27.7/pyodide-0.27.7.tar.bz2 \
+          | tar -xj -C pyodide --strip-components=1
+
+    - name: Build wheel
+      run: |
+        pip install build
+        python -m build --wheel
+        cp dist/kvgit-*.whl pyodide/
+
+    - name: Run IndexedDB tests
+      run: |
+        KVGIT_PYODIDE_TESTS=1 pytest tests/kv/test_indexeddb.py \
+          --runtime chrome --dist-dir ./pyodide -x -v

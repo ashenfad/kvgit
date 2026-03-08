@@ -12,9 +12,10 @@ from .versioned.protocol import Versioned
 
 
 def store(
-    kind: Literal["memory", "disk", "git"] = "memory",
+    kind: Literal["memory", "disk", "git", "indexeddb"] = "memory",
     *,
     path: str | None = None,
+    db_name: str = "kvgit",
     branch: str = "main",
     encoder: Callable[[Any], bytes] = pickle.dumps,
     decoder: Callable[[bytes], Any] = pickle.loads,
@@ -25,9 +26,11 @@ def store(
     """Create a Staged store with sensible defaults.
 
     Args:
-        kind: ``"memory"`` (default), ``"disk"``, or ``"git"``.
+        kind: ``"memory"`` (default), ``"disk"``, ``"git"``, or ``"indexeddb"``.
         path: Required when ``kind="disk"`` or ``kind="git"``.
             Directory path for the disk backend or repo path for git.
+        db_name: IndexedDB database name (default ``"kvgit"``).
+            Only used when ``kind="indexeddb"``.
         branch: Branch name (default ``"main"``).
         encoder: Value encoder (default ``pickle.dumps``).
         decoder: Value decoder (default ``pickle.loads``).
@@ -68,6 +71,10 @@ def store(
             from .kv.disk import Disk
 
             backend = Disk(path, size_limit=0)
+        elif kind == "indexeddb":
+            from .kv.indexeddb import IndexedDB
+
+            backend = IndexedDB(db_name=db_name)
         else:
             raise ValueError(f"Unknown kind: {kind!r}")
 
