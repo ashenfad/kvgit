@@ -3,16 +3,12 @@
 import hashlib
 import json
 import time
-from collections import deque
-from typing import Iterable
 
 from ..encoding import MetaEntry, from_bytes, meta_from_bytes, meta_to_bytes, to_bytes
-from ..errors import ConcurrencyError, MergeConflict
 from ..kv.base import KVStore
 from ..kv.memory import Memory
-from .protocol import BytesMergeFn, DiffResult, MergeResult
-from .helpers import diff_keysets, walk_history
-from .merge import resolve_merge
+from .base import VersionedBase
+from .merge import MergeResolution
 
 PARENT_COMMIT = "__parent_commit__%s"
 COMMIT_KEYSET = "__commit_keyset__%s"
@@ -44,7 +40,7 @@ def content_hash(
     return h.hexdigest()[:40]
 
 
-class VersionedKV:
+class VersionedKV(VersionedBase):
     """A commit log over a KV store.
 
     The caller owns the working state. VersionedKV provides:
@@ -64,7 +60,6 @@ class VersionedKV:
         if store is None:
             store = Memory()
         self.store = store
-        self._branch = branch
 
         if commit_hash is None:
             head_bytes = store.get(BRANCH_HEAD % branch)
@@ -86,11 +81,10 @@ class VersionedKV:
             raise TypeError(
                 f"commit_hash must be str, got {type(commit_hash).__name__}"
             )
-        self._current_commit: str = commit_hash
-        self._base_commit: str = commit_hash
+
+        super().__init__(branch=branch, commit_hash=commit_hash)
 
         # Load commit keyset
-        self._commit_keys: dict[str, str] = {}
         keyset_bytes = self.store.get(COMMIT_KEYSET % self._current_commit)
         if keyset_bytes is not None:
             self._commit_keys = from_bytes(keyset_bytes)
@@ -108,29 +102,6 @@ class VersionedKV:
             if self._meta
             else 0
         )
-
-        # Merge function registry
-        self._merge_fns: dict[str, BytesMergeFn] = {}
-        self._default_merge: BytesMergeFn | None = None
-        self.last_merge_result: MergeResult | None = None
-
-    @property
-    def current_commit(self) -> str:
-        return self._current_commit
-
-    @property
-    def base_commit(self) -> str:
-        return self._base_commit
-
-    @property
-    def current_branch(self) -> str:
-        """The name of the current branch."""
-        return self._branch
-
-    def __repr__(self) -> str:
-        n_keys = len(self._commit_keys)
-        short_hash = self._current_commit[:8]
-        return f"VersionedKV(branch={self._branch!r}, commit={short_hash}..., keys={n_keys})"
 
     @property
     def latest_head(self) -> str | None:
@@ -172,24 +143,7 @@ class VersionedKV:
             self._touch(key)
         return result
 
-    def keys(self) -> Iterable[str]:
-        """All keys in the current commit."""
-        return self._commit_keys.keys()
-
-    def __contains__(self, key: str) -> bool:
-        return key in self._commit_keys
-
-    # -- Merge function registry --
-
-    def set_merge_fn(self, key: str, fn: BytesMergeFn) -> None:
-        """Register a merge function for a specific key."""
-        self._merge_fns[key] = fn
-
-    def set_default_merge(self, fn: BytesMergeFn) -> None:
-        """Register a default merge function for unregistered keys."""
-        self._default_merge = fn
-
-    # -- Write operations --
+    # -- Abstract method implementations --
 
     def _snapshot_state(self) -> tuple:
         """Capture in-memory state before a commit attempt."""
@@ -281,177 +235,15 @@ class VersionedKV:
 
         return new_hash
 
-    # -- Branching / concurrency --
-
-    def commit(
+    def _create_merge_commit(
         self,
-        updates: dict[str, bytes] | None = None,
-        removals: set[str] | None = None,
-        *,
-        on_conflict: str = "raise",
-        merge_fns: dict[str, BytesMergeFn] | None = None,
-        default_merge: BytesMergeFn | None = None,
-        info: dict | None = None,
-    ) -> MergeResult:
-        """Commit changes and atomically advance HEAD.
-
-        Creates a new commit with the given changes and advances the
-        branch HEAD. If HEAD has diverged, performs a three-way merge.
-
-        Args:
-            updates: Key-value pairs to add or update (bytes values).
-            removals: Keys to remove.
-            on_conflict: 'raise' (default) or 'abandon' for CAS failures.
-            merge_fns: Per-key merge functions (override instance-level).
-            default_merge: Default merge function (override instance-level).
-            info: Optional metadata dict for the commit.
-
-        Returns:
-            A MergeResult (truthy when committed, falsy if abandoned).
-
-        Raises:
-            ConcurrencyError: If on_conflict='raise' and CAS fails.
-            MergeConflict: If keys conflict and no merge function
-                resolves them.
-        """
-        # No-op if no changes
-        if not updates and not removals and info is None:
-            result = MergeResult(
-                merged=True,
-                commit=self._current_commit,
-                strategy="no_op",
-                auto_merged_keys=(),
-                carried_keys=(),
-            )
-            self.last_merge_result = result
-            return result
-
-        if on_conflict not in ("raise", "abandon"):
-            raise ValueError(
-                f"on_conflict must be 'raise' or 'abandon', got {on_conflict!r}"
-            )
-
-        branch_key = BRANCH_HEAD % self._branch
-        current_head = self.latest_head
-
-        if current_head == self._base_commit:
-            # Fast-forward path: create commit with info, CAS HEAD
-            saved = self._snapshot_state()
-            self._create_commit(updates, removals, info=info)
-
-            expected = to_bytes(self._base_commit)
-            new_head = to_bytes(self._current_commit)
-            if self.store.cas(branch_key, new_head, expected=expected):
-                self._base_commit = self._current_commit
-                result = MergeResult(
-                    merged=True,
-                    commit=self._current_commit,
-                    strategy="fast_forward",
-                    auto_merged_keys=(),
-                    carried_keys=tuple(self._commit_keys.keys()),
-                )
-                self.last_merge_result = result
-                return result
-            self._restore_state(saved)
-            if on_conflict == "abandon":
-                result = MergeResult(
-                    merged=False,
-                    commit=None,
-                    strategy="fast_forward",
-                    auto_merged_keys=(),
-                    carried_keys=(),
-                )
-                self.last_merge_result = result
-                return result
-            raise ConcurrencyError(
-                f"HEAD changed from {self._base_commit}. Refresh and retry."
-            )
-
-        # Three-way path: create commit without info, merge with info
-        if current_head is None:
-            raise ValueError(f"Branch '{self._branch}' has no HEAD")
-        saved = self._snapshot_state()
-        self._create_commit(updates, removals)
-        return self._three_way_merge(
-            current_head,
-            on_conflict=on_conflict,
-            merge_fns=merge_fns,
-            default_merge=default_merge,
-            info=info,
-            saved_state=saved,
-        )
-
-    def _three_way_merge(
-        self,
-        their_head: str,
-        *,
-        on_conflict: str,
-        merge_fns: dict[str, BytesMergeFn] | None,
-        default_merge: BytesMergeFn | None,
+        resolution: MergeResolution,
+        parents: tuple[str, ...],
         info: dict | None,
-        saved_state: tuple | None = None,
-    ) -> MergeResult:
-        """Perform a three-way merge between our branch and their HEAD."""
-        branch_key = BRANCH_HEAD % self._branch
-        lca = self._find_lca(self._current_commit, their_head)
-        if lca is None:
-            if saved_state is not None:
-                self._restore_state(saved_state)
-            if on_conflict == "abandon":
-                result = MergeResult(
-                    merged=False,
-                    commit=None,
-                    strategy="three_way",
-                    auto_merged_keys=(),
-                    carried_keys=(),
-                )
-                self.last_merge_result = result
-                return result
-            raise ConcurrencyError(
-                "No common ancestor found between current commit and HEAD."
-            )
-
-        our_diff = self.diff(lca, self._current_commit)
-        their_diff = self.diff(lca, their_head)
-
-        # Build effective merge function lookup
-        effective_fns = dict(self._merge_fns)
-        if merge_fns:
-            effective_fns.update(merge_fns)
-        effective_default = default_merge or self._default_merge
-
-        # Resolve the merge
-        try:
-            resolution = resolve_merge(
-                lca_keyset=self._load_keyset(lca),
-                our_keyset=self._load_keyset(self._current_commit),
-                their_keyset=self._load_keyset(their_head),
-                our_diff=our_diff,
-                their_diff=their_diff,
-                blob_reader=lambda cid: self.store.get(cid),
-                merge_fns=effective_fns,
-                default_merge=effective_default,
-            )
-        except MergeConflict:
-            if saved_state is not None:
-                self._restore_state(saved_state)
-            if on_conflict == "abandon":
-                result = MergeResult(
-                    merged=False,
-                    commit=None,
-                    strategy="three_way",
-                    auto_merged_keys=(),
-                    carried_keys=(),
-                )
-                self.last_merge_result = result
-                return result
-            raise
+    ) -> str:
+        """Create a merge commit from a resolved three-way merge."""
         merged_keyset = resolution.merged_keyset
         merged_values = resolution.merged_values
-        auto_merged = resolution.auto_merged_keys
-
-        # Build merge commit
-        parents = (their_head, self._current_commit)
 
         preview_keys = dict(merged_keyset)
         for key in merged_values:
@@ -468,7 +260,7 @@ class VersionedKV:
 
         # Build meta for merge commit
         our_meta_bytes = self.store.get(META_KEY % self._current_commit)
-        their_meta_bytes = self.store.get(META_KEY % their_head)
+        their_meta_bytes = self.store.get(META_KEY % parents[0])
         our_meta = meta_from_bytes(our_meta_bytes) if our_meta_bytes else {}
         their_meta = meta_from_bytes(their_meta_bytes) if their_meta_bytes else {}
 
@@ -496,43 +288,81 @@ class VersionedKV:
 
         self.store.set_many(**diffs)
 
-        # CAS HEAD from their_head to merge_hash
-        expected = to_bytes(their_head)
-        new_head_bytes = to_bytes(merge_hash)
-        if self.store.cas(branch_key, new_head_bytes, expected=expected):
-            self._commit_keys = merged_keyset
-            self._current_commit = merge_hash
-            self._base_commit = merge_hash
-            self._meta = merged_meta
-            result = MergeResult(
-                merged=True,
-                commit=merge_hash,
-                strategy="three_way",
-                auto_merged_keys=tuple(auto_merged),
-                carried_keys=tuple(
-                    k
-                    for k in merged_keyset
-                    if k not in auto_merged and k not in merged_values
-                ),
-            )
-            self.last_merge_result = result
-            return result
+        # Update in-memory state
+        self._commit_keys = merged_keyset
+        self._current_commit = merge_hash
+        self._meta = merged_meta
 
-        if saved_state is not None:
-            self._restore_state(saved_state)
-        if on_conflict == "abandon":
-            result = MergeResult(
-                merged=False,
-                commit=None,
-                strategy="three_way",
-                auto_merged_keys=(),
-                carried_keys=(),
-            )
-            self.last_merge_result = result
-            return result
-        raise ConcurrencyError(
-            "HEAD changed during three-way merge. Refresh and retry."
+        return merge_hash
+
+    def _cas_head(self, expected: str, new_head: str) -> bool:
+        """Atomically advance branch HEAD via KVStore CAS."""
+        branch_key = BRANCH_HEAD % self._branch
+        return self.store.cas(
+            branch_key, to_bytes(new_head), expected=to_bytes(expected)
         )
+
+    def _load_keyset(self, commit_hash: str) -> dict[str, str]:
+        """Load just the keyset for a commit (key -> versioned_key mapping)."""
+        keyset_bytes = self.store.get(COMMIT_KEYSET % commit_hash)
+        if keyset_bytes is None:
+            return {}
+        return from_bytes(keyset_bytes)
+
+    def _load_parents(self, commit_hash: str) -> tuple[str, ...]:
+        """Load the parent tuple for a commit."""
+        parent_bytes = self.store.get(PARENT_COMMIT % commit_hash)
+        if parent_bytes is None:
+            return ()
+        raw = from_bytes(parent_bytes)
+        if raw is None:
+            return ()
+        if isinstance(raw, str):
+            return (raw,)
+        return tuple(raw)
+
+    def _find_lca(self, commit_a: str, commit_b: str) -> str | None:
+        """Find the lowest common ancestor of two commits."""
+        if commit_a == commit_b:
+            return commit_a
+
+        from collections import deque
+
+        seen_a: set[str] = {commit_a}
+        seen_b: set[str] = {commit_b}
+        queue_a: deque[str] = deque([commit_a])
+        queue_b: deque[str] = deque([commit_b])
+
+        while queue_a or queue_b:
+            if queue_a:
+                current = queue_a.popleft()
+                if current in seen_b:
+                    return current
+                for p in self._load_parents(current):
+                    if p not in seen_a:
+                        seen_a.add(p)
+                        queue_a.append(p)
+                        if p in seen_b:
+                            return p
+
+            if queue_b:
+                current = queue_b.popleft()
+                if current in seen_a:
+                    return current
+                for p in self._load_parents(current):
+                    if p not in seen_b:
+                        seen_b.add(p)
+                        queue_b.append(p)
+                        if p in seen_a:
+                            return p
+
+        return None
+
+    def _read_blob(self, content_id: str) -> bytes | None:
+        """Read a blob by its versioned key."""
+        return self.store.get(content_id)
+
+    # -- Navigation --
 
     def refresh(self) -> None:
         """Reload state from HEAD."""
@@ -594,10 +424,10 @@ class VersionedKV:
         if keyset_bytes is None:
             return None
         keyset = from_bytes(keyset_bytes)
-        content_hash = keyset.get(key)
-        if content_hash is None:
+        content_hash_ = keyset.get(key)
+        if content_hash_ is None:
             return None
-        return self.store.get(content_hash)
+        return self.store.get(content_hash_)
 
     def reset_to(self, commit_hash: str) -> bool:
         """Reset HEAD to a specific commit."""
@@ -606,26 +436,6 @@ class VersionedKV:
         self.store.set(BRANCH_HEAD % self._branch, to_bytes(commit_hash))
         self._load_commit(commit_hash, update_base=True)
         return True
-
-    # -- History --
-
-    def history(
-        self,
-        commit_hash: str | None = None,
-        *,
-        all_parents: bool = False,
-    ) -> Iterable[str]:
-        """Yield the commit chain from newest to oldest."""
-        start = commit_hash or self._current_commit
-        yield from walk_history(start, self._load_parents, all_parents=all_parents)
-
-    @property
-    def initial_commit(self) -> str:
-        """The root commit hash (cached after first access)."""
-        if not hasattr(self, "_initial_commit"):
-            commits = list(self.history())
-            self._initial_commit = commits[-1]
-        return self._initial_commit
 
     @staticmethod
     def branches(store: KVStore) -> list[str]:
@@ -651,70 +461,7 @@ class VersionedKV:
             return None
         return from_bytes(info_bytes)
 
-    def diff(self, commit_a: str, commit_b: str) -> DiffResult:
-        """Compute key-level differences between two commits."""
-        return diff_keysets(self._load_keyset(commit_a), self._load_keyset(commit_b))
-
-    def parents(self, commit_hash: str | None = None) -> tuple[str, ...]:
-        """Get the direct parent commit(s) of a commit."""
-        target = commit_hash or self._current_commit
-        return self._load_parents(target)
-
     # -- Internal --
-
-    def _find_lca(self, commit_a: str, commit_b: str) -> str | None:
-        """Find the lowest common ancestor of two commits."""
-        if commit_a == commit_b:
-            return commit_a
-
-        seen_a: set[str] = {commit_a}
-        seen_b: set[str] = {commit_b}
-        queue_a: deque[str] = deque([commit_a])
-        queue_b: deque[str] = deque([commit_b])
-
-        while queue_a or queue_b:
-            if queue_a:
-                current = queue_a.popleft()
-                if current in seen_b:
-                    return current
-                for p in self._load_parents(current):
-                    if p not in seen_a:
-                        seen_a.add(p)
-                        queue_a.append(p)
-                        if p in seen_b:
-                            return p
-
-            if queue_b:
-                current = queue_b.popleft()
-                if current in seen_a:
-                    return current
-                for p in self._load_parents(current):
-                    if p not in seen_b:
-                        seen_b.add(p)
-                        queue_b.append(p)
-                        if p in seen_a:
-                            return p
-
-        return None
-
-    def _load_keyset(self, commit_hash: str) -> dict[str, str]:
-        """Load just the keyset for a commit (key -> versioned_key mapping)."""
-        keyset_bytes = self.store.get(COMMIT_KEYSET % commit_hash)
-        if keyset_bytes is None:
-            return {}
-        return from_bytes(keyset_bytes)
-
-    def _load_parents(self, commit_hash: str) -> tuple[str, ...]:
-        """Load the parent tuple for a commit."""
-        parent_bytes = self.store.get(PARENT_COMMIT % commit_hash)
-        if parent_bytes is None:
-            return ()
-        raw = from_bytes(parent_bytes)
-        if raw is None:
-            return ()
-        if isinstance(raw, str):
-            return (raw,)
-        return tuple(raw)
 
     def _touch(self, key: str) -> None:
         """Update last_touch for a key (in-memory only, persisted on commit)."""
