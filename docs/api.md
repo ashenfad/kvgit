@@ -6,9 +6,10 @@ Factory function that returns a configured `Staged` instance.
 
 ```python
 kvgit.store(
-    kind="memory",       # "memory", "disk", or "git"
+    kind="memory",       # "memory", "disk", "git", or "indexeddb"
     *,
     path=None,           # required for "disk" and "git"
+    db_name="kvgit",     # IndexedDB database name (only for "indexeddb")
     branch="main",
     encoder=pickle.dumps,
     decoder=pickle.loads,
@@ -20,8 +21,9 @@ kvgit.store(
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `kind` | `Literal["memory", "disk", "git"]` | `"memory"` | Backend type |
+| `kind` | `Literal["memory", "disk", "git", "indexeddb"]` | `"memory"` | Backend type |
 | `path` | `str \| None` | `None` | Required for `"disk"` and `"git"` |
+| `db_name` | `str` | `"kvgit"` | IndexedDB database name. Only used with `"indexeddb"`. |
 | `branch` | `str` | `"main"` | Branch name |
 | `encoder` | `Callable[[Any], bytes]` | `pickle.dumps` | Value encoder |
 | `decoder` | `Callable[[bytes], Any]` | `pickle.loads` | Value decoder |
@@ -466,3 +468,23 @@ store = Disk("/path/to/db", size_limit=1024**3)  # default: 1 GB
 ```
 
 CAS and transactional operations are safe across multiple processes (backed by SQLite file locking).
+
+---
+
+## IndexedDB
+
+Browser-persistent `KVStore` via IndexedDB. Available automatically in [Pyodide](https://pyodide.org/) environments (no extra install needed).
+
+```python
+from kvgit.kv.indexeddb import IndexedDB
+
+store = IndexedDB()
+store = IndexedDB(db_name="myapp", store_name="state")
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `db_name` | `str` | `"kvgit"` | IndexedDB database name. Each name is an independent store, persisted across page reloads. |
+| `store_name` | `str` | `"kv"` | Object store name within the database. |
+
+Requires JSPI (JavaScript Promise Integration) -- Chrome 133+, Firefox and Node with flags. CAS is atomic across Web Workers sharing the same database.

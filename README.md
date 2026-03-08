@@ -9,7 +9,7 @@ Git-style versioning for your data. Commits, branches, and merges -- backed by a
 | **Branches** | Cheap forks with CAS-based optimistic concurrency |
 | **Three-way merge** | Auto-merges non-overlapping changes; pluggable merge fns for conflicts |
 | **Eviction** | High/low water rebase drops least-recently-used keys automatically |
-| **Pluggable backends** | In-memory, disk (diskcache), git (GitPython), or bring your own `KVStore` |
+| **Pluggable backends** | In-memory, disk (diskcache), git (GitPython), IndexedDB (Pyodide/browser), or bring your own `KVStore` |
 
 ## Install
 
@@ -17,6 +17,7 @@ Git-style versioning for your data. Commits, branches, and merges -- backed by a
 pip install kvgit            # in-memory only
 pip install kvgit[disk]      # adds disk backend via diskcache
 pip install kvgit[git]       # adds git backend via GitPython (requires git on PATH)
+# IndexedDB backend is available automatically in Pyodide (browser) environments
 ```
 
 ## Quick example

@@ -6,3 +6,10 @@ from .disk import Disk
 from .memory import Memory
 
 __all__ = ["Composite", "Disk", "KVStore", "Memory"]
+
+try:
+    from .indexeddb import IndexedDB
+
+    __all__ += ["IndexedDB"]
+except ImportError:
+    pass

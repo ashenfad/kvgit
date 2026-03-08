@@ -13,9 +13,10 @@ That's it. You have a versioned key-value store backed by in-memory storage. For
 ```python
 s = kvgit.store(kind="disk", path="/tmp/mydb")       # SQLite-backed via diskcache
 s = kvgit.store(kind="git", path="/tmp/myrepo")       # real git repo via GitPython
+s = kvgit.store(kind="indexeddb", db_name="myapp")    # browser-persistent via IndexedDB
 ```
 
-`kind="disk"` requires `pip install kvgit[disk]`. `kind="git"` requires `pip install kvgit[git]` and git on PATH.
+`kind="disk"` requires `pip install kvgit[disk]`. `kind="git"` requires `pip install kvgit[git]` and git on PATH. `kind="indexeddb"` is available automatically in Pyodide (browser) environments.
 
 ---
 
