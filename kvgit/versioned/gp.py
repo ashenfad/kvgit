@@ -5,12 +5,9 @@ import io
 import json
 import os
 import urllib.parse
-from typing import Iterable
 
-from ..errors import ConcurrencyError, MergeConflict
-from .protocol import BytesMergeFn, DiffResult, MergeResult
-from .helpers import diff_keysets, walk_history
-from .merge import resolve_merge
+from .base import VersionedBase
+from .merge import MergeResolution
 
 try:
     import git
@@ -29,7 +26,7 @@ def _unquote(quoted: str) -> str:
     return urllib.parse.unquote_plus(quoted)
 
 
-class VersionedGP:
+class VersionedGP(VersionedBase):
     """A commit log backed by a Git repository."""
 
     def __init__(
@@ -40,7 +37,6 @@ class VersionedGP:
         branch: str = "main",
     ) -> None:
         self.repo_path = repo_path
-        self._branch = branch
 
         if not os.path.exists(repo_path):
             self.repo = Repo.init(repo_path, bare=True)
@@ -59,17 +55,11 @@ class VersionedGP:
             raise TypeError(
                 f"commit_hash must be str, got {type(commit_hash).__name__}"
             )
-        self._current_commit: str = commit_hash
-        self._base_commit: str = commit_hash
+
+        super().__init__(branch=branch, commit_hash=commit_hash)
 
         # Load commit keyset
-        self._commit_keys: dict[str, str] = {}
         self._load_commit(commit_hash, update_base=True)
-
-        # Merge function registry
-        self._merge_fns: dict[str, BytesMergeFn] = {}
-        self._default_merge: BytesMergeFn | None = None
-        self.last_merge_result: MergeResult | None = None
 
     def _create_empty_commit(self, branch: str) -> str:
         # Create an empty tree
@@ -88,36 +78,11 @@ class VersionedGP:
         return commit.hexsha
 
     @property
-    def current_commit(self) -> str:
-        return self._current_commit
-
-    @property
-    def base_commit(self) -> str:
-        return self._base_commit
-
-    @property
-    def current_branch(self) -> str:
-        return self._branch
-
-    def __repr__(self) -> str:
-        n_keys = len(self._commit_keys)
-        short_hash = self._current_commit[:8]
-        return f"VersionedGP(branch={self._branch!r}, commit={short_hash}..., keys={n_keys})"
-
-    @property
     def latest_head(self) -> str | None:
         try:
             return self.repo.heads[self._branch].commit.hexsha
         except (IndexError, AttributeError):
             return None
-
-    @property
-    def initial_commit(self) -> str:
-        """The root commit hash (cached after first access)."""
-        if not hasattr(self, "_initial_commit"):
-            commits = list(self.history())
-            self._initial_commit = commits[-1]
-        return self._initial_commit
 
     # -- Read operations --
 
@@ -128,10 +93,6 @@ class VersionedGP:
             return None
         return self._read_blob(hexsha)
 
-    def _read_blob(self, hexsha: str) -> bytes:
-        blob = Blob(self.repo, binascii.unhexlify(hexsha))
-        return blob.data_stream.read()
-
     def get_many(self, *keys: str) -> dict[str, bytes]:
         """Get multiple values from the current commit."""
         result = {}
@@ -141,30 +102,18 @@ class VersionedGP:
                 result[key] = val
         return result
 
-    def keys(self) -> Iterable[str]:
-        """All keys in the current commit."""
-        return self._commit_keys.keys()
-
-    def __contains__(self, key: str) -> bool:
-        return key in self._commit_keys
-
-    # -- Merge function registry --
-
-    def set_merge_fn(self, key: str, fn: BytesMergeFn) -> None:
-        """Register a merge function for a specific key."""
-        self._merge_fns[key] = fn
-
-    def set_default_merge(self, fn: BytesMergeFn) -> None:
-        """Register a default merge function for unregistered keys."""
-        self._default_merge = fn
-
-    # -- Write operations --
+    # -- Abstract method implementations --
 
     def _snapshot_state(self) -> tuple:
         return (self._current_commit, dict(self._commit_keys))
 
     def _restore_state(self, saved: tuple) -> None:
         self._current_commit, self._commit_keys = saved
+
+    def _read_blob(self, content_id: str) -> bytes | None:
+        """Read a blob by its git hex SHA."""
+        blob = Blob(self.repo, binascii.unhexlify(content_id))
+        return blob.data_stream.read()
 
     def _write_blob(self, data: bytes) -> str:
         istream = self.repo.odb.store(IStream(Blob.type, len(data), io.BytesIO(data)))
@@ -189,7 +138,7 @@ class VersionedGP:
         )
         return istream.hexsha
 
-    def _create_commit(
+    def _create_git_commit(
         self,
         updates: dict[str, bytes] | None = None,
         removals: set[str] | None = None,
@@ -197,6 +146,10 @@ class VersionedGP:
         info: dict | None = None,
         parents: list[str] | None = None,
     ) -> str:
+        """Create a git commit object.
+
+        Internal method that supports explicit parents (for merge commits).
+        """
         updates = updates or {}
         removals = removals or set()
 
@@ -226,213 +179,62 @@ class VersionedGP:
         self._current_commit = commit.hexsha
         return commit.hexsha
 
-    def commit(
+    def _create_commit(
         self,
         updates: dict[str, bytes] | None = None,
         removals: set[str] | None = None,
         *,
-        on_conflict: str = "raise",
-        merge_fns: dict[str, BytesMergeFn] | None = None,
-        default_merge: BytesMergeFn | None = None,
         info: dict | None = None,
-    ) -> MergeResult:
-        """Commit changes and atomically advance HEAD.
+    ) -> str:
+        """Create a single-parent commit (parent = current commit)."""
+        return self._create_git_commit(updates, removals, info=info)
 
-        If HEAD has diverged, performs a three-way merge.
-
-        Args:
-            updates: Key-value pairs to add or update (bytes values).
-            removals: Keys to remove.
-            on_conflict: ``'raise'`` (default) or ``'abandon'``.
-            merge_fns: Per-key merge functions (override instance-level).
-            default_merge: Default merge function (override instance-level).
-            info: Optional metadata dict for the commit.
-
-        Returns:
-            A ``MergeResult`` (truthy when committed, falsy if abandoned).
-
-        Raises:
-            ConcurrencyError: If ``on_conflict='raise'`` and CAS fails.
-            MergeConflict: If keys conflict with no merge function.
-        """
-        if not updates and not removals and info is None:
-            result = MergeResult(
-                merged=True,
-                commit=self._current_commit,
-                strategy="no_op",
-                auto_merged_keys=(),
-                carried_keys=(),
-            )
-            self.last_merge_result = result
-            return result
-
-        if on_conflict not in ("raise", "abandon"):
-            raise ValueError(
-                f"on_conflict must be 'raise' or 'abandon', got {on_conflict!r}"
-            )
-
-        current_head = self.latest_head
-
-        if current_head == self._base_commit:
-            saved = self._snapshot_state()
-            new_hash = self._create_commit(updates, removals, info=info)
-
-            try:
-                self.repo.git.update_ref(
-                    f"refs/heads/{self._branch}", new_hash, self._base_commit
-                )
-                self._base_commit = self._current_commit
-                result = MergeResult(
-                    merged=True,
-                    commit=self._current_commit,
-                    strategy="fast_forward",
-                    auto_merged_keys=(),
-                    carried_keys=tuple(self._commit_keys.keys()),
-                )
-                self.last_merge_result = result
-                return result
-            except GitCommandError:
-                self._restore_state(saved)
-                if on_conflict == "abandon":
-                    result = MergeResult(
-                        merged=False,
-                        commit=None,
-                        strategy="fast_forward",
-                        auto_merged_keys=(),
-                        carried_keys=(),
-                    )
-                    self.last_merge_result = result
-                    return result
-                raise ConcurrencyError(
-                    f"HEAD changed from {self._base_commit}. Refresh and retry."
-                )
-
-        if current_head is None:
-            raise ValueError(f"Branch '{self._branch}' has no HEAD")
-
-        saved = self._snapshot_state()
-        self._create_commit(updates, removals)
-        return self._three_way_merge(
-            current_head,
-            on_conflict=on_conflict,
-            merge_fns=merge_fns,
-            default_merge=default_merge,
-            info=info,
-            saved_state=saved,
-        )
-
-    def _three_way_merge(
+    def _create_merge_commit(
         self,
-        their_head: str,
-        *,
-        on_conflict: str,
-        merge_fns: dict[str, BytesMergeFn] | None,
-        default_merge: BytesMergeFn | None,
+        resolution: MergeResolution,
+        parents: tuple[str, ...],
         info: dict | None,
-        saved_state: tuple | None = None,
-    ) -> MergeResult:
-        lca = self._find_lca(self._current_commit, their_head)
-        if lca is None:
-            if saved_state is not None:
-                self._restore_state(saved_state)
-            if on_conflict == "abandon":
-                result = MergeResult(
-                    merged=False,
-                    commit=None,
-                    strategy="three_way",
-                    auto_merged_keys=(),
-                    carried_keys=(),
-                )
-                self.last_merge_result = result
-                return result
-            raise ConcurrencyError(
-                "No common ancestor found between current commit and HEAD."
-            )
-
-        our_diff = self.diff(lca, self._current_commit)
-        their_diff = self.diff(lca, their_head)
-
-        effective_fns = dict(self._merge_fns)
-        if merge_fns:
-            effective_fns.update(merge_fns)
-        effective_default = default_merge or self._default_merge
-
-        # Resolve the merge
-        try:
-            resolution = resolve_merge(
-                lca_keyset=self._load_keyset(lca),
-                our_keyset=self._load_keyset(self._current_commit),
-                their_keyset=self._load_keyset(their_head),
-                our_diff=our_diff,
-                their_diff=their_diff,
-                blob_reader=self._read_blob,
-                merge_fns=effective_fns,
-                default_merge=effective_default,
-            )
-        except MergeConflict:
-            if saved_state is not None:
-                self._restore_state(saved_state)
-            if on_conflict == "abandon":
-                result = MergeResult(
-                    merged=False,
-                    commit=None,
-                    strategy="three_way",
-                    auto_merged_keys=(),
-                    carried_keys=(),
-                )
-                self.last_merge_result = result
-                return result
-            raise
-
+    ) -> str:
+        """Create a multi-parent merge commit from a resolved merge."""
         merged_keyset = resolution.merged_keyset
         merged_values = resolution.merged_values
-        auto_merged = resolution.auto_merged_keys
 
-        parents = [their_head, self._current_commit]
-
-        updates = merged_values
         removals = (
             set(self._commit_keys.keys())
             - set(merged_keyset.keys())
             - set(merged_values.keys())
         )
         self._commit_keys = merged_keyset
-        merge_hash = self._create_commit(updates, removals, info=info, parents=parents)
+        return self._create_git_commit(
+            merged_values, removals, info=info, parents=list(parents)
+        )
 
+    def _cas_head(self, expected: str, new_head: str) -> bool:
+        """Atomically advance branch HEAD via git update-ref."""
         try:
-            self.repo.git.update_ref(
-                f"refs/heads/{self._branch}", merge_hash, their_head
-            )
-            self._base_commit = merge_hash
-            result = MergeResult(
-                merged=True,
-                commit=merge_hash,
-                strategy="three_way",
-                auto_merged_keys=tuple(auto_merged),
-                carried_keys=tuple(
-                    k
-                    for k in merged_keyset
-                    if k not in auto_merged and k not in merged_values
-                ),
-            )
-            self.last_merge_result = result
-            return result
+            self.repo.git.update_ref(f"refs/heads/{self._branch}", new_head, expected)
+            return True
         except GitCommandError:
-            if saved_state is not None:
-                self._restore_state(saved_state)
-            if on_conflict == "abandon":
-                result = MergeResult(
-                    merged=False,
-                    commit=None,
-                    strategy="three_way",
-                    auto_merged_keys=(),
-                    carried_keys=(),
-                )
-                self.last_merge_result = result
-                return result
-            raise ConcurrencyError(
-                "HEAD changed during three-way merge. Refresh and retry."
-            )
+            return False
+
+    def _load_keyset(self, commit_hash: str) -> dict[str, str]:
+        c = Commit(self.repo, binascii.unhexlify(commit_hash))
+        return {_unquote(blob.name): blob.hexsha for blob in c.tree.blobs}
+
+    def _load_parents(self, commit_hash: str) -> tuple[str, ...]:
+        c = Commit(self.repo, binascii.unhexlify(commit_hash))
+        return tuple(p.hexsha for p in c.parents)
+
+    def _find_lca(self, commit_a: str, commit_b: str) -> str | None:
+        try:
+            bases = self.repo.merge_base(commit_a, commit_b)
+        except GitCommandError:
+            return None
+        if bases:
+            return bases[0].hexsha
+        return None
+
+    # -- Navigation --
 
     def refresh(self) -> None:
         """Reload state from HEAD."""
@@ -510,13 +312,6 @@ class VersionedGP:
         self._load_commit(commit_hash, update_base=True)
         return True
 
-    def history(
-        self, commit_hash: str | None = None, *, all_parents: bool = False
-    ) -> Iterable[str]:
-        """Yield the commit chain from newest to oldest."""
-        start = commit_hash or self._current_commit
-        yield from walk_history(start, self._load_parents, all_parents=all_parents)
-
     def list_branches(self) -> list[str]:
         """List all branch names."""
         return [h.name for h in self.repo.heads]
@@ -536,33 +331,7 @@ class VersionedGP:
             return None
         return json.loads(info_part)
 
-    def diff(self, commit_a: str, commit_b: str) -> DiffResult:
-        """Compute key-level differences between two commits."""
-        return diff_keysets(self._load_keyset(commit_a), self._load_keyset(commit_b))
-
-    def parents(self, commit_hash: str | None = None) -> tuple[str, ...]:
-        """Get the direct parent commit(s) of a commit."""
-        target = commit_hash or self._current_commit
-        return self._load_parents(target)
-
     # -- Internal --
-
-    def _find_lca(self, commit_a: str, commit_b: str) -> str | None:
-        try:
-            bases = self.repo.merge_base(commit_a, commit_b)
-        except GitCommandError:
-            return None
-        if bases:
-            return bases[0].hexsha
-        return None
-
-    def _load_keyset(self, commit_hash: str) -> dict[str, str]:
-        c = Commit(self.repo, binascii.unhexlify(commit_hash))
-        return {_unquote(blob.name): blob.hexsha for blob in c.tree.blobs}
-
-    def _load_parents(self, commit_hash: str) -> tuple[str, ...]:
-        c = Commit(self.repo, binascii.unhexlify(commit_hash))
-        return tuple(p.hexsha for p in c.parents)
 
     def _load_commit(self, commit_hash: str, *, update_base: bool) -> None:
         self._current_commit = commit_hash
