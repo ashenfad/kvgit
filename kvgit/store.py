@@ -6,7 +6,6 @@ from typing import Any, Callable, Literal
 from .kv.base import KVStore
 from .kv.memory import Memory
 from .staged import Staged
-from .versioned.gc import GCVersionedKV
 from .versioned.kv import VersionedKV
 from .versioned.protocol import Versioned
 
@@ -19,9 +18,6 @@ def store(
     branch: str = "main",
     encoder: Callable[[Any], bytes] = pickle.dumps,
     decoder: Callable[[bytes], Any] = pickle.loads,
-    high_water_bytes: int | None = None,
-    low_water_bytes: int | None = None,
-    is_protected: Callable[[str], bool] | None = None,
 ) -> Staged:
     """Create a Staged store with sensible defaults.
 
@@ -34,14 +30,6 @@ def store(
         branch: Branch name (default ``"main"``).
         encoder: Value encoder (default ``pickle.dumps``).
         decoder: Value decoder (default ``pickle.loads``).
-        high_water_bytes: Enable GC with this high-water threshold.
-            Not supported with ``kind="git"``.
-        low_water_bytes: GC low-water threshold (defaults to 80%
-            of high_water). Not supported with ``kind="git"``.
-        is_protected: Callable that returns True for keys GC should
-            never drop. Only used when ``high_water_bytes`` is set.
-            Defaults to protecting keys starting with ``__``.
-            Not supported with ``kind="git"``.
 
     Returns:
         A ``Staged`` store instance.
@@ -49,12 +37,6 @@ def store(
     versioned: Versioned
 
     if kind == "git":
-        if (
-            high_water_bytes is not None
-            or low_water_bytes is not None
-            or is_protected is not None
-        ):
-            raise ValueError("GC parameters are not supported with kind='git'")
         if path is None:
             raise ValueError("path is required when kind='git'")
         from .versioned.gp import VersionedGP
@@ -78,16 +60,6 @@ def store(
         else:
             raise ValueError(f"Unknown kind: {kind!r}")
 
-        if high_water_bytes is not None:
-            gc_kwargs: dict[str, Any] = {
-                "branch": branch,
-                "high_water_bytes": high_water_bytes,
-                "low_water_bytes": low_water_bytes,
-            }
-            if is_protected is not None:
-                gc_kwargs["is_protected"] = is_protected
-            versioned = GCVersionedKV(backend, **gc_kwargs)
-        else:
-            versioned = VersionedKV(backend, branch=branch)
+        versioned = VersionedKV(backend, branch=branch)
 
     return Staged(versioned, encoder=encoder, decoder=decoder)
