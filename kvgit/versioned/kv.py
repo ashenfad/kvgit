@@ -522,8 +522,8 @@ class VersionedKV(VersionedBase):
             try:
                 meta = meta_from_bytes(meta_bytes)
                 if meta:
-                    first_entry = next(iter(meta.values()), None)
-                    if first_entry and first_entry.created_at < cutoff_time:
+                    newest = max(e.created_at for e in meta.values())
+                    if newest < cutoff_time:
                         orphans.append(commit_hash)
                 else:
                     orphans.append(commit_hash)
