@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.7] - 2026-03-12
+
+### Added
+- **`clean_orphans(min_age=3600)`** on `VersionedKV` -- mark-and-sweep cleanup of commits unreachable from any branch HEAD, safe for shared blob histories
+- **Automatic orphan cleanup** -- `delete_branch()` now calls `clean_orphans(min_age=0)` after removing the branch HEAD
+
+### Removed
+- **`GCVersionedKV`** -- destructive LRU eviction class removed entirely. Use `delete_branch()` (which auto-cleans orphans) or call `clean_orphans()` directly.
+- **`RebaseResult`** and **`MetaEntry`** removed from public API docs
+
 ## [0.1.6] - 2026-03-08
 
 ### Added
