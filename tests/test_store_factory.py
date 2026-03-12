@@ -3,7 +3,6 @@
 import pytest
 
 from kvgit import Staged, store
-from kvgit.versioned.gc import GCVersionedKV as GCVersioned
 
 
 class TestStoreFactory:
@@ -18,11 +17,6 @@ class TestStoreFactory:
     def test_disk_requires_path(self):
         with pytest.raises(ValueError, match="path is required"):
             store(kind="disk")
-
-    def test_gc_versioned(self):
-        s = store(high_water_bytes=5000)
-        assert isinstance(s, Staged)
-        assert isinstance(s.versioned, GCVersioned)
 
     def test_branch_parameter(self):
         s = store(branch="dev")

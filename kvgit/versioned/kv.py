@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import logging
 import time
 
 from ..encoding import MetaEntry, from_bytes, meta_from_bytes, meta_to_bytes, to_bytes
@@ -397,13 +398,14 @@ class VersionedKV(VersionedBase):
         return VersionedKV(self.store, commit_hash=target, branch=name)
 
     def delete_branch(self, name: str) -> None:
-        """Delete a branch by name."""
+        """Delete a branch and clean up orphaned commits."""
         if name == self._branch:
             raise ValueError("Cannot delete the current branch")
         branch_key = BRANCH_HEAD % name
         if self.store.get(branch_key) is None:
             raise ValueError(f"Branch '{name}' does not exist")
         self.store.remove(branch_key)
+        self.clean_orphans(min_age=0)
 
     def switch_branch(self, name: str) -> None:
         """Switch this instance to a different branch in-place."""
@@ -460,6 +462,99 @@ class VersionedKV(VersionedBase):
         if info_bytes is None:
             return None
         return from_bytes(info_bytes)
+
+    # -- Orphan cleanup --
+
+    def clean_orphans(self, min_age: float = 3600) -> int:
+        """Remove orphaned commits unreachable from any branch HEAD.
+
+        Traces all reachable commits from live branch HEADs, then
+        deletes commit metadata and versioned keys for any commit
+        not in the reachable set. Only deletes blobs that are not
+        referenced by any reachable commit.
+
+        The ``min_age`` guard (default 1 hour) prevents recently
+        created commits from being falsely swept during concurrent
+        writes. Use ``min_age=0`` when concurrency is not a concern
+        (e.g. single-user browser environments).
+
+        Returns:
+            Number of orphaned commits removed.
+        """
+        logger = logging.getLogger("kvgit.orphans")
+
+        # Mark phase: find all reachable commits and their blob keys
+        reachable: set[str] = set()
+        reachable_blobs: set[str] = set()
+        prefix = BRANCH_HEAD.replace("%s", "")
+        for key in self.store.keys():
+            if isinstance(key, str) and key.startswith(prefix):
+                head_bytes = self.store.get(key)
+                if head_bytes is None:
+                    continue
+                branch_head = from_bytes(head_bytes)
+                for commit in self.history(commit_hash=branch_head, all_parents=True):
+                    if commit not in reachable:
+                        reachable.add(commit)
+                        ks_bytes = self.store.get(COMMIT_KEYSET % commit)
+                        if ks_bytes:
+                            try:
+                                for vk in from_bytes(ks_bytes).values():
+                                    reachable_blobs.add(vk)
+                            except Exception:
+                                pass
+
+        # Sweep phase: find orphaned commits by scanning for meta keys
+        meta_prefix = META_KEY.replace("%s", "")
+        cutoff_time = time.time() - min_age
+        orphans: list[str] = []
+
+        for key in self.store.keys():
+            if not isinstance(key, str) or not key.startswith(meta_prefix):
+                continue
+            commit_hash = key[len(meta_prefix) :]
+            if not commit_hash or commit_hash in reachable:
+                continue
+            # Check age
+            meta_bytes = self.store.get(key)
+            if meta_bytes is None:
+                continue
+            try:
+                meta = meta_from_bytes(meta_bytes)
+                if meta:
+                    first_entry = next(iter(meta.values()), None)
+                    if first_entry and first_entry.created_at < cutoff_time:
+                        orphans.append(commit_hash)
+                else:
+                    orphans.append(commit_hash)
+            except (json.JSONDecodeError, TypeError, KeyError):
+                continue
+
+        # Delete orphaned commits — only remove blobs not used by reachable commits
+        for orphan_hash in orphans:
+            keyset_bytes = self.store.get(COMMIT_KEYSET % orphan_hash)
+            if keyset_bytes:
+                try:
+                    keyset = from_bytes(keyset_bytes)
+                    orphan_only = [
+                        vk for vk in keyset.values() if vk not in reachable_blobs
+                    ]
+                    if orphan_only:
+                        self.store.remove_many(*orphan_only)
+                except Exception:
+                    pass
+            self.store.remove_many(
+                META_KEY % orphan_hash,
+                COMMIT_KEYSET % orphan_hash,
+                PARENT_COMMIT % orphan_hash,
+                TOTAL_VAR_SIZE_KEY % orphan_hash,
+                INFO_KEY % orphan_hash,
+            )
+
+        if orphans:
+            logger.debug("Cleaned %d orphaned commit(s)", len(orphans))
+
+        return len(orphans)
 
     # -- Internal --
 

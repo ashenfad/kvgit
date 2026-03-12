@@ -1013,3 +1013,73 @@ class TestStagedBranchOps:
         assert s.peek("title", branch="dev") == "Dev Session"
         # Peek at nonexistent branch
         assert s.peek("title", branch="nope") is None
+
+
+class TestCleanOrphans:
+    def test_delete_branch_cleans_orphaned_commits(self):
+        """Deleting a branch should clean up commits only reachable from it."""
+        store = Memory()
+        v = Versioned(store)
+
+        # Create a branch with unique data
+        dev = v.create_branch("dev")
+        dev.commit({"dev_key": b"dev_value"})
+        dev.commit({"dev_key2": b"dev_value2"})
+
+        # Count keys before deletion
+        keys_before = len(list(store.keys()))
+
+        # Delete branch — should auto-clean orphans
+        v.delete_branch("dev")
+
+        keys_after = len(list(store.keys()))
+        assert keys_after < keys_before
+
+    def test_delete_branch_preserves_shared_commits(self):
+        """Deleting a branch should NOT remove commits shared with other branches."""
+        store = Memory()
+        v = Versioned(store)
+        v.commit({"shared": b"data"})
+
+        # Both branches fork from the same commit
+        v.create_branch("dev")
+        v.create_branch("staging")
+
+        # Add unique data to dev
+        dev = Versioned(store, branch="dev")
+        dev.commit({"dev_only": b"value"})
+
+        # Delete dev — shared commits should survive (still reachable from staging)
+        v.delete_branch("dev")
+
+        # staging should still work fine
+        staging = Versioned(store, branch="staging")
+        assert staging.get("shared") == b"data"
+
+    def test_clean_orphans_explicit(self):
+        """clean_orphans() can be called explicitly."""
+        store = Memory()
+        v = Versioned(store)
+        v.create_branch("temp")
+        temp = Versioned(store, branch="temp")
+        temp.commit({"t": b"val"})
+
+        # Remove HEAD pointer manually (simulating external deletion)
+        store.remove(BRANCH_HEAD % "temp")
+
+        cleaned = v.clean_orphans(min_age=0)
+        assert cleaned >= 1
+
+    def test_clean_orphans_respects_min_age(self):
+        """Recent orphans should NOT be cleaned when min_age is large."""
+        store = Memory()
+        v = Versioned(store)
+        v.create_branch("temp")
+        temp = Versioned(store, branch="temp")
+        temp.commit({"t": b"val"})
+
+        store.remove(BRANCH_HEAD % "temp")
+
+        # With a very large min_age, nothing should be cleaned
+        cleaned = v.clean_orphans(min_age=999999)
+        assert cleaned == 0

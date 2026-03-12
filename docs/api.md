@@ -13,9 +13,6 @@ kvgit.store(
     branch="main",
     encoder=pickle.dumps,
     decoder=pickle.loads,
-    high_water_bytes=None,
-    low_water_bytes=None,
-    is_protected=None,
 )
 ```
 
@@ -27,9 +24,6 @@ kvgit.store(
 | `branch` | `str` | `"main"` | Branch name |
 | `encoder` | `Callable[[Any], bytes]` | `pickle.dumps` | Value encoder |
 | `decoder` | `Callable[[bytes], Any]` | `pickle.loads` | Value decoder |
-| `high_water_bytes` | `int \| None` | `None` | Enable eviction. Not supported with `"git"`. |
-| `low_water_bytes` | `int \| None` | `None` | Eviction low-water target. Defaults to 80% of high water. Not supported with `"git"`. |
-| `is_protected` | `Callable[[str], bool] \| None` | `None` | Keys that should never be evicted. Defaults to keys starting with `__`. Only used when `high_water_bytes` is set. Not supported with `"git"`. |
 
 ---
 
@@ -111,7 +105,7 @@ Register a fallback merge function for any key without a specific registration.
 | `create_branch` | `(name, *, at=None) -> Staged` | Fork onto a new branch. Returns a new `Staged`. |
 | `checkout` | `(commit_hash, *, branch=None) -> Staged \| None` | Open a specific commit. Returns `None` if not found. |
 | `switch_branch` | `(name) -> None` | Switch to an existing branch (clears staged buffer). |
-| `delete_branch` | `(name) -> None` | Delete a branch. Cannot delete the current branch. |
+| `delete_branch` | `(name) -> None` | Delete a branch and clean up orphaned commits. Cannot delete the current branch. |
 | `list_branches` | `() -> list[str]` | All branch names in the store. |
 | `peek` | `(key, *, branch) -> Any \| None` | Read a decoded value from another branch's HEAD. |
 | `reset_to` | `(commit_hash) -> bool` | Force HEAD to a specific commit. Returns `False` if not found. |
@@ -241,30 +235,6 @@ Bytes-level merge function type, used by `VersionedKV` / `VersionedGP`:
 BytesMergeFn = Callable[[bytes | None, bytes | None, bytes | None], bytes]
 ```
 
-### MetaEntry
-
-Per-key metadata used for eviction.
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `last_touch` | `int` | Touch counter (higher = more recently accessed) |
-| `size` | `int \| None` | Value size in bytes |
-| `created_at` | `float` | Creation timestamp |
-
-### RebaseResult
-
-Frozen dataclass returned by eviction rebase operations.
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `performed` | `bool` | Whether a rebase was actually performed |
-| `new_commit` | `str \| None` | New root commit hash |
-| `dropped_keys` | `tuple[str, ...]` | Keys that were dropped |
-| `kept_keys` | `tuple[str, ...]` | Keys that were retained |
-| `total_size_before` | `int` | Total user-data size before rebase |
-| `total_size_after` | `int` | Total user-data size after rebase |
-| `orphans_cleaned` | `int` | Number of orphaned commits deleted |
-
 ---
 
 ## Built-in merge functions
@@ -283,7 +253,7 @@ Always returns `theirs` (the HEAD value).
 
 ### ConcurrencyError
 
-Raised when a CAS operation fails during `commit()` or `rebase()`. Another writer updated HEAD between when this instance last read it and when the commit was attempted.
+Raised when a CAS operation fails during `commit()`. Another writer updated HEAD between when this instance last read it and when the commit was attempted.
 
 ### MergeConflict
 
@@ -332,59 +302,21 @@ All methods from the `Versioned` protocol are implemented. Additional:
 |--------------------|-------------|
 | `store` | Direct access to the underlying `KVStore` |
 | `branches(store)` | Static method: list branch names for a store |
+| `clean_orphans(min_age=3600)` | Remove orphaned commits unreachable from any branch HEAD. Returns count of cleaned orphans. Only deletes commits older than `min_age` seconds. |
 
----
+### Orphan Cleanup
 
-## GCVersionedKV
+When branches are deleted, the commits they referenced may become unreachable ("orphaned"). `delete_branch()` automatically calls `clean_orphans(min_age=0)` to remove these orphans immediately.
 
-Extends `VersionedKV` with automatic eviction via rebase. When total serialized value size exceeds the high-water threshold, the least-recently-accessed keys are evicted until the size drops to the low-water mark.
+You can also call `clean_orphans()` manually:
 
 ```python
-from kvgit.versioned.gc import GCVersionedKV
-
-v = GCVersionedKV(high_water_bytes=10_000)
-v = GCVersionedKV(high_water_bytes=10_000, low_water_bytes=5_000)
+v = VersionedKV(store)
+cleaned = v.clean_orphans(min_age=0)  # remove all orphans now
+cleaned = v.clean_orphans()            # only orphans older than 1 hour (default)
 ```
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `store` | `KVStore \| None` | `None` | Backend. |
-| `commit_hash` | `str \| None` | `None` | Resume from this commit. |
-| `branch` | `str` | `"main"` | Branch name. |
-| `high_water_bytes` | `int` | (required) | Eviction triggers above this. |
-| `low_water_bytes` | `int \| None` | `None` | Evict keys until at or below this. Defaults to 80% of high water. |
-| `is_protected` | `Callable[[str], bool]` | `is_system_key` | Returns `True` for keys that should never be evicted. Default protects `__`-prefixed keys. |
-
-### Methods
-
-#### `commit(...) -> MergeResult`
-
-Same as `VersionedKV.commit()`, but automatically runs eviction afterward if above high water.
-
-#### `maybe_rebase() -> RebaseResult`
-
-Check size and evict if above high water. Returns a no-op result if below.
-
-#### `rebase(keep_keys=None, *, info=None) -> RebaseResult`
-
-Force a rebase. Creates a fresh root commit with retained keys.
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `keep_keys` | `set[str] \| None` | `None` | Retain exactly these keys (plus protected). Otherwise uses high/low water eviction strategy. |
-| `info` | `dict \| None` | `None` | Metadata for the rebase commit. |
-
-#### `clean_orphans(min_age=3600) -> int`
-
-Remove orphaned commits unreachable from any branch HEAD. Only deletes commits older than `min_age` seconds. Returns count of cleaned orphans.
-
-### Attributes
-
-| Attribute | Type | Description |
-|-----------|------|-------------|
-| `high_water` | `int` | High water threshold |
-| `low_water` | `int` | Low water threshold |
-| `last_rebase_result` | `RebaseResult \| None` | Result of last rebase |
+The cleanup is safe for shared commit histories (e.g., forked branches). Blobs referenced by any reachable commit are never deleted.
 
 ---
 
