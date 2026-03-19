@@ -117,10 +117,17 @@ async def _idb_tx_complete(tx):
 
 
 def _to_bytes(js_value) -> bytes | None:
-    """Convert a JS result to bytes, or None if absent."""
+    """Convert a JS result to bytes, or None if absent.
+
+    Uses Uint8Array.to_py() for fast memcpy from JS to WASM memory,
+    avoiding the slow element-wise iteration of bytes(js_proxy).
+    """
     if js_value is None or js_value is undefined:
         return None
-    return bytes(js_value)
+    from js import Uint8Array  # type: ignore[import-not-found]
+
+    arr = Uint8Array.new(js_value)
+    return arr.to_py().tobytes()
 
 
 class IndexedDB(KVStore):
