@@ -213,7 +213,7 @@ class IndexedDB(KVStore):
                 def on_success(event):
                     cursor = event.target.result
                     if cursor:
-                        results.append((str(cursor.key), bytes(cursor.value)))
+                        results.append((str(cursor.key), _to_bytes(cursor.value)))
                         cursor.continue_()
                     else:
                         resolve(None)
