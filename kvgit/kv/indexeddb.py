@@ -124,10 +124,14 @@ def _to_bytes(js_value) -> bytes | None:
     """
     if js_value is None or js_value is undefined:
         return None
-    from js import Uint8Array  # type: ignore[import-not-found]
+    try:
+        from js import Uint8Array  # type: ignore[import-not-found]
 
-    arr = Uint8Array.new(js_value)
-    return arr.to_py().tobytes()
+        arr = Uint8Array.new(js_value)
+        return arr.to_py().tobytes()
+    except Exception:
+        # Corrupted or unexpected JS value — treat as missing
+        return None
 
 
 class IndexedDB(KVStore):
