@@ -53,8 +53,12 @@ def _safe_from_bytes(raw: bytes):
         return None
 
 
-def _resolve_head(store: KVStore, branch: str) -> str | None:
+def _resolve_head(store: KVStore, branch: str, *, repair: bool = True) -> str | None:
     """Resolve a branch HEAD, falling back to prev HEAD or commit scan.
+
+    When *repair* is True (default), a corrupt HEAD is automatically
+    healed by writing the recovered commit hash back to the store.
+    Pass ``repair=False`` for side-effect-free reads (e.g. properties).
 
     Returns a valid commit hash, or None if unrecoverable.
     """
@@ -79,7 +83,8 @@ def _resolve_head(store: KVStore, branch: str) -> str | None:
             logger.warning(
                 "Branch '%s': HEAD corrupt, recovered from prev HEAD", branch
             )
-            store.set(BRANCH_HEAD % branch, to_bytes(commit_hash))
+            if repair:
+                store.set(BRANCH_HEAD % branch, to_bytes(commit_hash))
             return commit_hash
 
     # 3. HEAD existed but is corrupt and no prev — scan for best commit
@@ -89,7 +94,8 @@ def _resolve_head(store: KVStore, branch: str) -> str | None:
             logger.warning(
                 "Branch '%s': HEAD corrupt, recovered via commit scan", branch
             )
-            store.set(BRANCH_HEAD % branch, to_bytes(commit_hash))
+            if repair:
+                store.set(BRANCH_HEAD % branch, to_bytes(commit_hash))
             return commit_hash
 
     return None
@@ -241,7 +247,7 @@ class VersionedKV(VersionedBase):
     @property
     def latest_head(self) -> str | None:
         """Read HEAD directly from the KV store (reflects other writers)."""
-        return _resolve_head(self.store, self._branch)
+        return _resolve_head(self.store, self._branch, repair=False)
 
     # -- Read operations --
 
