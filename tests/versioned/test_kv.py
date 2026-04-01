@@ -2,7 +2,7 @@
 
 import pytest
 
-from kvgit import ConcurrencyError, MergeConflict, MergeResult, VersionedKV as Versioned
+from kvgit import MergeConflict, MergeResult, VersionedKV as Versioned
 from kvgit.kv.memory import Memory
 from kvgit.versioned.kv import BRANCH_HEAD
 from kvgit.encoding import to_bytes
@@ -804,12 +804,13 @@ class TestMergeResultReturn:
         v1 = Versioned(store)
         v1.commit({"x": b"1"})
 
-        v2 = Versioned(store)
+        v2 = Versioned(store)  # snapshots HEAD
 
-        # Overwrite HEAD to something v2 doesn't expect
-        store.set(BRANCH_HEAD % "main", to_bytes("bogus_hash"))
+        # Concurrent writer modifies the same key — merge conflict
+        v1.commit({"x": b"v1_conflict"})
 
-        result = v2.commit({"y": b"2"}, on_conflict="abandon")
+        # v2 also modifies x — no merge function, so conflict → abandon
+        result = v2.commit({"x": b"v2_conflict"}, on_conflict="abandon")
         assert isinstance(result, MergeResult)
         assert not result
         assert result.merged is False
@@ -856,8 +857,10 @@ class TestBugFixes:
         with pytest.raises(ValueError, match="on_conflict"):
             v.commit({"x": b"1"}, on_conflict="bogus")
 
-    def test_state_clean_after_concurrency_error(self):
-        """Object state is restored after ConcurrencyError on fast-forward."""
+    def test_state_clean_after_merge_conflict(self):
+        """Object state is restored after MergeConflict."""
+        from kvgit.errors import MergeConflict
+
         store = Memory()
         v = Versioned(store)
         v.commit({"x": b"1"})
@@ -865,52 +868,52 @@ class TestBugFixes:
         original_commit = v.current_commit
         original_base = v.base_commit
 
-        # Simulate concurrent HEAD change
-        store.set(BRANCH_HEAD % "main", to_bytes("bogus_hash"))
+        # Concurrent writer modifies same key — no merge function → conflict
+        v_other = Versioned(store)
+        v_other.commit({"x": b"concurrent"})
 
-        with pytest.raises(ConcurrencyError):
-            v.commit({"y": b"2"})
+        with pytest.raises(MergeConflict):
+            v.commit({"x": b"2"})
 
         # State should be unchanged
         assert v.current_commit == original_commit
         assert v.base_commit == original_base
         assert v.get("x") == b"1"
-        assert v.get("y") is None
 
-    def test_state_clean_after_abandon_on_fast_forward(self):
-        """Object state is restored after abandon on fast-forward CAS failure."""
+    def test_state_clean_after_abandon_on_conflict(self):
+        """Object state is restored after abandon on merge conflict."""
+
         store = Memory()
         v = Versioned(store)
         v.commit({"x": b"1"})
 
         original_commit = v.current_commit
 
-        store.set(BRANCH_HEAD % "main", to_bytes("bogus_hash"))
+        # Concurrent writer modifies same key — conflict
+        v_other = Versioned(store)
+        v_other.commit({"x": b"concurrent"})
 
-        result = v.commit({"y": b"2"}, on_conflict="abandon")
+        result = v.commit({"x": b"2"}, on_conflict="abandon")
         assert result.merged is False
         assert v.current_commit == original_commit
-        assert v.get("y") is None
 
-    def test_state_clean_after_concurrency_error_three_way(self):
-        """Object state is restored after ConcurrencyError on three-way merge."""
+    def test_state_clean_after_merge_conflict_three_way(self):
+        """Object state is restored after MergeConflict on three-way merge."""
+        from kvgit.errors import MergeConflict
+
         store = Memory()
         v1 = Versioned(store)
         v1.commit({"x": b"1"})
 
         v2 = Versioned(store)
+        # v1 advances HEAD — v2 is now behind
         v1.commit({"x": b"v1"})
 
         original_commit = v2.current_commit
 
-        # Sabotage HEAD so the three-way merge CAS fails.
-        # v2 already read latest_head (v1's commit) which differs from
-        # v2._base_commit, triggering the three-way path. Overwriting
-        # HEAD means the CAS expected value won't match.
-        store.set(BRANCH_HEAD % "main", to_bytes("sabotaged"))
-
-        with pytest.raises(ConcurrencyError):
-            v2.commit({"x": b"v2"}, default_merge=lambda o, a, b: a or b"")
+        # v2 modifies same key — no merge function → conflict
+        with pytest.raises(MergeConflict):
+            v2.commit({"x": b"v2"})
 
         assert v2.current_commit == original_commit
         assert v2.get("x") == b"1"
@@ -1083,3 +1086,122 @@ class TestCleanOrphans:
         # With a very large min_age, nothing should be cleaned
         cleaned = v.clean_orphans(min_age=999999)
         assert cleaned == 0
+
+
+class TestHeadRecovery:
+    """Tests for corrupt HEAD detection and recovery."""
+
+    def test_prev_head_written_on_commit(self):
+        """Committing writes a prev HEAD backup."""
+        from kvgit.versioned.kv import BRANCH_HEAD_PREV
+
+        store = Memory()
+        v = Versioned(store)
+        first = v.current_commit
+        v.commit({"x": b"1"})
+
+        prev_bytes = store.get(BRANCH_HEAD_PREV % "main")
+        assert prev_bytes is not None
+        from kvgit.encoding import from_bytes
+
+        assert from_bytes(prev_bytes) == first
+
+    def test_recover_from_empty_head(self):
+        """Constructor recovers from empty HEAD bytes via prev HEAD."""
+        store = Memory()
+        v = Versioned(store)
+        v.commit({"x": b"1"})
+        v.commit({"x": b"2"})  # prev HEAD now has x=1
+
+        # Corrupt HEAD
+        store.set(BRANCH_HEAD % "main", b"")
+
+        # Should recover from prev HEAD
+        v2 = Versioned(store)
+        assert v2.get("x") == b"1"
+
+    def test_recover_from_invalid_json_head(self):
+        """Constructor recovers from invalid JSON HEAD bytes."""
+        store = Memory()
+        v = Versioned(store)
+        v.commit({"x": b"1"})
+        v.commit({"x": b"2"})  # prev HEAD now points to commit with x=1
+
+        store.set(BRANCH_HEAD % "main", b"not-json{{{")
+        v2 = Versioned(store)
+        # Recovers to prev HEAD (one commit behind)
+        assert v2.get("x") == b"1"
+
+    def test_recover_from_dangling_head(self):
+        """Constructor recovers when HEAD points to nonexistent commit."""
+        store = Memory()
+        v = Versioned(store)
+        v.commit({"x": b"1"})
+        v.commit({"x": b"2"})
+
+        store.set(BRANCH_HEAD % "main", to_bytes("deadbeef" * 5))
+        v2 = Versioned(store)
+        assert v2.get("x") == b"1"
+
+    def test_peek_survives_corrupt_branch(self):
+        """peek() returns None for a corrupt branch instead of crashing."""
+        store = Memory()
+        v = Versioned(store)
+        v.commit({"x": b"1"})
+        v.create_branch("other")
+        other = Versioned(store, branch="other")
+        other.commit({"y": b"2"})
+        other.commit({"y": b"3"})  # ensure prev HEAD has data
+
+        # Corrupt the other branch
+        store.set(BRANCH_HEAD % "other", b"")
+
+        # peek should not crash — returns value via prev HEAD recovery
+        result = v.peek("y", branch="other")
+        assert result == b"2"
+
+    def test_switch_branch_survives_corrupt_head(self):
+        """switch_branch() recovers from corrupt HEAD."""
+        store = Memory()
+        v = Versioned(store)
+        v.create_branch("dev")
+        dev = Versioned(store, branch="dev")
+        dev.commit({"d": b"1"})
+        dev.commit({"d": b"2"})
+
+        store.set(BRANCH_HEAD % "dev", b"")
+
+        v.switch_branch("dev")
+        assert v.get("d") == b"1"
+
+    def test_scan_recovery_when_no_prev_head(self):
+        """Falls back to commit scan when prev HEAD doesn't exist."""
+        from kvgit.versioned.kv import BRANCH_HEAD_PREV
+
+        store = Memory()
+        v = Versioned(store)
+        v.commit({"x": b"1"})
+
+        # Corrupt HEAD and remove prev
+        store.set(BRANCH_HEAD % "main", b"")
+        store.remove(BRANCH_HEAD_PREV % "main")
+
+        # Should still recover via commit scan
+        v2 = Versioned(store)
+        assert v2.get("x") == b"1"
+
+    def test_reset_to_saves_prev_head(self):
+        """reset_to() preserves prev HEAD for recovery."""
+        from kvgit.versioned.kv import BRANCH_HEAD_PREV
+        from kvgit.encoding import from_bytes
+
+        store = Memory()
+        v = Versioned(store)
+        v.commit({"x": b"1"})
+        first = v.current_commit
+        v.commit({"x": b"2"})
+        second = v.current_commit
+
+        v.reset_to(first)
+        prev = from_bytes(store.get(BRANCH_HEAD_PREV % "main"))
+        assert prev == second

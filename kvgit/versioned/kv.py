@@ -14,6 +14,7 @@ from .merge import MergeResolution
 PARENT_COMMIT = "__parent_commit__%s"
 COMMIT_KEYSET = "__commit_keyset__%s"
 BRANCH_HEAD = "__branch_head__%s"
+BRANCH_HEAD_PREV = "__branch_head_prev__%s"
 META_KEY = "__meta__%s"
 TOTAL_VAR_SIZE_KEY = "__total_var_size__%s"
 INFO_KEY = "__info__%s"
@@ -41,6 +42,139 @@ def content_hash(
     return h.hexdigest()[:40]
 
 
+logger = logging.getLogger("kvgit")
+
+
+def _safe_from_bytes(raw: bytes):
+    """Like from_bytes but returns None on any decode/parse error."""
+    try:
+        return from_bytes(raw)
+    except Exception:
+        return None
+
+
+def _resolve_head(store: KVStore, branch: str) -> str | None:
+    """Resolve a branch HEAD, falling back to prev HEAD or commit scan.
+
+    Returns a valid commit hash, or None if unrecoverable.
+    """
+    # 1. Try current HEAD
+    head_bytes = store.get(BRANCH_HEAD % branch)
+    if head_bytes is not None:
+        commit_hash = _safe_from_bytes(head_bytes)
+        if (
+            isinstance(commit_hash, str)
+            and store.get(COMMIT_KEYSET % commit_hash) is not None
+        ):
+            return commit_hash
+
+    # 2. Try previous HEAD (backup written before each CAS)
+    prev_bytes = store.get(BRANCH_HEAD_PREV % branch)
+    if prev_bytes is not None:
+        commit_hash = _safe_from_bytes(prev_bytes)
+        if (
+            isinstance(commit_hash, str)
+            and store.get(COMMIT_KEYSET % commit_hash) is not None
+        ):
+            logger.warning(
+                "Branch '%s': HEAD corrupt, recovered from prev HEAD", branch
+            )
+            store.set(BRANCH_HEAD % branch, to_bytes(commit_hash))
+            return commit_hash
+
+    # 3. HEAD existed but is corrupt and no prev — scan for best commit
+    if head_bytes is not None:
+        commit_hash = _scan_for_best_commit(store, branch)
+        if commit_hash is not None:
+            logger.warning(
+                "Branch '%s': HEAD corrupt, recovered via commit scan", branch
+            )
+            store.set(BRANCH_HEAD % branch, to_bytes(commit_hash))
+            return commit_hash
+
+    return None
+
+
+def _scan_for_best_commit(store: KVStore, branch: str) -> str | None:
+    """Scan the store for the best valid commit for a corrupt branch.
+
+    Finds all valid commits, excludes those reachable from healthy branches,
+    and returns the most recent tip.
+    """
+    # Collect all valid commits with timestamps
+    ks_prefix = COMMIT_KEYSET.replace("%s", "")
+    meta_prefix = META_KEY.replace("%s", "")
+    all_commits: dict[str, float] = {}
+    for key in store.keys():
+        if not isinstance(key, str) or not key.startswith(ks_prefix):
+            continue
+        h = key[len(ks_prefix) :]
+        if not h:
+            continue
+        meta_bytes = store.get(meta_prefix + h)
+        ts = 0.0
+        if meta_bytes is not None:
+            try:
+                meta = json.loads(meta_bytes)
+                ts = max((e.get("created_at", 0) for e in meta.values()), default=0)
+            except Exception:
+                pass
+        all_commits[h] = ts
+
+    if not all_commits:
+        return None
+
+    # Exclude commits reachable from healthy branches
+    claimed: set[str] = set()
+    head_prefix = BRANCH_HEAD.replace("%s", "")
+    for key in store.keys():
+        if not isinstance(key, str) or not key.startswith(head_prefix):
+            continue
+        other = key[len(head_prefix) :]
+        if other == branch or not other:
+            continue
+        hb = store.get(key)
+        if hb is None:
+            continue
+        h = _safe_from_bytes(hb)
+        if not isinstance(h, str) or store.get(COMMIT_KEYSET % h) is None:
+            continue
+        # Walk parent chain
+        stack = [h]
+        while stack:
+            c = stack.pop()
+            if c in claimed:
+                continue
+            claimed.add(c)
+            pb = store.get(PARENT_COMMIT % c)
+            if pb is not None:
+                parsed = _safe_from_bytes(pb)
+                if isinstance(parsed, str):
+                    stack.append(parsed)
+                elif isinstance(parsed, list):
+                    stack.extend(p for p in parsed if isinstance(p, str))
+
+    candidates = {h for h in all_commits if h not in claimed}
+    if not candidates:
+        candidates = set(all_commits)
+
+    # Find tips (not a parent of any other candidate)
+    all_parents: set[str] = set()
+    for h in candidates:
+        pb = store.get(PARENT_COMMIT % h)
+        if pb is not None:
+            parsed = _safe_from_bytes(pb)
+            if isinstance(parsed, str):
+                all_parents.add(parsed)
+            elif isinstance(parsed, list):
+                all_parents.update(p for p in parsed if isinstance(p, str))
+    tips = candidates - all_parents
+    if not tips:
+        tips = candidates
+
+    return max(tips, key=lambda h: all_commits.get(h, 0))
+
+
 class VersionedKV(VersionedBase):
     """A commit log over a KV store.
 
@@ -63,10 +197,10 @@ class VersionedKV(VersionedBase):
         self.store = store
 
         if commit_hash is None:
-            head_bytes = store.get(BRANCH_HEAD % branch)
-            if head_bytes is not None:
-                commit_hash = from_bytes(head_bytes)
-            else:
+            commit_hash = _resolve_head(store, branch)
+            if commit_hash is None and store.get(BRANCH_HEAD % branch) is not None:
+                raise ValueError(f"Branch '{branch}' HEAD is corrupt and unrecoverable")
+            if commit_hash is None:
                 # Create initial empty commit
                 commit_hash = content_hash((), {}, {})
                 initial = {
@@ -107,10 +241,7 @@ class VersionedKV(VersionedBase):
     @property
     def latest_head(self) -> str | None:
         """Read HEAD directly from the KV store (reflects other writers)."""
-        head_bytes = self.store.get(BRANCH_HEAD % self._branch)
-        if head_bytes is not None:
-            return from_bytes(head_bytes)
-        return None
+        return _resolve_head(self.store, self._branch)
 
     # -- Read operations --
 
@@ -297,8 +428,14 @@ class VersionedKV(VersionedBase):
         return merge_hash
 
     def _cas_head(self, expected: str, new_head: str) -> bool:
-        """Atomically advance branch HEAD via KVStore CAS."""
+        """Atomically advance branch HEAD via KVStore CAS.
+
+        Saves the current HEAD as prev HEAD before advancing, so a
+        corrupt write can be recovered from.
+        """
         branch_key = BRANCH_HEAD % self._branch
+        prev_key = BRANCH_HEAD_PREV % self._branch
+        self.store.set(prev_key, to_bytes(expected))
         return self.store.cas(
             branch_key, to_bytes(new_head), expected=to_bytes(expected)
         )
@@ -367,10 +504,10 @@ class VersionedKV(VersionedBase):
 
     def refresh(self) -> None:
         """Reload state from HEAD."""
-        head_bytes = self.store.get(BRANCH_HEAD % self._branch)
-        if head_bytes is None:
+        commit_hash = _resolve_head(self.store, self._branch)
+        if commit_hash is None:
             raise ValueError("No HEAD commit found for branch %s" % self._branch)
-        self._load_commit(from_bytes(head_bytes), update_base=True)
+        self._load_commit(commit_hash, update_base=True)
 
     def checkout(
         self, commit_hash: str, *, branch: str | None = None
@@ -409,23 +546,25 @@ class VersionedKV(VersionedBase):
 
     def switch_branch(self, name: str) -> None:
         """Switch this instance to a different branch in-place."""
-        branch_key = BRANCH_HEAD % name
-        head_bytes = self.store.get(branch_key)
-        if head_bytes is None:
+        commit_hash = _resolve_head(self.store, name)
+        if commit_hash is None:
+            if self.store.get(BRANCH_HEAD % name) is not None:
+                raise ValueError(f"Branch '{name}' HEAD is corrupt and unrecoverable")
             raise ValueError(f"Branch '{name}' does not exist")
         self._branch = name
-        self._load_commit(from_bytes(head_bytes), update_base=True)
+        self._load_commit(commit_hash, update_base=True)
 
     def peek(self, key: str, *, branch: str) -> bytes | None:
         """Read a key from another branch's HEAD without switching."""
-        head_bytes = self.store.get(BRANCH_HEAD % branch)
-        if head_bytes is None:
+        commit_hash = _resolve_head(self.store, branch)
+        if commit_hash is None:
             return None
-        commit_hash = from_bytes(head_bytes)
         keyset_bytes = self.store.get(COMMIT_KEYSET % commit_hash)
         if keyset_bytes is None:
             return None
-        keyset = from_bytes(keyset_bytes)
+        keyset = _safe_from_bytes(keyset_bytes)
+        if not isinstance(keyset, dict):
+            return None
         content_hash_ = keyset.get(key)
         if content_hash_ is None:
             return None
@@ -435,7 +574,13 @@ class VersionedKV(VersionedBase):
         """Reset HEAD to a specific commit."""
         if self.store.get(COMMIT_KEYSET % commit_hash) is None:
             return False
-        self.store.set(BRANCH_HEAD % self._branch, to_bytes(commit_hash))
+        branch_key = BRANCH_HEAD % self._branch
+        prev_key = BRANCH_HEAD_PREV % self._branch
+        # Save current HEAD as prev before overwriting
+        current = self.store.get(branch_key)
+        if current is not None:
+            self.store.set(prev_key, current)
+        self.store.set(branch_key, to_bytes(commit_hash))
         self._load_commit(commit_hash, update_base=True)
         return True
 
@@ -489,10 +634,10 @@ class VersionedKV(VersionedBase):
         prefix = BRANCH_HEAD.replace("%s", "")
         for key in self.store.keys():
             if isinstance(key, str) and key.startswith(prefix):
-                head_bytes = self.store.get(key)
-                if head_bytes is None:
+                branch_name = key[len(prefix) :]
+                branch_head = _resolve_head(self.store, branch_name)
+                if branch_head is None:
                     continue
-                branch_head = from_bytes(head_bytes)
                 for commit in self.history(commit_hash=branch_head, all_parents=True):
                     if commit not in reachable:
                         reachable.add(commit)
