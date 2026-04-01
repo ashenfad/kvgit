@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.9] - 2026-04-01
+
+### Added
+- **Backup HEAD** (`__branch_head_prev__`) -- each HEAD update now saves the previous HEAD, providing a one-commit-behind fallback if a write is interrupted (e.g. browser tab closed mid-commit)
+- **Automatic HEAD recovery** -- all HEAD resolution goes through a three-tier fallback: current HEAD, prev HEAD, full commit scan. Corrupt HEADs are auto-repaired and logged as warnings. Covers `__init__`, `peek`, `switch_branch`, `refresh`, and `clean_orphans`
+
+### Fixed
+- **IndexedDB byte conversion** -- `_to_bytes` now handles corrupted or unexpected JS values gracefully instead of crashing
+- **`latest_head` property** is now side-effect free (reads but never writes to the store); repair only happens in explicit methods
+
 ## [0.1.8] - 2026-03-18
 
 ### Fixed
