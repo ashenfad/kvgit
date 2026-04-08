@@ -305,6 +305,41 @@ async def test_type_error_on_non_bytes(selenium_jspi):
 
 
 @run_in_pyodide(packages=["micropip"])
+async def test_binary_roundtrip(selenium_jspi):
+    """Pickle-style binary data must survive the IndexedDB round-trip."""
+    import micropip
+    from pyodide.http import pyfetch
+
+    resp = await pyfetch("./_kvgit_whl.txt")
+    whl = (await resp.string()).strip()
+    await micropip.install(f"./{whl}", deps=False)
+
+    from kvgit.kv.indexeddb import IndexedDB
+
+    store = IndexedDB(db_name="test_binary_roundtrip")
+
+    # Pickle protocol 5 header + every possible byte value
+    all_bytes = bytes(range(256))
+    # Realistic pickle payload (protocol 5 starts with \x80\x05)
+    pickle_like = b"\x80\x05\x95\x0a\x00\x00\x00\x00\x00\x00\x00hello"
+
+    store.set("all", all_bytes)
+    store.set("pickle", pickle_like)
+    store.set_many(all2=all_bytes, pickle2=pickle_like)
+
+    assert store.get("all") == all_bytes
+    assert store.get("pickle") == pickle_like
+
+    batch = store.get_many("all2", "pickle2")
+    assert batch["all2"] == all_bytes
+    assert batch["pickle2"] == pickle_like
+
+    # CAS with binary data
+    assert store.cas("pickle", pickle_like + b"\xff", expected=pickle_like)
+    assert store.get("pickle") == pickle_like + b"\xff"
+
+
+@run_in_pyodide(packages=["micropip"])
 async def test_versioned_integration(selenium_jspi):
     """Full integration: Staged -> VersionedKV -> IndexedDB."""
     import micropip
