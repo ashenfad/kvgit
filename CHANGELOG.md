@@ -5,10 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.10] - 2026-04-07
+## [0.1.11] - 2026-04-08
 
 ### Fixed
-- **IndexedDB binary data corruption** -- write path now uses explicit `Uint8Array` conversion (`_to_uint8array`) matching the read-side `Uint8Array.new()`, preventing pickle stream corruption through IndexedDB's structured clone (manifested as `UnpicklingError: invalid load key, '\x0a'`)
+- **IndexedDB binary data corruption** -- write path now uses `.slice()` to copy `to_js(bytes)` WASM memory views into standalone ArrayBuffers before storing, preventing pickle stream corruption through IndexedDB's structured clone (manifested as `UnpicklingError: invalid load key, '\x0a'`)
+- **IndexedDB read path** -- removed `Uint8Array.new()` constructor from `_to_bytes`, calling `.to_py().tobytes()` directly to avoid constructor failures in some Pyodide environments
 
 ### Added
 - **Binary round-trip test** -- `test_binary_roundtrip` covers all 256 byte values and realistic pickle payloads across `set`, `set_many`, and `cas`
