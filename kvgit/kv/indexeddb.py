@@ -116,6 +116,18 @@ async def _idb_tx_complete(tx):
     await _promise(_executor)
 
 
+def _to_uint8array(data: bytes):
+    """Convert Python bytes to a JS Uint8Array for IndexedDB storage.
+
+    Ensures the value is a true JS typed array that IndexedDB can
+    structured-clone without data loss.  Mirrors ``_to_bytes`` on the
+    read side.
+    """
+    from js import Uint8Array  # type: ignore[import-not-found]
+
+    return Uint8Array.new(to_js(data))
+
+
 def _to_bytes(js_value) -> bytes | None:
     """Convert a JS result to bytes, or None if absent.
 
@@ -170,7 +182,7 @@ class IndexedDB(KVStore):
 
         async def _op():
             store, tx = self._object_store("readwrite")
-            store.put(to_js(value), key)
+            store.put(_to_uint8array(value), key)
             await _idb_tx_complete(tx)
 
         run_sync(_op())
@@ -201,7 +213,7 @@ class IndexedDB(KVStore):
         async def _op():
             store, tx = self._object_store("readwrite")
             for key, value in kwargs.items():
-                store.put(to_js(value), key)
+                store.put(_to_uint8array(value), key)
             await _idb_tx_complete(tx)
 
         run_sync(_op())
@@ -290,7 +302,7 @@ class IndexedDB(KVStore):
                     current = _to_bytes(event.target.result)
                     if current != expected:
                         return  # tx will auto-commit empty
-                    store.put(to_js(value), key)
+                    store.put(_to_uint8array(value), key)
                     cas_result[0] = True
 
                 read_req.onsuccess = on_read_success
