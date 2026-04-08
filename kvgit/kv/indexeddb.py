@@ -119,28 +119,25 @@ async def _idb_tx_complete(tx):
 def _to_uint8array(data: bytes):
     """Convert Python bytes to a JS Uint8Array for IndexedDB storage.
 
-    Ensures the value is a true JS typed array that IndexedDB can
-    structured-clone without data loss.  Mirrors ``_to_bytes`` on the
-    read side.
+    ``to_js(bytes)`` returns a Uint8Array *view* into WASM linear
+    memory.  IndexedDB's structured-clone may not handle WASM memory
+    views correctly, corrupting binary data on round-trip.  ``.slice()``
+    copies the bytes into a standalone ArrayBuffer that clones safely.
     """
-    from js import Uint8Array  # type: ignore[import-not-found]
-
-    return Uint8Array.new(to_js(data))
+    return to_js(data).slice()
 
 
 def _to_bytes(js_value) -> bytes | None:
     """Convert a JS result to bytes, or None if absent.
 
-    Uses Uint8Array.to_py() for fast memcpy from JS to WASM memory,
-    avoiding the slow element-wise iteration of bytes(js_proxy).
+    Calls ``.to_py().tobytes()`` directly on the JS typed array,
+    avoiding the ``Uint8Array`` constructor which can fail in some
+    Pyodide environments.
     """
     if js_value is None or js_value is undefined:
         return None
     try:
-        from js import Uint8Array  # type: ignore[import-not-found]
-
-        arr = Uint8Array.new(js_value)
-        return arr.to_py().tobytes()
+        return js_value.to_py().tobytes()
     except Exception:
         # Corrupted or unexpected JS value — treat as missing
         return None
