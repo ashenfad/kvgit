@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.10] - 2026-04-07
+
+### Fixed
+- **IndexedDB binary data corruption** -- write path now uses explicit `Uint8Array` conversion (`_to_uint8array`) matching the read-side `Uint8Array.new()`, preventing pickle stream corruption through IndexedDB's structured clone (manifested as `UnpicklingError: invalid load key, '\x0a'`)
+
+### Added
+- **Binary round-trip test** -- `test_binary_roundtrip` covers all 256 byte values and realistic pickle payloads across `set`, `set_many`, and `cas`
+
 ## [0.1.9] - 2026-04-01
 
 ### Added
