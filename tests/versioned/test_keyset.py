@@ -74,20 +74,20 @@ def test_empty_keyset_does_not_write():
 
 def test_set_and_get():
     e = _entry(blob="commit1:foo", size=100)
-    ks = Keyset(Memory()).commit({"foo": e})
+    ks = Keyset(Memory()).persist({"foo": e})
     assert ks.get("foo") == e
     assert "foo" in ks
 
 
 def test_get_blob_shortcut():
     e = _entry(blob="commit1:foo")
-    ks = Keyset(Memory()).commit({"foo": e})
+    ks = Keyset(Memory()).persist({"foo": e})
     assert ks.get_blob("foo") == "commit1:foo"
     assert ks.get_blob("missing") is None
 
 
 def test_get_missing_returns_none():
-    ks = Keyset(Memory()).commit({"a": _entry()})
+    ks = Keyset(Memory()).persist({"a": _entry()})
     assert ks.get("b") is None
 
 
@@ -98,7 +98,7 @@ def test_multiple_entries():
     entries = {
         f"key-{i}": _entry(blob=f"commit:key-{i}", size=i * 10) for i in range(20)
     }
-    ks = Keyset(Memory(), bucket_max=4).commit(entries)
+    ks = Keyset(Memory(), bucket_max=4).persist(entries)
     for k, e in entries.items():
         assert ks.get(k) == e
     assert len(ks) == 20
@@ -106,21 +106,21 @@ def test_multiple_entries():
 
 def test_iteration_yields_decoded_entries():
     entries = {f"k{i}": _entry(blob=f"b{i}", size=i) for i in range(15)}
-    ks = Keyset(Memory(), bucket_max=4).commit(entries)
+    ks = Keyset(Memory(), bucket_max=4).persist(entries)
     yielded = dict(ks.items())
     assert yielded == entries
 
 
 def test_keys_iteration():
     entries = {f"k{i}": _entry() for i in range(10)}
-    ks = Keyset(Memory(), bucket_max=4).commit(entries)
+    ks = Keyset(Memory(), bucket_max=4).persist(entries)
     assert set(ks.keys()) == set(entries.keys())
     assert set(iter(ks)) == set(entries.keys())
 
 
 def test_values_iteration():
     entries = {f"k{i}": _entry(blob=f"b{i}") for i in range(10)}
-    ks = Keyset(Memory(), bucket_max=4).commit(entries)
+    ks = Keyset(Memory(), bucket_max=4).persist(entries)
     blobs = {v.blob for v in ks.values()}
     assert blobs == {f"b{i}" for i in range(10)}
 
@@ -129,8 +129,8 @@ def test_values_iteration():
 
 
 def test_update_existing_entry():
-    ks = Keyset(Memory()).commit({"a": _entry(blob="old", size=1)})
-    ks2 = ks.commit({"a": _entry(blob="new", size=2)})
+    ks = Keyset(Memory()).persist({"a": _entry(blob="old", size=1)})
+    ks2 = ks.persist({"a": _entry(blob="new", size=2)})
     assert ks2.get("a") == _entry(blob="new", size=2)
     # Original is unchanged
     assert ks.get("a") == _entry(blob="old", size=1)
@@ -138,7 +138,7 @@ def test_update_existing_entry():
 
 def test_setting_same_entry_is_noop():
     e = _entry(blob="x", size=1)
-    ks = Keyset(Memory()).commit({"a": e})
+    ks = Keyset(Memory()).persist({"a": e})
     new_ks, pending = ks.updated({"a": e})
     assert new_ks.root == ks.root
     assert pending == {}
@@ -148,8 +148,8 @@ def test_setting_same_entry_is_noop():
 
 
 def test_remove_entry():
-    ks = Keyset(Memory()).commit({"a": _entry(), "b": _entry()})
-    ks2 = ks.commit(removals=["a"])
+    ks = Keyset(Memory()).persist({"a": _entry(), "b": _entry()})
+    ks2 = ks.persist(removals=["a"])
     assert ks2.get("a") is None
     assert ks2.get("b") is not None
     assert "a" not in ks2
@@ -158,8 +158,8 @@ def test_remove_entry():
 
 def test_remove_all_returns_to_empty():
     entries = {f"k{i}": _entry() for i in range(10)}
-    ks = Keyset(Memory(), bucket_max=3).commit(entries)
-    ks = ks.commit(removals=list(entries.keys()))
+    ks = Keyset(Memory(), bucket_max=3).persist(entries)
+    ks = ks.persist(removals=list(entries.keys()))
     assert ks.root == EMPTY_HASH
     assert len(ks) == 0
 
@@ -171,11 +171,11 @@ def test_canonical_form_inherited_from_hamt():
     """Two Keysets with the same logical content must share the same root."""
     entries = {f"k{i}": _entry(blob=f"b{i}") for i in range(20)}
 
-    ks_a = Keyset(Memory(), bucket_max=4).commit(entries)
+    ks_a = Keyset(Memory(), bucket_max=4).persist(entries)
 
     ks_b = Keyset(Memory(), bucket_max=4)
     for k, e in entries.items():
-        ks_b = ks_b.commit({k: e})
+        ks_b = ks_b.persist({k: e})
 
     assert ks_a.root == ks_b.root
 
@@ -205,9 +205,9 @@ def test_flush_persists():
     assert fresh.get_blob("a") == "x"
 
 
-def test_commit_persists_immediately():
+def test_persist_writes_immediately():
     store = Memory()
-    ks = Keyset(store).commit({"a": _entry(blob="x")})
+    ks = Keyset(store).persist({"a": _entry(blob="x")})
     # Can read from a fresh Keyset on the same store + root
     fresh = Keyset(store, ks.root)
     assert fresh.get_blob("a") == "x"
@@ -222,8 +222,8 @@ def test_keyset_uses_distinct_prefix_from_default_hamt():
     from kvgit.hamt import Hamt
 
     store = Memory()
-    ks = Keyset(store).commit({"a": _entry(blob="ksval")})
-    h = Hamt(store).commit({"a": b"hamtval"})
+    ks = Keyset(store).persist({"a": _entry(blob="ksval")})
+    h = Hamt(store).persist({"a": b"hamtval"})
 
     # Both have data, no interference
     assert ks.get_blob("a") == "ksval"
@@ -244,10 +244,10 @@ def test_structural_sharing_via_keyset():
     """Modifying one entry should add only a handful of new HAMT nodes."""
     store = Memory()
     entries = {f"k{i:04d}": _entry(blob=f"b{i}", size=i) for i in range(200)}
-    ks = Keyset(store, bucket_max=4).commit(entries)
+    ks = Keyset(store, bucket_max=4).persist(entries)
     nodes_before = sum(1 for k in store.keys() if k.startswith(ks.prefix))
 
-    ks2 = ks.commit({"k0050": _entry(blob="changed", size=999)})
+    ks2 = ks.persist({"k0050": _entry(blob="changed", size=999)})
     nodes_after = sum(1 for k in store.keys() if k.startswith(ks.prefix))
     new_nodes = nodes_after - nodes_before
 
@@ -267,7 +267,7 @@ def test_reachable_nodes_empty():
 def test_reachable_nodes_covers_full_keyset():
     store = Memory()
     entries = {f"k{i:04d}": _entry(blob=f"b{i}") for i in range(100)}
-    ks = Keyset(store, bucket_max=4).commit(entries)
+    ks = Keyset(store, bucket_max=4).persist(entries)
 
     reachable = set(ks.reachable_nodes())
     all_nodes = {k[len(ks.prefix) :] for k in store.keys() if k.startswith(ks.prefix)}
@@ -290,8 +290,8 @@ def test_diff_added_removed_modified():
     e2_new = _entry(blob="b2-new", size=22)
     e3 = _entry(blob="b3", size=3)
 
-    a = Keyset(Memory(), bucket_max=4).commit({"k1": e1, "k2": e2})
-    b = a.commit({"k2": e2_new, "k3": e3}).commit(removals=["k1"])
+    a = Keyset(Memory(), bucket_max=4).persist({"k1": e1, "k2": e2})
+    b = a.persist({"k2": e2_new, "k3": e3}).persist(removals=["k1"])
 
     d = a.diff(b)
     assert d.added == {"k3": e3}
@@ -301,8 +301,8 @@ def test_diff_added_removed_modified():
 
 def test_diff_returns_decoded_entries():
     """Diff results should be KeysetEntry objects, not raw bytes."""
-    a = Keyset(Memory()).commit({"k": _entry(blob="old")})
-    b = a.commit({"k": _entry(blob="new")})
+    a = Keyset(Memory()).persist({"k": _entry(blob="old")})
+    b = a.persist({"k": _entry(blob="new")})
     d = a.diff(b)
     assert isinstance(d.modified["k"][0], KeysetEntry)
     assert isinstance(d.modified["k"][1], KeysetEntry)
@@ -313,8 +313,8 @@ def test_diff_returns_decoded_entries():
 
 def test_bucket_max_configurable():
     entries = {f"k{i:03d}": _entry() for i in range(30)}
-    ks_small = Keyset(Memory(), bucket_max=2).commit(entries)
-    ks_large = Keyset(Memory(), bucket_max=16).commit(entries)
+    ks_small = Keyset(Memory(), bucket_max=2).persist(entries)
+    ks_large = Keyset(Memory(), bucket_max=16).persist(entries)
     assert dict(ks_small.items()) == dict(ks_large.items()) == entries
     assert ks_small.root != ks_large.root
 
@@ -328,7 +328,7 @@ def test_meta_field_round_trip():
         blob="commit-abc:my-key",
         meta=MetaEntry(size=98765, created_at=1234567890.5),
     )
-    ks = Keyset(Memory()).commit({"k": e})
+    ks = Keyset(Memory()).persist({"k": e})
     got = ks.get("k")
     assert got == e
     assert got.meta.size == 98765

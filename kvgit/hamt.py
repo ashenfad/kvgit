@@ -243,16 +243,17 @@ class Hamt:
         )
         return new_hamt, reachable_pending
 
-    def commit(
+    def persist(
         self,
         updates: Mapping[str, bytes] | None = None,
         removals: Iterable[str] = (),
     ) -> "Hamt":
-        """Apply updates and persist to the store immediately.
+        """Apply updates and write any new nodes to the store immediately.
 
         Convenience for callers that don't need to batch writes with
         other store operations. Returns a fresh ``Hamt`` with empty
-        pending.
+        pending. Distinct from ``Versioned.commit``: a HAMT has no
+        notion of a commit history — this just flushes node bytes.
         """
         new_hamt, pending = self.updated(updates, removals)
         if pending:

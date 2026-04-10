@@ -57,7 +57,7 @@ def test_empty_hash_is_deterministic():
 
 
 def test_single_insert_get():
-    h = Hamt(_store()).commit({"a": b"1"})
+    h = Hamt(_store()).persist({"a": b"1"})
     assert h.get("a") == b"1"
     assert "a" in h
     assert h.get("nope") is None
@@ -65,7 +65,7 @@ def test_single_insert_get():
 
 def test_single_insert_persists_to_store():
     store = _store()
-    Hamt(store).commit({"a": b"1"})
+    Hamt(store).persist({"a": b"1"})
     # One leaf node should be in the store
     assert len(_all_node_keys(store)) == 1
 
@@ -92,7 +92,7 @@ def test_insert_then_read_through_pending_before_flush():
 
 def test_inserts_within_bucket_max_stay_in_one_leaf():
     store = _store()
-    h = Hamt(store, bucket_max=8).commit({f"k{i}": f"v{i}".encode() for i in range(8)})
+    h = Hamt(store, bucket_max=8).persist({f"k{i}": f"v{i}".encode() for i in range(8)})
     assert len(_all_node_keys(store)) == 1
     for i in range(8):
         assert h.get(f"k{i}") == f"v{i}".encode()
@@ -101,7 +101,7 @@ def test_inserts_within_bucket_max_stay_in_one_leaf():
 def test_overflow_triggers_split():
     store = _store()
     items = {f"k{i}": f"v{i}".encode() for i in range(20)}
-    h = Hamt(store, bucket_max=4).commit(items)
+    h = Hamt(store, bucket_max=4).persist(items)
 
     # All keys must still be retrievable
     for k, v in items.items():
@@ -117,13 +117,13 @@ def test_overflow_triggers_split():
 def test_same_content_different_insertion_order_same_hash():
     items = {f"k{i}": f"v{i}".encode() for i in range(50)}
 
-    h1 = Hamt(_store(), bucket_max=4).commit(items)
+    h1 = Hamt(_store(), bucket_max=4).persist(items)
 
     shuffled = list(items.items())
     random.Random(42).shuffle(shuffled)
     h2 = Hamt(_store(), bucket_max=4)
     for k, v in shuffled:
-        h2 = h2.commit({k: v})
+        h2 = h2.persist({k: v})
 
     assert h1.root == h2.root
 
@@ -134,21 +134,21 @@ def test_same_content_after_inserts_and_deletes_same_hash():
     extra = {f"e{i}": f"x{i}".encode() for i in range(10)}
 
     # Path A: insert only the keepers
-    h_only = Hamt(_store(), bucket_max=3).commit(keep)
+    h_only = Hamt(_store(), bucket_max=3).persist(keep)
 
     # Path B: insert keepers + extras, then delete the extras
-    h_mixed = Hamt(_store(), bucket_max=3).commit({**keep, **extra})
-    h_mixed = h_mixed.commit(removals=list(extra.keys()))
+    h_mixed = Hamt(_store(), bucket_max=3).persist({**keep, **extra})
+    h_mixed = h_mixed.persist(removals=list(extra.keys()))
 
     assert h_only.root == h_mixed.root
 
 
 def test_collapse_after_delete_returns_to_empty():
     items = {f"k{i}": f"v{i}".encode() for i in range(15)}
-    h = Hamt(_store(), bucket_max=2).commit(items)
+    h = Hamt(_store(), bucket_max=2).persist(items)
     assert h.root != EMPTY_HASH
 
-    h = h.commit(removals=list(items.keys()))
+    h = h.persist(removals=list(items.keys()))
     assert h.root == EMPTY_HASH
     assert len(h) == 0
 
@@ -163,14 +163,14 @@ def test_canonical_form_under_random_operations():
     target = {k: rng.randbytes(16) for k in rng.sample(keys, 25)}
 
     # Path A: build target directly
-    h_a = Hamt(_store(), bucket_max=3).commit(target)
+    h_a = Hamt(_store(), bucket_max=3).persist(target)
 
     # Path B: insert ALL keys with random values, then delete the
     # non-target ones, then overwrite the target ones with target values
     all_initial = {k: rng.randbytes(16) for k in keys}
-    h_b = Hamt(_store(), bucket_max=3).commit(all_initial)
-    h_b = h_b.commit(removals=[k for k in keys if k not in target])
-    h_b = h_b.commit(target)  # overwrite to match
+    h_b = Hamt(_store(), bucket_max=3).persist(all_initial)
+    h_b = h_b.persist(removals=[k for k in keys if k not in target])
+    h_b = h_b.persist(target)  # overwrite to match
 
     assert h_a.root == h_b.root
 
@@ -179,14 +179,14 @@ def test_canonical_form_under_random_operations():
 
 
 def test_update_existing_key():
-    h = Hamt(_store()).commit({"a": b"1"})
-    h2 = h.commit({"a": b"2"})
+    h = Hamt(_store()).persist({"a": b"1"})
+    h2 = h.persist({"a": b"2"})
     assert h2.get("a") == b"2"
     assert h.get("a") == b"1"  # original is unchanged
 
 
 def test_setting_same_value_is_noop():
-    h = Hamt(_store()).commit({"a": b"1"})
+    h = Hamt(_store()).persist({"a": b"1"})
     new_h, pending = h.updated({"a": b"1"})
     assert new_h.root == h.root
     assert pending == {}
@@ -196,8 +196,8 @@ def test_setting_same_value_is_noop():
 
 
 def test_remove_key():
-    h = Hamt(_store()).commit({"a": b"1", "b": b"2"})
-    h2 = h.commit(removals=["a"])
+    h = Hamt(_store()).persist({"a": b"1", "b": b"2"})
+    h2 = h.persist(removals=["a"])
     assert h2.get("a") is None
     assert h2.get("b") == b"2"
     # Original is unchanged
@@ -205,7 +205,7 @@ def test_remove_key():
 
 
 def test_remove_missing_key_is_noop():
-    h = Hamt(_store()).commit({"a": b"1"})
+    h = Hamt(_store()).persist({"a": b"1"})
     new_h, pending = h.updated(removals=["nope"])
     assert new_h.root == h.root
     assert pending == {}
@@ -213,8 +213,8 @@ def test_remove_missing_key_is_noop():
 
 def test_remove_all_keys_returns_empty():
     items = {f"k{i}": f"v{i}".encode() for i in range(10)}
-    h = Hamt(_store(), bucket_max=3).commit(items)
-    h = h.commit(removals=list(items.keys()))
+    h = Hamt(_store(), bucket_max=3).persist(items)
+    h = h.persist(removals=list(items.keys()))
     assert h.root == EMPTY_HASH
 
 
@@ -225,7 +225,7 @@ def test_deep_collisions_via_tiny_bucket():
     """With bucket_max=1, every collision forces a split. Use many keys
     so we exercise the recursive split path."""
     items = {f"k{i:04d}": f"v{i}".encode() for i in range(100)}
-    h = Hamt(_store(), bucket_max=1).commit(items)
+    h = Hamt(_store(), bucket_max=1).persist(items)
     for k, v in items.items():
         assert h.get(k) == v
     assert len(list(h.items())) == 100
@@ -249,7 +249,7 @@ def test_split_recursion_when_all_share_next_nibble():
         seen_prefixes[h] = k
         i += 1
 
-    h = Hamt(_store(), bucket_max=1).commit({found[0]: b"a", found[1]: b"b"})
+    h = Hamt(_store(), bucket_max=1).persist({found[0]: b"a", found[1]: b"b"})
     assert h.get(found[0]) == b"a"
     assert h.get(found[1]) == b"b"
 
@@ -262,10 +262,10 @@ def test_structural_sharing_one_changed_key():
     whole tree. Verify by counting nodes added to the store."""
     store = _store()
     items = {f"k{i:04d}": f"v{i}".encode() for i in range(200)}
-    h = Hamt(store, bucket_max=4).commit(items)
+    h = Hamt(store, bucket_max=4).persist(items)
     nodes_before = len(_all_node_keys(store))
 
-    h2 = h.commit({"k0050": b"changed"})
+    h2 = h.persist({"k0050": b"changed"})
     nodes_after = len(_all_node_keys(store))
     new_nodes = nodes_after - nodes_before
 
@@ -300,14 +300,14 @@ def test_batch_update_filters_orphan_intermediates():
 
 def test_iteration_yields_all_entries():
     items = {f"k{i:03d}": f"v{i}".encode() for i in range(100)}
-    h = Hamt(_store(), bucket_max=4).commit(items)
+    h = Hamt(_store(), bucket_max=4).persist(items)
     yielded = dict(h.items())
     assert yielded == items
 
 
 def test_keys_values_iteration():
     items = {f"k{i}": f"v{i}".encode() for i in range(20)}
-    h = Hamt(_store(), bucket_max=4).commit(items)
+    h = Hamt(_store(), bucket_max=4).persist(items)
     assert set(h.keys()) == set(items.keys())
     assert set(h.values()) == set(items.values())
     assert set(iter(h)) == set(items.keys())
@@ -315,7 +315,7 @@ def test_keys_values_iteration():
 
 def test_len():
     items = {f"k{i}": b"x" for i in range(50)}
-    h = Hamt(_store(), bucket_max=4).commit(items)
+    h = Hamt(_store(), bucket_max=4).persist(items)
     assert len(h) == 50
 
 
@@ -325,19 +325,19 @@ def test_len():
 def test_value_with_arbitrary_bytes():
     """Values containing nulls, high bytes, etc. must round-trip."""
     nasty = bytes(range(256))
-    h = Hamt(_store()).commit({"k": nasty})
+    h = Hamt(_store()).persist({"k": nasty})
     assert h.get("k") == nasty
 
 
 def test_value_empty_bytes():
-    h = Hamt(_store()).commit({"k": b""})
+    h = Hamt(_store()).persist({"k": b""})
     assert h.get("k") == b""
     assert "k" in h
 
 
 def test_key_with_special_chars():
     keys = ["with space", 'with "quote"', "with\nnewline", "unicode-café-🦀"]
-    h = Hamt(_store()).commit({k: k.encode() for k in keys})
+    h = Hamt(_store()).persist({k: k.encode() for k in keys})
     for k in keys:
         assert h.get(k) == k.encode()
 
@@ -347,8 +347,8 @@ def test_key_with_special_chars():
 
 def test_two_hamts_in_same_store_with_different_prefixes():
     store = _store()
-    h_a = Hamt(store, prefix="a:").commit({"k": b"a-val"})
-    h_b = Hamt(store, prefix="b:").commit({"k": b"b-val"})
+    h_a = Hamt(store, prefix="a:").persist({"k": b"a-val"})
+    h_b = Hamt(store, prefix="b:").persist({"k": b"b-val"})
 
     # Both readable, no interference
     assert h_a.get("k") == b"a-val"
@@ -370,7 +370,7 @@ def test_reachable_nodes_empty():
 
 
 def test_reachable_nodes_single_leaf():
-    h = Hamt(_store()).commit({"a": b"1"})
+    h = Hamt(_store()).persist({"a": b"1"})
     nodes = list(h.reachable_nodes())
     assert len(nodes) == 1
     assert nodes[0] == h.root
@@ -379,7 +379,7 @@ def test_reachable_nodes_single_leaf():
 def test_reachable_nodes_covers_full_tree():
     store = _store()
     items = {f"k{i:04d}": f"v{i}".encode() for i in range(100)}
-    h = Hamt(store, bucket_max=4).commit(items)
+    h = Hamt(store, bucket_max=4).persist(items)
 
     reachable = set(h.reachable_nodes())
     all_nodes = {k[len(h.prefix) :] for k in _all_node_keys(store, h.prefix)}
@@ -410,7 +410,7 @@ def test_diff_empty_vs_empty():
 
 def test_diff_empty_vs_populated():
     h1 = Hamt(_store())
-    h2 = Hamt(_store()).commit({"a": b"1", "b": b"2"})
+    h2 = Hamt(_store()).persist({"a": b"1", "b": b"2"})
     d = h1.diff(h2)
     assert d.added == {"a": b"1", "b": b"2"}
     assert d.removed == {}
@@ -418,7 +418,7 @@ def test_diff_empty_vs_populated():
 
 
 def test_diff_populated_vs_empty():
-    h1 = Hamt(_store()).commit({"a": b"1", "b": b"2"})
+    h1 = Hamt(_store()).persist({"a": b"1", "b": b"2"})
     h2 = Hamt(_store())
     d = h1.diff(h2)
     assert d.added == {}
@@ -427,9 +427,9 @@ def test_diff_populated_vs_empty():
 
 
 def test_diff_added_removed_modified():
-    h1 = Hamt(_store(), bucket_max=4).commit({"a": b"1", "b": b"2", "c": b"3"})
-    h2 = h1.commit({"b": b"22", "d": b"4"})  # modify b, add d
-    h3 = h2.commit(removals=["a"])  # remove a
+    h1 = Hamt(_store(), bucket_max=4).persist({"a": b"1", "b": b"2", "c": b"3"})
+    h2 = h1.persist({"b": b"22", "d": b"4"})  # modify b, add d
+    h3 = h2.persist(removals=["a"])  # remove a
 
     d = h1.diff(h3)
     assert d.added == {"d": b"4"}
@@ -442,8 +442,8 @@ def test_diff_skips_identical_subtrees():
     We verify this by ensuring it returns the right thing for a tree with
     many shared subtrees and one changed key."""
     items = {f"k{i:04d}": f"v{i}".encode() for i in range(200)}
-    h1 = Hamt(_store(), bucket_max=4).commit(items)
-    h2 = h1.commit({"k0050": b"changed"})
+    h1 = Hamt(_store(), bucket_max=4).persist(items)
+    h2 = h1.persist({"k0050": b"changed"})
 
     d = h1.diff(h2)
     assert d.added == {}
@@ -456,8 +456,8 @@ def test_diff_skips_identical_subtrees():
 
 def test_bucket_max_affects_shape_but_not_contents():
     items = {f"k{i:03d}": f"v{i}".encode() for i in range(50)}
-    h_small = Hamt(_store(), bucket_max=2).commit(items)
-    h_large = Hamt(_store(), bucket_max=16).commit(items)
+    h_small = Hamt(_store(), bucket_max=2).persist(items)
+    h_large = Hamt(_store(), bucket_max=16).persist(items)
 
     # Both contain the same logical data
     assert dict(h_small.items()) == dict(h_large.items()) == items
@@ -467,7 +467,7 @@ def test_bucket_max_affects_shape_but_not_contents():
 
 def test_bucket_max_one_is_valid():
     items = {f"k{i:03d}": f"v{i}".encode() for i in range(20)}
-    h = Hamt(_store(), bucket_max=1).commit(items)
+    h = Hamt(_store(), bucket_max=1).persist(items)
     for k, v in items.items():
         assert h.get(k) == v
 
@@ -485,7 +485,7 @@ def test_large_random_workload():
     n = 1000
     items = {f"k-{rng.randint(0, 10**9)}": rng.randbytes(32) for _ in range(n)}
 
-    h = Hamt(_store(), bucket_max=4).commit(items)
+    h = Hamt(_store(), bucket_max=4).persist(items)
 
     # Every key readable
     for k, v in items.items():
@@ -504,8 +504,8 @@ def test_large_random_with_deletes():
     items = {f"k-{i}": rng.randbytes(16) for i in range(500)}
     to_delete = set(rng.sample(list(items.keys()), 200))
 
-    h = Hamt(_store(), bucket_max=4).commit(items)
-    h = h.commit(removals=list(to_delete))
+    h = Hamt(_store(), bucket_max=4).persist(items)
+    h = h.persist(removals=list(to_delete))
 
     survivors = {k: v for k, v in items.items() if k not in to_delete}
     assert dict(h.items()) == survivors
@@ -540,9 +540,9 @@ def test_chained_updated_calls_accumulate_pending():
     assert h2_clean.get("k5") == b"w"
 
 
-def test_commit_clears_pending():
+def test_persist_clears_pending():
     h0 = Hamt(_store(), bucket_max=4)
-    h1 = h0.commit({"a": b"1"})
+    h1 = h0.persist({"a": b"1"})
     assert h1.pending == {}
 
 
