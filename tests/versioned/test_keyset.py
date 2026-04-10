@@ -14,19 +14,19 @@ from kvgit.versioned.keyset import (
 )
 
 
-def _meta(touch=1, size=10, created=1000.0) -> MetaEntry:
-    return MetaEntry(last_touch=touch, size=size, created_at=created)
+def _meta(size=10, created=1000.0) -> MetaEntry:
+    return MetaEntry(size=size, created_at=created)
 
 
-def _entry(blob="abc:k", touch=1, size=10, created=1000.0) -> KeysetEntry:
-    return KeysetEntry(blob=blob, meta=_meta(touch, size, created))
+def _entry(blob="abc:k", size=10, created=1000.0) -> KeysetEntry:
+    return KeysetEntry(blob=blob, meta=_meta(size, created))
 
 
 # ---- entry encoding ----
 
 
 def test_encode_decode_round_trip():
-    e = _entry(blob="commit-hash:user-key", touch=42, size=100, created=1234.5)
+    e = _entry(blob="commit-hash:user-key", size=100, created=1234.5)
     raw = encode_entry(e)
     assert isinstance(raw, bytes)
     decoded = decode_entry(raw)
@@ -39,7 +39,7 @@ def test_encode_is_deterministic():
 
 
 def test_encode_handles_none_size():
-    e = KeysetEntry(blob="x", meta=MetaEntry(last_touch=1, size=None, created_at=0.0))
+    e = KeysetEntry(blob="x", meta=MetaEntry(size=None, created_at=0.0))
     decoded = decode_entry(encode_entry(e))
     assert decoded == e
     assert decoded.meta.size is None
@@ -73,7 +73,7 @@ def test_empty_keyset_does_not_write():
 
 
 def test_set_and_get():
-    e = _entry(blob="commit1:foo", touch=5, size=100)
+    e = _entry(blob="commit1:foo", size=100)
     ks = Keyset(Memory()).commit({"foo": e})
     assert ks.get("foo") == e
     assert "foo" in ks
@@ -96,8 +96,7 @@ def test_get_missing_returns_none():
 
 def test_multiple_entries():
     entries = {
-        f"key-{i}": _entry(blob=f"commit:key-{i}", touch=i, size=i * 10)
-        for i in range(20)
+        f"key-{i}": _entry(blob=f"commit:key-{i}", size=i * 10) for i in range(20)
     }
     ks = Keyset(Memory(), bucket_max=4).commit(entries)
     for k, e in entries.items():
@@ -106,7 +105,7 @@ def test_multiple_entries():
 
 
 def test_iteration_yields_decoded_entries():
-    entries = {f"k{i}": _entry(blob=f"b{i}", touch=i) for i in range(15)}
+    entries = {f"k{i}": _entry(blob=f"b{i}", size=i) for i in range(15)}
     ks = Keyset(Memory(), bucket_max=4).commit(entries)
     yielded = dict(ks.items())
     assert yielded == entries
@@ -130,15 +129,15 @@ def test_values_iteration():
 
 
 def test_update_existing_entry():
-    ks = Keyset(Memory()).commit({"a": _entry(blob="old", touch=1)})
-    ks2 = ks.commit({"a": _entry(blob="new", touch=2)})
-    assert ks2.get("a") == _entry(blob="new", touch=2)
+    ks = Keyset(Memory()).commit({"a": _entry(blob="old", size=1)})
+    ks2 = ks.commit({"a": _entry(blob="new", size=2)})
+    assert ks2.get("a") == _entry(blob="new", size=2)
     # Original is unchanged
-    assert ks.get("a") == _entry(blob="old", touch=1)
+    assert ks.get("a") == _entry(blob="old", size=1)
 
 
 def test_setting_same_entry_is_noop():
-    e = _entry(blob="x", touch=1)
+    e = _entry(blob="x", size=1)
     ks = Keyset(Memory()).commit({"a": e})
     new_ks, pending = ks.updated({"a": e})
     assert new_ks.root == ks.root
@@ -244,11 +243,11 @@ def test_keyset_uses_distinct_prefix_from_default_hamt():
 def test_structural_sharing_via_keyset():
     """Modifying one entry should add only a handful of new HAMT nodes."""
     store = Memory()
-    entries = {f"k{i:04d}": _entry(blob=f"b{i}", touch=i, size=i) for i in range(200)}
+    entries = {f"k{i:04d}": _entry(blob=f"b{i}", size=i) for i in range(200)}
     ks = Keyset(store, bucket_max=4).commit(entries)
     nodes_before = sum(1 for k in store.keys() if k.startswith(ks.prefix))
 
-    ks2 = ks.commit({"k0050": _entry(blob="changed", touch=999)})
+    ks2 = ks.commit({"k0050": _entry(blob="changed", size=999)})
     nodes_after = sum(1 for k in store.keys() if k.startswith(ks.prefix))
     new_nodes = nodes_after - nodes_before
 
@@ -286,10 +285,10 @@ def test_diff_empty_vs_empty():
 
 
 def test_diff_added_removed_modified():
-    e1 = _entry(blob="b1", touch=1)
-    e2 = _entry(blob="b2", touch=2)
-    e2_new = _entry(blob="b2-new", touch=22)
-    e3 = _entry(blob="b3", touch=3)
+    e1 = _entry(blob="b1", size=1)
+    e2 = _entry(blob="b2", size=2)
+    e2_new = _entry(blob="b2-new", size=22)
+    e3 = _entry(blob="b3", size=3)
 
     a = Keyset(Memory(), bucket_max=4).commit({"k1": e1, "k2": e2})
     b = a.commit({"k2": e2_new, "k3": e3}).commit(removals=["k1"])
@@ -327,11 +326,10 @@ def test_meta_field_round_trip():
     """All MetaEntry fields must round-trip exactly through encode/decode/HAMT."""
     e = KeysetEntry(
         blob="commit-abc:my-key",
-        meta=MetaEntry(last_touch=12345, size=98765, created_at=1234567890.5),
+        meta=MetaEntry(size=98765, created_at=1234567890.5),
     )
     ks = Keyset(Memory()).commit({"k": e})
     got = ks.get("k")
     assert got == e
-    assert got.meta.last_touch == 12345
     assert got.meta.size == 98765
     assert got.meta.created_at == 1234567890.5

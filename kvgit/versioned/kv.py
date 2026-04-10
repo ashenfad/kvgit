@@ -294,7 +294,6 @@ class VersionedKV(VersionedBase):
 
         # Materialize keyset + meta from the HAMT
         self._meta: dict[str, MetaEntry] = {}
-        self._touch_counter = 0
         self._populate_state(commit_hash)
 
     def _populate_state(self, commit_hash: str) -> None:
@@ -303,7 +302,6 @@ class VersionedKV(VersionedBase):
         if root is None:
             self._commit_keys = {}
             self._meta = {}
-            self._touch_counter = 0
             return
 
         ks = Keyset(self.store, root=root)
@@ -314,9 +312,6 @@ class VersionedKV(VersionedBase):
             meta[key] = entry.meta
         self._commit_keys = commit_keys
         self._meta = meta
-        self._touch_counter = (
-            max((e.last_touch for e in meta.values()), default=0) if meta else 0
-        )
 
     @property
     def latest_head(self) -> str | None:
@@ -326,14 +321,11 @@ class VersionedKV(VersionedBase):
     # -- Read operations --
 
     def get(self, key: str) -> bytes | None:
-        """Get a value from the current commit. Updates touch for GC."""
+        """Get a value from the current commit."""
         versioned_key = self._commit_keys.get(key)
         if versioned_key is None:
             return None
-        value = self.store.get(versioned_key)
-        if value is not None:
-            self._touch(key)
-        return value
+        return self.store.get(versioned_key)
 
     def get_many(self, *keys: str) -> dict[str, bytes]:
         """Get multiple values from the current commit."""
@@ -348,12 +340,7 @@ class VersionedKV(VersionedBase):
             return {}
 
         raw = self.store.get_many(*vk_to_key.keys())
-        result: dict[str, bytes] = {}
-        for vk, value in raw.items():
-            key = vk_to_key[vk]
-            result[key] = value
-            self._touch(key)
-        return result
+        return {vk_to_key[vk]: value for vk, value in raw.items()}
 
     # -- Abstract method implementations --
 
@@ -363,12 +350,11 @@ class VersionedKV(VersionedBase):
             self._current_commit,
             dict(self._commit_keys),
             dict(self._meta),
-            self._touch_counter,
         )
 
     def _restore_state(self, saved: tuple) -> None:
         """Restore in-memory state after a failed commit attempt."""
-        self._current_commit, self._commit_keys, self._meta, self._touch_counter = saved
+        self._current_commit, self._commit_keys, self._meta = saved
 
     def _create_commit(
         self,
@@ -416,14 +402,11 @@ class VersionedKV(VersionedBase):
             size = len(value)
             if key in new_meta:
                 new_meta[key] = MetaEntry(
-                    last_touch=new_meta[key].last_touch,
                     size=size,
                     created_at=new_meta[key].created_at,
                 )
             else:
-                self._touch_counter += 1
                 new_meta[key] = MetaEntry(
-                    last_touch=self._touch_counter,
                     size=size,
                     created_at=time.time(),
                 )
@@ -493,9 +476,7 @@ class VersionedKV(VersionedBase):
         merged_meta: dict[str, MetaEntry] = {}
         for key in merged_keyset:
             if key in merged_values:
-                self._touch_counter += 1
                 merged_meta[key] = MetaEntry(
-                    last_touch=self._touch_counter,
                     size=len(merged_values[key]),
                     created_at=time.time(),
                 )
@@ -833,24 +814,6 @@ class VersionedKV(VersionedBase):
         return len(orphans)
 
     # -- Internal --
-
-    def _touch(self, key: str) -> None:
-        """Update last_touch for a key (in-memory only).
-
-        Note: as of storage v2 this no longer persists across commits.
-        Persisting touch counts would require rewriting every leaf on
-        every commit, which would obliterate structural sharing.
-        ``last_touch`` is now an in-session counter that resets when a
-        commit is reloaded.
-        """
-        if key in self._meta:
-            self._touch_counter += 1
-            entry = self._meta[key]
-            self._meta[key] = MetaEntry(
-                last_touch=self._touch_counter,
-                size=entry.size,
-                created_at=entry.created_at,
-            )
 
     def _load_commit(self, commit_hash: str, *, update_base: bool) -> None:
         """Load a commit's state into memory."""

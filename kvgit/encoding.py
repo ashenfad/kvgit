@@ -18,6 +18,5 @@ def from_bytes(raw: bytes):
 class MetaEntry:
     """Metadata for a single key in versioned state."""
 
-    last_touch: int
     size: int | None
     created_at: float
