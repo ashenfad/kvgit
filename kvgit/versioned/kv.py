@@ -734,11 +734,12 @@ class VersionedKV(VersionedBase):
                 root = _load_root(self.store, commit)
                 if root is None:
                     continue
-                ks = Keyset(self.store, root=root)
-                for _, entry in ks.items():
+                # Single batched walk per commit collects both the
+                # blob references and the HAMT node hashes.
+                entries, nodes = Keyset(self.store, root=root).walk()
+                for entry in entries.values():
                     reachable_blobs.add(entry.blob)
-                for node_hash in ks.reachable_nodes():
-                    reachable_nodes.add(node_hash)
+                reachable_nodes.update(nodes)
 
         # Sweep phase: find orphaned commits via __commit_root__ scan.
         cutoff_time = time.time() - min_age
@@ -772,8 +773,9 @@ class VersionedKV(VersionedBase):
             orphan_root = _load_root(self.store, orphan_hash)
             if orphan_root is not None and orphan_root != EMPTY_HASH:
                 try:
-                    orphan_ks = Keyset(self.store, root=orphan_root)
-                    for _, entry in orphan_ks.items():
+                    # Batched walk for the orphan's blob references.
+                    orphan_entries = Keyset(self.store, root=orphan_root).materialize()
+                    for entry in orphan_entries.values():
                         if entry.blob not in reachable_blobs:
                             all_removals.append(entry.blob)
                 except Exception:

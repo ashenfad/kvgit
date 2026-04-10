@@ -358,3 +358,34 @@ def test_materialize_matches_items():
     entries = {f"k{i:03d}": _entry(blob=f"b{i}") for i in range(100)}
     ks = Keyset(Memory(), bucket_max=4).persist(entries)
     assert ks.materialize() == dict(ks.items())
+
+
+# ---- walk (combined entries + node hashes) ----
+
+
+def test_walk_empty():
+    ks = Keyset(Memory())
+    entries, nodes = ks.walk()
+    assert entries == {}
+    assert nodes == set()
+
+
+def test_walk_returns_decoded_entries_and_nodes():
+    entries = {f"k{i}": _entry(blob=f"b{i}", size=i) for i in range(20)}
+    ks = Keyset(Memory(), bucket_max=4).persist(entries)
+
+    walked_entries, walked_nodes = ks.walk()
+    assert walked_entries == entries
+    sample = next(iter(walked_entries.values()))
+    assert isinstance(sample, KeysetEntry)
+    assert len(walked_nodes) > 0
+    # Root must be in the node set
+    assert ks.root in walked_nodes
+
+
+def test_walk_node_set_matches_reachable_nodes():
+    entries = {f"k{i:03d}": _entry(blob=f"b{i}") for i in range(80)}
+    ks = Keyset(Memory(), bucket_max=4).persist(entries)
+    _, walked_nodes = ks.walk()
+    via_reachable = set(ks.reachable_nodes())
+    assert walked_nodes == via_reachable

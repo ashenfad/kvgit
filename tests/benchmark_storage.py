@@ -211,6 +211,71 @@ def run_latency(n_keys: int, latency_ms: float) -> None:
         print(f"Speedup: ~{t_items / t_versioned:.1f}x")
 
 
+def run_clean_orphans(
+    n_keys: int,
+    n_branches: int,
+    commits_per_branch: int,
+    latency_ms: float,
+) -> None:
+    """clean_orphans benchmark against a latency-wrapped Memory store.
+
+    Sets up several branches with realistic commit histories, then
+    runs clean_orphans against a latency-wrapped store to measure
+    how the round-trip cost compounds across the mark-and-sweep.
+
+    The pre-walk fix replaces two per-node walks per commit
+    (items + reachable_nodes) with a single batched walk(), and
+    switches the sweep's per-orphan walk from items() to
+    materialize(). For network-attached stores this is the
+    difference between minutes and seconds.
+    """
+    print("kvgit clean_orphans benchmark with simulated latency")
+    print(
+        f"  keys per branch={n_keys}  branches={n_branches}  "
+        f"commits per branch={commits_per_branch}"
+    )
+    print(f"  per-call latency={latency_ms} ms")
+    print()
+
+    # Build state in a fast Memory backend (no latency during setup).
+    real_store = Memory()
+    v = VersionedKV(real_store, branch="main")
+    # Initial seed
+    v.commit({f"k{i:06d}": f"v{i}".encode() for i in range(n_keys)})
+    # Fork branches and commit on each
+    for b in range(n_branches):
+        worker = v.create_branch(f"b{b}")
+        for c in range(commits_per_branch):
+            worker.commit({f"k{(c * 7) % n_keys:06d}": f"branch-{b}-{c}".encode()})
+
+    # Create a doomed branch that will be deleted (so clean_orphans
+    # has work to do during the timed run).
+    doomed = v.create_branch("doomed")
+    for c in range(commits_per_branch):
+        doomed.commit({f"k{c:06d}": f"doomed-{c}".encode()})
+
+    # Snapshot to the latency-wrapped store
+    slow = _LatencyMemory(latency_ms=latency_ms)
+    for k, val in real_store.items():
+        slow.memory[k] = val
+    del real_store, v, doomed, worker
+
+    # Open the slow store and time delete_branch (which calls clean_orphans).
+    slow_v = VersionedKV(slow, branch="main")
+    print("Running delete_branch(doomed) → clean_orphans on latency-wrapped store")
+    t0 = time.perf_counter()
+    slow_v.delete_branch("doomed")
+    t = time.perf_counter() - t0
+    print(f"  wall: {t * 1000:8.0f} ms")
+    print()
+    print(
+        "  (Before the walk() optimization this would be roughly\n"
+        "   2x the per-commit reads + a per-orphan items() walk —\n"
+        "   compounding to many seconds at 1ms latency, multiple\n"
+        "   minutes at 5ms.)"
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--keys", type=int, default=1000)
@@ -220,13 +285,26 @@ def main():
         type=float,
         default=None,
         help=(
-            "If set, run the latency-simulated cold-load benchmark "
-            "instead of the storage-growth benchmark. The value is "
-            "the per-call sleep applied to a Memory backend, in ms."
+            "If set, run a latency-simulated benchmark instead of the "
+            "storage-growth one. With --clean-orphans, runs the GC "
+            "benchmark; otherwise runs the cold-load benchmark."
         ),
     )
+    parser.add_argument(
+        "--clean-orphans",
+        action="store_true",
+        help="Run the clean_orphans benchmark (requires --latency-ms).",
+    )
+    parser.add_argument("--branches", type=int, default=4)
+    parser.add_argument("--commits-per-branch", type=int, default=20)
     args = parser.parse_args()
-    if args.latency_ms is not None:
+    if args.clean_orphans:
+        if args.latency_ms is None:
+            parser.error("--clean-orphans requires --latency-ms")
+        run_clean_orphans(
+            args.keys, args.branches, args.commits_per_branch, args.latency_ms
+        )
+    elif args.latency_ms is not None:
         run_latency(args.keys, args.latency_ms)
     else:
         run(args.keys, args.commits)
