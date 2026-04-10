@@ -23,7 +23,7 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from kvgit.encoding import from_bytes
+from kvgit.encoding import loads
 from kvgit.kv.disk import Disk
 from kvgit.versioned.keyset import Keyset
 from kvgit.versioned.kv import (
@@ -54,7 +54,7 @@ def verify_store(backend: Disk) -> list[str]:
             continue
 
         try:
-            head_hash = from_bytes(head_bytes)
+            head_hash = loads(head_bytes)
         except Exception as e:
             errors.append(f"[{branch}] HEAD decode failed: {e}")
             continue
@@ -104,7 +104,7 @@ def verify_store(backend: Disk) -> list[str]:
             parent_bytes = backend.get(PARENT_COMMIT % commit_hash)
             if parent_bytes is not None:
                 try:
-                    parents_raw = from_bytes(parent_bytes)
+                    parents_raw = loads(parent_bytes)
                 except Exception:
                     parents_raw = None
                 if isinstance(parents_raw, str):

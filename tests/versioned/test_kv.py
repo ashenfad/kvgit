@@ -5,7 +5,7 @@ import pytest
 from kvgit import MergeConflict, MergeResult, VersionedKV as Versioned
 from kvgit.kv.memory import Memory
 from kvgit.versioned.kv import BRANCH_HEAD
-from kvgit.encoding import to_bytes
+from kvgit.encoding import dumps
 
 
 class TestVersionedBasic:
@@ -1102,9 +1102,9 @@ class TestHeadRecovery:
 
         prev_bytes = store.get(BRANCH_HEAD_PREV % "main")
         assert prev_bytes is not None
-        from kvgit.encoding import from_bytes
+        from kvgit.encoding import loads
 
-        assert from_bytes(prev_bytes) == first
+        assert loads(prev_bytes) == first
 
     def test_recover_from_empty_head(self):
         """Constructor recovers from empty HEAD bytes via prev HEAD."""
@@ -1139,7 +1139,7 @@ class TestHeadRecovery:
         v.commit({"x": b"1"})
         v.commit({"x": b"2"})
 
-        store.set(BRANCH_HEAD % "main", to_bytes("deadbeef" * 5))
+        store.set(BRANCH_HEAD % "main", dumps("deadbeef" * 5))
         v2 = Versioned(store)
         assert v2.get("x") == b"1"
 
@@ -1193,7 +1193,7 @@ class TestHeadRecovery:
     def test_reset_to_saves_prev_head(self):
         """reset_to() preserves prev HEAD for recovery."""
         from kvgit.versioned.kv import BRANCH_HEAD_PREV
-        from kvgit.encoding import from_bytes
+        from kvgit.encoding import loads
 
         store = Memory()
         v = Versioned(store)
@@ -1203,5 +1203,5 @@ class TestHeadRecovery:
         second = v.current_commit
 
         v.reset_to(first)
-        prev = from_bytes(store.get(BRANCH_HEAD_PREV % "main"))
+        prev = loads(store.get(BRANCH_HEAD_PREV % "main"))
         assert prev == second
