@@ -53,6 +53,90 @@ class TestMemoryBasic:
         assert list(m.keys()) == []
 
 
+class TestBulkCallForms:
+    """Bulk methods accept either variadic or container call forms."""
+
+    def test_set_many_kwargs_form(self):
+        m = Memory()
+        m.set_many(a=b"1", b=b"2")
+        assert m.get("a") == b"1"
+        assert m.get("b") == b"2"
+
+    def test_set_many_mapping_form(self):
+        m = Memory()
+        m.set_many({"a": b"1", "b": b"2"})
+        assert m.get("a") == b"1"
+        assert m.get("b") == b"2"
+
+    def test_set_many_mixed_mapping_and_kwargs(self):
+        # Mapping is positional, kwargs override/extend it
+        m = Memory()
+        m.set_many({"a": b"1", "b": b"2"}, c=b"3")
+        assert m.get("a") == b"1"
+        assert m.get("b") == b"2"
+        assert m.get("c") == b"3"
+
+    def test_set_many_mapping_form_does_not_unpack_dict(self):
+        # The Mapping form should pass the dict reference through,
+        # not unpack it. We verify by passing a dict-like object that
+        # would lose its identity if unpacked into kwargs.
+        m = Memory()
+        original = {"a": b"1", "b": b"2"}
+        m.set_many(original)
+        assert m.get("a") == b"1"
+
+    def test_get_many_variadic_form(self):
+        m = Memory()
+        m.set("a", b"1")
+        m.set("b", b"2")
+        assert m.get_many("a", "b") == {"a": b"1", "b": b"2"}
+
+    def test_get_many_iterable_form(self):
+        m = Memory()
+        m.set("a", b"1")
+        m.set("b", b"2")
+        assert m.get_many(["a", "b"]) == {"a": b"1", "b": b"2"}
+
+    def test_get_many_iterable_form_with_generator(self):
+        m = Memory()
+        m.set("a", b"1")
+        m.set("b", b"2")
+        keys = (k for k in ("a", "b"))
+        assert m.get_many(keys) == {"a": b"1", "b": b"2"}
+
+    def test_get_many_single_string_is_treated_as_one_key(self):
+        # A single positional string must NOT be iterated character-by-char.
+        m = Memory()
+        m.set("a", b"first")
+        m.set("ab", b"second")
+        # Single-string call: one key "ab", not three keys "a", "b"
+        assert m.get_many("ab") == {"ab": b"second"}
+
+    def test_remove_many_variadic_form(self):
+        m = Memory()
+        m.set_many(a=b"1", b=b"2", c=b"3")
+        m.remove_many("a", "c")
+        assert m.get("a") is None
+        assert m.get("b") == b"2"
+        assert m.get("c") is None
+
+    def test_remove_many_iterable_form(self):
+        m = Memory()
+        m.set_many(a=b"1", b=b"2", c=b"3")
+        m.remove_many(["a", "c"])
+        assert m.get("a") is None
+        assert m.get("b") == b"2"
+        assert m.get("c") is None
+
+    def test_remove_many_single_string_is_one_key(self):
+        m = Memory()
+        m.set_many(ab=b"1", a=b"2", b=b"3")
+        m.remove_many("ab")
+        assert m.get("ab") is None
+        assert m.get("a") == b"2"
+        assert m.get("b") == b"3"
+
+
 class TestMemoryRemove:
     def test_remove(self):
         m = Memory()

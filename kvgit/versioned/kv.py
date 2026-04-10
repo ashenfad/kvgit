@@ -275,7 +275,7 @@ class VersionedKV(VersionedBase):
                     COMMIT_TIME % commit_hash: dumps(time.time()),
                     BRANCH_HEAD % branch: dumps(commit_hash),
                 }
-                store.set_many(**initial)
+                store.set_many(initial)
 
         if not isinstance(commit_hash, str):
             raise TypeError(
@@ -423,7 +423,7 @@ class VersionedKV(VersionedBase):
             diffs[INFO_KEY % new_hash] = dumps(info)
 
         # Write everything atomically
-        self.store.set_many(**diffs)
+        self.store.set_many(diffs)
 
         # Update in-memory state
         self._commit_keys = new_commit_keys
@@ -504,7 +504,7 @@ class VersionedKV(VersionedBase):
         if info is not None:
             diffs[INFO_KEY % merge_hash] = dumps(info)
 
-        self.store.set_many(**diffs)
+        self.store.set_many(diffs)
 
         # Update in-memory state
         self._commit_keys = merged_keyset

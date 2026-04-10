@@ -96,6 +96,34 @@ class TestDiskCAS:
         assert store.get("k") == b"old"
 
 
+class TestDiskBulkCallForms:
+    """Disk backend supports both variadic and container call forms."""
+
+    def test_set_many_mapping_form(self, disk_store):
+        store, _ = disk_store
+        store.set_many({"a": b"1", "b": b"2"})
+        assert store.get("a") == b"1"
+        assert store.get("b") == b"2"
+
+    def test_set_many_kwargs_form(self, disk_store):
+        store, _ = disk_store
+        store.set_many(a=b"1", b=b"2")
+        assert store.get("a") == b"1"
+        assert store.get("b") == b"2"
+
+    def test_get_many_iterable_form(self, disk_store):
+        store, _ = disk_store
+        store.set_many({"a": b"1", "b": b"2"})
+        assert store.get_many(["a", "b"]) == {"a": b"1", "b": b"2"}
+
+    def test_remove_many_iterable_form(self, disk_store):
+        store, _ = disk_store
+        store.set_many({"a": b"1", "b": b"2", "c": b"3"})
+        store.remove_many(["a", "c"])
+        assert store.get("a") is None
+        assert store.get("b") == b"2"
+
+
 class TestDiskSizeLimit:
     """The default ``Disk()`` constructor must not silently cap storage.
 

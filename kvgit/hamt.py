@@ -257,7 +257,7 @@ class Hamt:
         """
         new_hamt, pending = self.updated(updates, removals)
         if pending:
-            self.store.set_many(**pending)
+            self.store.set_many(pending)
         return Hamt(
             self.store,
             new_hamt.root,

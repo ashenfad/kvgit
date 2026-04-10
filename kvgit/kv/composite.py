@@ -1,8 +1,8 @@
 """N-tier composite cache over multiple KV stores."""
 
-from typing import Iterable, Mapping
+from collections.abc import Iterable, Mapping
 
-from .base import KVStore
+from .base import KVStore, _normalize_items, _normalize_keys
 
 
 class Composite(KVStore):
@@ -40,9 +40,9 @@ class Composite(KVStore):
                 continue  # tier unavailable, try next
         return None
 
-    def get_many(self, *args: str) -> Mapping[str, bytes]:
+    def get_many(self, *args) -> Mapping[str, bytes]:
         result: dict[str, bytes] = {}
-        remaining = set(args)
+        remaining = set(_normalize_keys(args))
         for i, store in enumerate(self._stores):
             if not remaining:
                 break
@@ -55,7 +55,7 @@ class Composite(KVStore):
                 if tier_values and i > 0:
                     for j in range(i):
                         try:
-                            self._stores[j].set_many(**tier_values)
+                            self._stores[j].set_many(tier_values)
                         except Exception:
                             pass
                 result.update(tier_values)
@@ -87,11 +87,17 @@ class Composite(KVStore):
             except Exception:
                 pass  # best-effort cache population
 
-    def set_many(self, **kwargs: bytes) -> None:
-        self._stores[-1].set_many(**kwargs)
+    def set_many(
+        self,
+        items: Mapping[str, bytes] | None = None,
+        /,
+        **kwargs: bytes,
+    ) -> None:
+        items = _normalize_items(items, kwargs)
+        self._stores[-1].set_many(items)
         for store in self._stores[:-1]:
             try:
-                store.set_many(**kwargs)
+                store.set_many(items)
             except Exception:
                 pass  # best-effort cache population
 
@@ -103,11 +109,12 @@ class Composite(KVStore):
             except Exception:
                 pass  # best-effort cache population
 
-    def remove_many(self, *keys: str) -> None:
-        self._stores[-1].remove_many(*keys)
+    def remove_many(self, *args) -> None:
+        keys = list(_normalize_keys(args))
+        self._stores[-1].remove_many(keys)
         for store in self._stores[:-1]:
             try:
-                store.remove_many(*keys)
+                store.remove_many(keys)
             except Exception:
                 pass  # best-effort cache population
 

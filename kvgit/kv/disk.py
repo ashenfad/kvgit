@@ -1,8 +1,9 @@
 """Disk-backed KV store using diskcache."""
 
-from typing import Iterable, Mapping, cast
+from collections.abc import Iterable, Mapping
+from typing import cast
 
-from .base import KVStore
+from .base import KVStore, _normalize_items, _normalize_keys
 
 # diskcache has no native "unlimited" sentinel — its eviction policy
 # is driven by a numeric byte cap. We use a value far above any
@@ -33,15 +34,22 @@ class Disk(KVStore):
             raise TypeError(f"Expected bytes, got {type(value).__name__}")
         self.store[key] = value
 
-    def get_many(self, *args: str) -> Mapping[str, bytes]:
-        return {k: v for k in args if (v := self.get(k)) is not None}
+    def get_many(self, *args) -> Mapping[str, bytes]:
+        keys = _normalize_keys(args)
+        return {k: v for k in keys if (v := self.get(k)) is not None}
 
-    def set_many(self, **kwargs: bytes) -> None:
-        for key, value in kwargs.items():
+    def set_many(
+        self,
+        items: Mapping[str, bytes] | None = None,
+        /,
+        **kwargs: bytes,
+    ) -> None:
+        items = _normalize_items(items, kwargs)
+        for key, value in items.items():
             if not isinstance(value, bytes):
                 raise TypeError(f"Expected bytes for {key}, got {type(value).__name__}")
         with self.store.transact():
-            for key, value in kwargs.items():
+            for key, value in items.items():
                 self.set(key, value)
 
     def items(self) -> Iterable[tuple[str, bytes]]:
@@ -61,7 +69,8 @@ class Disk(KVStore):
         except KeyError:
             pass
 
-    def remove_many(self, *keys: str) -> None:
+    def remove_many(self, *args) -> None:
+        keys = _normalize_keys(args)
         with self.store.transact():
             for key in keys:
                 self.store.delete(key, retry=False)
