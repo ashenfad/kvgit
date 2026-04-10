@@ -26,6 +26,32 @@ def _flush_and_count(h: Hamt) -> int:
     return len(_all_node_keys(h.store, h.prefix))
 
 
+class _CountingMemory(Memory):
+    """Memory store that counts get / get_many calls.
+
+    Used by tests that verify batching behavior — e.g.,
+    ``materialize()`` should issue a small number of ``get_many``
+    calls and zero per-key ``get`` calls.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.get_calls = 0
+        self.get_many_calls = 0
+
+    def get(self, key):
+        self.get_calls += 1
+        return super().get(key)
+
+    def get_many(self, *args):
+        self.get_many_calls += 1
+        return super().get_many(*args)
+
+    def reset_counts(self) -> None:
+        self.get_calls = 0
+        self.get_many_calls = 0
+
+
 # ---- empty ----
 
 
@@ -571,3 +597,90 @@ def test_pending_not_visible_to_separate_hamt_instance():
     # After flushing the original, the fresh view sees it.
     new_h.flush()
     assert fresh.get("a") == b"1"
+
+
+# ---- materialize ----
+
+
+def test_materialize_empty():
+    h = Hamt(_store())
+    assert h.materialize() == {}
+
+
+def test_materialize_single():
+    h = Hamt(_store()).persist({"a": b"1"})
+    assert h.materialize() == {"a": b"1"}
+
+
+def test_materialize_matches_items():
+    rng = random.Random(99)
+    items = {f"k{i}": rng.randbytes(16) for i in range(150)}
+    h = Hamt(_store(), bucket_max=4).persist(items)
+
+    via_items = dict(h.items())
+    via_materialize = h.materialize()
+    assert via_items == via_materialize == items
+
+
+def test_materialize_includes_pending_writes():
+    """A non-flushed Hamt's materialize() must see its pending nodes."""
+    store = _store()
+    h0 = Hamt(store, bucket_max=4)
+    new_h, _ = h0.updated({f"k{i}": f"v{i}".encode() for i in range(20)})
+
+    # Nothing flushed yet
+    assert len(_all_node_keys(store)) == 0
+    # But materialize through the pending Hamt sees everything
+    materialized = new_h.materialize()
+    assert len(materialized) == 20
+    assert materialized["k5"] == b"v5"
+
+
+def test_materialize_uses_batched_reads():
+    """materialize() should issue O(depth) get_many calls and zero per-key gets."""
+    store = _CountingMemory()
+    items = {f"k{i:04d}": f"v{i}".encode() for i in range(200)}
+    h = Hamt(store, bucket_max=4).persist(items)
+
+    store.reset_counts()
+    result = h.materialize()
+    assert result == items
+
+    # No per-key reads at all
+    assert store.get_calls == 0, (
+        f"materialize used {store.get_calls} per-key get() calls; expected 0"
+    )
+    # Bounded number of batched reads (one per tree level).
+    # 200 keys with bucket_max=4 fits in ~4 levels at branching factor 16,
+    # so we expect at most that many round-trips.
+    assert 0 < store.get_many_calls <= 6, (
+        f"unexpected get_many call count: {store.get_many_calls}"
+    )
+
+
+def test_items_uses_per_node_reads():
+    """Sanity check the contrast: items() does one get per visited node."""
+    store = _CountingMemory()
+    items = {f"k{i:04d}": f"v{i}".encode() for i in range(200)}
+    h = Hamt(store, bucket_max=4).persist(items)
+
+    store.reset_counts()
+    list(h.items())
+
+    # items() doesn't batch — it's many per-key gets, no get_many calls.
+    assert store.get_calls > 50, (
+        f"items() should issue many per-node get calls, got {store.get_calls}"
+    )
+    assert store.get_many_calls == 0
+
+
+def test_materialize_round_trip_through_store():
+    """A Hamt rebuilt from a fresh view should materialize to the same dict."""
+    store = _store()
+    items = {f"k{i:03d}": f"v{i}".encode() for i in range(50)}
+    h = Hamt(store, bucket_max=4).persist(items)
+    root = h.root
+
+    # Open a fresh Hamt at the same root and materialize.
+    fresh = Hamt(store, root, bucket_max=4)
+    assert fresh.materialize() == items

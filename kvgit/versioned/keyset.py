@@ -129,8 +129,22 @@ class Keyset:
         return key in self._hamt
 
     def items(self) -> Iterator[tuple[str, KeysetEntry]]:
+        """Iterate over all (key, entry) pairs lazily.
+
+        See ``materialize()`` for a batched-read alternative when the
+        underlying store has non-trivial per-call latency.
+        """
         for k, raw in self._hamt.items():
             yield k, decode_entry(raw)
+
+    def materialize(self) -> dict[str, KeysetEntry]:
+        """Walk the entire keyset using batched reads.
+
+        Returns ``{key: KeysetEntry}`` after one batched store fetch
+        per HAMT level. See ``Hamt.materialize`` for the underlying
+        mechanism and tradeoffs.
+        """
+        return {k: decode_entry(v) for k, v in self._hamt.materialize().items()}
 
     def keys(self) -> Iterator[str]:
         return self._hamt.keys()

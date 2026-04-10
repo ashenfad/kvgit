@@ -289,21 +289,22 @@ class VersionedKV(VersionedBase):
         self._populate_state(commit_hash)
 
     def _populate_state(self, commit_hash: str) -> None:
-        """Walk the commit's HAMT and populate ``_commit_keys`` / ``_meta``."""
+        """Walk the commit's HAMT and populate ``_commit_keys`` / ``_meta``.
+
+        Uses ``Keyset.materialize`` (batched BFS, one ``get_many`` per
+        tree level) so cold loads against high-latency stores like
+        Redis or IndexedDB are O(log_branching N) round-trips, not
+        O(N).
+        """
         root = _load_root(self.store, commit_hash)
         if root is None:
             self._commit_keys = {}
             self._meta = {}
             return
 
-        ks = Keyset(self.store, root=root)
-        commit_keys: dict[str, str] = {}
-        meta: dict[str, MetaEntry] = {}
-        for key, entry in ks.items():
-            commit_keys[key] = entry.blob
-            meta[key] = entry.meta
-        self._commit_keys = commit_keys
-        self._meta = meta
+        materialized = Keyset(self.store, root=root).materialize()
+        self._commit_keys = {k: e.blob for k, e in materialized.items()}
+        self._meta = {k: e.meta for k, e in materialized.items()}
 
     @property
     def latest_head(self) -> str | None:
