@@ -5,6 +5,65 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-04-10
+
+Per-commit keysets are now stored as a content-addressable HAMT, so
+single-key commits write O(log N) new nodes instead of rewriting the
+full keyset. Cold loads and orphan cleanup use batched BFS for
+O(log N) round-trips on high-latency backends. **Storage format is
+not backward compatible with v0.1.x** -- pre-v2 stores raise on open.
+
+### Breaking Changes
+
+- **Storage format v2** -- `__commit_keyset__` / `__meta__` / `__total_var_size__` replaced by `__commit_root__` + `kvgit:keyset:<hash>` HAMT nodes. New `__kvgit_version__` sentinel raises on pre-v2 stores.
+- **`MetaEntry.last_touch` removed** along with `_touch()` / `_touch_counter`. Persisting touch counts would rewrite every leaf on every commit, defeating structural sharing. `MetaEntry` is now `(size, created_at)`.
+- **`Disk` default `size_limit` is now unbounded.** Previously defaulted to 1 GiB, silently evicting past the cap. `None` also accepted as an explicit "no limit".
+- **`Hamt.commit` / `Keyset.commit` renamed to `.persist`** -- avoids name collision with `Versioned.commit`.
+- **`kvgit.encoding` helpers renamed**: `to_bytes` → `dumps`, `from_bytes` → `loads`, plus new `safe_loads`. Matches the `json` module's convention.
+- **`MetaEntry` relocated** from `kvgit.encoding` to `kvgit.versioned.keyset`.
+
+### Added
+
+- **`kvgit.hamt.Hamt`** -- generic content-addressable HAMT over a `KVStore`. Branching factor 16, configurable `bucket_max` (default 8), canonical form preserved across insert/delete patterns.
+- **`kvgit.versioned.keyset.Keyset`** -- thin kvgit-specific wrapper that decodes HAMT values into `KeysetEntry(blob, meta)`.
+- **`Hamt.materialize()` / `Keyset.materialize()`** -- batched BFS returning the full map as a dict in O(log_branching N) round-trips instead of one read per node.
+- **`Hamt.walk()` / `Keyset.walk()`** -- single batched BFS returning `(items, node_hashes)` for GC mark phases.
+- **`KVStore` bulk methods accept `Mapping` / `Iterable` forms** (non-breaking): `set_many({"a": b"1"})`, `get_many(["a", "b"])`, `remove_many(["a", "b"])`. Existing `**kwargs` / `*args` callers continue to work.
+- **`Keyset.diff()`** -- structural diff that skips identical subtrees by hash equality.
+- **`tests/benchmark_storage.py`** -- storage-growth and cold-load benchmarks, including a `--latency-ms` mode that simulates network-attached backends.
+- **`tests/stress_kill.py`** -- concurrent commit + branch-delete stress test.
+
+### Changed
+
+- **`clean_orphans` uses batched walks** -- mark phase uses `Keyset.walk()` (one BFS per commit instead of separate `items()` + `reachable_nodes()` passes); sweep phase uses `Keyset.materialize()` for orphan blob enumeration.
+- **`_three_way_merge` dedupes `_load_keyset` calls** -- loads each unique commit's keyset once per merge instead of up to three times.
+
+### Fixed
+
+- **`clean_orphans` could corrupt live branches under concurrent writes.** `delete_branch` previously called `clean_orphans(min_age=0)`, bypassing the age guard. The sweep is now also batched into a single `remove_many` so it's atomic at the store level.
+- **`kvgit.store(kind="disk")` was producing zero-byte caches.** The factory passed `size_limit=0`, which `diskcache` 5.6.3 interprets as "zero bytes allowed". Every write was evicted immediately. Adds disk-factory round-trip regression tests.
+- **`VersionedGP` now raises `ImportError` instead of `NameError`** when GitPython is missing. `tests/versioned/test_gp.py` uses `pytest.importorskip("git")` so the full suite runs cleanly without GitPython installed.
+
+### Performance
+
+Measured against the new benchmarks (1000 keys, 1000 single-key commits for storage; 1000-key cold load and 5-branch / 20-commits-per-branch `delete_branch` for round-trips):
+
+| Metric | v0.1.x | v0.2.0 | Speedup |
+|---|---|---|---|
+| Per-commit storage growth | ~195 KB | ~6.2 KB | **~30x** |
+| Cold load (1 ms latency) | ~400 ms | ~10 ms | **~38x** |
+| Cold load (5 ms latency) | ~1.9 s | ~40 ms | **~47x** |
+| `delete_branch` (1 ms latency) | ~2 min | ~1.2 s | **~100x** |
+| `delete_branch` (5 ms latency) | ~9 min | ~4.7 s | **~115x** |
+
+Local backends (Memory, Disk) are unchanged -- the batching wins apply only where per-call latency dominates.
+
+### Removed
+
+- **`__commit_keyset__` / `__meta__` / `__total_var_size__`** storage keys (`__total_var_size__` was dead weight; the others are replaced by the HAMT).
+- **`kvgit.encoding.meta_to_bytes` / `meta_from_bytes`**.
+- **`MetaEntry.last_touch`**, **`VersionedKV._touch_counter`**, **`VersionedKV._touch()`**.
+
 ## [0.1.11] - 2026-04-08
 
 ### Fixed
