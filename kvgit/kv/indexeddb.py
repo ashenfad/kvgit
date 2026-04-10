@@ -45,12 +45,12 @@ the two gives the event loop a chance to complete the request before
 the handler is set, causing a deadlock.
 """
 
-from typing import Iterable, Mapping
+from collections.abc import Iterable, Mapping
 
 from pyodide.ffi import create_proxy, run_sync, to_js  # type: ignore[import-not-found]
 from js import Promise, indexedDB, undefined  # type: ignore[import-not-found]
 
-from .base import KVStore
+from .base import KVStore, _normalize_items, _normalize_keys
 
 
 def _promise(executor):
@@ -184,13 +184,15 @@ class IndexedDB(KVStore):
 
         run_sync(_op())
 
-    def get_many(self, *args: str) -> Mapping[str, bytes]:
+    def get_many(self, *args) -> Mapping[str, bytes]:
+        keys = list(_normalize_keys(args))
+
         async def _op():
             store, _tx = self._object_store("readonly")
             # Attach all handlers synchronously before any await to prevent
             # the transaction from auto-committing between suspensions.
             promises = []
-            for key in args:
+            for key in keys:
                 req = store.get(key)
                 promises.append((key, _idb_request_promise(req)))
             result = {}
@@ -202,14 +204,20 @@ class IndexedDB(KVStore):
 
         return run_sync(_op())
 
-    def set_many(self, **kwargs: bytes) -> None:
-        for key, value in kwargs.items():
+    def set_many(
+        self,
+        items: Mapping[str, bytes] | None = None,
+        /,
+        **kwargs: bytes,
+    ) -> None:
+        items = _normalize_items(items, kwargs)
+        for key, value in items.items():
             if not isinstance(value, bytes):
                 raise TypeError(f"Expected bytes for {key}, got {type(value).__name__}")
 
         async def _op():
             store, tx = self._object_store("readwrite")
-            for key, value in kwargs.items():
+            for key, value in items.items():
                 store.put(_to_uint8array(value), key)
             await _idb_tx_complete(tx)
 
@@ -266,7 +274,9 @@ class IndexedDB(KVStore):
 
         run_sync(_op())
 
-    def remove_many(self, *keys: str) -> None:
+    def remove_many(self, *args) -> None:
+        keys = list(_normalize_keys(args))
+
         async def _op():
             store, tx = self._object_store("readwrite")
             for key in keys:

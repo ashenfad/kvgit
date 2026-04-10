@@ -1,9 +1,9 @@
 """In-memory KV store."""
 
 import threading
-from typing import Iterable, Mapping
+from collections.abc import Iterable, Mapping
 
-from .base import KVStore
+from .base import KVStore, _normalize_items, _normalize_keys
 
 
 class Memory(KVStore):
@@ -28,18 +28,25 @@ class Memory(KVStore):
         with self._lock:
             self.memory[key] = value
 
-    def get_many(self, *args: str) -> Mapping[str, bytes]:
+    def get_many(self, *args) -> Mapping[str, bytes]:
+        keys = _normalize_keys(args)
         with self._lock:
             return {
-                key: val for key in args if (val := self.memory.get(key)) is not None
+                key: val for key in keys if (val := self.memory.get(key)) is not None
             }
 
-    def set_many(self, **kwargs: bytes) -> None:
-        for key, value in kwargs.items():
+    def set_many(
+        self,
+        items: Mapping[str, bytes] | None = None,
+        /,
+        **kwargs: bytes,
+    ) -> None:
+        items = _normalize_items(items, kwargs)
+        for key, value in items.items():
             if not isinstance(value, bytes):
                 raise TypeError(f"Expected bytes for {key}, got {type(value).__name__}")
         with self._lock:
-            self.memory.update(kwargs)
+            self.memory.update(items)
 
     def items(self) -> Iterable[tuple[str, bytes]]:
         with self._lock:
@@ -57,7 +64,8 @@ class Memory(KVStore):
         with self._lock:
             self.memory.pop(key, None)
 
-    def remove_many(self, *keys: str) -> None:
+    def remove_many(self, *args) -> None:
+        keys = _normalize_keys(args)
         with self._lock:
             for key in keys:
                 self.memory.pop(key, None)
