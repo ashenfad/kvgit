@@ -52,7 +52,7 @@ def store(
                 raise ValueError("path is required when kind='disk'")
             from .kv.disk import Disk
 
-            backend = Disk(path, size_limit=0)
+            backend = Disk(path)
         elif kind == "indexeddb":
             from .kv.indexeddb import IndexedDB
 
