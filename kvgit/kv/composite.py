@@ -2,7 +2,7 @@
 
 from collections.abc import Iterable, Mapping
 
-from .base import KVStore, _normalize_items, _normalize_keys
+from .base import KVStore
 
 
 class Composite(KVStore):
@@ -42,7 +42,7 @@ class Composite(KVStore):
 
     def get_many(self, *args) -> Mapping[str, bytes]:
         result: dict[str, bytes] = {}
-        remaining = set(_normalize_keys(args))
+        remaining = set(self._normalize_keys(args))
         for i, store in enumerate(self._stores):
             if not remaining:
                 break
@@ -93,7 +93,7 @@ class Composite(KVStore):
         /,
         **kwargs: bytes,
     ) -> None:
-        items = _normalize_items(items, kwargs)
+        items = self._normalize_items(items, kwargs)
         self._stores[-1].set_many(items)
         for store in self._stores[:-1]:
             try:
@@ -110,7 +110,7 @@ class Composite(KVStore):
                 pass  # best-effort cache population
 
     def remove_many(self, *args) -> None:
-        keys = list(_normalize_keys(args))
+        keys = list(self._normalize_keys(args))
         self._stores[-1].remove_many(keys)
         for store in self._stores[:-1]:
             try:

@@ -95,33 +95,37 @@ class KVStore(ABC):
     def clear(self) -> None:
         """Remove all items from the store."""
 
+    # ---- protected helpers for subclass implementations ----
 
-def _normalize_keys(args) -> Iterable[str]:
-    """Normalize *args from get_many/remove_many to an iterable of keys.
+    @staticmethod
+    def _normalize_keys(args) -> Iterable[str]:
+        """Normalize ``*args`` from get_many/remove_many to an iterable
+        of keys.
 
-    Accepts either a single non-string iterable or many positional
-    string args. Used by KVStore implementations to support both
-    call forms with one helper.
-    """
-    if (
-        len(args) == 1
-        and isinstance(args[0], Iterable)
-        and not isinstance(args[0], (str, bytes))
-    ):
-        return args[0]
-    return args
+        Accepts either a single non-string iterable or many positional
+        string args. Subclasses call this from their bulk methods to
+        support both call forms with one line of code.
+        """
+        if (
+            len(args) == 1
+            and isinstance(args[0], Iterable)
+            and not isinstance(args[0], (str, bytes))
+        ):
+            return args[0]
+        return args
 
+    @staticmethod
+    def _normalize_items(
+        items: Mapping[str, bytes] | None,
+        kwargs: Mapping[str, bytes],
+    ) -> Mapping[str, bytes]:
+        """Normalize set_many's positional + kwargs into a single Mapping.
 
-def _normalize_items(
-    items: Mapping[str, bytes] | None, kwargs: Mapping[str, bytes]
-) -> Mapping[str, bytes]:
-    """Normalize set_many's positional + kwargs into a single Mapping.
-
-    Used by KVStore implementations to support both call forms with
-    one helper.
-    """
-    if items is None:
-        return kwargs
-    if not kwargs:
-        return items
-    return {**items, **kwargs}
+        Subclasses call this from ``set_many`` to merge the two call
+        forms into one container.
+        """
+        if items is None:
+            return kwargs
+        if not kwargs:
+            return items
+        return {**items, **kwargs}

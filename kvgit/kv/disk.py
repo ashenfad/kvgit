@@ -3,7 +3,7 @@
 from collections.abc import Iterable, Mapping
 from typing import cast
 
-from .base import KVStore, _normalize_items, _normalize_keys
+from .base import KVStore
 
 # diskcache has no native "unlimited" sentinel — its eviction policy
 # is driven by a numeric byte cap. We use a value far above any
@@ -35,7 +35,7 @@ class Disk(KVStore):
         self.store[key] = value
 
     def get_many(self, *args) -> Mapping[str, bytes]:
-        keys = _normalize_keys(args)
+        keys = self._normalize_keys(args)
         return {k: v for k in keys if (v := self.get(k)) is not None}
 
     def set_many(
@@ -44,7 +44,7 @@ class Disk(KVStore):
         /,
         **kwargs: bytes,
     ) -> None:
-        items = _normalize_items(items, kwargs)
+        items = self._normalize_items(items, kwargs)
         for key, value in items.items():
             if not isinstance(value, bytes):
                 raise TypeError(f"Expected bytes for {key}, got {type(value).__name__}")
@@ -70,7 +70,7 @@ class Disk(KVStore):
             pass
 
     def remove_many(self, *args) -> None:
-        keys = _normalize_keys(args)
+        keys = self._normalize_keys(args)
         with self.store.transact():
             for key in keys:
                 self.store.delete(key, retry=False)

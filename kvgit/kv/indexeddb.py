@@ -50,7 +50,7 @@ from collections.abc import Iterable, Mapping
 from pyodide.ffi import create_proxy, run_sync, to_js  # type: ignore[import-not-found]
 from js import Promise, indexedDB, undefined  # type: ignore[import-not-found]
 
-from .base import KVStore, _normalize_items, _normalize_keys
+from .base import KVStore
 
 
 def _promise(executor):
@@ -185,7 +185,7 @@ class IndexedDB(KVStore):
         run_sync(_op())
 
     def get_many(self, *args) -> Mapping[str, bytes]:
-        keys = list(_normalize_keys(args))
+        keys = list(self._normalize_keys(args))
 
         async def _op():
             store, _tx = self._object_store("readonly")
@@ -210,7 +210,7 @@ class IndexedDB(KVStore):
         /,
         **kwargs: bytes,
     ) -> None:
-        items = _normalize_items(items, kwargs)
+        items = self._normalize_items(items, kwargs)
         for key, value in items.items():
             if not isinstance(value, bytes):
                 raise TypeError(f"Expected bytes for {key}, got {type(value).__name__}")
@@ -275,7 +275,7 @@ class IndexedDB(KVStore):
         run_sync(_op())
 
     def remove_many(self, *args) -> None:
-        keys = list(_normalize_keys(args))
+        keys = list(self._normalize_keys(args))
 
         async def _op():
             store, tx = self._object_store("readwrite")
