@@ -226,8 +226,17 @@ class VersionedBase(ABC):
                 "No common ancestor found between current commit and HEAD."
             )
 
-        our_diff = self.diff(lca, self._current_commit)
-        their_diff = self.diff(lca, their_head)
+        # Load each unique commit's keyset exactly once. The naive
+        # form (calling self.diff() then self._load_keyset() three
+        # more times in resolve_merge) loads each commit twice or
+        # three times. For backends with non-trivial per-call
+        # latency, deduping cuts merge round-trips by ~60%.
+        lca_keyset = self._load_keyset(lca)
+        our_keyset = self._load_keyset(self._current_commit)
+        their_keyset = self._load_keyset(their_head)
+
+        our_diff = diff_keysets(lca_keyset, our_keyset)
+        their_diff = diff_keysets(lca_keyset, their_keyset)
 
         # Build effective merge function lookup
         effective_fns = dict(self._merge_fns)
@@ -238,9 +247,9 @@ class VersionedBase(ABC):
         # Resolve the merge
         try:
             resolution = resolve_merge(
-                lca_keyset=self._load_keyset(lca),
-                our_keyset=self._load_keyset(self._current_commit),
-                their_keyset=self._load_keyset(their_head),
+                lca_keyset=lca_keyset,
+                our_keyset=our_keyset,
+                their_keyset=their_keyset,
                 our_diff=our_diff,
                 their_diff=their_diff,
                 blob_reader=self._read_blob,

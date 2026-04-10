@@ -742,6 +742,45 @@ class TestThreeWayMerge:
         assert v2.get("new_key") == b"new"
         assert v2.get("keep") == b"yes"
 
+    def test_three_way_merge_loads_each_keyset_at_most_once(self):
+        """Regression: ``_three_way_merge`` should load LCA / ours / theirs
+        once each, not once per consumer.
+
+        The naive form (``self.diff()`` building each diff and then
+        ``resolve_merge`` re-loading each keyset) loaded each commit's
+        keyset 2-3 times — 7 calls total per merge. The dedup makes
+        merges noticeably faster on high-latency stores.
+        """
+        store = Memory()
+        v1 = Versioned(store)
+        v1.commit({"base": b"0"})
+
+        v2 = Versioned(store)
+        v1.commit({"a": b"1"})
+
+        # Patch _load_keyset to record every call.
+        call_log: list[str] = []
+        original = v2._load_keyset
+
+        def counting(commit_hash: str):
+            call_log.append(commit_hash)
+            return original(commit_hash)
+
+        v2._load_keyset = counting  # type: ignore[method-assign]
+
+        v2.commit({"b": b"2"})  # triggers a three-way merge
+
+        # Three-way merge needs LCA, ours, theirs — three unique commits.
+        # Each should appear at most once in the call log.
+        assert len(call_log) == len(set(call_log)), (
+            f"_load_keyset called multiple times for the same commit: {call_log}"
+        )
+        # And there should be exactly three unique loads.
+        assert len(set(call_log)) == 3, (
+            f"expected 3 unique _load_keyset calls, got {len(set(call_log))}: "
+            f"{call_log}"
+        )
+
 
 class TestMergeResultReturn:
     def test_merge_result_truthy(self):
