@@ -684,3 +684,98 @@ def test_materialize_round_trip_through_store():
     # Open a fresh Hamt at the same root and materialize.
     fresh = Hamt(store, root, bucket_max=4)
     assert fresh.materialize() == items
+
+
+# ---- walk (combined items + node hashes) ----
+
+
+def test_walk_empty():
+    h = Hamt(_store())
+    items, nodes = h.walk()
+    assert items == {}
+    assert nodes == set()
+
+
+def test_walk_returns_both_items_and_nodes():
+    items = {f"k{i}": f"v{i}".encode() for i in range(20)}
+    h = Hamt(_store(), bucket_max=4).persist(items)
+
+    walked_items, walked_nodes = h.walk()
+    assert walked_items == items
+    assert len(walked_nodes) > 0
+    # Root must be in the node set
+    assert h.root in walked_nodes
+
+
+def test_walk_node_set_matches_reachable_nodes():
+    """walk() should return the same node set as reachable_nodes()."""
+    items = {f"k{i:04d}": f"v{i}".encode() for i in range(150)}
+    h = Hamt(_store(), bucket_max=4).persist(items)
+
+    _, walked_nodes = h.walk()
+    via_reachable = set(h.reachable_nodes())
+    assert walked_nodes == via_reachable
+
+
+def test_walk_uses_batched_reads():
+    """walk() should issue O(depth) get_many calls and zero per-key gets."""
+    store = _CountingMemory()
+    items = {f"k{i:04d}": f"v{i}".encode() for i in range(200)}
+    h = Hamt(store, bucket_max=4).persist(items)
+
+    store.reset_counts()
+    walked_items, walked_nodes = h.walk()
+    assert walked_items == items
+    assert len(walked_nodes) > 0
+
+    assert store.get_calls == 0, (
+        f"walk used {store.get_calls} per-key get() calls; expected 0"
+    )
+    assert 0 < store.get_many_calls <= 6, (
+        f"unexpected get_many call count: {store.get_many_calls}"
+    )
+
+
+def test_walk_is_one_pass_compared_to_separate_walks():
+    """walk() should make ~half the round-trips of items() + reachable_nodes()."""
+    store = _CountingMemory()
+    items = {f"k{i:04d}": f"v{i}".encode() for i in range(200)}
+    h = Hamt(store, bucket_max=4).persist(items)
+
+    # walk() — single batched BFS
+    store.reset_counts()
+    h.walk()
+    walk_calls = store.get_many_calls + store.get_calls
+
+    # items() + reachable_nodes() — two separate per-node walks
+    store.reset_counts()
+    list(h.items())
+    list(h.reachable_nodes())
+    separate_calls = store.get_many_calls + store.get_calls
+
+    # walk() should be drastically cheaper
+    assert walk_calls * 10 < separate_calls, (
+        f"walk={walk_calls}, separate={separate_calls} — "
+        f"expected walk to be at least 10x cheaper"
+    )
+
+
+def test_walk_includes_pending_writes():
+    store = _store()
+    h0 = Hamt(store, bucket_max=4)
+    new_h, _ = h0.updated({f"k{i}": f"v{i}".encode() for i in range(15)})
+
+    # Nothing flushed yet
+    assert len(_all_node_keys(store)) == 0
+    # walk() through pending sees everything
+    walked_items, walked_nodes = new_h.walk()
+    assert len(walked_items) == 15
+    assert len(walked_nodes) > 0
+    assert new_h.root in walked_nodes
+
+
+def test_materialize_is_walk_dot_zero():
+    """materialize() should return exactly walk()[0]."""
+    items = {f"k{i:03d}": f"v{i}".encode() for i in range(50)}
+    h = Hamt(_store(), bucket_max=4).persist(items)
+    assert h.materialize() == h.walk()[0]

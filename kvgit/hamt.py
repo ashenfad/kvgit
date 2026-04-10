@@ -212,11 +212,29 @@ class Hamt:
         Use ``items()`` when you want laziness (e.g. to break out
         early); use ``materialize()`` when you know you want the
         whole map.
+
+        Equivalent to ``walk()[0]``.
+        """
+        return self.walk()[0]
+
+    def walk(self) -> tuple[dict[str, bytes], set[str]]:
+        """Walk the entire HAMT, returning (items, node_hashes).
+
+        Single batched BFS that collects both the key→value entries
+        and the set of every visited node hash. Equivalent to
+        calling ``materialize()`` and ``reachable_nodes()`` separately
+        but in one tree traversal — used by GC mark phases that want
+        both, like ``clean_orphans``.
+
+        Same batching properties as ``materialize()``: one
+        ``get_many`` call per tree level, O(log_branching N)
+        round-trips total.
         """
         if self.root == EMPTY_HASH:
-            return {}
+            return {}, set()
 
-        result: dict[str, bytes] = {}
+        items: dict[str, bytes] = {}
+        nodes: set[str] = set()
         current_level: list[str] = [self.root]
 
         while current_level:
@@ -239,7 +257,8 @@ class Hamt:
             )
 
             # Walk the level: leaves contribute entries, branches
-            # contribute the next level's node hashes.
+            # contribute the next level's node hashes. Track every
+            # node hash we successfully load.
             next_level: list[str] = []
             for node_hash in current_level:
                 if node_hash == EMPTY_HASH:
@@ -252,15 +271,17 @@ class Hamt:
                         continue  # missing — skip rather than crash
                     node = json.loads(raw)
 
+                nodes.add(node_hash)
+
                 if node["kind"] == "leaf":
                     for k, v in node["items"].items():
-                        result[k] = _decode_value(v)
+                        items[k] = _decode_value(v)
                 else:  # branch
                     next_level.extend(node["children"].values())
 
             current_level = next_level
 
-        return result
+        return items, nodes
 
     def keys(self) -> Iterator[str]:
         for k, _ in self.items():

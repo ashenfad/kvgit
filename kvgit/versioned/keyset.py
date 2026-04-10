@@ -146,6 +146,16 @@ class Keyset:
         """
         return {k: decode_entry(v) for k, v in self._hamt.materialize().items()}
 
+    def walk(self) -> tuple[dict[str, KeysetEntry], set[str]]:
+        """Single batched walk returning (entries, hamt_node_hashes).
+
+        Equivalent to ``materialize()`` plus collecting every HAMT
+        node hash, in one tree traversal. Used by GC mark phases
+        that need both — see ``Hamt.walk``.
+        """
+        raw_items, nodes = self._hamt.walk()
+        return {k: decode_entry(v) for k, v in raw_items.items()}, nodes
+
     def keys(self) -> Iterator[str]:
         return self._hamt.keys()
 
