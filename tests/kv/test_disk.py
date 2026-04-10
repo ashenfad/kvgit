@@ -94,3 +94,33 @@ class TestDiskCAS:
         store.set("k", b"old")
         assert not store.cas("k", b"new", expected=b"wrong")
         assert store.get("k") == b"old"
+
+
+class TestDiskSizeLimit:
+    """The default ``Disk()`` constructor must not silently cap storage.
+
+    Regression: a previous version defaulted to a 1 GiB cap, and the
+    factory function passed size_limit=0 (which diskcache interprets
+    as "0 bytes allowed", evicting everything). The default is now
+    effectively unbounded; explicit caps must be opted into.
+    """
+
+    def test_default_size_limit_does_not_evict(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = Disk(d)
+            store.set("k", b"v" * 10000)
+            assert store.get("k") == b"v" * 10000
+
+    def test_explicit_none_means_unbounded(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = Disk(d, size_limit=None)
+            store.set("k", b"v")
+            assert store.get("k") == b"v"
+
+    def test_explicit_cap_still_works(self):
+        # Pass a cap large enough to fit the test data; verify it
+        # doesn't evict our small write.
+        with tempfile.TemporaryDirectory() as d:
+            store = Disk(d, size_limit=10 * 1024 * 1024)  # 10 MiB
+            store.set("k", b"v")
+            assert store.get("k") == b"v"
