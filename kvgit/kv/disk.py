@@ -4,15 +4,25 @@ from typing import Iterable, Mapping, cast
 
 from .base import KVStore
 
-ONE_GB = 1024 * 1024 * 1024
+# diskcache has no native "unlimited" sentinel — its eviction policy
+# is driven by a numeric byte cap. We use a value far above any
+# realistic disk size as the effective "no limit" default. Callers
+# that want a real cap pass an explicit size_limit.
+_UNBOUNDED = 2**62  # ~4.6 exabytes
 
 
 class Disk(KVStore):
-    """KV store backed by diskcache (SQLite + mmap)."""
+    """KV store backed by diskcache (SQLite + mmap).
 
-    def __init__(self, directory: str, size_limit: int = ONE_GB) -> None:
+    By default the store has no practical size cap. Pass an explicit
+    ``size_limit`` (in bytes) to enable diskcache's eviction policy.
+    """
+
+    def __init__(self, directory: str, size_limit: int | None = None) -> None:
         from diskcache import Cache as DiskCache
 
+        if size_limit is None:
+            size_limit = _UNBOUNDED
         self.store = DiskCache(directory, size_limit=size_limit)
 
     def get(self, key: str) -> bytes | None:
