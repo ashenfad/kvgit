@@ -333,3 +333,28 @@ def test_meta_field_round_trip():
     assert got == e
     assert got.meta.size == 98765
     assert got.meta.created_at == 1234567890.5
+
+
+# ---- materialize ----
+
+
+def test_materialize_empty():
+    ks = Keyset(Memory())
+    assert ks.materialize() == {}
+
+
+def test_materialize_returns_decoded_entries():
+    entries = {f"k{i}": _entry(blob=f"b{i}", size=i * 10) for i in range(20)}
+    ks = Keyset(Memory(), bucket_max=4).persist(entries)
+
+    materialized = ks.materialize()
+    assert materialized == entries
+    # Values should be KeysetEntry objects, not raw bytes
+    sample = next(iter(materialized.values()))
+    assert isinstance(sample, KeysetEntry)
+
+
+def test_materialize_matches_items():
+    entries = {f"k{i:03d}": _entry(blob=f"b{i}") for i in range(100)}
+    ks = Keyset(Memory(), bucket_max=4).persist(entries)
+    assert ks.materialize() == dict(ks.items())

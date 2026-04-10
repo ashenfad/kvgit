@@ -177,7 +177,12 @@ class Hamt:
         return self.get(key) is not None
 
     def items(self) -> Iterator[tuple[str, bytes]]:
-        """Iterate over all (key, value) pairs. Order is not insertion order."""
+        """Iterate over all (key, value) pairs lazily.
+
+        One store read per visited node. Use ``materialize()`` if
+        you want the whole map and the underlying store has
+        non-trivial per-call latency.
+        """
         if self.root == EMPTY_HASH:
             return
         yield from self._items_from(self.root)
@@ -192,6 +197,70 @@ class Hamt:
         else:
             for child_hash in node["children"].values():
                 yield from self._items_from(child_hash)
+
+    def materialize(self) -> dict[str, bytes]:
+        """Walk the entire HAMT and return its contents as a dict.
+
+        Uses batched store reads — one ``get_many`` call per tree
+        level — so the cost is roughly O(log_branching N) round-trips
+        instead of one per node. For backends with non-trivial
+        per-call latency (Redis, IndexedDB) this is dramatically
+        faster than draining ``items()``.
+
+        For local backends (Memory, Disk) the speedup over ``items()``
+        is small because there's no per-call latency to amortize.
+        Use ``items()`` when you want laziness (e.g. to break out
+        early); use ``materialize()`` when you know you want the
+        whole map.
+        """
+        if self.root == EMPTY_HASH:
+            return {}
+
+        result: dict[str, bytes] = {}
+        current_level: list[str] = [self.root]
+
+        while current_level:
+            # Partition this level: nodes already in pending vs
+            # nodes that need to be fetched from the store.
+            cached_nodes: dict[str, dict] = {}
+            to_fetch: list[str] = []
+            for node_hash in current_level:
+                if node_hash == EMPTY_HASH:
+                    continue
+                prefixed = self.prefix + node_hash
+                if prefixed in self.pending:
+                    cached_nodes[node_hash] = json.loads(self.pending[prefixed])
+                else:
+                    to_fetch.append(prefixed)
+
+            # Single batched fetch for everything at this level.
+            fetched: Mapping[str, bytes] = (
+                self.store.get_many(to_fetch) if to_fetch else {}
+            )
+
+            # Walk the level: leaves contribute entries, branches
+            # contribute the next level's node hashes.
+            next_level: list[str] = []
+            for node_hash in current_level:
+                if node_hash == EMPTY_HASH:
+                    continue
+                if node_hash in cached_nodes:
+                    node = cached_nodes[node_hash]
+                else:
+                    raw = fetched.get(self.prefix + node_hash)
+                    if raw is None:
+                        continue  # missing — skip rather than crash
+                    node = json.loads(raw)
+
+                if node["kind"] == "leaf":
+                    for k, v in node["items"].items():
+                        result[k] = _decode_value(v)
+                else:  # branch
+                    next_level.extend(node["children"].values())
+
+            current_level = next_level
+
+        return result
 
     def keys(self) -> Iterator[str]:
         for k, _ in self.items():
