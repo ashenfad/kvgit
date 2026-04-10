@@ -5,8 +5,11 @@ import shutil
 
 import pytest
 
-from kvgit.errors import MergeConflict
-from kvgit.versioned.gp import VersionedGP as GitVersioned
+# Skip the entire module if GitPython isn't installed.
+pytest.importorskip("git")
+
+from kvgit.errors import MergeConflict  # noqa: E402
+from kvgit.versioned.gp import VersionedGP as GitVersioned  # noqa: E402
 
 
 @pytest.fixture
