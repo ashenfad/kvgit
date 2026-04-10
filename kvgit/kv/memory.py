@@ -3,7 +3,7 @@
 import threading
 from collections.abc import Iterable, Mapping
 
-from .base import KVStore, _normalize_items, _normalize_keys
+from .base import KVStore
 
 
 class Memory(KVStore):
@@ -29,7 +29,7 @@ class Memory(KVStore):
             self.memory[key] = value
 
     def get_many(self, *args) -> Mapping[str, bytes]:
-        keys = _normalize_keys(args)
+        keys = self._normalize_keys(args)
         with self._lock:
             return {
                 key: val for key in keys if (val := self.memory.get(key)) is not None
@@ -41,7 +41,7 @@ class Memory(KVStore):
         /,
         **kwargs: bytes,
     ) -> None:
-        items = _normalize_items(items, kwargs)
+        items = self._normalize_items(items, kwargs)
         for key, value in items.items():
             if not isinstance(value, bytes):
                 raise TypeError(f"Expected bytes for {key}, got {type(value).__name__}")
@@ -65,7 +65,7 @@ class Memory(KVStore):
             self.memory.pop(key, None)
 
     def remove_many(self, *args) -> None:
-        keys = _normalize_keys(args)
+        keys = self._normalize_keys(args)
         with self._lock:
             for key in keys:
                 self.memory.pop(key, None)
