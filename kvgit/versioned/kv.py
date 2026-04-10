@@ -44,8 +44,6 @@ INFO_KEY = "__info__%s"
 STORAGE_VERSION_KEY = "__kvgit_version__"
 STORAGE_VERSION = 2
 
-KEYSET_PREFIX = "kvgit:keyset:"
-
 
 def content_hash(
     parents: tuple[str, ...],
@@ -817,11 +815,12 @@ class VersionedKV(VersionedBase):
                 ]
             )
 
-        # Orphan HAMT nodes: any kvgit:keyset:* not in reachable_nodes
+        # Orphan HAMT nodes: any keyset node not reachable from a live commit
+        keyset_prefix = Keyset.DEFAULT_PREFIX
         for key in self.store.keys():
-            if not (isinstance(key, str) and key.startswith(KEYSET_PREFIX)):
+            if not (isinstance(key, str) and key.startswith(keyset_prefix)):
                 continue
-            node_hash = key[len(KEYSET_PREFIX) :]
+            node_hash = key[len(keyset_prefix) :]
             if node_hash and node_hash not in reachable_nodes:
                 all_removals.append(key)
 
