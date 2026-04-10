@@ -548,7 +548,7 @@ class VersionedKV(VersionedBase):
         if self.store.get(branch_key) is None:
             raise ValueError(f"Branch '{name}' does not exist")
         self.store.remove(branch_key)
-        self.clean_orphans(min_age=0)
+        self.clean_orphans()
 
     def switch_branch(self, name: str) -> None:
         """Switch this instance to a different branch in-place."""
@@ -681,26 +681,31 @@ class VersionedKV(VersionedBase):
             except (json.JSONDecodeError, TypeError, KeyError):
                 continue
 
-        # Delete orphaned commits — only remove blobs not used by reachable commits
+        # Delete orphaned commits — only remove blobs not used by reachable commits.
+        # Batch all removals into a single remove_many call so the sweep is atomic.
+        all_removals: list[str] = []
         for orphan_hash in orphans:
             keyset_bytes = self.store.get(COMMIT_KEYSET % orphan_hash)
             if keyset_bytes:
                 try:
                     keyset = from_bytes(keyset_bytes)
-                    orphan_only = [
+                    all_removals.extend(
                         vk for vk in keyset.values() if vk not in reachable_blobs
-                    ]
-                    if orphan_only:
-                        self.store.remove_many(*orphan_only)
+                    )
                 except Exception:
                     pass
-            self.store.remove_many(
-                META_KEY % orphan_hash,
-                COMMIT_KEYSET % orphan_hash,
-                PARENT_COMMIT % orphan_hash,
-                TOTAL_VAR_SIZE_KEY % orphan_hash,
-                INFO_KEY % orphan_hash,
+            all_removals.extend(
+                [
+                    META_KEY % orphan_hash,
+                    COMMIT_KEYSET % orphan_hash,
+                    PARENT_COMMIT % orphan_hash,
+                    TOTAL_VAR_SIZE_KEY % orphan_hash,
+                    INFO_KEY % orphan_hash,
+                ]
             )
+
+        if all_removals:
+            self.store.remove_many(*all_removals)
 
         if orphans:
             logger.debug("Cleaned %d orphaned commit(s)", len(orphans))
