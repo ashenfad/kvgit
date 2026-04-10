@@ -306,14 +306,14 @@ All methods from the `Versioned` protocol are implemented. Additional:
 
 ### Orphan Cleanup
 
-When branches are deleted, the commits they referenced may become unreachable ("orphaned"). `delete_branch()` automatically calls `clean_orphans(min_age=0)` to remove these orphans immediately.
+When branches are deleted, the commits they referenced may become unreachable ("orphaned"). `delete_branch()` automatically calls `clean_orphans()` after removing the branch HEAD. The default `min_age=3600` (1 hour) guards against concurrent writes: recently-created commits are left alone so that a commit from another thread can't be mistaken for an orphan mid-sweep. Orphaned commits from deleted branches are cleaned up by subsequent `clean_orphans()` calls once they age past the guard.
 
 You can also call `clean_orphans()` manually:
 
 ```python
 v = VersionedKV(store)
-cleaned = v.clean_orphans(min_age=0)  # remove all orphans now
-cleaned = v.clean_orphans()            # only orphans older than 1 hour (default)
+cleaned = v.clean_orphans()            # default: only orphans older than 1 hour
+cleaned = v.clean_orphans(min_age=0)   # immediate (only safe without concurrent writers)
 ```
 
 The cleanup is safe for shared commit histories (e.g., forked branches). Blobs referenced by any reachable commit are never deleted.
@@ -395,11 +395,12 @@ Persistent `KVStore` via [diskcache](https://pypi.org/project/diskcache/). Requi
 ```python
 from kvgit.kv.disk import Disk
 
-store = Disk("/path/to/db")
-store = Disk("/path/to/db", size_limit=1024**3)  # default: 1 GB
+store = Disk("/path/to/db")                      # default: unbounded
+store = Disk("/path/to/db", size_limit=10 * 1024**3)  # explicit 10 GiB cap
+store = Disk("/path/to/db", size_limit=None)     # also unbounded (explicit)
 ```
 
-CAS and transactional operations are safe across multiple processes (backed by SQLite file locking).
+By default the store has no practical size cap. Pass `size_limit` (in bytes) to enable diskcache's eviction policy. CAS and transactional operations are safe across multiple processes (backed by SQLite file locking).
 
 ---
 

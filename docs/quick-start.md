@@ -276,34 +276,29 @@ s.get("agent/worker/task")  # "fetch"
 
 ---
 
-## Eviction
+## Cleaning up unreachable commits
 
-Bound the store's size with high/low water marks. When total serialized value size exceeds the high-water threshold, the least-recently-accessed keys are evicted automatically until the size drops to the low-water mark.
+Committing creates history. When a branch is deleted, the commits it referenced may become unreachable -- no branch HEAD can walk to them anymore -- but they still occupy storage along with any blobs and keyset nodes they uniquely owned. kvgit reclaims this with reachability-based garbage collection via `clean_orphans()`. This is not LRU eviction: nothing is ever removed just because it's old or infrequently accessed. Only truly unreachable commits are swept.
 
-```python
-s = kvgit.store(high_water_bytes=10_000)
-
-# Eviction runs automatically on commit() when above high water
-s["big"] = "x" * 5000
-s.commit()
-```
-
-Customize the low-water target (defaults to 80% of high water):
+`delete_branch()` calls `clean_orphans()` automatically, so in the common case you don't need to think about it:
 
 ```python
-s = kvgit.store(high_water_bytes=10_000, low_water_bytes=5_000)
+s = kvgit.store(kind="disk", path="/tmp/mydb")
+worker = s.create_branch("experiment")
+# ... work on the branch ...
+s.delete_branch("experiment")   # calls clean_orphans() for you
 ```
 
-Keys starting with `__` are protected from eviction by default. Customize with `is_protected`:
+For periodic background cleanup -- or after a batch of deletions -- call it directly via the underlying `Versioned`:
 
 ```python
-s = kvgit.store(
-    high_water_bytes=10_000,
-    is_protected=lambda key: key.startswith("config/"),
-)
+s.versioned.clean_orphans()           # default: skip commits younger than 1 hour
+s.versioned.clean_orphans(min_age=0)  # immediate (only safe without concurrent writers)
 ```
 
-Eviction is not supported with the git backend.
+The default `min_age=3600` guards against concurrent writers: a commit created by another thread while the sweep is running could look like an orphan if you don't give it a chance to settle. Leave the default unless you're certain no one else is committing.
+
+Cleanup is safe for shared commit histories -- blobs and keyset nodes referenced by any reachable commit are never deleted. See [Orphan Cleanup in the API reference](api.md#orphan-cleanup) for details.
 
 ---
 
