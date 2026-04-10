@@ -1,4 +1,12 @@
-"""GitPython-backed versioned store."""
+"""GitPython-backed versioned store.
+
+Importing this module requires GitPython. Both ``kvgit.__init__`` and
+``kvgit.versioned.__init__`` already wrap their imports of this module
+in ``try: ... except ImportError: pass`` so the public ``kvgit`` API
+stays usable on installs that don't have GitPython. Anyone who imports
+this module directly is signaling intent to use the git backend and
+should get a clear ImportError.
+"""
 
 import binascii
 import io
@@ -6,16 +14,13 @@ import json
 import os
 import urllib.parse
 
+import git  # noqa: F401  (re-exported names below need this)
+from git import Blob, Commit, Repo, Tree
+from git.exc import BadObject, GitCommandError
+from gitdb import IStream
+
 from .base import VersionedBase
 from .merge import MergeResolution
-
-try:
-    import git
-    from git import Blob, Commit, Repo, Tree
-    from git.exc import BadObject, GitCommandError
-    from gitdb import IStream
-except ImportError:
-    pass
 
 
 def _quote(key: str) -> str:
