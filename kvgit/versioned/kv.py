@@ -1,23 +1,50 @@
-"""KVStore-backed versioned state."""
+"""KVStore-backed versioned state.
+
+Storage layout (v2):
+
+- ``__kvgit_version__``                — storage version sentinel
+- ``__branch_head__<branch>``          — current HEAD commit hash
+- ``__branch_head_prev__<branch>``     — previous HEAD (recovery backup)
+- ``__commit_root__<commit>``          — keyset HAMT root hash
+- ``__parent_commit__<commit>``        — list of parent commit hashes
+- ``__commit_time__<commit>``          — wall time the commit was created
+- ``__info__<commit>``                 — optional caller-supplied info dict
+- ``kvgit:keyset:<node_hash>``         — HAMT node bytes
+- ``<commit_hash>:<user_key>``         — blob value bytes
+
+The keyset (key -> blob_pointer + meta) is stored as a content-addressable
+HAMT, so unchanged subtrees are shared across commits by hash equality. A
+single-key change writes O(log N) new nodes instead of rewriting a full
+keyset snapshot per commit.
+
+Storage is **not backward-compatible** with the v1 layout. Stores written
+by an earlier version raise on open and need to be rebuilt fresh.
+"""
 
 import hashlib
 import json
 import logging
 import time
 
-from ..encoding import MetaEntry, from_bytes, meta_from_bytes, meta_to_bytes, to_bytes
+from ..encoding import MetaEntry, from_bytes, to_bytes
+from ..hamt import EMPTY_HASH
 from ..kv.base import KVStore
 from ..kv.memory import Memory
 from .base import VersionedBase
+from .keyset import Keyset, KeysetEntry
 from .merge import MergeResolution
 
 PARENT_COMMIT = "__parent_commit__%s"
-COMMIT_KEYSET = "__commit_keyset__%s"
+COMMIT_ROOT = "__commit_root__%s"
+COMMIT_TIME = "__commit_time__%s"
 BRANCH_HEAD = "__branch_head__%s"
 BRANCH_HEAD_PREV = "__branch_head_prev__%s"
-META_KEY = "__meta__%s"
-TOTAL_VAR_SIZE_KEY = "__total_var_size__%s"
 INFO_KEY = "__info__%s"
+
+STORAGE_VERSION_KEY = "__kvgit_version__"
+STORAGE_VERSION = 2
+
+KEYSET_PREFIX = "kvgit:keyset:"
 
 
 def content_hash(
@@ -28,8 +55,11 @@ def content_hash(
 ) -> str:
     """Compute a content-addressable commit hash.
 
-    Hashes the parent pointers, keyset, update blob digests, and
-    optional info to produce a deterministic 40-hex-char commit hash.
+    Hashes the parent pointers, keyset preview, update blob digests,
+    and optional info to produce a deterministic 40-hex-char commit
+    hash. The keyset passed here is the in-memory placeholder dict
+    (with ``<pending:key>`` markers for not-yet-written blobs), the
+    same shape v1 used.
     """
     h = hashlib.sha256()
     h.update(json.dumps(list(parents), separators=(",", ":")).encode())
@@ -53,6 +83,45 @@ def _safe_from_bytes(raw: bytes):
         return None
 
 
+def _check_storage_version(store: KVStore) -> None:
+    """Verify the store's kvgit version is compatible.
+
+    Stamps the version on a fresh store. Raises on any pre-v2 layout
+    (detected by the presence of branch heads without a version sentinel).
+    """
+    raw = store.get(STORAGE_VERSION_KEY)
+    if raw is not None:
+        version = _safe_from_bytes(raw)
+        if version != STORAGE_VERSION:
+            raise ValueError(
+                f"Store has kvgit storage version {version!r}, "
+                f"expected {STORAGE_VERSION}. Use a fresh store."
+            )
+        return
+
+    # No version sentinel. Either fresh, or pre-v2.
+    branch_prefix = BRANCH_HEAD.replace("%s", "")
+    has_existing = any(
+        isinstance(k, str) and k.startswith(branch_prefix) for k in store.keys()
+    )
+    if has_existing:
+        raise ValueError(
+            "Store appears to use an older kvgit storage format. "
+            f"This version requires storage v{STORAGE_VERSION}. "
+            "Use a fresh store."
+        )
+    store.set(STORAGE_VERSION_KEY, to_bytes(STORAGE_VERSION))
+
+
+def _load_root(store: KVStore, commit_hash: str) -> str | None:
+    """Load the keyset HAMT root hash for a commit, or None if missing."""
+    raw = store.get(COMMIT_ROOT % commit_hash)
+    if raw is None:
+        return None
+    val = _safe_from_bytes(raw)
+    return val if isinstance(val, str) else None
+
+
 def _resolve_head(store: KVStore, branch: str, *, repair: bool = True) -> str | None:
     """Resolve a branch HEAD, falling back to prev HEAD or commit scan.
 
@@ -68,7 +137,7 @@ def _resolve_head(store: KVStore, branch: str, *, repair: bool = True) -> str | 
         commit_hash = _safe_from_bytes(head_bytes)
         if (
             isinstance(commit_hash, str)
-            and store.get(COMMIT_KEYSET % commit_hash) is not None
+            and store.get(COMMIT_ROOT % commit_hash) is not None
         ):
             return commit_hash
 
@@ -78,7 +147,7 @@ def _resolve_head(store: KVStore, branch: str, *, repair: bool = True) -> str | 
         commit_hash = _safe_from_bytes(prev_bytes)
         if (
             isinstance(commit_hash, str)
-            and store.get(COMMIT_KEYSET % commit_hash) is not None
+            and store.get(COMMIT_ROOT % commit_hash) is not None
         ):
             logger.warning(
                 "Branch '%s': HEAD corrupt, recovered from prev HEAD", branch
@@ -105,24 +174,23 @@ def _scan_for_best_commit(store: KVStore, branch: str) -> str | None:
     """Scan the store for the best valid commit for a corrupt branch.
 
     Finds all valid commits, excludes those reachable from healthy branches,
-    and returns the most recent tip.
+    and returns the most recent tip (by ``__commit_time__``).
     """
-    # Collect all valid commits with timestamps
-    ks_prefix = COMMIT_KEYSET.replace("%s", "")
-    meta_prefix = META_KEY.replace("%s", "")
+    root_prefix = COMMIT_ROOT.replace("%s", "")
     all_commits: dict[str, float] = {}
     for key in store.keys():
-        if not isinstance(key, str) or not key.startswith(ks_prefix):
+        if not isinstance(key, str) or not key.startswith(root_prefix):
             continue
-        h = key[len(ks_prefix) :]
+        h = key[len(root_prefix) :]
         if not h:
             continue
-        meta_bytes = store.get(meta_prefix + h)
+        time_bytes = store.get(COMMIT_TIME % h)
         ts = 0.0
-        if meta_bytes is not None:
+        if time_bytes is not None:
             try:
-                meta = json.loads(meta_bytes)
-                ts = max((e.get("created_at", 0) for e in meta.values()), default=0)
+                val = _safe_from_bytes(time_bytes)
+                if isinstance(val, (int, float)):
+                    ts = float(val)
             except Exception:
                 pass
         all_commits[h] = ts
@@ -143,7 +211,7 @@ def _scan_for_best_commit(store: KVStore, branch: str) -> str | None:
         if hb is None:
             continue
         h = _safe_from_bytes(hb)
-        if not isinstance(h, str) or store.get(COMMIT_KEYSET % h) is None:
+        if not isinstance(h, str) or store.get(COMMIT_ROOT % h) is None:
             continue
         # Walk parent chain
         stack = [h]
@@ -202,6 +270,8 @@ class VersionedKV(VersionedBase):
             store = Memory()
         self.store = store
 
+        _check_storage_version(store)
+
         if commit_hash is None:
             commit_hash = _resolve_head(store, branch)
             if commit_hash is None and store.get(BRANCH_HEAD % branch) is not None:
@@ -210,11 +280,10 @@ class VersionedKV(VersionedBase):
                 # Create initial empty commit
                 commit_hash = content_hash((), {}, {})
                 initial = {
-                    COMMIT_KEYSET % commit_hash: to_bytes({}),
+                    COMMIT_ROOT % commit_hash: to_bytes(EMPTY_HASH),
                     PARENT_COMMIT % commit_hash: to_bytes([]),
+                    COMMIT_TIME % commit_hash: to_bytes(time.time()),
                     BRANCH_HEAD % branch: to_bytes(commit_hash),
-                    META_KEY % commit_hash: meta_to_bytes({}),
-                    TOTAL_VAR_SIZE_KEY % commit_hash: to_bytes(0),
                 }
                 store.set_many(**initial)
 
@@ -225,23 +294,30 @@ class VersionedKV(VersionedBase):
 
         super().__init__(branch=branch, commit_hash=commit_hash)
 
-        # Load commit keyset
-        keyset_bytes = self.store.get(COMMIT_KEYSET % self._current_commit)
-        if keyset_bytes is not None:
-            self._commit_keys = from_bytes(keyset_bytes)
-
-        # Load metadata for GC
+        # Materialize keyset + meta from the HAMT
         self._meta: dict[str, MetaEntry] = {}
-        meta_bytes = self.store.get(META_KEY % self._current_commit)
-        if meta_bytes is not None:
-            try:
-                self._meta = meta_from_bytes(meta_bytes)
-            except Exception:
-                self._meta = {}
+        self._touch_counter = 0
+        self._populate_state(commit_hash)
+
+    def _populate_state(self, commit_hash: str) -> None:
+        """Walk the commit's HAMT and populate ``_commit_keys`` / ``_meta``."""
+        root = _load_root(self.store, commit_hash)
+        if root is None:
+            self._commit_keys = {}
+            self._meta = {}
+            self._touch_counter = 0
+            return
+
+        ks = Keyset(self.store, root=root)
+        commit_keys: dict[str, str] = {}
+        meta: dict[str, MetaEntry] = {}
+        for key, entry in ks.items():
+            commit_keys[key] = entry.blob
+            meta[key] = entry.meta
+        self._commit_keys = commit_keys
+        self._meta = meta
         self._touch_counter = (
-            max((e.last_touch for e in self._meta.values()), default=0)
-            if self._meta
-            else 0
+            max((e.last_touch for e in meta.values()), default=0) if meta else 0
         )
 
     @property
@@ -313,7 +389,7 @@ class VersionedKV(VersionedBase):
         updates = updates or {}
         removals = removals or set()
 
-        # Build new keyset: carry forward, apply removals, apply updates
+        # Build new in-memory dicts: carry forward, apply removals, apply updates
         new_commit_keys: dict[str, str] = {}
         new_meta: dict[str, MetaEntry] = {}
 
@@ -324,8 +400,8 @@ class VersionedKV(VersionedBase):
             if key in self._meta:
                 new_meta[key] = self._meta[key]
 
-        # Compute content-addressable hash
-        # (includes parent, new keyset preview, and update blobs)
+        # Compute content-addressable hash from a placeholder keyset
+        # (real versioned blob keys depend on the commit hash itself).
         preview_keys = dict(new_commit_keys)
         for key in updates:
             preview_keys[key] = f"<pending:{key}>"
@@ -333,7 +409,7 @@ class VersionedKV(VersionedBase):
             (self._current_commit,), preview_keys, updates, info=info
         )
 
-        # Store update blobs with versioned keys
+        # Resolve real versioned blob keys for new updates
         diffs: dict[str, bytes] = {}
         for key, value in updates.items():
             versioned_key = f"{new_hash}:{key}"
@@ -354,16 +430,26 @@ class VersionedKV(VersionedBase):
                     created_at=time.time(),
                 )
 
-        # Store commit metadata
-        diffs[COMMIT_KEYSET % new_hash] = to_bytes(new_commit_keys)
+        # Build the new keyset by applying changes to the parent's HAMT.
+        # Only the explicitly changed keys generate new entries; structural
+        # sharing reuses unchanged subtrees from the parent commit.
+        parent_root = _load_root(self.store, self._current_commit) or EMPTY_HASH
+        parent_ks = Keyset(self.store, root=parent_root)
+        keyset_updates = {
+            key: KeysetEntry(blob=new_commit_keys[key], meta=new_meta[key])
+            for key in updates
+        }
+        new_ks, pending = parent_ks.updated(updates=keyset_updates, removals=removals)
+        diffs.update(pending)
+
+        # Commit metadata
+        diffs[COMMIT_ROOT % new_hash] = to_bytes(new_ks.root)
         diffs[PARENT_COMMIT % new_hash] = to_bytes([self._current_commit])
-        diffs[META_KEY % new_hash] = meta_to_bytes(new_meta)
-        total_size = sum(e.size for e in new_meta.values() if e.size is not None)
-        diffs[TOTAL_VAR_SIZE_KEY % new_hash] = to_bytes(total_size)
+        diffs[COMMIT_TIME % new_hash] = to_bytes(time.time())
         if info is not None:
             diffs[INFO_KEY % new_hash] = to_bytes(info)
 
-        # Write everything
+        # Write everything atomically
         self.store.set_many(**diffs)
 
         # Update in-memory state
@@ -396,11 +482,15 @@ class VersionedKV(VersionedBase):
             merged_keyset[key] = vk
             diffs[vk] = value
 
-        # Build meta for merge commit
-        our_meta_bytes = self.store.get(META_KEY % self._current_commit)
-        their_meta_bytes = self.store.get(META_KEY % parents[0])
-        our_meta = meta_from_bytes(our_meta_bytes) if our_meta_bytes else {}
-        their_meta = meta_from_bytes(their_meta_bytes) if their_meta_bytes else {}
+        # Build merged meta from the parents' meta. ``self._meta`` is
+        # already our parent's meta (in memory). Their parent's meta
+        # we have to walk via the HAMT.
+        their_root = _load_root(self.store, parents[0])
+        their_meta: dict[str, MetaEntry] = {}
+        if their_root is not None:
+            their_ks = Keyset(self.store, root=their_root)
+            for key, entry in their_ks.items():
+                their_meta[key] = entry.meta
 
         merged_meta: dict[str, MetaEntry] = {}
         for key in merged_keyset:
@@ -411,16 +501,35 @@ class VersionedKV(VersionedBase):
                     size=len(merged_values[key]),
                     created_at=time.time(),
                 )
-            elif key in our_meta:
-                merged_meta[key] = our_meta[key]
+            elif key in self._meta:
+                merged_meta[key] = self._meta[key]
             elif key in their_meta:
                 merged_meta[key] = their_meta[key]
 
-        diffs[COMMIT_KEYSET % merge_hash] = to_bytes(merged_keyset)
+        # Apply the merge result on top of our parent's HAMT. We compute
+        # the minimal updates and removals so structural sharing kicks in
+        # for unchanged subtrees.
+        our_root = _load_root(self.store, self._current_commit) or EMPTY_HASH
+        parent_ks = Keyset(self.store, root=our_root)
+
+        keyset_updates: dict[str, KeysetEntry] = {}
+        for key, blob in merged_keyset.items():
+            new_entry = KeysetEntry(blob=blob, meta=merged_meta[key])
+            old_blob = self._commit_keys.get(key)
+            old_meta = self._meta.get(key)
+            if old_blob != new_entry.blob or old_meta != new_entry.meta:
+                keyset_updates[key] = new_entry
+
+        keyset_removals = {key for key in self._commit_keys if key not in merged_keyset}
+
+        new_ks, pending = parent_ks.updated(
+            updates=keyset_updates, removals=keyset_removals
+        )
+        diffs.update(pending)
+
+        diffs[COMMIT_ROOT % merge_hash] = to_bytes(new_ks.root)
         diffs[PARENT_COMMIT % merge_hash] = to_bytes(list(parents))
-        diffs[META_KEY % merge_hash] = meta_to_bytes(merged_meta)
-        total_size = sum(e.size for e in merged_meta.values() if e.size is not None)
-        diffs[TOTAL_VAR_SIZE_KEY % merge_hash] = to_bytes(total_size)
+        diffs[COMMIT_TIME % merge_hash] = to_bytes(time.time())
         if info is not None:
             diffs[INFO_KEY % merge_hash] = to_bytes(info)
 
@@ -447,11 +556,15 @@ class VersionedKV(VersionedBase):
         )
 
     def _load_keyset(self, commit_hash: str) -> dict[str, str]:
-        """Load just the keyset for a commit (key -> versioned_key mapping)."""
-        keyset_bytes = self.store.get(COMMIT_KEYSET % commit_hash)
-        if keyset_bytes is None:
+        """Load just the keyset for a commit (key -> versioned_key mapping).
+
+        Used by the merge layer; returns a flat dict, dropping meta.
+        """
+        root = _load_root(self.store, commit_hash)
+        if root is None:
             return {}
-        return from_bytes(keyset_bytes)
+        ks = Keyset(self.store, root=root)
+        return {key: entry.blob for key, entry in ks.items()}
 
     def _load_parents(self, commit_hash: str) -> tuple[str, ...]:
         """Load the parent tuple for a commit."""
@@ -519,7 +632,7 @@ class VersionedKV(VersionedBase):
         self, commit_hash: str, *, branch: str | None = None
     ) -> "VersionedKV | None":
         """Return a new VersionedKV at a specific commit."""
-        if self.store.get(COMMIT_KEYSET % commit_hash) is None:
+        if self.store.get(COMMIT_ROOT % commit_hash) is None:
             return None
         return VersionedKV(
             self.store,
@@ -534,7 +647,7 @@ class VersionedKV(VersionedBase):
         """
         branch_key = BRANCH_HEAD % name
         target = at or self._current_commit
-        if at is not None and self.store.get(COMMIT_KEYSET % at) is None:
+        if at is not None and self.store.get(COMMIT_ROOT % at) is None:
             raise ValueError(f"Commit '{at}' does not exist")
         if not self.store.cas(branch_key, to_bytes(target), expected=None):
             raise ValueError(f"Branch '{name}' already exists")
@@ -565,20 +678,18 @@ class VersionedKV(VersionedBase):
         commit_hash = _resolve_head(self.store, branch)
         if commit_hash is None:
             return None
-        keyset_bytes = self.store.get(COMMIT_KEYSET % commit_hash)
-        if keyset_bytes is None:
+        root = _load_root(self.store, commit_hash)
+        if root is None:
             return None
-        keyset = _safe_from_bytes(keyset_bytes)
-        if not isinstance(keyset, dict):
+        ks = Keyset(self.store, root=root)
+        entry = ks.get(key)
+        if entry is None:
             return None
-        content_hash_ = keyset.get(key)
-        if content_hash_ is None:
-            return None
-        return self.store.get(content_hash_)
+        return self.store.get(entry.blob)
 
     def reset_to(self, commit_hash: str) -> bool:
         """Reset HEAD to a specific commit."""
-        if self.store.get(COMMIT_KEYSET % commit_hash) is None:
+        if self.store.get(COMMIT_ROOT % commit_hash) is None:
             return False
         branch_key = BRANCH_HEAD % self._branch
         prev_key = BRANCH_HEAD_PREV % self._branch
@@ -620,102 +731,119 @@ class VersionedKV(VersionedBase):
         """Remove orphaned commits unreachable from any branch HEAD.
 
         Traces all reachable commits from live branch HEADs, then
-        deletes commit metadata and versioned keys for any commit
-        not in the reachable set. Only deletes blobs that are not
-        referenced by any reachable commit.
+        deletes commit metadata, blobs, and HAMT nodes that are not
+        reachable from any reachable commit.
 
         The ``min_age`` guard (default 1 hour) prevents recently
         created commits from being falsely swept during concurrent
-        writes. Use ``min_age=0`` when concurrency is not a concern
-        (e.g. single-user browser environments).
+        writes.
 
         Returns:
             Number of orphaned commits removed.
         """
-        logger = logging.getLogger("kvgit.orphans")
+        gc_logger = logging.getLogger("kvgit.orphans")
 
-        # Mark phase: find all reachable commits and their blob keys
-        reachable: set[str] = set()
+        # Mark phase: walk every branch's history, collecting reachable
+        # commits, blob keys, and HAMT node hashes.
+        reachable_commits: set[str] = set()
         reachable_blobs: set[str] = set()
-        prefix = BRANCH_HEAD.replace("%s", "")
-        for key in self.store.keys():
-            if isinstance(key, str) and key.startswith(prefix):
-                branch_name = key[len(prefix) :]
-                branch_head = _resolve_head(self.store, branch_name)
-                if branch_head is None:
-                    continue
-                for commit in self.history(commit_hash=branch_head, all_parents=True):
-                    if commit not in reachable:
-                        reachable.add(commit)
-                        ks_bytes = self.store.get(COMMIT_KEYSET % commit)
-                        if ks_bytes:
-                            try:
-                                for vk in from_bytes(ks_bytes).values():
-                                    reachable_blobs.add(vk)
-                            except Exception:
-                                pass
+        reachable_nodes: set[str] = set()
 
-        # Sweep phase: find orphaned commits by scanning for meta keys
-        meta_prefix = META_KEY.replace("%s", "")
+        branch_prefix = BRANCH_HEAD.replace("%s", "")
+        for key in self.store.keys():
+            if not (isinstance(key, str) and key.startswith(branch_prefix)):
+                continue
+            branch_name = key[len(branch_prefix) :]
+            branch_head = _resolve_head(self.store, branch_name)
+            if branch_head is None:
+                continue
+            for commit in self.history(commit_hash=branch_head, all_parents=True):
+                if commit in reachable_commits:
+                    continue
+                reachable_commits.add(commit)
+                root = _load_root(self.store, commit)
+                if root is None:
+                    continue
+                ks = Keyset(self.store, root=root)
+                for _, entry in ks.items():
+                    reachable_blobs.add(entry.blob)
+                for node_hash in ks.reachable_nodes():
+                    reachable_nodes.add(node_hash)
+
+        # Sweep phase: find orphaned commits via __commit_root__ scan.
         cutoff_time = time.time() - min_age
         orphans: list[str] = []
+        root_prefix = COMMIT_ROOT.replace("%s", "")
 
         for key in self.store.keys():
-            if not isinstance(key, str) or not key.startswith(meta_prefix):
+            if not (isinstance(key, str) and key.startswith(root_prefix)):
                 continue
-            commit_hash = key[len(meta_prefix) :]
-            if not commit_hash or commit_hash in reachable:
+            commit_hash = key[len(root_prefix) :]
+            if not commit_hash or commit_hash in reachable_commits:
                 continue
-            # Check age
-            meta_bytes = self.store.get(key)
-            if meta_bytes is None:
+            time_bytes = self.store.get(COMMIT_TIME % commit_hash)
+            if time_bytes is None:
+                # No timestamp recorded — be conservative, leave it alone.
                 continue
             try:
-                meta = meta_from_bytes(meta_bytes)
-                if meta:
-                    newest = max(e.created_at for e in meta.values())
-                    if newest < cutoff_time:
-                        orphans.append(commit_hash)
-                else:
+                ts_val = _safe_from_bytes(time_bytes)
+                if not isinstance(ts_val, (int, float)):
+                    continue
+                if float(ts_val) < cutoff_time:
                     orphans.append(commit_hash)
-            except (json.JSONDecodeError, TypeError, KeyError):
+            except (TypeError, ValueError):
                 continue
 
-        # Delete orphaned commits — only remove blobs not used by reachable commits.
-        # Batch all removals into a single remove_many call so the sweep is atomic.
+        # Collect everything to delete in one batch so the sweep is atomic
+        # at the store level (defends against partial sweeps under crash).
         all_removals: list[str] = []
+
         for orphan_hash in orphans:
-            keyset_bytes = self.store.get(COMMIT_KEYSET % orphan_hash)
-            if keyset_bytes:
+            orphan_root = _load_root(self.store, orphan_hash)
+            if orphan_root is not None and orphan_root != EMPTY_HASH:
                 try:
-                    keyset = from_bytes(keyset_bytes)
-                    all_removals.extend(
-                        vk for vk in keyset.values() if vk not in reachable_blobs
-                    )
+                    orphan_ks = Keyset(self.store, root=orphan_root)
+                    for _, entry in orphan_ks.items():
+                        if entry.blob not in reachable_blobs:
+                            all_removals.append(entry.blob)
                 except Exception:
                     pass
             all_removals.extend(
                 [
-                    META_KEY % orphan_hash,
-                    COMMIT_KEYSET % orphan_hash,
+                    COMMIT_ROOT % orphan_hash,
                     PARENT_COMMIT % orphan_hash,
-                    TOTAL_VAR_SIZE_KEY % orphan_hash,
+                    COMMIT_TIME % orphan_hash,
                     INFO_KEY % orphan_hash,
                 ]
             )
+
+        # Orphan HAMT nodes: any kvgit:keyset:* not in reachable_nodes
+        for key in self.store.keys():
+            if not (isinstance(key, str) and key.startswith(KEYSET_PREFIX)):
+                continue
+            node_hash = key[len(KEYSET_PREFIX) :]
+            if node_hash and node_hash not in reachable_nodes:
+                all_removals.append(key)
 
         if all_removals:
             self.store.remove_many(*all_removals)
 
         if orphans:
-            logger.debug("Cleaned %d orphaned commit(s)", len(orphans))
+            gc_logger.debug("Cleaned %d orphaned commit(s)", len(orphans))
 
         return len(orphans)
 
     # -- Internal --
 
     def _touch(self, key: str) -> None:
-        """Update last_touch for a key (in-memory only, persisted on commit)."""
+        """Update last_touch for a key (in-memory only).
+
+        Note: as of storage v2 this no longer persists across commits.
+        Persisting touch counts would require rewriting every leaf on
+        every commit, which would obliterate structural sharing.
+        ``last_touch`` is now an in-session counter that resets when a
+        commit is reloaded.
+        """
         if key in self._meta:
             self._touch_counter += 1
             entry = self._meta[key]
@@ -730,21 +858,4 @@ class VersionedKV(VersionedBase):
         self._current_commit = commit_hash
         if update_base:
             self._base_commit = commit_hash
-
-        keyset_bytes = self.store.get(COMMIT_KEYSET % commit_hash)
-        self._commit_keys = from_bytes(keyset_bytes) if keyset_bytes else {}
-
-        meta_bytes = self.store.get(META_KEY % commit_hash)
-        if meta_bytes is not None:
-            try:
-                self._meta = meta_from_bytes(meta_bytes)
-            except Exception:
-                self._meta = {}
-        else:
-            self._meta = {}
-
-        self._touch_counter = (
-            max((e.last_touch for e in self._meta.values()), default=0)
-            if self._meta
-            else 0
-        )
+        self._populate_state(commit_hash)

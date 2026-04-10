@@ -25,12 +25,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from kvgit.encoding import from_bytes
 from kvgit.kv.disk import Disk
+from kvgit.versioned.keyset import Keyset
 from kvgit.versioned.kv import (
     BRANCH_HEAD,
-    COMMIT_KEYSET,
-    META_KEY,
+    COMMIT_ROOT,
     PARENT_COMMIT,
     VersionedKV,
+    _load_root,
 )
 
 
@@ -70,26 +71,36 @@ def verify_store(backend: Disk) -> list[str]:
                 continue
             visited.add(commit_hash)
 
-            ks_bytes = backend.get(COMMIT_KEYSET % commit_hash)
-            if ks_bytes is None:
-                errors.append(f"[{branch}] commit {commit_hash[:12]} missing keyset")
-                continue
-
-            try:
-                keyset = from_bytes(ks_bytes)
-            except Exception:
+            # Commit must have a root pointer
+            if backend.get(COMMIT_ROOT % commit_hash) is None:
                 errors.append(
-                    f"[{branch}] commit {commit_hash[:12]} keyset decode error"
+                    f"[{branch}] commit {commit_hash[:12]} missing commit root"
                 )
                 continue
 
-            if not isinstance(keyset, dict):
+            # Walk the keyset HAMT and verify every entry's blob exists
+            root = _load_root(backend, commit_hash)
+            if root is None:
+                errors.append(
+                    f"[{branch}] commit {commit_hash[:12]} root pointer corrupt"
+                )
                 continue
 
-            meta_bytes = backend.get(META_KEY % commit_hash)
-            if meta_bytes is None:
-                errors.append(f"[{branch}] commit {commit_hash[:12]} missing meta")
+            try:
+                ks = Keyset(backend, root=root)
+                for user_key, entry in ks.items():
+                    if backend.get(entry.blob) is None:
+                        errors.append(
+                            f"[{branch}] commit {commit_hash[:12]} "
+                            f"blob missing for key '{user_key}'"
+                        )
+            except Exception as e:
+                errors.append(
+                    f"[{branch}] commit {commit_hash[:12]} keyset walk failed: {e}"
+                )
+                continue
 
+            # Walk parents
             parent_bytes = backend.get(PARENT_COMMIT % commit_hash)
             if parent_bytes is not None:
                 try:
@@ -100,13 +111,6 @@ def verify_store(backend: Disk) -> list[str]:
                     queue.append(parents_raw)
                 elif isinstance(parents_raw, list):
                     queue.extend(p for p in parents_raw if isinstance(p, str))
-
-            for user_key, blob_key in keyset.items():
-                if backend.get(blob_key) is None:
-                    errors.append(
-                        f"[{branch}] commit {commit_hash[:12]} "
-                        f"blob missing for key '{user_key}'"
-                    )
 
     return errors
 
