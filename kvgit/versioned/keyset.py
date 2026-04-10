@@ -157,16 +157,20 @@ class Keyset:
         new_hamt, pending = self._hamt.updated(encoded_updates, removals)
         return Keyset._wrap(new_hamt), pending
 
-    def commit(
+    def persist(
         self,
         updates: Mapping[str, KeysetEntry] | None = None,
         removals: Iterable[str] = (),
     ) -> "Keyset":
-        """Apply updates and persist to the store immediately."""
+        """Apply updates and write any new nodes to the store immediately.
+
+        Distinct from ``Versioned.commit``: a Keyset has no notion of
+        a commit history — this just flushes HAMT node bytes.
+        """
         encoded_updates: dict[str, bytes] | None = None
         if updates:
             encoded_updates = {k: encode_entry(v) for k, v in updates.items()}
-        new_hamt = self._hamt.commit(encoded_updates, removals)
+        new_hamt = self._hamt.persist(encoded_updates, removals)
         return Keyset._wrap(new_hamt)
 
     def flush(self) -> "Keyset":
