@@ -15,9 +15,16 @@ from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import asdict, dataclass
 from typing import NamedTuple
 
-from ..encoding import MetaEntry
 from ..hamt import EMPTY_HASH, Hamt
 from ..kv.base import KVStore
+
+
+@dataclass
+class MetaEntry:
+    """Per-key metadata stored alongside a blob pointer in a Keyset."""
+
+    size: int | None
+    created_at: float
 
 
 @dataclass(frozen=True)

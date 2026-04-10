@@ -26,12 +26,12 @@ import json
 import logging
 import time
 
-from ..encoding import MetaEntry, from_bytes, to_bytes
+from ..encoding import dumps, loads, safe_loads
 from ..hamt import EMPTY_HASH
 from ..kv.base import KVStore
 from ..kv.memory import Memory
 from .base import VersionedBase
-from .keyset import Keyset, KeysetEntry
+from .keyset import Keyset, KeysetEntry, MetaEntry
 from .merge import MergeResolution
 
 PARENT_COMMIT = "__parent_commit__%s"
@@ -73,14 +73,6 @@ def content_hash(
 logger = logging.getLogger("kvgit")
 
 
-def _safe_from_bytes(raw: bytes):
-    """Like from_bytes but returns None on any decode/parse error."""
-    try:
-        return from_bytes(raw)
-    except Exception:
-        return None
-
-
 def _check_storage_version(store: KVStore) -> None:
     """Verify the store's kvgit version is compatible.
 
@@ -89,7 +81,7 @@ def _check_storage_version(store: KVStore) -> None:
     """
     raw = store.get(STORAGE_VERSION_KEY)
     if raw is not None:
-        version = _safe_from_bytes(raw)
+        version = safe_loads(raw)
         if version != STORAGE_VERSION:
             raise ValueError(
                 f"Store has kvgit storage version {version!r}, "
@@ -108,7 +100,7 @@ def _check_storage_version(store: KVStore) -> None:
             f"This version requires storage v{STORAGE_VERSION}. "
             "Use a fresh store."
         )
-    store.set(STORAGE_VERSION_KEY, to_bytes(STORAGE_VERSION))
+    store.set(STORAGE_VERSION_KEY, dumps(STORAGE_VERSION))
 
 
 def _load_root(store: KVStore, commit_hash: str) -> str | None:
@@ -116,7 +108,7 @@ def _load_root(store: KVStore, commit_hash: str) -> str | None:
     raw = store.get(COMMIT_ROOT % commit_hash)
     if raw is None:
         return None
-    val = _safe_from_bytes(raw)
+    val = safe_loads(raw)
     return val if isinstance(val, str) else None
 
 
@@ -132,7 +124,7 @@ def _resolve_head(store: KVStore, branch: str, *, repair: bool = True) -> str | 
     # 1. Try current HEAD
     head_bytes = store.get(BRANCH_HEAD % branch)
     if head_bytes is not None:
-        commit_hash = _safe_from_bytes(head_bytes)
+        commit_hash = safe_loads(head_bytes)
         if (
             isinstance(commit_hash, str)
             and store.get(COMMIT_ROOT % commit_hash) is not None
@@ -142,7 +134,7 @@ def _resolve_head(store: KVStore, branch: str, *, repair: bool = True) -> str | 
     # 2. Try previous HEAD (backup written before each CAS)
     prev_bytes = store.get(BRANCH_HEAD_PREV % branch)
     if prev_bytes is not None:
-        commit_hash = _safe_from_bytes(prev_bytes)
+        commit_hash = safe_loads(prev_bytes)
         if (
             isinstance(commit_hash, str)
             and store.get(COMMIT_ROOT % commit_hash) is not None
@@ -151,7 +143,7 @@ def _resolve_head(store: KVStore, branch: str, *, repair: bool = True) -> str | 
                 "Branch '%s': HEAD corrupt, recovered from prev HEAD", branch
             )
             if repair:
-                store.set(BRANCH_HEAD % branch, to_bytes(commit_hash))
+                store.set(BRANCH_HEAD % branch, dumps(commit_hash))
             return commit_hash
 
     # 3. HEAD existed but is corrupt and no prev — scan for best commit
@@ -162,7 +154,7 @@ def _resolve_head(store: KVStore, branch: str, *, repair: bool = True) -> str | 
                 "Branch '%s': HEAD corrupt, recovered via commit scan", branch
             )
             if repair:
-                store.set(BRANCH_HEAD % branch, to_bytes(commit_hash))
+                store.set(BRANCH_HEAD % branch, dumps(commit_hash))
             return commit_hash
 
     return None
@@ -186,7 +178,7 @@ def _scan_for_best_commit(store: KVStore, branch: str) -> str | None:
         ts = 0.0
         if time_bytes is not None:
             try:
-                val = _safe_from_bytes(time_bytes)
+                val = safe_loads(time_bytes)
                 if isinstance(val, (int, float)):
                     ts = float(val)
             except Exception:
@@ -208,7 +200,7 @@ def _scan_for_best_commit(store: KVStore, branch: str) -> str | None:
         hb = store.get(key)
         if hb is None:
             continue
-        h = _safe_from_bytes(hb)
+        h = safe_loads(hb)
         if not isinstance(h, str) or store.get(COMMIT_ROOT % h) is None:
             continue
         # Walk parent chain
@@ -220,7 +212,7 @@ def _scan_for_best_commit(store: KVStore, branch: str) -> str | None:
             claimed.add(c)
             pb = store.get(PARENT_COMMIT % c)
             if pb is not None:
-                parsed = _safe_from_bytes(pb)
+                parsed = safe_loads(pb)
                 if isinstance(parsed, str):
                     stack.append(parsed)
                 elif isinstance(parsed, list):
@@ -235,7 +227,7 @@ def _scan_for_best_commit(store: KVStore, branch: str) -> str | None:
     for h in candidates:
         pb = store.get(PARENT_COMMIT % h)
         if pb is not None:
-            parsed = _safe_from_bytes(pb)
+            parsed = safe_loads(pb)
             if isinstance(parsed, str):
                 all_parents.add(parsed)
             elif isinstance(parsed, list):
@@ -278,10 +270,10 @@ class VersionedKV(VersionedBase):
                 # Create initial empty commit
                 commit_hash = content_hash((), {}, {})
                 initial = {
-                    COMMIT_ROOT % commit_hash: to_bytes(EMPTY_HASH),
-                    PARENT_COMMIT % commit_hash: to_bytes([]),
-                    COMMIT_TIME % commit_hash: to_bytes(time.time()),
-                    BRANCH_HEAD % branch: to_bytes(commit_hash),
+                    COMMIT_ROOT % commit_hash: dumps(EMPTY_HASH),
+                    PARENT_COMMIT % commit_hash: dumps([]),
+                    COMMIT_TIME % commit_hash: dumps(time.time()),
+                    BRANCH_HEAD % branch: dumps(commit_hash),
                 }
                 store.set_many(**initial)
 
@@ -424,11 +416,11 @@ class VersionedKV(VersionedBase):
         diffs.update(pending)
 
         # Commit metadata
-        diffs[COMMIT_ROOT % new_hash] = to_bytes(new_ks.root)
-        diffs[PARENT_COMMIT % new_hash] = to_bytes([self._current_commit])
-        diffs[COMMIT_TIME % new_hash] = to_bytes(time.time())
+        diffs[COMMIT_ROOT % new_hash] = dumps(new_ks.root)
+        diffs[PARENT_COMMIT % new_hash] = dumps([self._current_commit])
+        diffs[COMMIT_TIME % new_hash] = dumps(time.time())
         if info is not None:
-            diffs[INFO_KEY % new_hash] = to_bytes(info)
+            diffs[INFO_KEY % new_hash] = dumps(info)
 
         # Write everything atomically
         self.store.set_many(**diffs)
@@ -506,11 +498,11 @@ class VersionedKV(VersionedBase):
         )
         diffs.update(pending)
 
-        diffs[COMMIT_ROOT % merge_hash] = to_bytes(new_ks.root)
-        diffs[PARENT_COMMIT % merge_hash] = to_bytes(list(parents))
-        diffs[COMMIT_TIME % merge_hash] = to_bytes(time.time())
+        diffs[COMMIT_ROOT % merge_hash] = dumps(new_ks.root)
+        diffs[PARENT_COMMIT % merge_hash] = dumps(list(parents))
+        diffs[COMMIT_TIME % merge_hash] = dumps(time.time())
         if info is not None:
-            diffs[INFO_KEY % merge_hash] = to_bytes(info)
+            diffs[INFO_KEY % merge_hash] = dumps(info)
 
         self.store.set_many(**diffs)
 
@@ -529,10 +521,8 @@ class VersionedKV(VersionedBase):
         """
         branch_key = BRANCH_HEAD % self._branch
         prev_key = BRANCH_HEAD_PREV % self._branch
-        self.store.set(prev_key, to_bytes(expected))
-        return self.store.cas(
-            branch_key, to_bytes(new_head), expected=to_bytes(expected)
-        )
+        self.store.set(prev_key, dumps(expected))
+        return self.store.cas(branch_key, dumps(new_head), expected=dumps(expected))
 
     def _load_keyset(self, commit_hash: str) -> dict[str, str]:
         """Load just the keyset for a commit (key -> versioned_key mapping).
@@ -550,7 +540,7 @@ class VersionedKV(VersionedBase):
         parent_bytes = self.store.get(PARENT_COMMIT % commit_hash)
         if parent_bytes is None:
             return ()
-        raw = from_bytes(parent_bytes)
+        raw = loads(parent_bytes)
         if raw is None:
             return ()
         if isinstance(raw, str):
@@ -628,7 +618,7 @@ class VersionedKV(VersionedBase):
         target = at or self._current_commit
         if at is not None and self.store.get(COMMIT_ROOT % at) is None:
             raise ValueError(f"Commit '{at}' does not exist")
-        if not self.store.cas(branch_key, to_bytes(target), expected=None):
+        if not self.store.cas(branch_key, dumps(target), expected=None):
             raise ValueError(f"Branch '{name}' already exists")
         return VersionedKV(self.store, commit_hash=target, branch=name)
 
@@ -676,7 +666,7 @@ class VersionedKV(VersionedBase):
         current = self.store.get(branch_key)
         if current is not None:
             self.store.set(prev_key, current)
-        self.store.set(branch_key, to_bytes(commit_hash))
+        self.store.set(branch_key, dumps(commit_hash))
         self._load_commit(commit_hash, update_base=True)
         return True
 
@@ -702,7 +692,7 @@ class VersionedKV(VersionedBase):
         info_bytes = self.store.get(INFO_KEY % target)
         if info_bytes is None:
             return None
-        return from_bytes(info_bytes)
+        return loads(info_bytes)
 
     # -- Orphan cleanup --
 
@@ -765,7 +755,7 @@ class VersionedKV(VersionedBase):
                 # No timestamp recorded — be conservative, leave it alone.
                 continue
             try:
-                ts_val = _safe_from_bytes(time_bytes)
+                ts_val = safe_loads(time_bytes)
                 if not isinstance(ts_val, (int, float)):
                     continue
                 if float(ts_val) < cutoff_time:

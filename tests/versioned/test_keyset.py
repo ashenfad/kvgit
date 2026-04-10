@@ -2,13 +2,13 @@
 
 import pytest
 
-from kvgit.encoding import MetaEntry
 from kvgit.hamt import EMPTY_HASH
 from kvgit.kv.memory import Memory
 from kvgit.versioned.keyset import (
     Keyset,
     KeysetDiff,
     KeysetEntry,
+    MetaEntry,
     decode_entry,
     encode_entry,
 )
