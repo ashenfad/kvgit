@@ -165,12 +165,14 @@ class Staged(MutableMapping[str, Any]):
         # Encode staged updates to bytes — scoped to keys if provided
         encoded_updates: dict[str, bytes] | None = None
         if keys is not None:
-            matched_updates = {k: v for k, v in self._updates.items() if k in keys}
+            # Iterate the (typically small) keys set, not the full _updates dict
+            matched_updates = {k: self._updates[k] for k in keys if k in self._updates}
             if matched_updates:
                 encoded_updates = {
                     k: self._encoder(v) for k, v in matched_updates.items()
                 }
-            removals = (self._removals & keys) or None
+            # .intersection() accepts any iterable, not just sets
+            removals = self._removals.intersection(keys) or None
         else:
             if self._updates:
                 encoded_updates = {
@@ -204,15 +206,16 @@ class Staged(MutableMapping[str, Any]):
         )
         if result.merged:
             if keys is not None:
-                # Only clear the committed keys
+                # Only clear the committed keys from staging
                 for k in keys:
                     self._updates.pop(k, None)
                     self._removals.discard(k)
-                    self._cache.pop(k, None)
             else:
                 self._updates.clear()
                 self._removals.clear()
-                self._cache.clear()
+            # Always clear the full read cache — HEAD moved, so cached
+            # values from other keys may be stale after a merge.
+            self._cache.clear()
         return result
 
     def reset(self) -> None:
