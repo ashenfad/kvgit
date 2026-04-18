@@ -69,16 +69,26 @@ s = Staged(VersionedKV(), encoder=pickle.dumps, decoder=pickle.loads)
 
 ### Committing
 
-#### `commit(*, on_conflict="raise", merge_fns=None, default_merge=None, info=None) -> MergeResult`
+#### `commit(*, keys=None, on_conflict="raise", merge_fns=None, default_merge=None, info=None) -> MergeResult`
 
 Encode staged changes and flush as a single atomic commit. If HEAD has diverged, a three-way merge is performed.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
+| `keys` | `set[str] \| None` | `None` | If provided, only commit these keys. Uncommitted keys remain staged. |
 | `on_conflict` | `str` | `"raise"` | `"raise"` or `"abandon"` |
 | `merge_fns` | `dict[str, MergeFn] \| None` | `None` | Per-key merge functions for this commit |
 | `default_merge` | `MergeFn \| None` | `None` | Fallback merge function for this commit |
 | `info` | `dict \| None` | `None` | Metadata attached to the commit |
+
+**Partial commits:** Pass `keys` to commit only a subset of staged changes. Keys not in `_updates` or `_removals` are silently ignored. Uncommitted keys remain staged for a future `commit()`.
+
+```python
+s["a"] = b"alpha"
+s["b"] = b"beta"
+s.commit(keys={"a"}, info={"message": "just a"})
+# "a" is committed; "b" remains staged
+```
 
 #### `reset() -> None`
 

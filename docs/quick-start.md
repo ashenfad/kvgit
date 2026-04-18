@@ -81,6 +81,15 @@ s.commit(info={"author": "alice", "message": "bump x"})
 s.versioned.commit_info()  # {"author": "alice", "message": "bump x"}
 ```
 
+Commit only specific keys — the rest stay staged:
+
+```python
+s["a"] = 1
+s["b"] = 2
+s.commit(keys={"a"}, info={"message": "just a"})
+# "a" is committed; "b" remains staged for a future commit
+```
+
 ---
 
 ## Branching
