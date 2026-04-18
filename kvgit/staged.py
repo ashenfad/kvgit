@@ -140,6 +140,7 @@ class Staged(MutableMapping[str, Any]):
     def commit(
         self,
         *,
+        keys: set[str] | None = None,
         on_conflict: str = "raise",
         merge_fns: dict[str, MergeFn] | None = None,
         default_merge: MergeFn | None = None,
@@ -148,20 +149,34 @@ class Staged(MutableMapping[str, Any]):
         """Flush staged changes to the underlying Versioned store.
 
         Encodes staged values to bytes, wraps merge functions, and
-        calls ``Versioned.commit()``. On success, clears the staging
-        buffer.
+        calls ``Versioned.commit()``. On success, clears the committed
+        entries from the staging buffer.
+
+        Args:
+            keys: If provided, only commit these specific keys.
+                Keys not in ``_updates`` or ``_removals`` are silently
+                ignored. Uncommitted keys remain staged for a future
+                commit. When ``None`` (default), all staged changes
+                are committed.
 
         Returns:
             A MergeResult (truthy when committed).
         """
-        # Encode staged updates to bytes
+        # Encode staged updates to bytes — scoped to keys if provided
         encoded_updates: dict[str, bytes] | None = None
-        if self._updates:
-            encoded_updates = {
-                key: self._encoder(value) for key, value in self._updates.items()
-            }
-
-        removals = self._removals if self._removals else None
+        if keys is not None:
+            matched_updates = {k: v for k, v in self._updates.items() if k in keys}
+            if matched_updates:
+                encoded_updates = {
+                    k: self._encoder(v) for k, v in matched_updates.items()
+                }
+            removals = (self._removals & keys) or None
+        else:
+            if self._updates:
+                encoded_updates = {
+                    key: self._encoder(value) for key, value in self._updates.items()
+                }
+            removals = self._removals if self._removals else None
 
         # Build effective merge fns and wrap to bytes-level
         effective_fns = dict(self._merge_fns)
@@ -188,9 +203,16 @@ class Staged(MutableMapping[str, Any]):
             info=info,
         )
         if result.merged:
-            self._updates.clear()
-            self._removals.clear()
-            self._cache.clear()
+            if keys is not None:
+                # Only clear the committed keys
+                for k in keys:
+                    self._updates.pop(k, None)
+                    self._removals.discard(k)
+                    self._cache.pop(k, None)
+            else:
+                self._updates.clear()
+                self._removals.clear()
+                self._cache.clear()
         return result
 
     def reset(self) -> None:
