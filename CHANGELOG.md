@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **`Staged.commit(keys=...)`** — partial commits. Pass a set of keys to flush only those entries from the staging buffer; uncommitted keys remain staged for a future commit. Enables selective version control workflows.
+
 ## [0.2.0] - 2026-04-10
 
 Per-commit keysets are now stored as a content-addressable HAMT, so
