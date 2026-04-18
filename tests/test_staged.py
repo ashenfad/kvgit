@@ -173,6 +173,117 @@ class TestStagedCommit:
         assert s.versioned.commit_info() == {"author": "test"}
 
 
+class TestStagedPartialCommit:
+    """Tests for commit(keys=...) partial commit support."""
+
+    def test_partial_commit_only_flushes_specified_keys(self):
+        store = Memory()
+        v = Versioned(store)
+        s = Staged(v)
+        s["a"] = 1
+        s["b"] = 2
+        result = s.commit(keys={"a"})
+        assert result.merged
+
+        # "a" is committed and no longer staged
+        assert not s.is_staged("a")
+        # "b" is still staged
+        assert s.is_staged("b")
+        assert s["b"] == 2
+
+    def test_partial_commit_persists_committed_keys(self):
+        store = Memory()
+        v = Versioned(store)
+        s = Staged(v)
+        s["a"] = 1
+        s["b"] = 2
+        s.commit(keys={"a"})
+
+        # Verify "a" is persisted (visible from a fresh Staged)
+        s2 = Staged(Versioned(store))
+        assert s2.get("a") == 1
+        # "b" is NOT persisted (still only in s's staging buffer)
+        assert s2.get("b") is None
+
+    def test_partial_commit_with_info(self):
+        s = Staged(Versioned())
+        s["a"] = 1
+        s["b"] = 2
+        result = s.commit(keys={"a"}, info={"message": "just a"})
+        assert result.merged
+        assert s.versioned.commit_info()["message"] == "just a"
+
+    def test_partial_commit_ignores_unknown_keys(self):
+        s = Staged(Versioned())
+        s["a"] = 1
+        # "ghost" is not staged — should be silently ignored
+        result = s.commit(keys={"a", "ghost"})
+        assert result.merged
+        assert not s.is_staged("a")
+
+    def test_partial_commit_with_removals(self):
+        s = Staged(Versioned())
+        s["a"] = 1
+        s["b"] = 2
+        s.commit()
+
+        del s["a"]
+        s["c"] = 3
+        # Partial commit: only the removal of "a"
+        s.commit(keys={"a"})
+        assert s.get("a") is None  # deleted
+        assert s.is_staged("c")  # still pending
+
+    def test_partial_commit_clears_full_cache(self):
+        """Regression test: after a partial commit, the entire read cache
+        must be cleared because HEAD moved. Cached values from non-committed
+        keys could be stale if a concurrent writer modified them.
+        """
+        store = Memory()
+        v = Versioned(store)
+        s = Staged(v)
+
+        s["x"] = "original_x"
+        s["y"] = "original_y"
+        s.commit()
+
+        # Read "y" to populate the cache
+        assert s["y"] == "original_y"
+
+        # Simulate a concurrent writer updating "y" on the same branch
+        v2 = Versioned(store)
+        v2.commit({"y": s._encoder("updated_by_other")})
+
+        # Partial commit of "x" — HEAD moves to include the concurrent write
+        s["x"] = "new_x"
+        s.commit(keys={"x"})
+
+        # After partial commit, "y" should reflect the concurrent update,
+        # NOT the stale cached value.  Before the fix, only "x" was evicted
+        # from cache, leaving "y" stale as "original_y".
+        s.refresh()
+        assert s["y"] == "updated_by_other"
+
+    def test_keys_accepts_non_set_iterable(self):
+        """keys parameter should accept any iterable, not just sets."""
+        s = Staged(Versioned())
+        s["a"] = 1
+        s["b"] = 2
+        # Pass a list instead of a set
+        result = s.commit(keys=["a"])
+        assert result.merged
+        assert not s.is_staged("a")
+        assert s.is_staged("b")
+
+    def test_full_commit_unchanged_when_keys_is_none(self):
+        """Without keys, commit flushes everything (backwards compatible)."""
+        s = Staged(Versioned())
+        s["a"] = 1
+        s["b"] = 2
+        s.commit()
+        assert not s.has_changes
+
+
 class TestStagedReset:
     def test_reset_clears_staging(self):
         s = Staged(Versioned())
