@@ -8,7 +8,6 @@ Git-style versioning for your data. Commits, branches, and merges -- backed by a
 | **Commits** | Immutable, content-addressable snapshots with rollback |
 | **Branches** | Cheap forks with CAS-based optimistic concurrency |
 | **Three-way merge** | Auto-merges non-overlapping changes; pluggable merge fns for conflicts |
-| **Eviction** | High/low water rebase drops least-recently-used keys automatically |
 | **Pluggable backends** | In-memory, disk (diskcache), git (GitPython), IndexedDB (Pyodide/browser), or bring your own `KVStore` |
 
 ## Install
