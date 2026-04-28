@@ -735,11 +735,17 @@ class VersionedKV(VersionedBase):
                 if root is None:
                     continue
                 # Single batched walk per commit collects both the
-                # blob references and the HAMT node hashes.
-                entries, nodes = Keyset(self.store, root=root).walk()
+                # blob references and the HAMT node hashes. Pass the
+                # cumulative ``reachable_nodes`` as ``skip_nodes`` so
+                # subtrees already seen on a prior commit / branch are
+                # not re-fetched — structural sharing means the blobs
+                # under those subtrees are also already accounted for.
+                entries, new_nodes = Keyset(self.store, root=root).walk(
+                    skip_nodes=reachable_nodes
+                )
                 for entry in entries.values():
                     reachable_blobs.add(entry.blob)
-                reachable_nodes.update(nodes)
+                reachable_nodes.update(new_nodes)
 
         # Sweep phase: find orphaned commits via __commit_root__ scan.
         cutoff_time = time.time() - min_age

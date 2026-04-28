@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - Unreleased
+
+### Added
+
+- **`Hamt.walk(skip_nodes=...)` / `Keyset.walk(skip_nodes=...)`** — optional cumulative seen-set parameter. Subtrees whose root hash is in `skip_nodes` are not fetched, not recursed into, and not included in the returned `nodes` set; items beneath them are also omitted. Pass an accumulating set across multiple walks (e.g. across the commits of a branch's history) so structurally-shared HAMT subtrees are visited only once. Turns N walks over a shared tree from `O(N · subtree)` into `O(unique nodes)`.
+
+### Changed
+
+- **`clean_orphans` mark phase shares walk work across commits and branches** — the cumulative `reachable_nodes` set is now passed as `skip_nodes` to each per-commit `Keyset.walk()`. On long histories with heavy structural sharing (e.g. ~600 commits where each commit changes a few keys against a large keyset), this collapses redundant subtree traversal: the mark phase becomes proportional to unique HAMT nodes instead of `commits × subtree-size`.
+
 ## [0.2.1] - 2026-04-18
 
 ### Added
