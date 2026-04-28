@@ -63,7 +63,14 @@ def _promise(executor):
 
 
 async def _idb_open(db_name: str, store_name: str):
-    """Open (or create) an IndexedDB database, returning the IDBDatabase."""
+    """Open (or create) an IndexedDB database, returning the IDBDatabase.
+
+    Rejects with a clear error when ``onblocked`` fires — a zombie
+    connection from another tab / window (or transient browser-side
+    state) can refuse the open indefinitely.  Without an explicit
+    handler the promise would never resolve and ``run_sync`` would
+    hang forever.
+    """
 
     def _executor(resolve, reject):
         request = indexedDB.open(db_name, 1)
@@ -79,9 +86,19 @@ async def _idb_open(db_name: str, store_name: str):
         def on_error(event):
             reject(event.target.error)
 
+        def on_blocked(event):
+            reject(
+                Exception(
+                    f"IndexedDB open of {db_name!r} is blocked. Close other "
+                    f"tabs / windows holding the database open and reload, "
+                    f"or restart the browser."
+                )
+            )
+
         request.onupgradeneeded = on_upgrade
         request.onsuccess = on_success
         request.onerror = on_error
+        request.onblocked = on_blocked
 
     return await _promise(_executor)
 

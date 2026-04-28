@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`clean_orphans` mark phase shares walk work across commits and branches** — the cumulative `reachable_nodes` set is now passed as `skip_nodes` to each per-commit `Keyset.walk()`. On long histories with heavy structural sharing (e.g. ~600 commits where each commit changes a few keys against a large keyset), this collapses redundant subtree traversal: the mark phase becomes proportional to unique HAMT nodes instead of `commits × subtree-size`.
 
+### Fixed
+
+- **`IndexedDB` open no longer hangs forever when the database is blocked by another connection.** The `_idb_open` executor now wires `onblocked` alongside `onsuccess` / `onerror`, rejecting with an actionable error message ("close other tabs holding the database open and reload, or restart the browser") instead of leaving `run_sync` suspended indefinitely. Previously a zombie connection from a closed tab could wedge `IndexedDB.__init__` until the browser was restarted.
+
 ## [0.2.1] - 2026-04-18
 
 ### Added
