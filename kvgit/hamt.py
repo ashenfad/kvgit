@@ -217,7 +217,9 @@ class Hamt:
         """
         return self.walk()[0]
 
-    def walk(self) -> tuple[dict[str, bytes], set[str]]:
+    def walk(
+        self, skip_nodes: set[str] | None = None
+    ) -> tuple[dict[str, bytes], set[str]]:
         """Walk the entire HAMT, returning (items, node_hashes).
 
         Single batched BFS that collects both the key→value entries
@@ -229,8 +231,19 @@ class Hamt:
         Same batching properties as ``materialize()``: one
         ``get_many`` call per tree level, O(log_branching N)
         round-trips total.
+
+        ``skip_nodes`` is an optional set of node hashes to treat as
+        already-visited. Skipped subtrees are not fetched, not
+        recursed into, and not included in the returned ``nodes``
+        set. Items beneath skipped subtrees are also omitted from
+        the returned ``items`` dict. Pass a cumulative seen-set
+        across multiple ``walk()`` calls (e.g. across the commits
+        of a branch's history) to share work where the underlying
+        HAMTs share structure — turns N-walks-over-shared-tree from
+        O(N · subtree) into O(unique nodes).
         """
-        if self.root == EMPTY_HASH:
+        skip = skip_nodes if skip_nodes is not None else set()
+        if self.root == EMPTY_HASH or self.root in skip:
             return {}, set()
 
         items: dict[str, bytes] = {}
@@ -239,11 +252,13 @@ class Hamt:
 
         while current_level:
             # Partition this level: nodes already in pending vs
-            # nodes that need to be fetched from the store.
+            # nodes that need to be fetched from the store. Drop
+            # anything in skip_nodes — those subtrees have already
+            # been visited by a prior walk.
             cached_nodes: dict[str, dict] = {}
             to_fetch: list[str] = []
             for node_hash in current_level:
-                if node_hash == EMPTY_HASH:
+                if node_hash == EMPTY_HASH or node_hash in skip:
                     continue
                 prefixed = self.prefix + node_hash
                 if prefixed in self.pending:
@@ -261,7 +276,7 @@ class Hamt:
             # node hash we successfully load.
             next_level: list[str] = []
             for node_hash in current_level:
-                if node_hash == EMPTY_HASH:
+                if node_hash == EMPTY_HASH or node_hash in skip:
                     continue
                 if node_hash in cached_nodes:
                     node = cached_nodes[node_hash]

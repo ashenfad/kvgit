@@ -389,3 +389,27 @@ def test_walk_node_set_matches_reachable_nodes():
     _, walked_nodes = ks.walk()
     via_reachable = set(ks.reachable_nodes())
     assert walked_nodes == via_reachable
+
+
+def test_walk_skip_nodes_forwards_to_hamt():
+    """Keyset.walk(skip_nodes=...) should prune subtrees the same
+    way Hamt.walk does — entries beneath skipped nodes vanish, and
+    skipped node hashes don't appear in the returned node set."""
+    entries = {f"k{i:03d}": _entry(blob=f"b{i}") for i in range(80)}
+    ks = Keyset(Memory(), bucket_max=4).persist(entries)
+
+    # Skipping the root prunes everything.
+    pruned_entries, pruned_nodes = ks.walk(skip_nodes={ks.root})
+    assert pruned_entries == {}
+    assert pruned_nodes == set()
+
+    # Cumulative seen-set across two structurally-related Keysets:
+    # walking the second after seeding from the first should visit
+    # only newly-introduced HAMT nodes.
+    ks2 = ks.persist({"new-key": _entry(blob="new-blob")})
+    seen: set[str] = set()
+    _, nodes1 = ks.walk(skip_nodes=seen)
+    seen |= nodes1
+    entries2, nodes2 = ks2.walk(skip_nodes=seen)
+    assert "new-key" in entries2
+    assert nodes1.isdisjoint(nodes2)

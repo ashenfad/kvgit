@@ -146,14 +146,17 @@ class Keyset:
         """
         return {k: decode_entry(v) for k, v in self._hamt.materialize().items()}
 
-    def walk(self) -> tuple[dict[str, KeysetEntry], set[str]]:
+    def walk(
+        self, skip_nodes: set[str] | None = None
+    ) -> tuple[dict[str, KeysetEntry], set[str]]:
         """Single batched walk returning (entries, hamt_node_hashes).
 
         Equivalent to ``materialize()`` plus collecting every HAMT
         node hash, in one tree traversal. Used by GC mark phases
-        that need both — see ``Hamt.walk``.
+        that need both — see ``Hamt.walk`` (including the
+        ``skip_nodes`` cumulative seen-set semantics).
         """
-        raw_items, nodes = self._hamt.walk()
+        raw_items, nodes = self._hamt.walk(skip_nodes=skip_nodes)
         return {k: decode_entry(v) for k, v in raw_items.items()}, nodes
 
     def keys(self) -> Iterator[str]:

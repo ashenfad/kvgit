@@ -779,3 +779,116 @@ def test_materialize_is_walk_dot_zero():
     items = {f"k{i:03d}": f"v{i}".encode() for i in range(50)}
     h = Hamt(_store(), bucket_max=4).persist(items)
     assert h.materialize() == h.walk()[0]
+
+
+# ---- walk(skip_nodes=...) cumulative seen-set ----
+
+
+def test_walk_skip_nodes_root_short_circuits():
+    """Skipping the root yields nothing — entire tree pruned."""
+    items = {f"k{i:03d}": f"v{i}".encode() for i in range(20)}
+    h = Hamt(_store(), bucket_max=4).persist(items)
+    walked_items, walked_nodes = h.walk(skip_nodes={h.root})
+    assert walked_items == {}
+    assert walked_nodes == set()
+
+
+def test_walk_skip_nodes_excludes_skipped_from_returned_set():
+    """Returned ``nodes`` excludes anything in ``skip_nodes``."""
+    items = {f"k{i:03d}": f"v{i}".encode() for i in range(60)}
+    h = Hamt(_store(), bucket_max=4).persist(items)
+    full_nodes = h.walk()[1]
+    # Pick an arbitrary non-root node to skip.
+    interior = next(iter(full_nodes - {h.root}))
+    _, walked_nodes = h.walk(skip_nodes={interior})
+    assert interior not in walked_nodes
+    # Other nodes are still visited (root at minimum).
+    assert h.root in walked_nodes
+
+
+def test_walk_skip_nodes_skips_subtree_items():
+    """Items beneath a skipped subtree are not returned."""
+    items = {f"k{i:03d}": f"v{i}".encode() for i in range(80)}
+    h = Hamt(_store(), bucket_max=4).persist(items)
+
+    # Find a non-root branch node and the items reachable beneath it,
+    # then verify those items are absent when we skip that node.
+    full_items, full_nodes = h.walk()
+    interior_candidates = full_nodes - {h.root}
+    # Walk only the subtree rooted at the candidate to see what's under it.
+    for candidate in interior_candidates:
+        sub_items = Hamt(h.store, root=candidate, bucket_max=4).walk()[0]
+        if sub_items and len(sub_items) < len(full_items):
+            walked_items, _ = h.walk(skip_nodes={candidate})
+            for k in sub_items:
+                assert k not in walked_items
+            # And the items not in that subtree are still present.
+            for k in full_items:
+                if k not in sub_items:
+                    assert walked_items[k] == full_items[k]
+            return
+    pytest.fail("expected to find at least one non-root subtree to skip")
+
+
+def test_walk_skip_nodes_does_not_fetch_skipped():
+    """Skipped nodes should not be fetched from the store at all."""
+    store = _CountingMemory()
+    items = {f"k{i:04d}": f"v{i}".encode() for i in range(200)}
+    h = Hamt(store, bucket_max=4).persist(items)
+    full_nodes = h.walk()[1]
+
+    # Skip every node — the only fetches should be ones forced by
+    # the level-batched fetch *before* we filter (we filter first
+    # in the implementation, so even those should be zero).
+    store.reset_counts()
+    walked_items, walked_nodes = h.walk(skip_nodes=full_nodes)
+    assert walked_items == {}
+    assert walked_nodes == set()
+    assert store.get_calls == 0
+    assert store.get_many_calls == 0, (
+        f"expected zero fetches when skipping the whole tree, "
+        f"got {store.get_many_calls}"
+    )
+
+
+def test_walk_skip_nodes_cumulative_across_shared_subtree():
+    """Two HAMTs sharing structure: walking the second with the
+    first's nodes as skip_nodes should fetch only what's new."""
+    base_items = {f"k{i:04d}": f"v{i}".encode() for i in range(120)}
+    store = _CountingMemory()
+    h1 = Hamt(store, bucket_max=4).persist(base_items)
+
+    # h2 shares the bulk of h1's structure — single-key delta.
+    h2 = h1.persist({"new-key": b"new-value"})
+    assert h2.root != h1.root
+
+    # First walk seeds the seen-set.
+    seen: set[str] = set()
+    items1, nodes1 = h1.walk(skip_nodes=seen)
+    seen |= nodes1
+
+    # Second walk: only the path from h2.root down to the changed
+    # leaf should be visited; the rest of the tree is in ``seen``.
+    store.reset_counts()
+    items2, nodes2 = h2.walk(skip_nodes=seen)
+    # New items: just the added key (and only items along visited
+    # paths — which by definition contain the new key).
+    assert "new-key" in items2
+    # Visited node count should be tiny relative to the full tree.
+    assert len(nodes2) < len(nodes1) // 4, (
+        f"expected shared-structure walk to revisit << {len(nodes1) // 4} "
+        f"nodes; got {len(nodes2)}"
+    )
+    # And no overlap between the two walks' returned node sets.
+    assert nodes1.isdisjoint(nodes2)
+
+
+def test_walk_skip_nodes_none_matches_no_arg():
+    """Passing skip_nodes=None is identical to omitting it."""
+    items = {f"k{i:03d}": f"v{i}".encode() for i in range(40)}
+    h = Hamt(_store(), bucket_max=4).persist(items)
+    a_items, a_nodes = h.walk()
+    b_items, b_nodes = h.walk(skip_nodes=None)
+    c_items, c_nodes = h.walk(skip_nodes=set())
+    assert a_items == b_items == c_items
+    assert a_nodes == b_nodes == c_nodes
