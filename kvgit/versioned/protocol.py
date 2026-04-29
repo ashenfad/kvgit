@@ -86,6 +86,8 @@ class Versioned(Protocol):
         merge_fns: dict[str, BytesMergeFn] | None = None,
         default_merge: BytesMergeFn | None = None,
         info: dict | None = None,
+        chunks: dict[str, bytes] | None = None,
+        chunk_refs: dict[str, list[str]] | None = None,
     ) -> MergeResult: ...
 
     def refresh(self) -> None: ...

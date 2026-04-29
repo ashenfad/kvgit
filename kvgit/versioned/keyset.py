@@ -12,7 +12,7 @@ work; the Keyset just gives the API a kvgit-friendly shape.
 
 import json
 from collections.abc import Iterable, Iterator, Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, field
 from typing import NamedTuple
 
 from ..hamt import EMPTY_HASH, Hamt
@@ -21,10 +21,18 @@ from ..kv.base import KVStore
 
 @dataclass
 class MetaEntry:
-    """Per-key metadata stored alongside a blob pointer in a Keyset."""
+    """Per-key metadata stored alongside a blob pointer in a Keyset.
+
+    ``chunks`` lists the content-addressed chunk references that the
+    blob references via the chunked-codec mechanism. ``None`` means
+    "this blob is opaque (e.g. plain pickle) — no chunks to track".
+    Stored only when non-empty so v2-format entries stay
+    byte-identical and remain readable by older code.
+    """
 
     size: int | None
     created_at: float
+    chunks: list[str] | None = field(default=None)
 
 
 @dataclass(frozen=True)
@@ -36,15 +44,33 @@ class KeysetEntry:
 
 
 def encode_entry(entry: KeysetEntry) -> bytes:
-    """Serialize a KeysetEntry to bytes deterministically."""
-    payload = [entry.blob, asdict(entry.meta)]
-    return json.dumps(payload, separators=(",", ":")).encode()
+    """Serialize a KeysetEntry to bytes deterministically.
+
+    Optional fields with default values are omitted from the payload
+    so that entries without those fields produce the same bytes as
+    they did before the field existed. Old-format readers that don't
+    know about the field stay backward-compatible for non-chunked
+    entries; chunked entries (with ``chunks`` populated) are
+    inherently a new format and require new code to read.
+    """
+    meta = entry.meta
+    meta_dict: dict = {"size": meta.size, "created_at": meta.created_at}
+    if meta.chunks:
+        meta_dict["chunks"] = list(meta.chunks)
+    return json.dumps([entry.blob, meta_dict], separators=(",", ":")).encode()
 
 
 def decode_entry(raw: bytes) -> KeysetEntry:
     """Deserialize bytes back into a KeysetEntry."""
     blob, meta_dict = json.loads(raw)
-    return KeysetEntry(blob=blob, meta=MetaEntry(**meta_dict))
+    return KeysetEntry(
+        blob=blob,
+        meta=MetaEntry(
+            size=meta_dict.get("size"),
+            created_at=meta_dict["created_at"],
+            chunks=meta_dict.get("chunks"),
+        ),
+    )
 
 
 class KeysetDiff(NamedTuple):

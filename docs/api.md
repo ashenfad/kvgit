@@ -13,6 +13,7 @@ kvgit.store(
     branch="main",
     encoder=pickle.dumps,
     decoder=pickle.loads,
+    codecs=None,         # named codec preset (mutually exclusive with encoder/decoder)
 )
 ```
 
@@ -22,8 +23,15 @@ kvgit.store(
 | `path` | `str \| None` | `None` | Required for `"disk"` and `"git"` |
 | `db_name` | `str` | `"kvgit"` | IndexedDB database name. Only used with `"indexeddb"`. |
 | `branch` | `str` | `"main"` | Branch name |
-| `encoder` | `Callable[[Any], bytes]` | `pickle.dumps` | Value encoder |
-| `decoder` | `Callable[[bytes], Any]` | `pickle.loads` | Value decoder |
+| `encoder` | `Callable[..., bytes]` | `pickle.dumps` | Value encoder. Pass a `compose()` pair to enable [chunked codecs](#chunked-codecs). |
+| `decoder` | `Callable[..., Any]` | `pickle.loads` | Value decoder. |
+| `codecs` | `str \| None` | `None` | Named codec preset shortcut. Currently `"scientific"` (numpy + pandas chunked codecs). Mutually exclusive with explicit `encoder` / `decoder`. |
+
+**Named codec presets** (passed via `codecs="..."`):
+
+| Name | Codecs included | Required dependency |
+|------|-----------------|---------------------|
+| `"scientific"` | `NumpyCodec()` (catches pandas DataFrame block buffers too) | `pip install kvgit[scientific]` |
 
 ---
 
@@ -42,8 +50,17 @@ s = Staged(VersionedKV(), encoder=pickle.dumps, decoder=pickle.loads)
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `versioned` | `Versioned` | (required) | Any `Versioned` implementation |
-| `encoder` | `Callable[[Any], bytes]` | `pickle.dumps` | Serializes values to bytes on commit |
-| `decoder` | `Callable[[bytes], Any]` | `pickle.loads` | Deserializes bytes to values on read |
+| `encoder` | `Callable[..., bytes]` | `pickle.dumps` | Serializes values to bytes on commit |
+| `decoder` | `Callable[..., Any]` | `pickle.loads` | Deserializes bytes to values on read |
+
+#### Chunked encoder/decoder
+
+`Staged` autodetects the encoder/decoder shape by signature:
+
+* **1-arg** -- `encoder(value) -> bytes` and `decoder(bytes) -> value` use the legacy in-blob serialization. The store layout stays v2-compatible.
+* **2-arg with required second parameter** -- `encoder(value, sink) -> bytes` and `decoder(blob, reader) -> value` route through a `ChunkSink` / `ChunkReader`, enabling content-addressed chunk dedup. The first chunked write upgrades the store to v3.
+
+The arity check is "second positional parameter has no default" -- so `pickle.dumps` (whose `protocol` arg has a default) stays 1-arg, and the encoders returned by `kvgit.codecs.compose(...)` are detected as 2-arg automatically. See [Chunked codecs](#chunked-codecs).
 
 ### Reading
 
@@ -276,6 +293,106 @@ Raised when a three-way merge encounters keys changed by both sides with no merg
 
 ---
 
+## Chunked codecs
+
+`kvgit.codecs` is an opt-in layer that externalizes large sub-values (numpy buffers, pandas DataFrames, ...) as content-addressed chunks. Equal buffers are stored once across keys, commits, and branches. Pass the resulting `(encoder, decoder)` pair to `Staged` (or `kvgit.store(...)`) to enable.
+
+Install with `pip install kvgit[numpy]` or `kvgit[scientific]`.
+
+### `compose(*codecs) -> (encoder, decoder)`
+
+Build the encoder/decoder pair from a list of codecs. Codecs are tried in order during encoding -- the first to claim an object wins. Plain pickling handles anything no codec claims; there is no need to register a "pickle codec".
+
+```python
+from kvgit.codecs import compose
+from kvgit.codecs.numpy import NumpyCodec
+
+encoder, decoder = compose(NumpyCodec())
+```
+
+Order matters when codecs claim overlapping types. Put the more specific codec first.
+
+### `scientific() -> (encoder, decoder)`
+
+One-liner shortcut: compose the numpy codec (which transparently handles pandas DataFrames via their pickle path). Equivalent to `compose(NumpyCodec())`. Raises `ImportError` if numpy is not installed.
+
+```python
+from kvgit.codecs import scientific
+
+encoder, decoder = scientific()
+```
+
+The same shortcut is exposed on the factory as `kvgit.store(codecs="scientific")` -- prefer that when you don't need to tune codec parameters.
+
+### `NumpyCodec(min_bytes=1024)`
+
+Externalizes `numpy.ndarray` instances. Built-in dedup behaviors:
+
+| Case | What happens |
+|------|--------------|
+| Same buffer (Python `is`) | One chunk; `id()` memo skips the second hash |
+| Two arrays with identical bytes | One chunk via content-addressed hash |
+| `arr2 = arr[i:j]` (view of a parent) | Chunk hashes the **root** buffer; both arrays share it |
+| `arr.dtype.hasobject` (object dtype) | Pass through to pickle (elements may be intercepted by other codecs) |
+| `arr.nbytes < min_bytes` and not a view | Pass through to pickle (chunk overhead exceeds savings) |
+
+Materialized arrays are **read-only**. Slices reconstruct via `numpy.lib.stride_tricks.as_strided` from the shared chunk bytes; making them writeable would risk silent cross-key corruption. Call `.copy()` to mutate.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `min_bytes` | `int` | `1024` | Below this size, standalone arrays inline rather than chunk. Tunable per backend (IndexedDB has higher per-entry overhead, so a higher threshold may be appropriate). |
+
+### `PandasCodec`
+
+Currently an alias for `NumpyCodec`. Pickling a DataFrame visits its block ndarrays as Python objects, which the numpy codec catches before reduction -- so DataFrame block buffers chunk for free, including `iloc` row-slice views that share blocks with their parent. Extension dtypes whose pickle path doesn't expose ndarrays uniformly (some `ArrowDtype` / `MaskedArray` cases) fall back to opaque pickle without chunking.
+
+```python
+from kvgit.codecs.pandas import PandasCodec  # alias of NumpyCodec
+```
+
+### Codec protocol
+
+Custom codecs implement two methods. Each codec must declare a unique short `name` (used as the persistent-id tag inside encoded blobs).
+
+```python
+class Codec(Protocol):
+    name: str
+
+    def try_externalize(self, obj, sink: ChunkSink) -> Any | None:
+        """Return a picklable token, or None to pass."""
+
+    def materialize(self, token, reader: ChunkReader) -> Any:
+        """Reconstruct the value from the token."""
+```
+
+`ChunkSink.put(data) -> str` registers a chunk and returns its content-addressed reference. `ChunkReader.get(ref) -> bytes` and `get_many(refs)` fetch chunks during decode.
+
+### Storage layout (v3)
+
+The first chunked write lazily upgrades a store from v2 to v3:
+
+| Key pattern | Contents |
+|-------------|----------|
+| `kvgit:chunk:<hash>` | Content-addressed chunk bytes |
+| `MetaEntry.chunks` (per key) | List of chunk hashes referenced by that key's blob |
+
+`clean_orphans` traces `MetaEntry.chunks` from every reachable commit, plus from any commit younger than `min_age` (in-flight writer protection), and sweeps unreferenced entries under `kvgit:chunk:`. Stores that never use chunks stay byte-identical to v2.
+
+### v2 ↔ v3 compatibility
+
+* **v3 code reading a v2 store**: works transparently; the store's `__kvgit_version__` stamp is left as-is until the first chunked write.
+* **v2 code reading a v3 store**: refused on open with a clear error. Once a chunk has been written, the store is v3-only.
+* **Mixed entries**: a single store can hold both plain-pickle and chunked entries; dispatch is per-entry based on whether `MetaEntry.chunks` is populated.
+* **Migration**: import values from a v2 source into a fresh v3 target (`new[k] = old[k]; new.commit()`). Equal buffers across the v2 source's keys collapse into one chunk in the target -- you get retroactive dedup as a side effect of the copy.
+
+### Limitations
+
+* **Merge results are not chunked.** When `Staged`'s wrapped merge function re-encodes a merged value, it always falls back to plain `pickle.dumps` (the bytes-level merge protocol has no place to land chunks). Subsequent commits that overwrite the merged key go through the chunked path normally. In single-writer use cases (e.g., one agent per branch), merges are rare and this rarely matters.
+* **Materialized arrays are read-only.** Trades one allocation against safe sharing. Call `.copy()` for mutation.
+* **Chunk dedup is a disk/storage optimization, not an in-memory one.** While values are sitting in the staging buffer, they're still distinct Python objects. Dedup happens at encode time.
+
+---
+
 ## Versioned protocol
 
 The `Versioned` protocol defines the shared interface implemented by all versioned backends. Most users interact with it through `Staged`, but it's useful for type annotations and custom backends.
@@ -312,11 +429,13 @@ All methods from the `Versioned` protocol are implemented. Additional:
 |--------------------|-------------|
 | `store` | Direct access to the underlying `KVStore` |
 | `branches(store)` | Static method: list branch names for a store |
-| `clean_orphans(min_age=3600)` | Remove orphaned commits unreachable from any branch HEAD. Returns count of cleaned orphans. Only deletes commits older than `min_age` seconds. |
+| `clean_orphans(min_age=3600)` | Remove orphaned commits unreachable from any branch HEAD. Returns count of cleaned orphans. Only deletes commits older than `min_age` seconds. Also sweeps unreferenced chunks (v3 stores). |
 
 ### Orphan Cleanup
 
 When branches are deleted, the commits they referenced may become unreachable ("orphaned"). `delete_branch()` automatically calls `clean_orphans()` after removing the branch HEAD. The default `min_age=3600` (1 hour) guards against concurrent writes: recently-created commits are left alone so that a commit from another thread can't be mistaken for an orphan mid-sweep. Orphaned commits from deleted branches are cleaned up by subsequent `clean_orphans()` calls once they age past the guard.
+
+For v3 stores (those using [chunked codecs](#chunked-codecs)), the same sweep also reclaims unreferenced `kvgit:chunk:*` entries. Chunks reachable from any live branch survive; chunks reachable only from young orphan commits (within the `min_age` window) also survive, protecting in-flight writers from premature collection.
 
 You can also call `clean_orphans()` manually:
 

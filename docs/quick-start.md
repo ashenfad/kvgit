@@ -326,6 +326,107 @@ s = kvgit.store(
 
 ---
 
+## Storing scientific data efficiently (chunked codecs)
+
+A common pain point: an agent or notebook holds a 10 MB DataFrame and slices it into half a dozen derived variables. With plain pickle, every commit re-serializes each derived value in full -- 10 MB times the number of slices, every commit. The store fills up fast, especially against IndexedDB or other quota-bound backends.
+
+The `kvgit.codecs` package solves this by externalizing large numpy buffers as content-addressed chunks. Equal buffers (across keys, across commits, across branches) are stored exactly once.
+
+```python
+import numpy as np
+import kvgit
+
+s = kvgit.store(codecs="scientific")  # numpy + pandas
+
+big = np.arange(1_000_000, dtype="float64")  # ~8 MB
+
+s["full"]  = big
+s["head"]  = big[:100_000]
+s["tail"]  = big[-100_000:]
+s["copy"]  = np.arange(1_000_000, dtype="float64")  # different ndarray, same content
+s.commit()
+# Storage cost: ~8 MB, not ~32 MB. All four keys reference one chunk.
+```
+
+The `codecs="scientific"` shortcut is equivalent to building the encoder/decoder pair by hand — useful when you want to tune codec parameters:
+
+```python
+from kvgit.codecs import compose
+from kvgit.codecs.numpy import NumpyCodec
+
+encoder, decoder = compose(NumpyCodec(min_bytes=4096))  # higher threshold
+s = kvgit.store(encoder=encoder, decoder=decoder)
+```
+
+Pandas DataFrames work without a separate codec -- their underlying block ndarrays are visible to the numpy codec during pickling:
+
+```python
+import pandas as pd
+
+df = pd.DataFrame({"x": np.arange(100_000), "y": np.random.normal(size=100_000)})
+s["df"]    = df
+s["head"]  = df.iloc[:1000]      # row-slice view
+s["tail"]  = df.iloc[-1000:]
+s.commit()
+# Block buffers shared across all three.
+```
+
+### Migrating an existing store
+
+A v3 store (one that has ever held a chunked write) is a strict superset of a v2 store. Opening a v2 store with chunked-codec code is allowed; the upgrade only happens on the first chunked write. To migrate an existing v2 store and reclaim disk from accidental duplicates, just import its values into a fresh chunked store -- the dedup happens during the copy:
+
+```python
+old = kvgit.store(kind="disk", path="/old/v2/store")        # plain pickle, v2
+new = kvgit.store(
+    kind="disk", path="/new/v3/store",
+    encoder=encoder, decoder=decoder,
+)
+for k in old.keys():
+    new[k] = old[k]
+new.commit()
+```
+
+If `old` happened to hold five separate copies of the same array under five keys, `new` ends up with one chunk and five small manifests.
+
+### What's chunked, what isn't
+
+| Type | Behavior |
+|------|----------|
+| `numpy.ndarray` (>= 1 KiB) | Externalized; views dedup against parent buffer |
+| `numpy.ndarray` (< 1 KiB) | Inlined into the value blob (chunk overhead would exceed savings) |
+| Object-dtype ndarrays | Pass through to pickle (their elements may still be intercepted by other codecs) |
+| `pandas.DataFrame` / `Series` | Block ndarrays externalize via the numpy codec |
+| Containers (`dict`, `list`, dataclass) holding ndarrays | The container pickles normally; nested arrays still externalize |
+| Anything else | Plain pickle, unchanged |
+
+Materialized arrays are read-only by default (they share the underlying chunk bytes). Call `.copy()` when you need to mutate.
+
+### Custom codecs
+
+`Codec` is a small protocol. Provide your own for non-numpy types:
+
+```python
+from kvgit.codecs import compose
+
+class MyCodec:
+    name = "my"          # short tag, must be unique within compose()
+
+    def try_externalize(self, obj, sink):
+        if not isinstance(obj, MyBigThing):
+            return None
+        ref = sink.put(obj.payload)
+        return {"ref": ref, "label": obj.label}
+
+    def materialize(self, token, reader):
+        return MyBigThing(label=token["label"], payload=reader.get(token["ref"]))
+
+encoder, decoder = compose(MyCodec(), NumpyCodec())  # order = priority
+```
+
+See [the API reference](api.md#chunked-codecs) for the full protocol and the storage layout.
+
+---
+
 ## Concurrency
 
 Multiple writers sharing the same backend coordinate via optimistic concurrency (compare-and-swap). If a CAS fails during commit, kvgit retries with a three-way merge. If the merge itself can't resolve, you get a `ConcurrencyError`:
