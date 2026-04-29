@@ -207,7 +207,9 @@ class NumpyCodec:
         # offset). Reshape the bytes in the recorded memory order.
         if offset == 0 and out_shape == root_shape and out_dtype == root_dtype:
             view = np.frombuffer(raw, dtype=root_dtype).reshape(root_shape, order=order)
-            return np.array(view)
+            # ``order='K'`` is np.array's default but we spell it out
+            # so an F-contig source comes back as F-contig.
+            return np.array(view, order="K")
 
         # General path: reconstruct the view via stride tricks against
         # the raw bytes. Critically, we go through a 1-D uint8 view
@@ -229,5 +231,7 @@ class NumpyCodec:
         )
         # ``np.array`` honours the view's strides while allocating
         # contiguous, writable storage — exactly the shape/contents
-        # the caller would get from a fresh pickle.loads.
-        return np.array(view)
+        # the caller would get from a fresh pickle.loads. ``order='K'``
+        # picks F-contig vs C-contig based on the input view's stride
+        # pattern, so an F-strided slice round-trips as F-contig.
+        return np.array(view, order="K")
