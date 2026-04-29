@@ -371,3 +371,50 @@ async def test_versioned_integration(selenium_jspi):
     versioned.reset_to(history[1])
     staged.refresh()
     assert staged["greeting"] == "hello"
+
+
+@run_in_pyodide(packages=["micropip", "numpy"])
+async def test_chunked_codec_round_trip(selenium_jspi):
+    """End-to-end: chunked numpy codec writing through IndexedDB.
+
+    Smoke-tests the read/write path that motivates the chunked codec
+    work in the first place — large array values stored under
+    ``kvgit:chunk:<hash>`` and retrieved across a fresh ``Staged``.
+    """
+    import micropip
+    from pyodide.http import pyfetch
+
+    resp = await pyfetch("./_kvgit_whl.txt")
+    whl = (await resp.string()).strip()
+    await micropip.install(f"./{whl}", deps=False)
+
+    import numpy as np
+
+    from kvgit.codecs import compose
+    from kvgit.codecs.numpy import NumpyCodec
+    from kvgit.kv.indexeddb import IndexedDB
+    from kvgit.staged import Staged
+    from kvgit.versioned.kv import CHUNK_PREFIX, VersionedKV
+
+    encoder, decoder = compose(NumpyCodec(min_bytes=64))
+    backend = IndexedDB(db_name="test_chunked_codec")
+    s = Staged(VersionedKV(backend), encoder=encoder, decoder=decoder)
+
+    big = np.arange(4096, dtype="float64")
+    s["full"] = big
+    s["head"] = big[:1024]
+    s["tail"] = big[-1024:]
+    s.commit()
+
+    # All three keys reference the same root buffer chunk via .base.
+    chunk_keys = [k for k in backend.keys() if k.startswith(CHUNK_PREFIX)]
+    assert len(chunk_keys) == 1, (
+        f"expected one chunk on disk, got {len(chunk_keys)}: {chunk_keys}"
+    )
+
+    # Drop the in-memory cache to force a real read from IndexedDB.
+    s.reset()
+    s._cache.clear()
+    np.testing.assert_array_equal(s["full"], big)
+    np.testing.assert_array_equal(s["head"], big[:1024])
+    np.testing.assert_array_equal(s["tail"], big[-1024:])

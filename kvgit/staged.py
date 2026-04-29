@@ -5,6 +5,7 @@ import pickle
 from collections.abc import Iterable, Iterator, MutableMapping
 from typing import Any, Callable
 
+from .codecs._hash import hash_bytes
 from .content_types import MergeFn
 from .versioned.kv import CHUNK_PREFIX, VersionedKV
 from .versioned.protocol import BytesMergeFn, MergeResult, Versioned
@@ -19,16 +20,13 @@ class _ChunkSink:
     """
 
     def __init__(self) -> None:
-        from .codecs._hash import hash_bytes
-
-        self._hash_bytes = hash_bytes
         self.chunks: dict[str, bytes] = {}
         # per-encode key tracking — set externally between encode calls
         self.current_key: str | None = None
         self.refs_by_key: dict[str, list[str]] = {}
 
     def put(self, data) -> str:
-        ref = self._hash_bytes(data)
+        ref = hash_bytes(data)
         if ref not in self.chunks:
             # Materialize once on first sight; later puts of the same
             # chunk hash are free (same ref returned, no new bytes).
@@ -118,10 +116,21 @@ class Staged(MutableMapping[str, Any]):
         self._decoder = decoder
         self._encoder_chunked = _is_chunk_aware(encoder)
         self._decoder_chunked = _is_chunk_aware(decoder)
+        # Chunked codecs need a content-addressed namespace under the
+        # backing store; only VersionedKV exposes one. Fail fast at
+        # construction rather than crashing later inside the decoder.
+        if (self._encoder_chunked or self._decoder_chunked) and not isinstance(
+            versioned, VersionedKV
+        ):
+            raise TypeError(
+                "chunked encoder/decoder requires a VersionedKV-backed Staged "
+                f"(got {type(versioned).__name__}). "
+                "Use kvgit.store(kind='memory'/'disk'/'indexeddb') or build a "
+                "VersionedKV directly. The git backend (VersionedGP) does not "
+                "support chunked codecs."
+            )
         self._chunk_reader = (
-            _ChunkReader(versioned.store)
-            if self._decoder_chunked and isinstance(versioned, VersionedKV)
-            else None
+            _ChunkReader(versioned.store) if self._decoder_chunked else None
         )
         self._updates: dict[str, Any] = {}
         self._removals: set[str] = set()

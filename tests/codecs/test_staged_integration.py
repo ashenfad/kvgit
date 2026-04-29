@@ -40,6 +40,107 @@ class TestArityDetection:
         assert s._decoder_chunked is False
 
 
+class TestMergeWithChunkedCodec:
+    """The wrapped merge fn re-encodes via plain pickle (no sink in scope).
+    The chunked decoder must still read those plain blobs back, and the
+    merge result must round-trip equal.
+
+    Three-way merge in kvgit triggers when a Staged commits to a branch
+    whose HEAD has advanced since this Staged read it — typically modeled
+    in tests by two Staged instances over the same store + branch.
+    """
+
+    def _build_pair(self, store):
+        encoder, decoder = compose(NumpyCodec(min_bytes=64))
+        return Staged(VersionedKV(store), encoder=encoder, decoder=decoder)
+
+    def test_custom_merge_fn_resolves_conflict_with_chunked_codec(self):
+        store = Memory()
+
+        # Seed with a baseline value.
+        bootstrap = self._build_pair(store)
+        bootstrap["arr"] = np.zeros(2048, dtype="float64")
+        bootstrap.commit()
+
+        # Two writers on the same branch, both reading the same base.
+        s1 = self._build_pair(store)
+        s2 = self._build_pair(store)
+        s2.set_merge_fn("arr", lambda old, ours, theirs: ours + theirs)
+
+        # s1 advances HEAD.
+        s1["arr"] = np.ones(2048, dtype="float64")
+        s1.commit()
+
+        # s2's commit must three-way-merge against s1's HEAD: 1 + 2 = 3.
+        s2["arr"] = np.full(2048, 2.0, dtype="float64")
+        result = s2.commit()
+        assert result.strategy == "three_way"
+
+        # Re-read via the chunked decoder; the merged blob is plain pickle
+        # but the chunked decoder handles plain pickle bytes naturally
+        # (persistent_id simply never fires).
+        s2.reset()
+        s2._cache.clear()
+        np.testing.assert_array_equal(s2["arr"], np.full(2048, 3.0, dtype="float64"))
+
+    def test_merge_result_blob_has_no_chunks_meta(self):
+        """Documented limitation: merge results are encoded inline,
+        not as chunks. ``MetaEntry.chunks`` should be empty for the
+        merge output."""
+        store = Memory()
+
+        bootstrap = self._build_pair(store)
+        bootstrap["arr"] = np.zeros(2048, dtype="float64")
+        bootstrap.commit()
+
+        s1 = self._build_pair(store)
+        s2 = self._build_pair(store)
+        s2.set_merge_fn("arr", lambda old, ours, theirs: ours + theirs)
+
+        s1["arr"] = np.ones(2048, dtype="float64")
+        s1.commit()
+
+        s2["arr"] = np.full(2048, 2.0, dtype="float64")
+        result = s2.commit()
+        assert result.strategy == "three_way"
+
+        assert not s2._versioned._meta["arr"].chunks
+
+
+class TestBackendCompatibility:
+    def test_chunked_codec_rejects_non_kv_backend(self):
+        """Pairing chunked codec with a non-KV Versioned must fail loud."""
+        encoder, decoder = compose(NumpyCodec(min_bytes=64))
+
+        class FakeVersioned:
+            """Stub Versioned that isn't a VersionedKV — should be rejected."""
+
+            store = None
+            current_commit = "x"
+            base_commit = "x"
+            current_branch = "main"
+            initial_commit = "x"
+            last_merge_result = None
+
+            def get(self, k):
+                return None
+
+            def get_many(self, *keys):
+                return {}
+
+            def keys(self):
+                return ()
+
+            def __contains__(self, k):
+                return False
+
+            def commit(self, *a, **kw):
+                raise NotImplementedError
+
+        with pytest.raises(TypeError, match="VersionedKV"):
+            Staged(FakeVersioned(), encoder=encoder, decoder=decoder)
+
+
 class TestRoundTripThroughStore:
     def test_round_trip(self, chunked):
         s, _ = chunked

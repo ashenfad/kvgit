@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from kvgit.codecs import compose
 from kvgit.codecs.numpy import NumpyCodec
 
-from conftest import DictSink, reader_for  # noqa: E402
+from conftest import DictSink, reader_for
 
 
 @dataclass
