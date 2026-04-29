@@ -166,6 +166,79 @@ class TestNonContiguous:
         np.testing.assert_array_equal(out, big[:, ::2])
 
 
+class TestFortranOrder:
+    """F-contig roots must round-trip without data corruption.
+
+    Regression: an earlier version of the codec stored
+    ``root.tobytes()`` (always C-ordered) for non-C-contig roots but
+    recorded ``obj.strides`` from the original layout. Applying
+    F-strides to C-ordered bytes during materialization produced
+    garbage. The fix records the layout order alongside the bytes.
+    """
+
+    def test_standalone_f_contig_round_trips(self, codec_pair):
+        encoder, decoder = codec_pair
+        f = np.arange(64, dtype="float64").reshape(8, 8, order="F")
+        assert f.flags["F_CONTIGUOUS"] and not f.flags["C_CONTIGUOUS"]
+        sink = DictSink()
+        out = decoder(encoder(f, sink), reader_for(sink))
+        np.testing.assert_array_equal(out, f)
+
+    def test_view_of_f_contig_parent_round_trips(self, codec_pair):
+        """The bug case: row-slice of an F-contig parent.
+
+        Pre-fix this stored C-ordered parent bytes (via tobytes) but
+        recorded F-strides on the view; reapplying F-strides to the
+        C-ordered buffer produced wrong values on read.
+        """
+        encoder, decoder = codec_pair
+        parent = np.arange(64, dtype="float64").reshape(8, 8, order="F")
+        assert parent.flags["F_CONTIGUOUS"] and not parent.flags["C_CONTIGUOUS"]
+        view = parent[1:5]
+        assert isinstance(view.base, np.ndarray)
+        sink = DictSink()
+        out = decoder(encoder(view, sink), reader_for(sink))
+        np.testing.assert_array_equal(out, parent[1:5])
+
+    def test_view_of_f_contig_dedups_to_parent_chunk(self, codec_pair):
+        """F-contig parent and its view must share one chunk."""
+        encoder, _ = codec_pair
+        parent = np.arange(2048, dtype="float64").reshape(32, 64, order="F")
+        view = parent[4:20]
+        sink = DictSink()
+        encoder({"parent": parent, "view": view}, sink)
+        assert len(sink.chunks) == 1
+
+    def test_column_slice_of_f_contig_round_trips(self, codec_pair):
+        encoder, decoder = codec_pair
+        parent = np.arange(64, dtype="float64").reshape(8, 8, order="F")
+        col = parent[:, 2:5]  # contiguous in F-memory
+        sink = DictSink()
+        out = decoder(encoder(col, sink), reader_for(sink))
+        np.testing.assert_array_equal(out, parent[:, 2:5])
+
+
+class TestPathologicalRoots:
+    """Roots that are neither C- nor F-contig fall back to per-obj
+    storage. Dedup against the parent is lost but data must still be
+    correct."""
+
+    def test_non_contig_root_falls_back_safely(self, codec_pair):
+        """A view whose .base chain ends at a non-contig array."""
+        encoder, decoder = codec_pair
+        # Build a non-contig array via as_strided that has no parent —
+        # then take a view of it. Walking .base lands on the non-contig
+        # one; the codec must canonicalize and round-trip correctly.
+        base = np.arange(64, dtype="float64")
+        weird = np.lib.stride_tricks.as_strided(
+            base, shape=(4, 4), strides=(16, 8), writeable=False
+        )  # writes out non-canonical layout (still readable)
+        view = weird[1:3]
+        sink = DictSink()
+        out = decoder(encoder(view, sink), reader_for(sink))
+        np.testing.assert_array_equal(out, weird[1:3])
+
+
 class TestObjectDtype:
     def test_object_dtype_passes_through(self, codec_pair):
         encoder, decoder = codec_pair
