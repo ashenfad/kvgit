@@ -228,6 +228,8 @@ class TestFortranOrder:
         sink = DictSink()
         out = decoder(encoder(f, sink), reader_for(sink))
         np.testing.assert_array_equal(out, f)
+        # Layout flag also survives the round-trip (matches pickle).
+        assert out.flags["F_CONTIGUOUS"] and not out.flags["C_CONTIGUOUS"]
 
     def test_view_of_f_contig_parent_round_trips(self, codec_pair):
         """The bug case: row-slice of an F-contig parent.
