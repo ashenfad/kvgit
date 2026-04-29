@@ -218,6 +218,47 @@ class TestFortranOrder:
         np.testing.assert_array_equal(out, parent[:, 2:5])
 
 
+class TestMultiDimByteOffset:
+    """Regression: a row-slice of a multi-row C-contig parent decoded
+    incorrectly because the materializer applied the byte offset to
+    a multi-dim ``view(uint8)`` of the reshaped root, which silently
+    sliced the wrong axis. The tail slice of a wide DataFrame-shaped
+    block is the canonical reproduction.
+    """
+
+    def test_tail_slice_of_2d_root_decodes_correctly(self, codec_pair):
+        encoder, decoder = codec_pair
+        # Parent shape mirrors a pandas float64 BlockManager block:
+        # (n_columns, n_rows). A row slice cuts along the fast axis.
+        parent = np.arange(3 * 1000, dtype="float64").reshape(3, 1000)
+        # Last 100 "rows" — the slice byte_offset would be 900*8 = 7200,
+        # well beyond the leading dim, which is the failure trigger.
+        view = parent[:, 900:]
+        sink = DictSink()
+        out = decoder(encoder(view, sink), reader_for(sink))
+        np.testing.assert_array_equal(out, parent[:, 900:])
+
+    def test_dataframe_tail_round_trips(self, codec_pair):
+        """Same shape as the agent benchmark: 3-column block, tail slice."""
+        pd = pytest.importorskip("pandas")
+        encoder, decoder = codec_pair
+        rng = np.random.default_rng(0)
+        df = pd.DataFrame({"x": rng.normal(size=10_000), "y": rng.normal(size=10_000)})
+        sink = DictSink()
+        # Encode the head block + the tail block in the same sink so
+        # they share the parent buffer.
+        head = df.iloc[:1000]
+        tail = df.iloc[-1000:]
+        encoder({"head": head, "tail": tail}, sink)
+        # Now decode each — they must round-trip to their respective halves.
+        head_blob = encoder(head, sink)
+        tail_blob = encoder(tail, sink)
+        out_head = decoder(head_blob, reader_for(sink))
+        out_tail = decoder(tail_blob, reader_for(sink))
+        pd.testing.assert_frame_equal(out_head, head)
+        pd.testing.assert_frame_equal(out_tail, tail)
+
+
 class TestPathologicalRoots:
     """Roots that are neither C- nor F-contig fall back to per-obj
     storage. Dedup against the parent is lost but data must still be
