@@ -193,8 +193,20 @@ class VersionedGP(VersionedBase):
         removals: set[str] | None = None,
         *,
         info: dict | None = None,
+        chunks: dict[str, bytes] | None = None,
+        chunk_refs: dict[str, list[str]] | None = None,
     ) -> str:
-        """Create a single-parent commit (parent = current commit)."""
+        """Create a single-parent commit (parent = current commit).
+
+        ``chunks`` and ``chunk_refs`` are part of the ``Versioned``
+        contract for the chunked-codec layer but the git backend has
+        no chunk namespace and no GC story; they're ignored. Pairing
+        a chunked codec with this backend is rejected at the
+        ``Staged`` construction site, so reaching this path with
+        non-None ``chunks`` would indicate a caller bypassing
+        ``Staged`` and writing to ``VersionedGP`` directly — which is
+        documented as unsupported.
+        """
         return self._create_git_commit(updates, removals, info=info)
 
     def _create_merge_commit(
