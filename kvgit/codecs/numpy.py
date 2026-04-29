@@ -158,34 +158,34 @@ class NumpyCodec:
         # existed (those tokens are only correct for C-contig roots,
         # which is the only path the older code took without bugs).
         order = token.get("order", "C")
-        # frombuffer over bytes returns a read-only ndarray sharing the
-        # underlying buffer — the dedup-friendly default.
-        root = np.frombuffer(raw, dtype=root_dtype).reshape(
-            token["root_shape"], order=order
-        )
 
         offset = token["offset"]
         out_dtype = np.dtype(token["dtype"])
         out_shape = tuple(token["shape"])
         out_strides = tuple(token["strides"])
+        root_shape = tuple(token["root_shape"])
 
-        # Fast path: the array IS the root (identical shape/dtype, no offset).
+        # Fast path: the array IS the root (identical shape/dtype, no
+        # offset). Reshape the bytes in the recorded memory order.
         if (
             offset == 0
-            and out_shape == root.shape
+            and out_shape == root_shape
             and token["dtype"] == token["root_dtype"]
         ):
-            return root
+            return np.frombuffer(raw, dtype=root_dtype).reshape(root_shape, order=order)
 
-        # General path: reconstruct the view via stride tricks. We
-        # cast through uint8 to apply a byte-level offset, then recast
-        # to the target dtype before applying shape and strides.
-        flat_bytes = root.view(np.uint8)
+        # General path: reconstruct the view via stride tricks against
+        # the raw bytes. Critically, we go through a 1-D uint8 view
+        # of ``raw`` rather than a multi-dim view of the reshaped
+        # root. ``ndarray.view(uint8)`` on a multi-dim array preserves
+        # the leading dimensions, so ``[offset:]`` would silently
+        # slice the wrong axis when the root has rank > 1 — producing
+        # data corruption for any non-trivial offset (e.g., a
+        # row-slice tail of a multi-column DataFrame block).
+        flat_bytes = np.frombuffer(raw, dtype=np.uint8)
         if offset:
             flat_bytes = flat_bytes[offset:]
         typed = flat_bytes.view(out_dtype)
-        if out_shape == typed.shape and out_strides == typed.strides:
-            return typed
         return np.lib.stride_tricks.as_strided(
             typed,
             shape=out_shape,
