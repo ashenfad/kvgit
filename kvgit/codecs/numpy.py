@@ -46,6 +46,26 @@ from .base import ChunkReader, ChunkSink
 DEFAULT_MIN_BYTES = 1024
 
 
+def _dtype_to_descr(dt) -> Any:
+    """Serialize a dtype to a JSON-safe descriptor.
+
+    ``dtype.str`` would lose metadata: a datetime64[ns] collapses to
+    ``'<M8'`` (no unit), a structured dtype collapses to ``'|V20'``
+    (no fields). ``np.lib.format.dtype_to_descr`` is the ``.npy``
+    format's serializer and preserves both — round-trips through
+    ``descr_to_dtype`` for every dtype numpy can ``.npy``-save.
+    """
+    from numpy.lib import format as npf
+
+    return npf.dtype_to_descr(dt)
+
+
+def _descr_to_dtype(descr):
+    from numpy.lib import format as npf
+
+    return npf.descr_to_dtype(descr)
+
+
 def _root_and_offset(arr: "np.ndarray") -> tuple["np.ndarray", int]:
     """Walk ``.base`` to the root buffer; return (root, byte_offset).
 
@@ -117,25 +137,31 @@ class NumpyCodec:
         # root (loses dedup against the original parent for this
         # branch, but keeps correctness).
         if root.flags["C_CONTIGUOUS"]:
-            ref = sink.put(memoryview(root).cast("B"))
+            # ``.view(uint8)`` first: not all dtypes are buffer-protocol
+            # compatible (datetime64, timedelta64, structured void
+            # types all reject ``memoryview(arr)``), but every numpy
+            # array can be reinterpreted as raw bytes via a uint8 view,
+            # which then *is* buffer-compatible. The resulting view
+            # shares memory with ``root``, so this is zero-copy.
+            ref = sink.put(memoryview(root.view(np.uint8)))
             order = "C"
         elif root.flags["F_CONTIGUOUS"]:
             # ``memoryview.cast`` only accepts C-contig sources, so
             # collapse to a 1-D view in memory order. ``ravel(order='K')``
             # is zero-copy when strides are positive (always true for
-            # F-contig arrays produced via numpy's normal APIs), and
-            # the resulting 1-D view is itself C-contig.
-            ref = sink.put(memoryview(np.ravel(root, order="K")).cast("B"))
+            # F-contig arrays produced via numpy's normal APIs); the
+            # uint8 view is then buffer-compatible regardless of dtype.
+            ref = sink.put(memoryview(np.ravel(root, order="K").view(np.uint8)))
             order = "F"
         else:
             canonical = np.ascontiguousarray(obj)
-            ref = sink.put(memoryview(canonical).cast("B"))
+            ref = sink.put(memoryview(canonical.view(np.uint8)))
             return {
                 "ref": ref,
                 "root_shape": list(canonical.shape),
-                "root_dtype": canonical.dtype.str,
+                "root_dtype": _dtype_to_descr(canonical.dtype),
                 "shape": list(obj.shape),
-                "dtype": obj.dtype.str,
+                "dtype": _dtype_to_descr(obj.dtype),
                 "strides": list(canonical.strides),
                 "offset": 0,
                 "order": "C",
@@ -144,9 +170,9 @@ class NumpyCodec:
         return {
             "ref": ref,
             "root_shape": list(root.shape),
-            "root_dtype": root.dtype.str,
+            "root_dtype": _dtype_to_descr(root.dtype),
             "shape": list(obj.shape),
-            "dtype": obj.dtype.str,
+            "dtype": _dtype_to_descr(obj.dtype),
             "strides": list(obj.strides),
             "offset": int(byte_offset),
             "order": order,
@@ -156,14 +182,14 @@ class NumpyCodec:
         import numpy as np
 
         raw = reader.get(token["ref"])
-        root_dtype = np.dtype(token["root_dtype"])
+        root_dtype = _descr_to_dtype(token["root_dtype"])
         # ``order`` defaults to 'C' for tokens written before the field
         # existed (those tokens are only correct for C-contig roots,
         # which is the only path the older code took without bugs).
         order = token.get("order", "C")
 
         offset = token["offset"]
-        out_dtype = np.dtype(token["dtype"])
+        out_dtype = _descr_to_dtype(token["dtype"])
         out_shape = tuple(token["shape"])
         out_strides = tuple(token["strides"])
         root_shape = tuple(token["root_shape"])
@@ -179,11 +205,7 @@ class NumpyCodec:
 
         # Fast path: the array IS the root (identical shape/dtype, no
         # offset). Reshape the bytes in the recorded memory order.
-        if (
-            offset == 0
-            and out_shape == root_shape
-            and token["dtype"] == token["root_dtype"]
-        ):
+        if offset == 0 and out_shape == root_shape and out_dtype == root_dtype:
             view = np.frombuffer(raw, dtype=root_dtype).reshape(root_shape, order=order)
             return np.array(view)
 
