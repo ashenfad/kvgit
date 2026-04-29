@@ -1,11 +1,90 @@
 """Staged: buffered writes over a Versioned store."""
 
+import inspect
 import pickle
 from collections.abc import Iterable, Iterator, MutableMapping
 from typing import Any, Callable
 
 from .content_types import MergeFn
+from .versioned.kv import CHUNK_PREFIX, VersionedKV
 from .versioned.protocol import BytesMergeFn, MergeResult, Versioned
+
+
+class _ChunkSink:
+    """Accumulates content-addressed chunks emitted during one encode.
+
+    Built fresh per ``commit()`` and shared across all encoded keys in
+    that commit so dedup naturally extends to "the same buffer
+    appearing under multiple staged keys".
+    """
+
+    def __init__(self) -> None:
+        from .codecs._hash import hash_bytes
+
+        self._hash_bytes = hash_bytes
+        self.chunks: dict[str, bytes] = {}
+        # per-encode key tracking — set externally between encode calls
+        self.current_key: str | None = None
+        self.refs_by_key: dict[str, list[str]] = {}
+
+    def put(self, data) -> str:
+        ref = self._hash_bytes(data)
+        if ref not in self.chunks:
+            # Materialize once on first sight; later puts of the same
+            # chunk hash are free (same ref returned, no new bytes).
+            self.chunks[ref] = bytes(data) if isinstance(data, memoryview) else data
+        if self.current_key is not None:
+            self.refs_by_key.setdefault(self.current_key, []).append(ref)
+        return ref
+
+
+class _ChunkReader:
+    """Fetches chunks from the underlying KVStore by content-addressed key."""
+
+    def __init__(self, kv) -> None:
+        self._kv = kv
+
+    def get(self, ref: str) -> bytes:
+        raw = self._kv.get(CHUNK_PREFIX + ref)
+        if raw is None:
+            raise KeyError(f"chunk not found: {ref!r}")
+        return raw
+
+    def get_many(self, refs):
+        prefixed = [CHUNK_PREFIX + r for r in refs]
+        raw = self._kv.get_many(*prefixed)
+        # Strip the prefix back off so callers see the codec-level refs.
+        return {k[len(CHUNK_PREFIX) :]: v for k, v in raw.items()}
+
+    def prefetch(self, refs) -> None:
+        # Default: a no-op. Backends with async fetch can override via
+        # subclass; the in-process backends do nothing useful here.
+        return None
+
+
+def _is_chunk_aware(fn) -> bool:
+    """Detect if an encoder/decoder takes a required sink/reader arg.
+
+    Chunk-aware encoders/decoders (built via ``kvgit.codecs.compose``)
+    have exactly two **required** positional parameters: the value/blob
+    and the sink/reader. Stdlib ``pickle.dumps`` and friends have
+    optional second args (``protocol=...``) and stay 1-arg.
+    """
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    required = [
+        p
+        for p in sig.parameters.values()
+        if p.kind
+        in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+        and p.default is inspect.Parameter.empty
+    ]
+    return len(required) >= 2
 
 
 class Staged(MutableMapping[str, Any]):
@@ -16,23 +95,44 @@ class Staged(MutableMapping[str, Any]):
 
     Values are encoded to bytes on commit using the configured encoder.
     Implements ``MutableMapping[str, Any]``.
+
+    Encoder/decoder arity is autodetected:
+
+    * 1-arg ``encoder(value) -> bytes`` and ``decoder(bytes) -> value``
+      preserve the legacy pickle-style API. Stores remain v2-compatible.
+    * 2-arg ``encoder(value, sink) -> bytes`` and
+      ``decoder(bytes, reader) -> value`` enable chunked codecs from
+      :mod:`kvgit.codecs`. The first chunked write upgrades the store
+      to v3.
     """
 
     def __init__(
         self,
         versioned: Versioned,
         *,
-        encoder: Callable[[Any], bytes] = pickle.dumps,
-        decoder: Callable[[bytes], Any] = pickle.loads,
+        encoder: Callable[..., bytes] = pickle.dumps,
+        decoder: Callable[..., Any] = pickle.loads,
     ) -> None:
         self._versioned = versioned
         self._encoder = encoder
         self._decoder = decoder
+        self._encoder_chunked = _is_chunk_aware(encoder)
+        self._decoder_chunked = _is_chunk_aware(decoder)
+        self._chunk_reader = (
+            _ChunkReader(versioned.store)
+            if self._decoder_chunked and isinstance(versioned, VersionedKV)
+            else None
+        )
         self._updates: dict[str, Any] = {}
         self._removals: set[str] = set()
         self._cache: dict[str, Any] = {}
         self._merge_fns: dict[str, MergeFn] = {}
         self._default_merge: MergeFn | None = None
+
+    def _decode(self, raw: bytes) -> Any:
+        if self._decoder_chunked:
+            return self._decoder(raw, self._chunk_reader)
+        return self._decoder(raw)
 
     # -- Read operations --
 
@@ -47,7 +147,7 @@ class Staged(MutableMapping[str, Any]):
         raw = self._versioned.get(key)
         if raw is None:
             return default
-        value = self._decoder(raw)
+        value = self._decode(raw)
         self._cache[key] = value
         return value
 
@@ -66,7 +166,7 @@ class Staged(MutableMapping[str, Any]):
                 fetch.append(key)
         if fetch:
             for key, raw in self._versioned.get_many(*fetch).items():
-                value = self._decoder(raw)
+                value = self._decode(raw)
                 self._cache[key] = value
                 result[key] = value
         return result
@@ -121,17 +221,26 @@ class Staged(MutableMapping[str, Any]):
         self._default_merge = fn
 
     def _wrap_merge_fn(self, fn: MergeFn) -> BytesMergeFn:
-        """Wrap a user-level merge fn into a bytes-level merge fn."""
-        encoder = self._encoder
-        decoder = self._decoder
+        """Wrap a user-level merge fn into a bytes-level merge fn.
+
+        Decoding uses the configured (possibly chunked) decoder so the
+        merge sees real Python values for both sides. Encoding the
+        merge result, however, always falls back to plain ``pickle.dumps``
+        — the bytes-level merge protocol has no place to land chunks
+        (no commit context yet, no sink). Chunked dedup of merge
+        outputs is not supported in v1; merge outputs are stored as
+        opaque blobs. Subsequent commits that overwrite the merged key
+        do go through the chunked path normally.
+        """
+        decode = self._decode
 
         def wrapped(
             old: bytes | None, ours: bytes | None, theirs: bytes | None
         ) -> bytes:
-            old_val = decoder(old) if old is not None else None
-            ours_val = decoder(ours) if ours is not None else None
-            theirs_val = decoder(theirs) if theirs is not None else None
-            return encoder(fn(old_val, ours_val, theirs_val))
+            old_val = decode(old) if old is not None else None
+            ours_val = decode(ours) if ours is not None else None
+            theirs_val = decode(theirs) if theirs is not None else None
+            return pickle.dumps(fn(old_val, ours_val, theirs_val))
 
         return wrapped
 
@@ -162,23 +271,41 @@ class Staged(MutableMapping[str, Any]):
         Returns:
             A MergeResult (truthy when committed).
         """
-        # Encode staged updates to bytes — scoped to keys if provided
+        # Encode staged updates to bytes — scoped to keys if provided.
+        # When the encoder is chunk-aware, share one sink across all
+        # encodes in this commit so chunks dedup across staged keys.
+        sink = _ChunkSink() if self._encoder_chunked else None
+
+        def _encode_one(key: str, value: Any) -> bytes:
+            if sink is not None:
+                sink.current_key = key
+                try:
+                    return self._encoder(value, sink)
+                finally:
+                    sink.current_key = None
+            return self._encoder(value)
+
         encoded_updates: dict[str, bytes] | None = None
         if keys is not None:
             # Iterate the (typically small) keys set, not the full _updates dict
             matched_updates = {k: self._updates[k] for k in keys if k in self._updates}
             if matched_updates:
                 encoded_updates = {
-                    k: self._encoder(v) for k, v in matched_updates.items()
+                    k: _encode_one(k, v) for k, v in matched_updates.items()
                 }
             # .intersection() accepts any iterable, not just sets
             removals = self._removals.intersection(keys) or None
         else:
             if self._updates:
                 encoded_updates = {
-                    key: self._encoder(value) for key, value in self._updates.items()
+                    key: _encode_one(key, value) for key, value in self._updates.items()
                 }
             removals = self._removals if self._removals else None
+
+        chunks = sink.chunks if (sink is not None and sink.chunks) else None
+        chunk_refs = (
+            sink.refs_by_key if (sink is not None and sink.refs_by_key) else None
+        )
 
         # Build effective merge fns and wrap to bytes-level
         effective_fns = dict(self._merge_fns)
@@ -203,6 +330,8 @@ class Staged(MutableMapping[str, Any]):
             merge_fns=bytes_merge_fns,
             default_merge=bytes_default,
             info=info,
+            chunks=chunks,
+            chunk_refs=chunk_refs,
         )
         if result.merged:
             if keys is not None:
@@ -298,7 +427,7 @@ class Staged(MutableMapping[str, Any]):
         raw = self._versioned.peek(key, branch=branch)
         if raw is None:
             return None
-        return self._decoder(raw)
+        return self._decode(raw)
 
     def reset_to(self, commit_hash: str) -> bool:
         """Reset HEAD to a specific commit and clear staged changes.

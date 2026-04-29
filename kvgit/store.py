@@ -16,8 +16,9 @@ def store(
     path: str | None = None,
     db_name: str = "kvgit",
     branch: str = "main",
-    encoder: Callable[[Any], bytes] = pickle.dumps,
-    decoder: Callable[[bytes], Any] = pickle.loads,
+    encoder: Callable[..., bytes] = pickle.dumps,
+    decoder: Callable[..., Any] = pickle.loads,
+    codecs: str | None = None,
 ) -> Staged:
     """Create a Staged store with sensible defaults.
 
@@ -30,10 +31,31 @@ def store(
         branch: Branch name (default ``"main"``).
         encoder: Value encoder (default ``pickle.dumps``).
         decoder: Value decoder (default ``pickle.loads``).
+        codecs: Optional named codec preset. Currently supported:
+            ``"scientific"`` — numpy/pandas chunked codecs (requires
+            numpy; install with ``pip install kvgit[scientific]``).
+            Mutually exclusive with explicit ``encoder`` / ``decoder``.
 
     Returns:
         A ``Staged`` store instance.
+
+    Raises:
+        ValueError: if ``codecs`` is given alongside non-default
+            ``encoder`` / ``decoder``, or if ``codecs`` names an
+            unknown preset.
+        ImportError: if a codec preset's optional dependency is not
+            installed.
     """
+    if codecs is not None:
+        if encoder is not pickle.dumps or decoder is not pickle.loads:
+            raise ValueError(
+                "codecs= is mutually exclusive with explicit encoder/decoder; "
+                "pass one or the other"
+            )
+        from .codecs import _resolve_named
+
+        encoder, decoder = _resolve_named(codecs)
+
     versioned: Versioned
 
     if kind == "git":

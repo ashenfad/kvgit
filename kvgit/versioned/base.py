@@ -111,6 +111,8 @@ class VersionedBase(ABC):
         merge_fns: dict[str, BytesMergeFn] | None = None,
         default_merge: BytesMergeFn | None = None,
         info: dict | None = None,
+        chunks: dict[str, bytes] | None = None,
+        chunk_refs: dict[str, list[str]] | None = None,
     ) -> MergeResult:
         """Commit changes and atomically advance HEAD.
 
@@ -124,6 +126,12 @@ class VersionedBase(ABC):
             merge_fns: Per-key merge functions (override instance-level).
             default_merge: Default merge function (override instance-level).
             info: Optional metadata dict for the commit.
+            chunks: Optional content-addressed chunks to write under
+                ``kvgit:chunk:<hash>``. Keyed by chunk hash. Backends
+                that don't understand chunks ignore this argument.
+            chunk_refs: Optional per-key list of chunk hashes referenced
+                by that key's encoded blob. Stored on the keyset
+                ``MetaEntry.chunks`` so GC can trace reachability.
 
         Returns:
             A ``MergeResult`` (truthy when committed, falsy if abandoned).
@@ -155,7 +163,13 @@ class VersionedBase(ABC):
         if current_head == self._base_commit:
             # Fast-forward path
             saved = self._snapshot_state()
-            self._create_commit(updates, removals, info=info)
+            self._create_commit(
+                updates,
+                removals,
+                info=info,
+                chunks=chunks,
+                chunk_refs=chunk_refs,
+            )
 
             if self._cas_head(self._base_commit, self._current_commit):
                 self._base_commit = self._current_commit
@@ -187,7 +201,12 @@ class VersionedBase(ABC):
         if current_head is None:
             raise ValueError(f"Branch '{self._branch}' has no HEAD")
         saved = self._snapshot_state()
-        self._create_commit(updates, removals)
+        self._create_commit(
+            updates,
+            removals,
+            chunks=chunks,
+            chunk_refs=chunk_refs,
+        )
         return self._three_way_merge(
             current_head,
             on_conflict=on_conflict,
@@ -333,10 +352,15 @@ class VersionedBase(ABC):
         removals: set[str] | None = None,
         *,
         info: dict | None = None,
+        chunks: dict[str, bytes] | None = None,
+        chunk_refs: dict[str, list[str]] | None = None,
     ) -> str:
         """Create a single-parent commit with the given changes.
 
         Must update ``self._commit_keys`` and ``self._current_commit``.
+        ``chunks`` / ``chunk_refs`` are the optional content-addressed
+        chunks referenced by encoded blobs; backends that don't
+        support them should ignore.
         """
 
     @abstractmethod

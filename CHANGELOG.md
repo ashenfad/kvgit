@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-04-28
+
+Adds an opt-in `kvgit.codecs` package for content-addressed chunk dedup of large numpy / pandas values. Storage format bumps to v3, but v2 stores remain readable by v3 code and are only stamped as v3 on the first chunked write — the on-disk layout is unchanged for plain-pickle workloads.
+
+### Added
+
+- **`kvgit.codecs` package** — pluggable chunked-codec layer over the existing `Staged` encoder/decoder slot. Externalizes large sub-values as content-addressed chunks (under a new `kvgit:chunk:<hash>` namespace) and emits a small token via pickle's `persistent_id`. Composes with arbitrary container nesting; equal buffers are stored exactly once across keys, commits, and branches.
+  - `compose(*codecs) -> (encoder, decoder)` — public entry point.
+  - `Codec` / `ChunkSink` / `ChunkReader` protocols (`kvgit.codecs.base`).
+  - `NumpyCodec(min_bytes=1024)` (`kvgit.codecs.numpy`) — externalizes ndarrays; chases `.base` so view slices share the parent's chunk; passes through object-dtype and below-threshold standalone arrays.
+  - `PandasCodec` (`kvgit.codecs.pandas`) — alias of `NumpyCodec`. DataFrame block buffers are reachable through pandas' pickle path, so the numpy codec catches them automatically (including `iloc` row-slice views that share blocks with their parent).
+- **`MetaEntry.chunks`** — optional list of chunk-reference hashes per key. Omitted from the on-disk encoding when empty, so v2-format entries stay byte-identical and remain readable by older code.
+- **`Versioned.commit(chunks=..., chunk_refs=...)`** — new keyword args carrying the per-commit chunk batch through to `_create_commit`. Backends that don't support chunks ignore them.
+- **`Staged` autodetects chunked encoder/decoder** by signature (second positional parameter has no default). Default `pickle.dumps` / `pickle.loads` continue to behave as before.
+- **`pyproject.toml` extras**: `numpy`, `pandas`, `scientific`.
+- **`kvgit.codecs.scientific()`** — one-liner returning a pre-composed `(encoder, decoder)` pair using whichever scientific codecs are installed. Exposed as a named preset on the factory: `kvgit.store(codecs="scientific")`. The `codecs=` argument is mutually exclusive with explicit `encoder` / `decoder`.
+- **75 new tests** under `tests/codecs/` covering hash determinism, the pickler glue (composition, dedup-by-identity vs by-content, codec ordering, error paths), numpy round-trips across dtypes/shapes/views, pandas DataFrame/Series including row-slice dedup, end-to-end via `Staged`, GC reachability and young-orphan protection, v2 ↔ v3 import-as-migration dedup, and the `codecs="scientific"` factory shortcut.
+
+### Changed
+
+- **`STORAGE_VERSION` 2 → 3.** Lazy upgrade: `_check_storage_version` accepts `{2, 3}` on open; the v3 stamp is written by `_create_commit` only when the commit includes chunks. A v3-aware reader can open a v2 store transparently; a v2-only reader still refuses v3 stores (intentional — it can't decode chunked blobs).
+- **`clean_orphans` traces chunk reachability.** The mark phase accumulates `MetaEntry.chunks` from every reachable commit. Young orphan commits (younger than `min_age`) also contribute chunks to the reachable set, protecting in-flight writers. The sweep phase removes unreferenced `kvgit:chunk:*` entries alongside unreferenced HAMT nodes.
+
+### Limitations
+
+- **Merge results don't chunk.** When `Staged`'s wrapped merge function re-encodes a merged value, it falls back to plain `pickle.dumps`. The bytes-level merge protocol has no place to land chunks. Subsequent commits that overwrite the merged key go through the chunked path normally.
+- **Materialized arrays are read-only.** Mutating one slice would silently affect every other key sharing the same chunk; `.copy()` is the explicit escape hatch.
+
 ## [0.2.2] - 2026-04-28
 
 ### Added

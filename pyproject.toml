@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kvgit"
-version = "0.2.2"
+version = "0.3.0"
 description = "Versioned key-value store with git-like commit, branch, and merge semantics."
 authors = [{ name = "ashenfad" }]
 requires-python = ">=3.10"
@@ -37,8 +37,18 @@ dependencies = []
 [project.optional-dependencies]
 disk = ["diskcache"]
 git = ["gitpython>=3.1"]
-all = ["diskcache", "gitpython>=3.1"]
-dev = ["pytest", "diskcache", "gitpython>=3.1", "ruff"]
+numpy = ["numpy>=1.24"]
+pandas = ["numpy>=1.24", "pandas>=2.0"]
+scientific = ["numpy>=1.24", "pandas>=2.0"]
+all = ["diskcache", "gitpython>=3.1", "numpy>=1.24", "pandas>=2.0"]
+dev = [
+    "pytest",
+    "diskcache",
+    "gitpython>=3.1",
+    "ruff",
+    "numpy>=1.24",
+    "pandas>=2.0",
+]
 
 [tool.setuptools.packages.find]
 include = ["kvgit*"]
@@ -52,3 +62,10 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff.lint.per-file-ignores]
+# Codec tests gate themselves with `pytest.importorskip(...)` before
+# importing optional deps (numpy, pandas) and the matching codec modules,
+# which forces module-level imports to follow the skip call. E402 is the
+# wrong rule here — the pattern is the official pytest idiom.
+"tests/codecs/*.py" = ["E402"]
