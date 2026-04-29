@@ -121,6 +121,124 @@ class TestDedup:
         )
 
 
+class TestRealisticPatterns:
+    """Sweep across the kinds of DataFrames an agex agent typically
+    produces. Each must round-trip equal under the chunked codec."""
+
+    def test_mixed_dtype_dataframe(self, codec_pair):
+        """Mixed dtypes produce multiple BlockManager blocks; each
+        block ndarray must round-trip independently."""
+        encoder, decoder = codec_pair
+        rng = np.random.default_rng(0)
+        df = pd.DataFrame(
+            {
+                "f64": rng.normal(size=1024),
+                "i64": rng.integers(-1000, 1000, size=1024).astype("int64"),
+                "f32": rng.normal(size=1024).astype("float32"),
+                "bool": rng.integers(0, 2, size=1024).astype("bool"),
+                "str": [f"row_{i}" for i in range(1024)],
+            }
+        )
+        sink = DictSink()
+        out = decoder(encoder(df, sink), reader_for(sink))
+        pd.testing.assert_frame_equal(out, df)
+
+    def test_dataframe_with_nans(self, codec_pair):
+        encoder, decoder = codec_pair
+        rng = np.random.default_rng(0)
+        arr = rng.normal(size=1024)
+        arr[::5] = np.nan
+        df = pd.DataFrame({"x": arr, "y": arr * 2})
+        sink = DictSink()
+        out = decoder(encoder(df, sink), reader_for(sink))
+        pd.testing.assert_frame_equal(out, df)
+
+    def test_dataframe_with_datetime_index(self, codec_pair):
+        encoder, decoder = codec_pair
+        idx = pd.date_range("2024-01-01", periods=1024, freq="h")
+        df = pd.DataFrame(
+            {"x": np.arange(1024, dtype="float64")},
+            index=idx,
+        )
+        sink = DictSink()
+        out = decoder(encoder(df, sink), reader_for(sink))
+        pd.testing.assert_frame_equal(out, df)
+
+    def test_timezone_aware_datetime_column(self, codec_pair):
+        encoder, decoder = codec_pair
+        ts = pd.date_range("2024-01-01", periods=1024, freq="h", tz="UTC")
+        df = pd.DataFrame({"t": ts, "x": np.arange(1024, dtype="float64")})
+        sink = DictSink()
+        out = decoder(encoder(df, sink), reader_for(sink))
+        pd.testing.assert_frame_equal(out, df)
+
+    def test_categorical_column(self, codec_pair):
+        encoder, decoder = codec_pair
+        cats = pd.Categorical(
+            ["a", "b", "c", "a", "b"] * 256,
+            categories=["a", "b", "c", "d"],
+            ordered=True,
+        )
+        df = pd.DataFrame({"label": cats, "value": np.arange(1280, dtype="float64")})
+        sink = DictSink()
+        out = decoder(encoder(df, sink), reader_for(sink))
+        pd.testing.assert_frame_equal(out, df)
+
+    def test_nullable_int64(self, codec_pair):
+        """pandas extension dtype Int64 (note capital I) — nullable."""
+        encoder, decoder = codec_pair
+        df = pd.DataFrame({"x": pd.array([1, 2, None, 4, None] * 256, dtype="Int64")})
+        sink = DictSink()
+        out = decoder(encoder(df, sink), reader_for(sink))
+        pd.testing.assert_frame_equal(out, df)
+
+    def test_nullable_boolean(self, codec_pair):
+        encoder, decoder = codec_pair
+        df = pd.DataFrame(
+            {"flag": pd.array([True, False, None, True] * 256, dtype="boolean")}
+        )
+        sink = DictSink()
+        out = decoder(encoder(df, sink), reader_for(sink))
+        pd.testing.assert_frame_equal(out, df)
+
+    def test_single_row_dataframe(self, codec_pair):
+        encoder, decoder = codec_pair
+        df = pd.DataFrame({"a": [1.0], "b": [2.0], "c": [3.0]})
+        sink = DictSink()
+        out = decoder(encoder(df, sink), reader_for(sink))
+        pd.testing.assert_frame_equal(out, df)
+
+    def test_empty_dataframe_with_schema(self, codec_pair):
+        encoder, decoder = codec_pair
+        df = pd.DataFrame({"x": pd.Series([], dtype="float64")})
+        sink = DictSink()
+        out = decoder(encoder(df, sink), reader_for(sink))
+        pd.testing.assert_frame_equal(out, df)
+
+    def test_groupby_aggregate_result(self, codec_pair):
+        encoder, decoder = codec_pair
+        rng = np.random.default_rng(0)
+        df = pd.DataFrame(
+            {
+                "g": rng.integers(0, 4, size=2048),
+                "x": rng.normal(size=2048),
+                "y": rng.normal(size=2048),
+            }
+        )
+        agg = df.groupby("g").mean()
+        sink = DictSink()
+        out = decoder(encoder(agg, sink), reader_for(sink))
+        pd.testing.assert_frame_equal(out, agg)
+
+    def test_named_series_with_datetime_index(self, codec_pair):
+        encoder, decoder = codec_pair
+        idx = pd.date_range("2024-01-01", periods=1024, freq="D")
+        s = pd.Series(np.arange(1024, dtype="float64"), index=idx, name="metric")
+        sink = DictSink()
+        out = decoder(encoder(s, sink), reader_for(sink))
+        pd.testing.assert_series_equal(out, s)
+
+
 class TestAlias:
     def test_pandas_codec_is_numpy_codec(self):
         # Documented as an alias; ensure it stays one.

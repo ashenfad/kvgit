@@ -325,6 +325,149 @@ class TestPathologicalRoots:
         np.testing.assert_array_equal(out, weird[1:3])
 
 
+class TestUncommonDtypes:
+    """Coverage for less-common ndarray dtypes. The question for each
+    is "round-trips bit-for-bit?" — anything that doesn't either has
+    to be fixed or has to be documented as falling back to plain
+    pickle."""
+
+    def test_complex128(self, codec_pair):
+        encoder, decoder = codec_pair
+        arr = np.arange(256, dtype="complex128") * (1 + 2j)
+        sink = DictSink()
+        out = decoder(encoder(arr, sink), reader_for(sink))
+        assert out.dtype == arr.dtype
+        np.testing.assert_array_equal(out, arr)
+
+    @pytest.mark.parametrize("unit", ["ns", "us", "ms", "s", "D"])
+    def test_datetime64_units(self, codec_pair, unit):
+        """Time unit (``ns``/``us``/``s``/``D`` etc.) is part of the
+        dtype identity and must survive a round-trip."""
+        encoder, decoder = codec_pair
+        # Build via int64 view → datetime64; np.arange doesn't work
+        # for datetime64 directly.
+        arr = np.arange(256, dtype="int64").view(f"datetime64[{unit}]")
+        sink = DictSink()
+        out = decoder(encoder(arr, sink), reader_for(sink))
+        assert out.dtype == arr.dtype
+        np.testing.assert_array_equal(out, arr)
+
+    @pytest.mark.parametrize("unit", ["ns", "us", "ms", "s"])
+    def test_timedelta64_units(self, codec_pair, unit):
+        encoder, decoder = codec_pair
+        arr = np.arange(256, dtype="int64").view(f"timedelta64[{unit}]")
+        sink = DictSink()
+        out = decoder(encoder(arr, sink), reader_for(sink))
+        assert out.dtype == arr.dtype
+        np.testing.assert_array_equal(out, arr)
+
+    def test_fixed_width_bytes(self, codec_pair):
+        """``S`` dtype: fixed-width raw bytes."""
+        encoder, decoder = codec_pair
+        arr = np.array([b"hello", b"world", b"foo", b"bar"] * 64, dtype="S5")
+        sink = DictSink()
+        out = decoder(encoder(arr, sink), reader_for(sink))
+        assert out.dtype == arr.dtype
+        np.testing.assert_array_equal(out, arr)
+
+    def test_fixed_width_unicode(self, codec_pair):
+        """``U`` dtype: fixed-width unicode (4 bytes per char)."""
+        encoder, decoder = codec_pair
+        arr = np.array(["α", "β", "γ", "δ"] * 64, dtype="U2")
+        sink = DictSink()
+        out = decoder(encoder(arr, sink), reader_for(sink))
+        assert out.dtype == arr.dtype
+        np.testing.assert_array_equal(out, arr)
+
+    def test_structured_dtype_with_fields(self, codec_pair):
+        """Structured / record dtype with named fields."""
+        encoder, decoder = codec_pair
+        dt = np.dtype([("x", "f4"), ("y", "i8"), ("name", "S8")])
+        arr = np.zeros(256, dtype=dt)
+        arr["x"] = np.arange(256, dtype="f4")
+        arr["y"] = np.arange(256, dtype="i8") * 2
+        arr["name"] = [f"row{i:03d}".encode() for i in range(256)]
+        sink = DictSink()
+        out = decoder(encoder(arr, sink), reader_for(sink))
+        assert out.dtype == arr.dtype
+        np.testing.assert_array_equal(out, arr)
+
+    @pytest.mark.parametrize("byteorder", [">i4", "<i4", ">f8", "<f8"])
+    def test_explicit_byteorder(self, codec_pair, byteorder):
+        encoder, decoder = codec_pair
+        arr = np.arange(256, dtype=byteorder)
+        sink = DictSink()
+        out = decoder(encoder(arr, sink), reader_for(sink))
+        assert out.dtype == arr.dtype
+        np.testing.assert_array_equal(out, arr)
+
+
+class TestUnusualLayouts:
+    """Layout corner cases: scalars, singletons, negative strides,
+    broadcast views — anything the stride-and-offset reconstruction
+    needs to handle without silent corruption."""
+
+    def test_zero_d_scalar_array(self, codec_pair):
+        """``np.array(5.0)`` — shape (), one element."""
+        encoder, decoder = codec_pair
+        arr = np.array(5.0, dtype="float64")
+        assert arr.shape == ()
+        sink = DictSink()
+        out = decoder(encoder(arr, sink), reader_for(sink))
+        # Tiny by definition; falls back to pickle. Round-trip is what matters.
+        assert out.shape == ()
+        assert out.dtype == arr.dtype
+        assert out == arr
+
+    def test_singleton_dim_first(self, codec_pair):
+        encoder, decoder = codec_pair
+        arr = np.arange(2048, dtype="float64").reshape(1, 2048)
+        sink = DictSink()
+        out = decoder(encoder(arr, sink), reader_for(sink))
+        assert out.shape == arr.shape
+        np.testing.assert_array_equal(out, arr)
+
+    def test_singleton_dim_last(self, codec_pair):
+        encoder, decoder = codec_pair
+        arr = np.arange(2048, dtype="float64").reshape(2048, 1)
+        sink = DictSink()
+        out = decoder(encoder(arr, sink), reader_for(sink))
+        assert out.shape == arr.shape
+        np.testing.assert_array_equal(out, arr)
+
+    def test_negative_stride_reverse(self, codec_pair):
+        """``arr[::-1]`` is a view with negative stride. Our
+        ``_root_and_offset`` sanity check (offset < 0) should kick in
+        and treat the reversed view as its own root."""
+        encoder, decoder = codec_pair
+        parent = np.arange(2048, dtype="float64")
+        reversed_view = parent[::-1]
+        assert reversed_view.strides[0] < 0
+        sink = DictSink()
+        out = decoder(encoder(reversed_view, sink), reader_for(sink))
+        np.testing.assert_array_equal(out, parent[::-1])
+
+    def test_broadcast_view(self, codec_pair):
+        """``np.broadcast_to`` produces a view with stride-0 axes —
+        another non-canonical case that should fall back to a copy."""
+        encoder, decoder = codec_pair
+        seed = np.arange(2048, dtype="float64")
+        bcast = np.broadcast_to(seed, (4, 2048))
+        assert 0 in bcast.strides  # broadcast axis has stride 0
+        sink = DictSink()
+        out = decoder(encoder(bcast, sink), reader_for(sink))
+        np.testing.assert_array_equal(out, np.broadcast_to(seed, (4, 2048)))
+
+    def test_diagonal_view(self, codec_pair):
+        """``np.diag`` returns a non-contig view of a 2-D parent."""
+        encoder, decoder = codec_pair
+        parent = np.arange(2048, dtype="float64").reshape(32, 64)[:32, :32]
+        diag = np.diag(parent)  # view in modern numpy
+        sink = DictSink()
+        out = decoder(encoder(diag, sink), reader_for(sink))
+        np.testing.assert_array_equal(out, np.diag(parent))
+
+
 class TestObjectDtype:
     def test_object_dtype_passes_through(self, codec_pair):
         encoder, decoder = codec_pair
