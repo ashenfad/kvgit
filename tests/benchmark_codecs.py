@@ -86,6 +86,20 @@ def workload_slicing_only(df: "pd.DataFrame") -> dict[str, object]:
     }
 
 
+def workload_column_slicing(df: "pd.DataFrame") -> dict[str, object]:
+    """Column subsets. For a single-block float DataFrame, contiguous
+    column selections like ``df[['x','y']]`` produce C-contig views of
+    the parent block — they dedup just like row slices. Single-column
+    Series ``df['x']`` is a 1-D contig view of one block row."""
+    return {
+        "full": df,
+        "x": df["x"],
+        "y": df["y"],
+        "xy": df[["x", "y"]],
+        "yz": df[["y", "z"]],
+    }
+
+
 def workload_mixed(df: "pd.DataFrame") -> dict[str, object]:
     """Realistic mix: some views, some copies. The boolean filter and
     column-subset copies are independent buffers that don't dedup."""
@@ -139,6 +153,8 @@ def measure(
         v_round = s[k]
         if isinstance(v_orig, pd.DataFrame):
             pd.testing.assert_frame_equal(v_round, v_orig)
+        elif isinstance(v_orig, pd.Series):
+            pd.testing.assert_series_equal(v_round, v_orig)
         else:
             assert v_round.equals(v_orig)
 
@@ -153,10 +169,15 @@ def measure(
 
 def run_workload(name: str, build_data: Callable[[], dict]) -> None:
     data = build_data()
-    in_mem = sum(
-        v.memory_usage(deep=True).sum() if hasattr(v, "memory_usage") else 0
-        for v in data.values()
-    )
+
+    def _bytes(v) -> int:
+        if isinstance(v, pd.DataFrame):
+            return int(v.memory_usage(deep=True).sum())
+        if isinstance(v, pd.Series):
+            return int(v.memory_usage(deep=True))
+        return 0
+
+    in_mem = sum(_bytes(v) for v in data.values())
 
     print(f"\n--- {name} ---")
     print(f"workload keys:           {list(data.keys())}")
@@ -196,8 +217,12 @@ def main() -> None:
 
     df = base_df()
     run_workload(
-        "Pure slicing (agent reasoning over a DataFrame)",
+        "Pure row slicing (iloc views)",
         lambda: workload_slicing_only(df),
+    )
+    run_workload(
+        "Pure column slicing (df[col], df[[cols]])",
+        lambda: workload_column_slicing(df),
     )
     run_workload(
         "Mixed (some views, some independent copies)", lambda: workload_mixed(df)
