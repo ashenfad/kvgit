@@ -24,8 +24,11 @@ Dedup story:
   through to plain pickling (the elements may themselves be
   externalized by other codecs).
 
-Materialized arrays are read-only because the underlying chunk bytes
-are shared. Call ``.copy()`` to mutate.
+Materialized arrays are independent, writable copies — same mutation
+semantics as plain ``pickle.loads``. The dedup happens at the storage
+layer; reads always allocate a fresh array. (Reads pay one memcpy per
+key, equivalent to pickle's allocate-and-copy. The savings come from
+storing each unique buffer once instead of N times.)
 """
 
 from __future__ import annotations
@@ -165,6 +168,15 @@ class NumpyCodec:
         out_strides = tuple(token["strides"])
         root_shape = tuple(token["root_shape"])
 
+        # Build a read-only view of the requested data first (zero-copy
+        # against the chunk bytes), then ``np.array(view)`` allocates a
+        # fresh, writable, independent copy. This matches plain
+        # ``pickle.loads`` semantics: the array the caller gets back is
+        # safe to mutate and won't surprise neighbouring keys that share
+        # the same chunk on the underlying store. The dedup story still
+        # holds — chunks are stored once on disk, decoded into private
+        # copies on demand.
+
         # Fast path: the array IS the root (identical shape/dtype, no
         # offset). Reshape the bytes in the recorded memory order.
         if (
@@ -172,7 +184,8 @@ class NumpyCodec:
             and out_shape == root_shape
             and token["dtype"] == token["root_dtype"]
         ):
-            return np.frombuffer(raw, dtype=root_dtype).reshape(root_shape, order=order)
+            view = np.frombuffer(raw, dtype=root_dtype).reshape(root_shape, order=order)
+            return np.array(view)
 
         # General path: reconstruct the view via stride tricks against
         # the raw bytes. Critically, we go through a 1-D uint8 view
@@ -186,9 +199,13 @@ class NumpyCodec:
         if offset:
             flat_bytes = flat_bytes[offset:]
         typed = flat_bytes.view(out_dtype)
-        return np.lib.stride_tricks.as_strided(
+        view = np.lib.stride_tricks.as_strided(
             typed,
             shape=out_shape,
             strides=out_strides,
             writeable=False,
         )
+        # ``np.array`` honours the view's strides while allocating
+        # contiguous, writable storage — exactly the shape/contents
+        # the caller would get from a fresh pickle.loads.
+        return np.array(view)
