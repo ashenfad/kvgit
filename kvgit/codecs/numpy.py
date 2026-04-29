@@ -1,9 +1,9 @@
 """NumPy ndarray codec.
 
 Externalizes the underlying buffer of an ndarray as a content-addressed
-chunk; the token records the dtype, shape, and (for views) the slice
-geometry needed to reconstruct the array against the chunked root
-buffer.
+chunk; the token records the dtype, shape, layout order, and (for
+views) the slice geometry needed to reconstruct the array against the
+chunked root buffer.
 
 Dedup story:
 
@@ -11,6 +11,15 @@ Dedup story:
 * A view (``arr.base is not None``) hashes its **root** buffer, not
   the slice. Multiple slices of the same parent therefore share one
   chunk on disk.
+* Both C-contiguous and F-contiguous roots are stored verbatim
+  (zero-copy via ``memoryview``) and the layout order is recorded
+  so the strides recovered for any view remain valid against the
+  exact bytes we wrote.
+* Roots with non-canonical layouts (neither C- nor F-contig — rare,
+  usually only created via ``as_strided`` abuse) are not safe to
+  reuse as a shared buffer; the codec falls back to a C-contiguous
+  copy of the input array, treating it as its own root. Dedup
+  against the original parent is lost in that case.
 * Object-dtype arrays hold Python pointers, not data — they fall
   through to plain pickling (the elements may themselves be
   externalized by other codecs).
@@ -94,13 +103,40 @@ class NumpyCodec:
 
         root, byte_offset = _root_and_offset(obj)
 
-        # Hash the root buffer's bytes. Use canonical C-order bytes so
-        # two arrays with the same logical content (regardless of how
-        # constructed) collide.
+        # Pick a layout we can faithfully round-trip. C-contig and
+        # F-contig roots are both contiguous blocks of bytes — we
+        # store them verbatim and tag the order so materialize can
+        # reshape correctly. A non-contiguous root would force us to
+        # canonicalize the bytes (via ``tobytes()``) but the recorded
+        # strides would no longer describe that byte layout, leading
+        # to data corruption on reconstruction. Fall back to a
+        # C-contig copy of ``obj`` instead, treating it as its own
+        # root (loses dedup against the original parent for this
+        # branch, but keeps correctness).
         if root.flags["C_CONTIGUOUS"]:
             ref = sink.put(memoryview(root).cast("B"))
+            order = "C"
+        elif root.flags["F_CONTIGUOUS"]:
+            # ``memoryview.cast`` only accepts C-contig sources, so
+            # collapse to a 1-D view in memory order. ``ravel(order='K')``
+            # is zero-copy when strides are positive (always true for
+            # F-contig arrays produced via numpy's normal APIs), and
+            # the resulting 1-D view is itself C-contig.
+            ref = sink.put(memoryview(np.ravel(root, order="K")).cast("B"))
+            order = "F"
         else:
-            ref = sink.put(root.tobytes())
+            canonical = np.ascontiguousarray(obj)
+            ref = sink.put(memoryview(canonical).cast("B"))
+            return {
+                "ref": ref,
+                "root_shape": list(canonical.shape),
+                "root_dtype": canonical.dtype.str,
+                "shape": list(obj.shape),
+                "dtype": obj.dtype.str,
+                "strides": list(canonical.strides),
+                "offset": 0,
+                "order": "C",
+            }
 
         return {
             "ref": ref,
@@ -110,6 +146,7 @@ class NumpyCodec:
             "dtype": obj.dtype.str,
             "strides": list(obj.strides),
             "offset": int(byte_offset),
+            "order": order,
         }
 
     def materialize(self, token: Any, reader: ChunkReader) -> Any:
@@ -117,9 +154,15 @@ class NumpyCodec:
 
         raw = reader.get(token["ref"])
         root_dtype = np.dtype(token["root_dtype"])
+        # ``order`` defaults to 'C' for tokens written before the field
+        # existed (those tokens are only correct for C-contig roots,
+        # which is the only path the older code took without bugs).
+        order = token.get("order", "C")
         # frombuffer over bytes returns a read-only ndarray sharing the
         # underlying buffer — the dedup-friendly default.
-        root = np.frombuffer(raw, dtype=root_dtype).reshape(token["root_shape"])
+        root = np.frombuffer(raw, dtype=root_dtype).reshape(
+            token["root_shape"], order=order
+        )
 
         offset = token["offset"]
         out_dtype = np.dtype(token["dtype"])
