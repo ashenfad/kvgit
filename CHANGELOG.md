@@ -31,7 +31,7 @@ Adds an opt-in `kvgit.codecs` package for content-addressed chunk dedup of large
 ### Limitations
 
 - **Merge results don't chunk.** When `Staged`'s wrapped merge function re-encodes a merged value, it falls back to plain `pickle.dumps`. The bytes-level merge protocol has no place to land chunks. Subsequent commits that overwrite the merged key go through the chunked path normally.
-- **Materialized arrays are read-only.** Mutating one slice would silently affect every other key sharing the same chunk; `.copy()` is the explicit escape hatch.
+- **Decode allocates per key.** Every read materializes a fresh, writable array (one memcpy, same cost shape as plain `pickle.loads`). The codec is a storage-layer optimization — it saves disk and quota but doesn't reduce in-process RAM after read.
 
 ## [0.2.2] - 2026-04-28
 

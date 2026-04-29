@@ -336,7 +336,7 @@ Externalizes `numpy.ndarray` instances. Built-in dedup behaviors:
 | `arr.dtype.hasobject` (object dtype) | Pass through to pickle (elements may be intercepted by other codecs) |
 | `arr.nbytes < min_bytes` and not a view | Pass through to pickle (chunk overhead exceeds savings) |
 
-Materialized arrays are **read-only**. Slices reconstruct via `numpy.lib.stride_tricks.as_strided` from the shared chunk bytes; making them writeable would risk silent cross-key corruption. Call `.copy()` to mutate.
+Materialized arrays are independent, writable copies. Reads allocate a fresh array (one memcpy per key, equivalent to plain `pickle.loads`); the dedup story is purely at the storage layer. Mutating an array returned from one key has no effect on any other key, even when they share the same chunk on disk.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -388,7 +388,7 @@ The first chunked write lazily upgrades a store from v2 to v3:
 ### Limitations
 
 * **Merge results are not chunked.** When `Staged`'s wrapped merge function re-encodes a merged value, it always falls back to plain `pickle.dumps` (the bytes-level merge protocol has no place to land chunks). Subsequent commits that overwrite the merged key go through the chunked path normally. In single-writer use cases (e.g., one agent per branch), merges are rare and this rarely matters.
-* **Materialized arrays are read-only.** Trades one allocation against safe sharing. Call `.copy()` for mutation.
+* **Decode allocates per key.** The codec is a storage-layer optimization — every read materializes a fresh, writable array (one memcpy, same cost shape as plain `pickle.loads`). It saves disk and quota; it doesn't reduce in-process RAM after read.
 * **Chunk dedup is a disk/storage optimization, not an in-memory one.** While values are sitting in the staging buffer, they're still distinct Python objects. Dedup happens at encode time.
 
 ---

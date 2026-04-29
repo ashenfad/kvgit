@@ -155,6 +155,51 @@ class TestViews:
         np.testing.assert_array_equal(out, parent.T)
 
 
+class TestWritableMaterialization:
+    """Materialized arrays must behave like the result of plain
+    ``pickle.loads``: independent, writable, no shared memory with
+    sibling keys or the underlying chunk bytes. The dedup is purely
+    a storage-layer property; the runtime objects are private."""
+
+    def test_materialized_array_is_writable(self, codec_pair):
+        encoder, decoder = codec_pair
+        arr = np.arange(2048, dtype="float64")
+        sink = DictSink()
+        out = decoder(encoder(arr, sink), reader_for(sink))
+        assert out.flags["WRITEABLE"]
+        out[0] = 999.0  # must not raise
+        assert out[0] == 999.0
+
+    def test_materialized_view_is_writable(self, codec_pair):
+        """Views of a parent buffer also materialize as writable copies."""
+        encoder, decoder = codec_pair
+        parent = np.arange(2048, dtype="int64").reshape(32, 64)
+        view = parent[:, 8:24]  # non-contig view
+        sink = DictSink()
+        out = decoder(encoder(view, sink), reader_for(sink))
+        assert out.flags["WRITEABLE"]
+        out[0, 0] = -1
+        assert out[0, 0] == -1
+
+    def test_two_keys_decode_to_independent_arrays(self, codec_pair):
+        """Mutating one key's materialized array must not affect another
+        key that shares the same underlying chunk."""
+        encoder, decoder = codec_pair
+        shared = np.arange(2048, dtype="float64")
+        sink = DictSink()
+        # Both keys reference the same chunk; sink dedups on hash.
+        encoder({"a": shared, "b": shared}, sink)
+        # Decode each key independently from the same reader.
+        a_blob = encoder(shared, sink)
+        b_blob = encoder(shared, sink)
+        reader = reader_for(sink)
+        a = decoder(a_blob, reader)
+        b = decoder(b_blob, reader)
+        assert not np.shares_memory(a, b)
+        a[0] = -42.0
+        assert b[0] == 0.0  # unchanged
+
+
 class TestNonContiguous:
     def test_non_contiguous_array_round_trips(self, codec_pair):
         encoder, decoder = codec_pair

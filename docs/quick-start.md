@@ -399,7 +399,7 @@ If `old` happened to hold five separate copies of the same array under five keys
 | Containers (`dict`, `list`, dataclass) holding ndarrays | The container pickles normally; nested arrays still externalize |
 | Anything else | Plain pickle, unchanged |
 
-Materialized arrays are read-only by default (they share the underlying chunk bytes). Call `.copy()` when you need to mutate.
+Materialized arrays are independent, writable copies — same semantics as a value coming back from `pickle.loads`. Mutating one key's array doesn't affect any other key. The dedup happens at the storage layer; reads always allocate a fresh array.
 
 ### Custom codecs
 
