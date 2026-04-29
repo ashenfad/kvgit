@@ -17,7 +17,7 @@ from kvgit.codecs import compose
 from kvgit.codecs.numpy import NumpyCodec
 from kvgit.codecs.pandas import PandasCodec  # alias-of-NumpyCodec
 
-from conftest import DictSink, reader_for  # noqa: E402
+from conftest import DictSink, reader_for
 
 
 @pytest.fixture

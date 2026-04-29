@@ -12,7 +12,7 @@ work; the Keyset just gives the API a kvgit-friendly shape.
 
 import json
 from collections.abc import Iterable, Iterator, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import NamedTuple
 
 from ..hamt import EMPTY_HASH, Hamt
@@ -32,7 +32,7 @@ class MetaEntry:
 
     size: int | None
     created_at: float
-    chunks: list[str] | None = field(default=None)
+    chunks: list[str] | None = None
 
 
 @dataclass(frozen=True)

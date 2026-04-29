@@ -11,7 +11,7 @@ import pytest
 from kvgit.codecs import compose
 from kvgit.codecs.base import ChunkSink
 
-from conftest import DictSink, reader_for  # noqa: E402
+from conftest import DictSink, reader_for
 
 
 class TaggedThing:
