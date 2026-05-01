@@ -7,11 +7,10 @@ from .kv.base import KVStore
 from .kv.memory import Memory
 from .staged import Staged
 from .versioned.kv import VersionedKV
-from .versioned.protocol import Versioned
 
 
 def store(
-    kind: Literal["memory", "disk", "git", "indexeddb"] = "memory",
+    kind: Literal["memory", "disk", "indexeddb"] = "memory",
     *,
     path: str | None = None,
     db_name: str = "kvgit",
@@ -23,9 +22,9 @@ def store(
     """Create a Staged store with sensible defaults.
 
     Args:
-        kind: ``"memory"`` (default), ``"disk"``, ``"git"``, or ``"indexeddb"``.
-        path: Required when ``kind="disk"`` or ``kind="git"``.
-            Directory path for the disk backend or repo path for git.
+        kind: ``"memory"`` (default), ``"disk"``, or ``"indexeddb"``.
+        path: Required when ``kind="disk"``. Directory path for the
+            disk backend.
         db_name: IndexedDB database name (default ``"kvgit"``).
             Only used when ``kind="indexeddb"``.
         branch: Branch name (default ``"main"``).
@@ -56,32 +55,20 @@ def store(
 
         encoder, decoder = _resolve_named(codecs)
 
-    versioned: Versioned
-
-    if kind == "git":
+    backend: KVStore
+    if kind == "memory":
+        backend = Memory()
+    elif kind == "disk":
         if path is None:
-            raise ValueError("path is required when kind='git'")
-        from .versioned.gp import VersionedGP
+            raise ValueError("path is required when kind='disk'")
+        from .kv.disk import Disk
 
-        versioned = VersionedGP(path, branch=branch)
+        backend = Disk(path)
+    elif kind == "indexeddb":
+        from .kv.indexeddb import IndexedDB
+
+        backend = IndexedDB(db_name=db_name)
     else:
-        # Build KV backend
-        backend: KVStore
-        if kind == "memory":
-            backend = Memory()
-        elif kind == "disk":
-            if path is None:
-                raise ValueError("path is required when kind='disk'")
-            from .kv.disk import Disk
+        raise ValueError(f"Unknown kind: {kind!r}")
 
-            backend = Disk(path)
-        elif kind == "indexeddb":
-            from .kv.indexeddb import IndexedDB
-
-            backend = IndexedDB(db_name=db_name)
-        else:
-            raise ValueError(f"Unknown kind: {kind!r}")
-
-        versioned = VersionedKV(backend, branch=branch)
-
-    return Staged(versioned, encoder=encoder, decoder=decoder)
+    return Staged(VersionedKV(backend, branch=branch), encoder=encoder, decoder=decoder)

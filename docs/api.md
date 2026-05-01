@@ -6,9 +6,9 @@ Factory function that returns a configured `Staged` instance.
 
 ```python
 kvgit.store(
-    kind="memory",       # "memory", "disk", "git", or "indexeddb"
+    kind="memory",       # "memory", "disk", or "indexeddb"
     *,
-    path=None,           # required for "disk" and "git"
+    path=None,           # required for "disk"
     db_name="kvgit",     # IndexedDB database name (only for "indexeddb")
     branch="main",
     encoder=pickle.dumps,
@@ -19,8 +19,8 @@ kvgit.store(
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `kind` | `Literal["memory", "disk", "git", "indexeddb"]` | `"memory"` | Backend type |
-| `path` | `str \| None` | `None` | Required for `"disk"` and `"git"` |
+| `kind` | `Literal["memory", "disk", "indexeddb"]` | `"memory"` | Backend type |
+| `path` | `str \| None` | `None` | Required for `"disk"` |
 | `db_name` | `str` | `"kvgit"` | IndexedDB database name. Only used with `"indexeddb"`. |
 | `branch` | `str` | `"main"` | Branch name |
 | `encoder` | `Callable[..., bytes]` | `pickle.dumps` | Value encoder. Pass a `compose()` pair to enable [chunked codecs](#chunked-codecs). |
@@ -256,7 +256,7 @@ MergeFn = Callable[[Any | None, Any, Any], Any]
 
 ### BytesMergeFn
 
-Bytes-level merge function type, used by `VersionedKV` / `VersionedGP`:
+Bytes-level merge function type, used by `VersionedKV`:
 
 ```python
 BytesMergeFn = Callable[[bytes | None, bytes | None, bytes | None], bytes]
@@ -446,33 +446,6 @@ cleaned = v.clean_orphans(min_age=0)   # immediate (only safe without concurrent
 ```
 
 The cleanup is safe for shared commit histories (e.g., forked branches). Blobs referenced by any reachable commit are never deleted.
-
----
-
-## VersionedGP
-
-GitPython-backed implementation of `Versioned`. Stores data as blobs in a real git repository.
-
-```python
-from kvgit import VersionedGP
-
-v = VersionedGP("/path/to/repo")
-v = VersionedGP("/path/to/repo", branch="dev")
-v = VersionedGP("/path/to/repo", commit_hash="abc123...")
-```
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `repo_path` | `str` | (required) | Path to git repository (created if missing) |
-| `commit_hash` | `str \| None` | `None` | Resume from this commit. |
-| `branch` | `str` | `"main"` | Branch name. |
-
-All methods from the `Versioned` protocol are implemented. Additional:
-
-| Attribute | Type | Description |
-|-----------|------|-------------|
-| `repo` | `git.Repo` | The underlying GitPython `Repo` object |
-| `repo_path` | `str` | Path to the repository |
 
 ---
 

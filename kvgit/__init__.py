@@ -21,10 +21,3 @@ __all__ = [
     "last_writer_wins",
     "store",
 ]
-
-try:
-    from .versioned.gp import VersionedGP
-
-    __all__ += ["VersionedGP"]
-except ImportError:
-    pass

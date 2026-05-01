@@ -37,9 +37,8 @@ def resolve_merge(
 ) -> MergeResolution:
     """Resolve a three-way merge between two diverged keysets.
 
-    Implements the pure merge logic shared between VersionedKV and
-    VersionedGP.  Does NOT create commits or advance HEAD -- the
-    caller handles persistence.
+    Implements the pure merge logic used by VersionedKV. Does NOT
+    create commits or advance HEAD -- the caller handles persistence.
 
     Args:
         lca_keyset: Keyset of the lowest common ancestor commit.
