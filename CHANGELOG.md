@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Removed: `kvgit.versioned.gp` module, `VersionedGP` from the `kvgit` and `kvgit.versioned` namespaces, `kind="git"` branch in `kvgit.store()`, `tests/versioned/test_gp.py`, `tests/versioned/test_conformance.py` (now redundant with `test_kv.py`).
   - Migration: there is no in-place upgrade path. Stores written by `VersionedGP` were git repositories on disk and remain readable as plain git repositories — they are just no longer accessible through this library. If you need versioned KV semantics going forward, use `kind="disk"` (diskcache) or any other `KVStore` backend.
 
+### Fixed
+
+- **`Composite` no longer silently swallows tier failures.** Previously every tier operation was wrapped in a bare `except Exception: pass`, which would mask programming bugs (e.g. an `AttributeError` from a misconfigured tier) the same way it masked legitimate "tier unavailable" errors. The exception handlers now re-raise programming-bug exceptions (`TypeError`, `AttributeError`, `AssertionError`) so they surface, and log the rest at WARNING via the `kvgit.kv.composite` logger so cache degradation is visible. The "fall through to the next tier on operational failure" semantic is preserved.
+
 ## [0.3.0] - 2026-04-28
 
 Adds an opt-in `kvgit.codecs` package for content-addressed chunk dedup of large numpy / pandas values. Storage format bumps to v3, but v2 stores remain readable by v3 code and are only stamped as v3 on the first chunked write — the on-disk layout is unchanged for plain-pickle workloads.

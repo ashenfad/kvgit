@@ -1,9 +1,43 @@
 """Tests for the Composite KV store."""
 
+import logging
+
 import pytest
 
 from kvgit.kv.composite import Composite
 from kvgit.kv.memory import Memory
+
+
+class _FlakyStore(Memory):
+    """Memory tier that raises a configured exception on every operation."""
+
+    def __init__(self, exc: Exception) -> None:
+        super().__init__()
+        self._exc = exc
+
+    def get(self, key: str):
+        raise self._exc
+
+    def get_many(self, *args):
+        raise self._exc
+
+    def set(self, key: str, value: bytes) -> None:
+        raise self._exc
+
+    def set_many(self, items=None, /, **kwargs) -> None:
+        raise self._exc
+
+    def remove(self, key: str) -> None:
+        raise self._exc
+
+    def remove_many(self, *args) -> None:
+        raise self._exc
+
+    def clear(self) -> None:
+        raise self._exc
+
+    def __contains__(self, key: str) -> bool:
+        raise self._exc
 
 
 class TestCompositeBasic:
@@ -103,3 +137,61 @@ class TestCompositeCAS:
         c.clear()
         assert l1.get("a") is None
         assert l2.get("a") is None
+
+
+class TestCompositeFailureModes:
+    """Operational tier failures fall through with a warning;
+    programming-bug exceptions propagate."""
+
+    def test_get_falls_through_on_operational_failure(self, caplog):
+        flaky = _FlakyStore(OSError("disk gone"))
+        l2 = Memory()
+        l2.set("k", b"v")
+        c = Composite([flaky, l2])
+        with caplog.at_level(logging.WARNING, logger="kvgit.kv.composite"):
+            assert c.get("k") == b"v"
+        assert any("tier 0" in r.message for r in caplog.records)
+
+    def test_get_propagates_bug_exception(self):
+        flaky = _FlakyStore(TypeError("misconfigured tier"))
+        l2 = Memory()
+        l2.set("k", b"v")
+        c = Composite([flaky, l2])
+        with pytest.raises(TypeError, match="misconfigured tier"):
+            c.get("k")
+
+    def test_set_propagates_authoritative_failure(self):
+        # A failure in the authoritative (last) tier always propagates
+        # regardless of exception type — durability is the contract of set().
+        l1 = Memory()
+        flaky = _FlakyStore(OSError("disk full"))
+        c = Composite([l1, flaky])
+        with pytest.raises(OSError, match="disk full"):
+            c.set("k", b"v")
+
+    def test_set_logs_cache_tier_failure(self, caplog):
+        # Authoritative tier succeeds; cache tier fails operationally.
+        # User-visible behavior: success, with a warning.
+        flaky = _FlakyStore(OSError("cache stale"))
+        l2 = Memory()
+        c = Composite([flaky, l2])
+        with caplog.at_level(logging.WARNING, logger="kvgit.kv.composite"):
+            c.set("k", b"v")
+        assert l2.get("k") == b"v"
+        assert any("tier 0" in r.message for r in caplog.records)
+
+    def test_set_propagates_cache_tier_bug(self):
+        flaky = _FlakyStore(AttributeError("typo on tier impl"))
+        l2 = Memory()
+        c = Composite([flaky, l2])
+        with pytest.raises(AttributeError, match="typo on tier impl"):
+            c.set("k", b"v")
+
+    def test_contains_falls_through_on_operational_failure(self, caplog):
+        flaky = _FlakyStore(OSError("network down"))
+        l2 = Memory()
+        l2.set("k", b"v")
+        c = Composite([flaky, l2])
+        with caplog.at_level(logging.WARNING, logger="kvgit.kv.composite"):
+            assert "k" in c
+        assert any("tier 0" in r.message for r in caplog.records)
