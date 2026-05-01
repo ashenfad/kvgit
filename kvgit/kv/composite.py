@@ -76,11 +76,11 @@ class Composite(KVStore):
             if not remaining:
                 break
             try:
-                tier_values = {
-                    key: value
-                    for key in remaining
-                    if (value := store.get(key)) is not None
-                }
+                # Delegate to the tier's bulk get — backends with high
+                # per-call latency (Disk, IndexedDB) collapse N round-trips
+                # into one. The protocol guarantees only existing keys
+                # appear in the result.
+                tier_values = store.get_many(remaining)
             except Exception as e:
                 if _is_bug(e):
                     raise

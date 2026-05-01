@@ -95,6 +95,27 @@ class TestCompositeBasic:
         with pytest.raises(ValueError):
             Composite([])
 
+    def test_get_many_partial_hits_across_tiers(self):
+        # "a" only in L2, "b" only in L1, "c" missing entirely.
+        # Composite must collect a + b and skip c, populating L1 with a.
+        l1, l2 = Memory(), Memory()
+        l1.set("b", b"from-l1")
+        l2.set("a", b"from-l2")
+        c = Composite([l1, l2])
+        result = c.get_many("a", "b", "c")
+        assert dict(result) == {"a": b"from-l2", "b": b"from-l1"}
+        # L2 hit on "a" should have populated L1
+        assert l1.get("a") == b"from-l2"
+
+    def test_get_many_short_circuits_when_satisfied(self):
+        # With all keys served from L1, L2 must never be consulted.
+        l1 = Memory()
+        l1.set_many(a=b"1", b=b"2")
+        sentinel = _FlakyStore(AssertionError("L2 should not be touched"))
+        c = Composite([l1, sentinel])
+        result = c.get_many("a", "b")
+        assert dict(result) == {"a": b"1", "b": b"2"}
+
 
 class TestCompositeRemove:
     def test_remove_all_tiers(self):
