@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Removed
+
+- **`VersionedGP` and the GitPython backend.** The git-backed `Versioned` implementation has been deleted along with the `kind="git"` factory option, the `kvgit[git]` extra, and the `gitpython` dev dependency. The backend never gained chunked-codec support (storage v3 is KV-only) and was carrying a per-protocol-change tax on every refactor without a known user. `VersionedKV` remains the sole `Versioned` implementation.
+  - Removed: `kvgit.versioned.gp` module, `VersionedGP` from the `kvgit` and `kvgit.versioned` namespaces, `kind="git"` branch in `kvgit.store()`, `tests/versioned/test_gp.py`, `tests/versioned/test_conformance.py` (now redundant with `test_kv.py`).
+  - Migration: there is no in-place upgrade path. Stores written by `VersionedGP` were git repositories on disk and remain readable as plain git repositories — they are just no longer accessible through this library. If you need versioned KV semantics going forward, use `kind="disk"` (diskcache) or any other `KVStore` backend.
+
 ## [0.3.0] - 2026-04-28
 
 Adds an opt-in `kvgit.codecs` package for content-addressed chunk dedup of large numpy / pandas values. Storage format bumps to v3, but v2 stores remain readable by v3 code and are only stamped as v3 on the first chunked write — the on-disk layout is unchanged for plain-pickle workloads.

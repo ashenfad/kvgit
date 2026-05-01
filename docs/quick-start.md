@@ -12,11 +12,10 @@ That's it. You have a versioned key-value store backed by in-memory storage. For
 
 ```python
 s = kvgit.store(kind="disk", path="/tmp/mydb")       # SQLite-backed via diskcache
-s = kvgit.store(kind="git", path="/tmp/myrepo")       # real git repo via GitPython
 s = kvgit.store(kind="indexeddb", db_name="myapp")    # browser-persistent via IndexedDB
 ```
 
-`kind="disk"` requires `pip install kvgit[disk]`. `kind="git"` requires `pip install kvgit[git]` and git on PATH. `kind="indexeddb"` is available automatically in Pyodide (browser) environments.
+`kind="disk"` requires `pip install kvgit[disk]`. `kind="indexeddb"` is available automatically in Pyodide (browser) environments.
 
 ---
 
@@ -313,7 +312,7 @@ Cleanup is safe for shared commit histories -- blobs and keyset nodes referenced
 
 ## Custom serialization
 
-The default encoder/decoder is pickle. Switch to JSON for human-readable storage (especially useful with the git backend):
+The default encoder/decoder is pickle. Switch to JSON for human-readable storage:
 
 ```python
 import json

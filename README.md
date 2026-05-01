@@ -8,7 +8,7 @@ Git-style versioning for your data. Commits, branches, and merges -- backed by a
 | **Commits** | Immutable, content-addressable snapshots with rollback |
 | **Branches** | Cheap forks with CAS-based optimistic concurrency |
 | **Three-way merge** | Auto-merges non-overlapping changes; pluggable merge fns for conflicts |
-| **Pluggable backends** | In-memory, disk (diskcache), git (GitPython), IndexedDB (Pyodide/browser), or bring your own `KVStore` |
+| **Pluggable backends** | In-memory, disk (diskcache), IndexedDB (Pyodide/browser), or bring your own `KVStore` |
 | **Chunked codecs** | Optional content-addressed dedup for large numpy arrays and pandas DataFrames -- equal buffers stored once across keys, commits, and branches |
 
 ## Install
@@ -16,7 +16,6 @@ Git-style versioning for your data. Commits, branches, and merges -- backed by a
 ```bash
 pip install kvgit              # in-memory only
 pip install kvgit[disk]        # adds disk backend via diskcache
-pip install kvgit[git]         # adds git backend via GitPython (requires git on PATH)
 pip install kvgit[scientific]  # adds chunked codecs for numpy / pandas
 # IndexedDB backend is available automatically in Pyodide (browser) environments
 ```

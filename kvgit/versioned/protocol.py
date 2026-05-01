@@ -38,8 +38,7 @@ class MergeResult:
 class Versioned(Protocol):
     """Protocol for versioned key-value stores.
 
-    Defines the common interface implemented by ``VersionedKV``
-    (KVStore-backed) and ``VersionedGP`` (GitPython-backed).
+    Defines the common interface implemented by ``VersionedKV``.
     """
 
     last_merge_result: MergeResult | None

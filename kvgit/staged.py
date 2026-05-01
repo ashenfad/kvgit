@@ -126,8 +126,7 @@ class Staged(MutableMapping[str, Any]):
                 "chunked encoder/decoder requires a VersionedKV-backed Staged "
                 f"(got {type(versioned).__name__}). "
                 "Use kvgit.store(kind='memory'/'disk'/'indexeddb') or build a "
-                "VersionedKV directly. The git backend (VersionedGP) does not "
-                "support chunked codecs."
+                "VersionedKV directly."
             )
         self._chunk_reader = (
             _ChunkReader(versioned.store) if self._decoder_chunked else None

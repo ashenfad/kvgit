@@ -36,15 +36,13 @@ dependencies = []
 
 [project.optional-dependencies]
 disk = ["diskcache"]
-git = ["gitpython>=3.1"]
 numpy = ["numpy>=1.24"]
 pandas = ["numpy>=1.24", "pandas>=2.0"]
 scientific = ["numpy>=1.24", "pandas>=2.0"]
-all = ["diskcache", "gitpython>=3.1", "numpy>=1.24", "pandas>=2.0"]
+all = ["diskcache", "numpy>=1.24", "pandas>=2.0"]
 dev = [
     "pytest",
     "diskcache",
-    "gitpython>=3.1",
     "ruff",
     "numpy>=1.24",
     "pandas>=2.0",
@@ -57,7 +55,7 @@ include = ["kvgit*"]
 warn_unused_configs = true
 
 [[tool.mypy.overrides]]
-module = ["diskcache", "git", "git.*", "gitdb"]
+module = ["diskcache"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

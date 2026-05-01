@@ -10,10 +10,3 @@ __all__ = [
     "Versioned",
     "VersionedKV",
 ]
-
-try:
-    from .gp import VersionedGP
-
-    __all__ += ["VersionedGP"]
-except ImportError:
-    pass
