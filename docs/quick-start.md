@@ -15,7 +15,7 @@ s = kvgit.store(kind="disk", path="/tmp/mydb")       # SQLite-backed via diskcac
 s = kvgit.store(kind="indexeddb", db_name="myapp")    # browser-persistent via IndexedDB
 ```
 
-`kind="disk"` requires `pip install kvgit[disk]`. `kind="indexeddb"` is available automatically in Pyodide (browser) environments.
+`kind="disk"` requires `pip install kvgit[disk]`. `kind="indexeddb"` is available in Pyodide (browser) environments but has portability and durability tradeoffs — see [Browser persistence in Pyodide](pyodide.md) for the full picture and the recommended cross-browser alternative.
 
 ---
 
