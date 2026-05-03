@@ -10,15 +10,26 @@ Each probe is best-effort: a failure means "this option isn't viable
 in this Pyodide / browser combo," not a regression. The probes print
 their findings via stdout — run with ``-s`` to see them.
 
-Run alongside the IndexedDB tests:
+Run on Chrome:
 
     KVGIT_PYODIDE_TESTS=1 pytest tests/kv/test_pyodide_fs.py \\
         --runtime chrome --dist-dir ./pyodide -v -s
 
-Implementation note: ``@run_in_pyodide`` ships only the function body
-across the JS bridge — it does NOT capture module-level globals. JS
-snippets are therefore inlined inside each test function rather than
-factored to module-level constants.
+Or on Firefox (these probes don't need JSPI — they target the
+non-JSPI persistence paths, which is the whole point):
+
+    KVGIT_PYODIDE_TESTS=1 pytest tests/kv/test_pyodide_fs.py \\
+        --runtime firefox --dist-dir ./pyodide -v -s
+
+Implementation notes:
+
+* ``@run_in_pyodide`` ships only the function body across the JS
+  bridge — it does NOT capture module-level globals. JS snippets are
+  therefore inlined inside each test function rather than factored to
+  module-level constants.
+* The probes use the plain ``selenium`` fixture, not ``selenium_jspi``.
+  Their entire purpose is to validate paths that don't need JSPI, so
+  enabling JSPI flags would muddy the test signal.
 """
 
 import pytest
@@ -30,7 +41,7 @@ except ImportError:
 
 
 @run_in_pyodide()
-async def test_probe_apis(selenium_jspi):
+async def test_probe_apis(selenium):
     """Inventory which Pyodide / browser FS APIs are present."""
     from pyodide.code import run_js
 
@@ -77,7 +88,7 @@ async def test_probe_apis(selenium_jspi):
 
 
 @run_in_pyodide()
-async def test_probe_idbfs_roundtrip(selenium_jspi):
+async def test_probe_idbfs_roundtrip(selenium):
     """Mount IDBFS, write a file via Python, syncfs to IDB, read it back."""
     from pyodide.code import run_js
 
@@ -139,7 +150,7 @@ async def test_probe_idbfs_roundtrip(selenium_jspi):
 
 
 @run_in_pyodide()
-async def test_probe_opfs_native_mount(selenium_jspi):
+async def test_probe_opfs_native_mount(selenium):
     """Try mounting OPFS via pyodide.mountNativeFS, then write a file.
 
     OPFS is the modern Origin Private File System (distinct from the
@@ -198,7 +209,7 @@ async def test_probe_opfs_native_mount(selenium_jspi):
 
 
 @run_in_pyodide(packages=["micropip", "sqlite3"])
-async def test_probe_diskcache_on_idbfs(selenium_jspi):
+async def test_probe_diskcache_on_idbfs(selenium):
     """Install diskcache, point it at an IDBFS mount, round-trip a value.
 
     The actual reuse hypothesis: if this works, the entire

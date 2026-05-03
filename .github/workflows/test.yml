@@ -40,6 +40,10 @@ jobs:
 
   test-pyodide:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chrome, firefox]
 
     steps:
     - uses: actions/checkout@v4
@@ -50,9 +54,16 @@ jobs:
         python-version: "3.12"
 
     - name: Set up Chrome
+      if: matrix.browser == 'chrome'
       uses: browser-actions/setup-chrome@v1
       with:
         chrome-version: stable
+
+    - name: Set up Firefox
+      if: matrix.browser == 'firefox'
+      uses: browser-actions/setup-firefox@v1
+      with:
+        firefox-version: latest
 
     - name: Install dependencies
       run: |
@@ -72,7 +83,20 @@ jobs:
         python -m build --wheel
         cp dist/kvgit-*.whl pyodide/
 
-    - name: Run IndexedDB tests
+    # The IndexedDB backend depends on JSPI, which only Chromium ships
+    # by default — Firefox has it behind a flag and Safari has no
+    # implementation. Run those tests on Chrome only.
+    - name: Run IndexedDB tests (Chrome only)
+      if: matrix.browser == 'chrome'
       run: |
         KVGIT_PYODIDE_TESTS=1 pytest tests/kv/test_indexeddb.py \
           --runtime chrome --dist-dir ./pyodide -x -v
+
+    # FS persistence probes (IDBFS, OPFS, diskcache reuse) don't need
+    # JSPI — they're the cross-browser path. Run on both browsers to
+    # validate that the "kvgit[disk] over a mounted persistent FS"
+    # recipe works everywhere we claim it does.
+    - name: Run Pyodide FS probes
+      run: |
+        KVGIT_PYODIDE_TESTS=1 pytest tests/kv/test_pyodide_fs.py \
+          --runtime ${{ matrix.browser }} --dist-dir ./pyodide -v
