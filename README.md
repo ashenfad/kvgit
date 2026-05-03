@@ -77,3 +77,4 @@ See [`docs/`](docs/) for detailed documentation:
 
 - [Quick Start](docs/quick-start.md) -- common patterns with runnable examples
 - [API Reference](docs/api.md) -- full reference for all classes, methods, and types
+- [Browser persistence (Pyodide)](docs/pyodide.md) -- choosing between the IndexedDB and OPFS-mounted-disk backends, plus the syncfs flush requirement and recommended host-side patterns
