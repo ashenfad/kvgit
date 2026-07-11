@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`delete_branch` no longer leaves the branch recoverable.** Deleting a branch removed `__branch_head__<name>` but left the `__branch_head_prev__<name>` recovery backup behind — so creating a branch with the same name later would silently "recover" the deleted branch's state through `_resolve_head`'s corrupt-HEAD fallback (deleted data rising from the grave, nondeterministically: it depended on where prev-HEAD pointed). The backup key is now removed with the HEAD, before `clean_orphans`, so commits only it referenced are collectable.
+
 - **`Composite` no longer silently swallows tier failures.** Previously every tier operation was wrapped in a bare `except Exception: pass`, which would mask programming bugs (e.g. an `AttributeError` from a misconfigured tier) the same way it masked legitimate "tier unavailable" errors. The exception handlers now re-raise programming-bug exceptions (`TypeError`, `AttributeError`, `AssertionError`) so they surface, and log the rest at WARNING via the `kvgit.kv.composite` logger so cache degradation is visible. The "fall through to the next tier on operational failure" semantic is preserved.
 
 ## [0.3.0] - 2026-04-28

@@ -447,6 +447,27 @@ class TestBranches:
         v.delete_branch("dev")
         assert "dev" not in Versioned.branches(store)
 
+    def test_deleted_branch_name_reused_starts_empty(self):
+        """Recreating a deleted branch's name must NOT resurrect the
+        old state. delete_branch used to leave the prev-HEAD recovery
+        backup behind, and _resolve_head's fallback would 'recover'
+        the deleted branch from it."""
+        store = Memory()
+        v = Versioned(store)
+        dev = v.create_branch("dev")
+        dev.commit({"secret": b"deleted data"})
+        dev.commit({"more": b"commits move prev-HEAD off genesis"})
+        v.delete_branch("dev")
+
+        from kvgit.versioned.kv import BRANCH_HEAD_PREV, _resolve_head
+
+        assert store.get(BRANCH_HEAD_PREV % "dev") is None
+        assert _resolve_head(store, "dev") is None  # gone, not recoverable
+
+        reborn = Versioned(store, branch="dev")
+        assert reborn.get("secret") is None
+        assert reborn.get("more") is None
+
     def test_delete_current_branch_raises(self):
         v = Versioned()
         with pytest.raises(ValueError, match="Cannot delete the current branch"):
