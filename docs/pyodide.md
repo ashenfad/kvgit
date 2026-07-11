@@ -88,7 +88,15 @@ s.commit()  # writes hit the in-memory mirror; see flush requirement below
 
 ### The flush requirement (this is the important part)
 
-`mountNativeFS` buffers writes in an in-memory mirror of the OPFS directory and only pushes them to OPFS when you explicitly call `await pyodide.FS.syncfs(false)`. Without that call, every kvgit commit lives in RAM and is lost on tab close or reload — the OPFS directory stays empty.
+`mountNativeFS` buffers writes in an in-memory mirror of the OPFS directory and only pushes them to OPFS when you explicitly flush via `pyodide.FS.syncfs(false, callback)`. Without that call, every kvgit commit lives in RAM and is lost on tab close or reload — the OPFS directory stays empty.
+
+One trap: `FS.syncfs` is Emscripten's **callback-style** API — it does not return a Promise, so `await pyodide.FS.syncfs(false)` compiles, runs, and awaits `undefined` while the flush proceeds unobserved (and its errors vanish). Wrap it once:
+
+```javascript
+const syncfs = () => new Promise((resolve, reject) => {
+    pyodide.FS.syncfs(false, (err) => err ? reject(err) : resolve());
+});
+```
 
 This isn't a kvgit limitation: `Staged.commit()` is synchronous, `syncfs` is asynchronous, and there's no way to truly await durability from synchronous Python without JSPI (the very thing this approach exists to avoid). The flush has to live in the JS host, where async actually works.
 
@@ -100,10 +108,10 @@ A robust pattern combines two flush triggers:
 async function runPython(code) {
     try {
         const result = await pyodide.runPythonAsync(code);
-        await pyodide.FS.syncfs(false);
+        await syncfs();
         return result;
     } catch (e) {
-        await pyodide.FS.syncfs(false);  // flush partial commits too
+        await syncfs();  // flush partial commits too
         throw e;
     }
 }
@@ -116,7 +124,7 @@ async function runPython(code) {
 //    long agent runs, not just between them.
 setInterval(async () => {
     try {
-        await pyodide.FS.syncfs(false);
+        await syncfs();
     } catch (e) {
         console.error("[worker] syncfs failed:", e);
     }
