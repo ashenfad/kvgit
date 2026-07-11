@@ -681,6 +681,11 @@ class VersionedKV(VersionedBase):
         if self.store.get(branch_key) is None:
             raise ValueError(f"Branch '{name}' does not exist")
         self.store.remove(branch_key)
+        # The prev-HEAD recovery backup goes too: left behind, a
+        # same-named branch created later would "recover" the deleted
+        # state through _resolve_head's fallback. Removed before
+        # clean_orphans so commits only it referenced are collectable.
+        self.store.remove(BRANCH_HEAD_PREV % name)
         self.clean_orphans()
 
     def switch_branch(self, name: str) -> None:
