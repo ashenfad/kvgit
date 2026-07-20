@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] - 2026-07-20
+
+### Added
+
+- **`kvgit.delete_branches(names, *, kind="disk", path=None, db_name="kvgit")`** — module-level admin teardown that deletes branches with no branch anchor. `VersionedKV.delete_branch` refuses to delete the branch its handle is anchored on, and a handle always carries a current branch — so when the doomed branch is the store's only branch there is nothing safe to anchor on. The new function opens the raw `KVStore` backend (no `VersionedKV`, hence no current branch), removes each name's `__branch_head__` and `__branch_head_prev__` recovery backup, then runs a single orphan sweep. Missing names are no-ops (idempotent teardown), deleting every branch is legal (a fresh empty `main` mints on next open), and the disk backend handle is released via `finally`.
+- **`Disk.close()`** — closes the underlying diskcache connection, so admin teardown can release the directory handle for the next opener.
+
+### Changed
+
+- **`clean_orphans` is now also a module-level function** — `kvgit.versioned.kv.clean_orphans(store, min_age=3600)` holds the mark-and-sweep implementation; `VersionedKV.clean_orphans` delegates to it. Lets the anchor-free admin path share one implementation. Instance behavior (default `min_age`, return value, `kvgit.orphans` logging) is unchanged.
+
 ## [0.3.1] - 2026-07-11
 
 ### Removed

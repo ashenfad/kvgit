@@ -35,6 +35,33 @@ kvgit.store(
 
 ---
 
+## `kvgit.delete_branches()`
+
+Admin teardown: delete one or more branches directly on the backend, with no branch anchor, then sweep orphaned commits.
+
+```python
+kvgit.delete_branches(
+    names,               # iterable of branch names to delete
+    *,
+    kind="disk",         # "memory", "disk", or "indexeddb"
+    path=None,           # required for "disk"
+    db_name="kvgit",     # IndexedDB database name (only for "indexeddb")
+)
+```
+
+`Staged.delete_branch` / `VersionedKV.delete_branch` refuse to delete the branch the handle is anchored on, and a handle always has a current branch — so when the doomed branch is the store's only branch, there is nothing safe to anchor on. `delete_branches` opens the raw backend (no `VersionedKV`, hence no current branch) and edits the branch keys itself, so any branch — including the last one — can be removed.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `names` | `Iterable[str]` | — | Branch names to delete. Missing names are no-ops (idempotent teardown). |
+| `kind` | `Literal["memory", "disk", "indexeddb"]` | `"disk"` | Backend type |
+| `path` | `str \| None` | `None` | Required for `"disk"` |
+| `db_name` | `str` | `"kvgit"` | IndexedDB database name. Only used with `"indexeddb"`. |
+
+Each name's `__branch_head__` and its `__branch_head_prev__` recovery backup are removed (the backup too, so a later same-named branch can't resurrect the deleted state), then a single [`clean_orphans`](#orphan-cleanup) sweep — keeping its default `min_age` guard — reclaims commits only the deleted branches referenced. Deleting every branch is legal; the store mints a fresh empty `main` on next open.
+
+---
+
 ## Staged
 
 `Staged` wraps a `Versioned` implementation and provides a `MutableMapping[str, Any]` interface with buffered writes. Individual `set()` / `__setitem__()` calls are held in memory; `commit()` encodes and flushes them atomically.
