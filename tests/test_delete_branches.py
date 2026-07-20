@@ -113,6 +113,54 @@ class TestDeleteBranches:
         this is a no-op — but it must not raise."""
         kvgit.delete_branches(["anything"], kind="memory")
 
+    def test_bare_string_is_one_name(self):
+        """A bare string is treated as ONE branch name — iterated, it
+        would 'delete' each character as a branch and silently no-op
+        the real request."""
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "store")
+            s = store(kind="disk", path=p)
+            s["base"] = "ok"
+            s.commit()
+            s.create_branch("dev")["d"] = "1"
+            s.versioned.store.close()
+
+            kvgit.delete_branches("dev", kind="disk", path=p)
+
+            s2 = store(kind="disk", path=p)
+            assert s2.list_branches() == ["main"]
+            assert s2.get("base") == "ok"
+
+    def test_empty_names_early_return(self):
+        """An empty iterable returns before the backend opens — no
+        store directory is created as a side effect."""
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "store")
+            kvgit.delete_branches([], kind="disk", path=p)
+            assert not os.path.exists(p)
+
+    def test_min_age_zero_reclaims_immediately(self):
+        """min_age=0 lets an admin who knows the store is quiet reclaim
+        a just-committed branch's blobs in the same call, instead of
+        waiting out the one-hour concurrent-writer guard."""
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "store")
+            s = store(kind="disk", path=p)
+            s["base"] = "ok"
+            s.commit()
+            dev = s.create_branch("dev")
+            dev["secret"] = "unique-blob-value"
+            dev.commit()
+            backend = s.versioned.store
+            assert {k for k in _blob_keys(backend) if k.endswith(":secret")}
+            backend.close()
+
+            kvgit.delete_branches("dev", kind="disk", path=p, min_age=0)
+
+            s2 = store(kind="disk", path=p)
+            after = {k for k in _blob_keys(s2.versioned.store) if k.endswith(":secret")}
+            assert not after  # reclaimed without waiting out the guard
+
     def test_reopen_after_delete_not_locked(self):
         """The disk handle is released (finally-close), so the next
         opener on the same directory is not blocked."""
