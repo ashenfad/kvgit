@@ -41,11 +41,12 @@ Admin teardown: delete one or more branches directly on the backend, with no bra
 
 ```python
 kvgit.delete_branches(
-    names,               # iterable of branch names to delete
+    names,               # one branch name, or an iterable of them
     *,
     kind="disk",         # "memory", "disk", or "indexeddb"
     path=None,           # required for "disk"
     db_name="kvgit",     # IndexedDB database name (only for "indexeddb")
+    min_age=3600,        # sweep guard: commits younger than this survive
 )
 ```
 
@@ -53,12 +54,13 @@ kvgit.delete_branches(
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `names` | `Iterable[str]` | — | Branch names to delete. Missing names are no-ops (idempotent teardown). |
+| `names` | `str \| Iterable[str]` | — | Branch names to delete. Missing names are no-ops (idempotent teardown). A bare string is one name, not iterated per character. |
 | `kind` | `Literal["memory", "disk", "indexeddb"]` | `"disk"` | Backend type |
 | `path` | `str \| None` | `None` | Required for `"disk"` |
 | `db_name` | `str` | `"kvgit"` | IndexedDB database name. Only used with `"indexeddb"`. |
+| `min_age` | `float` | `3600` | Passed to the orphan sweep — commits younger than this many seconds survive. `0` reclaims immediately (only when no concurrent writers). |
 
-Each name's `__branch_head__` and its `__branch_head_prev__` recovery backup are removed (the backup too, so a later same-named branch can't resurrect the deleted state), then a single [`clean_orphans`](#orphan-cleanup) sweep — keeping its default `min_age` guard — reclaims commits only the deleted branches referenced. Deleting every branch is legal; the store mints a fresh empty `main` on next open.
+Each name's `__branch_head__` and its `__branch_head_prev__` recovery backup are removed (the backup too, so a later same-named branch can't resurrect the deleted state), then a single [`clean_orphans`](#orphan-cleanup) sweep — at `min_age` (default: the one-hour concurrent-writer guard) — reclaims commits only the deleted branches referenced. Deleting every branch is legal; the store mints a fresh empty `main` on next open.
 
 ---
 

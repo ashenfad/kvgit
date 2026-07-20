@@ -89,11 +89,12 @@ def store(
 
 
 def delete_branches(
-    names: Iterable[str],
+    names: str | Iterable[str],
     *,
     kind: Literal["memory", "disk", "indexeddb"] = "disk",
     path: str | None = None,
     db_name: str = "kvgit",
+    min_age: float = 3600,
 ) -> None:
     """Delete branches with no branch anchor, then sweep orphans.
 
@@ -116,23 +117,35 @@ def delete_branches(
     One :func:`clean_orphans` sweep runs after all removals, so commits
     that only the deleted branches referenced are reclaimed. All heads
     (and prev-heads) are gone before the sweep, so it can't mistake a
-    doomed branch for a live one. The sweep keeps ``clean_orphans``'s
-    default ``min_age`` guard (matching ``delete_branch``), so an
-    in-flight commit from a concurrent writer on another branch is not
-    swept out from under it.
+    doomed branch for a live one. ``min_age`` defaults to
+    ``clean_orphans``'s one-hour guard (matching ``delete_branch``), so
+    an in-flight commit from a concurrent writer on another branch is
+    not swept out from under it; an admin who knows the store is quiet
+    can pass ``0`` to reclaim young commits immediately.
 
     Args:
-        names: Branch names to delete. Missing names are no-ops.
+        names: Branch names to delete — one name or an iterable of
+            them. Missing names are no-ops. (A bare string is treated
+            as ONE name, not iterated per character.)
         kind: ``"disk"`` (default), ``"memory"``, or ``"indexeddb"``.
         path: Required when ``kind="disk"``. Store directory.
         db_name: IndexedDB database name (``kind="indexeddb"`` only).
+        min_age: Passed to :func:`clean_orphans` — commits younger than
+            this many seconds survive the sweep.
     """
+    # A bare string is a plausible one-branch call, and iterating it
+    # would "delete" each character as a branch name — a silent no-op
+    # at best. Treat it as a single name, like nontainer's
+    # delete_workspace does one layer up.
+    doomed = {names} if isinstance(names, str) else set(names)
+    if not doomed:
+        return  # nothing asked: skip the backend open and the sweep
     backend = _make_backend(kind, path=path, db_name=db_name)
     try:
-        for name in names:
+        for name in doomed:
             backend.remove(BRANCH_HEAD % name)
             backend.remove(BRANCH_HEAD_PREV % name)
-        clean_orphans(backend)
+        clean_orphans(backend, min_age=min_age)
     finally:
         close = getattr(backend, "close", None)
         if callable(close):
