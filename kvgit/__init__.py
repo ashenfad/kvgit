@@ -5,7 +5,7 @@ from .errors import ConcurrencyError, MergeConflict
 from .namespaced import Namespaced
 from .versioned.protocol import MergeResult, Versioned
 from .staged import Staged
-from .store import store
+from .store import delete_branches, store
 from .versioned.kv import VersionedKV
 
 __all__ = [
@@ -18,6 +18,7 @@ __all__ = [
     "Versioned",
     "VersionedKV",
     "counter",
+    "delete_branches",
     "last_writer_wins",
     "store",
 ]

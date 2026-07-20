@@ -47,6 +47,7 @@ from ..hamt import EMPTY_HASH
 from ..kv.base import KVStore
 from ..kv.memory import Memory
 from .base import VersionedBase
+from .helpers import walk_history
 from .keyset import Keyset, KeysetEntry, MetaEntry
 from .merge import MergeResolution
 
@@ -263,6 +264,167 @@ def _scan_for_best_commit(store: KVStore, branch: str) -> str | None:
         tips = candidates
 
     return max(tips, key=lambda h: all_commits.get(h, 0))
+
+
+def clean_orphans(store: KVStore, min_age: float = 3600) -> int:
+    """Remove orphaned commits unreachable from any branch HEAD.
+
+    Traces all reachable commits from live branch HEADs, then deletes
+    commit metadata, blobs, and HAMT nodes that are not reachable from
+    any reachable commit.
+
+    Handle-independent by design: it marks from ALL live branch HEADs
+    and touches nothing but ``store``, so it works with or without a
+    ``VersionedKV`` anchored on it. :meth:`VersionedKV.clean_orphans`
+    and the anchor-free admin path (:func:`kvgit.delete_branches`)
+    share this one implementation.
+
+    The ``min_age`` guard (default 1 hour) prevents recently created
+    commits from being falsely swept during concurrent writes.
+
+    Returns:
+        Number of orphaned commits removed.
+    """
+    gc_logger = logging.getLogger("kvgit.orphans")
+    cutoff_time = time.time() - min_age
+
+    def _parent_loader(commit_hash: str) -> tuple[str, ...]:
+        parent_bytes = store.get(PARENT_COMMIT % commit_hash)
+        if parent_bytes is None:
+            return ()
+        raw = loads(parent_bytes)
+        if raw is None:
+            return ()
+        if isinstance(raw, str):
+            return (raw,)
+        return tuple(raw)
+
+    # Mark phase: walk every branch's history, collecting reachable
+    # commits, blob keys, HAMT node hashes, and chunk references.
+    reachable_commits: set[str] = set()
+    reachable_blobs: set[str] = set()
+    reachable_nodes: set[str] = set()
+    reachable_chunks: set[str] = set()
+
+    def _walk_commit_for_marks(commit_hash: str) -> None:
+        """Walk one commit's keyset, accumulating reachable refs."""
+        root = _load_root(store, commit_hash)
+        if root is None:
+            return
+        # Single batched walk per commit collects HAMT node hashes
+        # and the entries (each carrying blob + optional chunks).
+        # ``skip_nodes`` lets us skip subtrees already seen via
+        # structural sharing — the blobs under those subtrees are
+        # already accounted for.
+        entries, new_nodes = Keyset(store, root=root).walk(skip_nodes=reachable_nodes)
+        for entry in entries.values():
+            reachable_blobs.add(entry.blob)
+            if entry.meta.chunks:
+                reachable_chunks.update(entry.meta.chunks)
+        reachable_nodes.update(new_nodes)
+
+    branch_prefix = BRANCH_HEAD.replace("%s", "")
+    for key in store.keys():
+        if not (isinstance(key, str) and key.startswith(branch_prefix)):
+            continue
+        branch_name = key[len(branch_prefix) :]
+        branch_head = _resolve_head(store, branch_name)
+        if branch_head is None:
+            continue
+        for commit in walk_history(branch_head, _parent_loader, all_parents=True):
+            if commit in reachable_commits:
+                continue
+            reachable_commits.add(commit)
+            _walk_commit_for_marks(commit)
+
+    # Sweep phase: find orphaned commits via __commit_root__ scan.
+    # Also identify "young orphans" — commits inside the min_age
+    # window that aren't branch-reachable. Their chunks must be
+    # protected from sweeping (they may be in-flight from another
+    # writer), even though we won't delete the commits themselves
+    # until they age past the cutoff.
+    orphans: list[str] = []
+    young_orphan_commits: list[str] = []
+    root_prefix = COMMIT_ROOT.replace("%s", "")
+
+    for key in store.keys():
+        if not (isinstance(key, str) and key.startswith(root_prefix)):
+            continue
+        commit_hash = key[len(root_prefix) :]
+        if not commit_hash or commit_hash in reachable_commits:
+            continue
+        time_bytes = store.get(COMMIT_TIME % commit_hash)
+        if time_bytes is None:
+            # No timestamp recorded — be conservative, leave it alone.
+            continue
+        try:
+            ts_val = safe_loads(time_bytes)
+            if not isinstance(ts_val, (int, float)):
+                continue
+            if float(ts_val) < cutoff_time:
+                orphans.append(commit_hash)
+            else:
+                young_orphan_commits.append(commit_hash)
+        except (TypeError, ValueError):
+            continue
+
+    # Protect chunks referenced by young orphan commits — those
+    # may belong to in-flight writers whose CAS has not landed yet.
+    for young in young_orphan_commits:
+        _walk_commit_for_marks(young)
+
+    # Collect everything to delete in one batch so the sweep is atomic
+    # at the store level (defends against partial sweeps under crash).
+    all_removals: list[str] = []
+
+    for orphan_hash in orphans:
+        orphan_root = _load_root(store, orphan_hash)
+        if orphan_root is not None and orphan_root != EMPTY_HASH:
+            try:
+                # Batched walk for the orphan's blob references.
+                orphan_entries = Keyset(store, root=orphan_root).materialize()
+                for entry in orphan_entries.values():
+                    if entry.blob not in reachable_blobs:
+                        all_removals.append(entry.blob)
+                    # Chunks in the orphan are only swept later via
+                    # the chunk-namespace scan below; here we only
+                    # need to ensure we've picked up the blob refs.
+            except Exception:
+                pass
+        all_removals.extend(
+            [
+                COMMIT_ROOT % orphan_hash,
+                PARENT_COMMIT % orphan_hash,
+                COMMIT_TIME % orphan_hash,
+                INFO_KEY % orphan_hash,
+            ]
+        )
+
+    # Orphan HAMT nodes: any keyset node not reachable from a live commit
+    keyset_prefix = Keyset.DEFAULT_PREFIX
+    for key in store.keys():
+        if not (isinstance(key, str) and key.startswith(keyset_prefix)):
+            continue
+        node_hash = key[len(keyset_prefix) :]
+        if node_hash and node_hash not in reachable_nodes:
+            all_removals.append(key)
+
+    # Orphan chunks: any chunk not reachable from a live commit
+    # (or a young orphan, see above) is fair game.
+    for key in store.keys():
+        if not (isinstance(key, str) and key.startswith(CHUNK_PREFIX)):
+            continue
+        chunk_hash = key[len(CHUNK_PREFIX) :]
+        if chunk_hash and chunk_hash not in reachable_chunks:
+            all_removals.append(key)
+
+    if all_removals:
+        store.remove_many(*all_removals)
+
+    if orphans:
+        gc_logger.debug("Cleaned %d orphaned commit(s)", len(orphans))
+
+    return len(orphans)
 
 
 class VersionedKV(VersionedBase):
@@ -755,148 +917,14 @@ class VersionedKV(VersionedBase):
     def clean_orphans(self, min_age: float = 3600) -> int:
         """Remove orphaned commits unreachable from any branch HEAD.
 
-        Traces all reachable commits from live branch HEADs, then
-        deletes commit metadata, blobs, and HAMT nodes that are not
-        reachable from any reachable commit.
-
-        The ``min_age`` guard (default 1 hour) prevents recently
-        created commits from being falsely swept during concurrent
-        writes.
+        Thin instance wrapper over :func:`clean_orphans`, which does the
+        mark-and-sweep against ``self.store``. Kept as a method so
+        existing callers (and ``delete_branch``) read naturally.
 
         Returns:
             Number of orphaned commits removed.
         """
-        gc_logger = logging.getLogger("kvgit.orphans")
-        cutoff_time = time.time() - min_age
-
-        # Mark phase: walk every branch's history, collecting reachable
-        # commits, blob keys, HAMT node hashes, and chunk references.
-        reachable_commits: set[str] = set()
-        reachable_blobs: set[str] = set()
-        reachable_nodes: set[str] = set()
-        reachable_chunks: set[str] = set()
-
-        def _walk_commit_for_marks(commit_hash: str) -> None:
-            """Walk one commit's keyset, accumulating reachable refs."""
-            root = _load_root(self.store, commit_hash)
-            if root is None:
-                return
-            # Single batched walk per commit collects HAMT node hashes
-            # and the entries (each carrying blob + optional chunks).
-            # ``skip_nodes`` lets us skip subtrees already seen via
-            # structural sharing — the blobs under those subtrees are
-            # already accounted for.
-            entries, new_nodes = Keyset(self.store, root=root).walk(
-                skip_nodes=reachable_nodes
-            )
-            for entry in entries.values():
-                reachable_blobs.add(entry.blob)
-                if entry.meta.chunks:
-                    reachable_chunks.update(entry.meta.chunks)
-            reachable_nodes.update(new_nodes)
-
-        branch_prefix = BRANCH_HEAD.replace("%s", "")
-        for key in self.store.keys():
-            if not (isinstance(key, str) and key.startswith(branch_prefix)):
-                continue
-            branch_name = key[len(branch_prefix) :]
-            branch_head = _resolve_head(self.store, branch_name)
-            if branch_head is None:
-                continue
-            for commit in self.history(commit_hash=branch_head, all_parents=True):
-                if commit in reachable_commits:
-                    continue
-                reachable_commits.add(commit)
-                _walk_commit_for_marks(commit)
-
-        # Sweep phase: find orphaned commits via __commit_root__ scan.
-        # Also identify "young orphans" — commits inside the min_age
-        # window that aren't branch-reachable. Their chunks must be
-        # protected from sweeping (they may be in-flight from another
-        # writer), even though we won't delete the commits themselves
-        # until they age past the cutoff.
-        orphans: list[str] = []
-        young_orphan_commits: list[str] = []
-        root_prefix = COMMIT_ROOT.replace("%s", "")
-
-        for key in self.store.keys():
-            if not (isinstance(key, str) and key.startswith(root_prefix)):
-                continue
-            commit_hash = key[len(root_prefix) :]
-            if not commit_hash or commit_hash in reachable_commits:
-                continue
-            time_bytes = self.store.get(COMMIT_TIME % commit_hash)
-            if time_bytes is None:
-                # No timestamp recorded — be conservative, leave it alone.
-                continue
-            try:
-                ts_val = safe_loads(time_bytes)
-                if not isinstance(ts_val, (int, float)):
-                    continue
-                if float(ts_val) < cutoff_time:
-                    orphans.append(commit_hash)
-                else:
-                    young_orphan_commits.append(commit_hash)
-            except (TypeError, ValueError):
-                continue
-
-        # Protect chunks referenced by young orphan commits — those
-        # may belong to in-flight writers whose CAS has not landed yet.
-        for young in young_orphan_commits:
-            _walk_commit_for_marks(young)
-
-        # Collect everything to delete in one batch so the sweep is atomic
-        # at the store level (defends against partial sweeps under crash).
-        all_removals: list[str] = []
-
-        for orphan_hash in orphans:
-            orphan_root = _load_root(self.store, orphan_hash)
-            if orphan_root is not None and orphan_root != EMPTY_HASH:
-                try:
-                    # Batched walk for the orphan's blob references.
-                    orphan_entries = Keyset(self.store, root=orphan_root).materialize()
-                    for entry in orphan_entries.values():
-                        if entry.blob not in reachable_blobs:
-                            all_removals.append(entry.blob)
-                        # Chunks in the orphan are only swept later via
-                        # the chunk-namespace scan below; here we only
-                        # need to ensure we've picked up the blob refs.
-                except Exception:
-                    pass
-            all_removals.extend(
-                [
-                    COMMIT_ROOT % orphan_hash,
-                    PARENT_COMMIT % orphan_hash,
-                    COMMIT_TIME % orphan_hash,
-                    INFO_KEY % orphan_hash,
-                ]
-            )
-
-        # Orphan HAMT nodes: any keyset node not reachable from a live commit
-        keyset_prefix = Keyset.DEFAULT_PREFIX
-        for key in self.store.keys():
-            if not (isinstance(key, str) and key.startswith(keyset_prefix)):
-                continue
-            node_hash = key[len(keyset_prefix) :]
-            if node_hash and node_hash not in reachable_nodes:
-                all_removals.append(key)
-
-        # Orphan chunks: any chunk not reachable from a live commit
-        # (or a young orphan, see above) is fair game.
-        for key in self.store.keys():
-            if not (isinstance(key, str) and key.startswith(CHUNK_PREFIX)):
-                continue
-            chunk_hash = key[len(CHUNK_PREFIX) :]
-            if chunk_hash and chunk_hash not in reachable_chunks:
-                all_removals.append(key)
-
-        if all_removals:
-            self.store.remove_many(*all_removals)
-
-        if orphans:
-            gc_logger.debug("Cleaned %d orphaned commit(s)", len(orphans))
-
-        return len(orphans)
+        return clean_orphans(self.store, min_age)
 
     # -- Internal --
 
