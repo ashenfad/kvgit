@@ -405,7 +405,7 @@ The first chunked write lazily upgrades a store from v2 to v3:
 | `kvgit:chunk:<hash>` | Content-addressed chunk bytes |
 | `MetaEntry.chunks` (per key) | List of chunk hashes referenced by that key's blob |
 
-`clean_orphans` traces `MetaEntry.chunks` from every reachable commit, plus from any commit younger than `min_age` (in-flight writer protection), and sweeps unreferenced entries under `kvgit:chunk:`. Stores that never use chunks stay byte-identical to v2.
+`clean_orphans` traces `MetaEntry.chunks` from every reachable commit, plus from any commit younger than `min_age` (in-flight writer protection). A chunk is reclaimed when the orphan commit that referenced it is deleted and nothing still reachable refers to it; a chunk that no commit references at all needs [`deep_clean`](#orphan-cleanup). Stores that never use chunks stay byte-identical to v2.
 
 ### v2 ↔ v3 compatibility
 
@@ -458,23 +458,35 @@ All methods from the `Versioned` protocol are implemented. Additional:
 |--------------------|-------------|
 | `store` | Direct access to the underlying `KVStore` |
 | `branches(store)` | Static method: list branch names for a store |
-| `clean_orphans(min_age=3600)` | Remove orphaned commits unreachable from any branch HEAD. Returns count of cleaned orphans. Only deletes commits older than `min_age` seconds. Also sweeps unreferenced chunks (v3 stores). |
+| `clean_orphans(min_age=3600)` | Remove orphaned commits unreachable from any branch HEAD, along with the blobs, HAMT nodes, and chunks they uniquely owned. Returns count of cleaned orphans. Only deletes commits older than `min_age` seconds. Safe under concurrent writers. |
+| `deep_clean(min_age=3600)` | `clean_orphans` plus a full scan of the `kvgit:keyset:` and `kvgit:chunk:` namespaces for artifacts no commit references. **Requires a quiescent store** — see below. |
 
 ### Orphan Cleanup
 
-When branches are deleted, the commits they referenced may become unreachable ("orphaned"). `delete_branch()` automatically calls `clean_orphans()` after removing the branch HEAD. The default `min_age=3600` (1 hour) guards against concurrent writes: recently-created commits are left alone so that a commit from another thread can't be mistaken for an orphan mid-sweep. Orphaned commits from deleted branches are cleaned up by subsequent `clean_orphans()` calls once they age past the guard.
+When branches are deleted, the commits they referenced may become unreachable ("orphaned"). `delete_branch()` automatically calls `clean_orphans()` after removing the branch HEAD. The default `min_age=3600` (1 hour) decides which unreachable commits are old enough to delete; orphans from deleted branches are cleaned up by subsequent `clean_orphans()` calls once they age past the guard.
 
-For v3 stores (those using [chunked codecs](#chunked-codecs)), the same sweep also reclaims unreferenced `kvgit:chunk:*` entries. Chunks reachable from any live branch survive; chunks reachable only from young orphan commits (within the `min_age` window) also survive, protecting in-flight writers from premature collection.
+`clean_orphans()` finds everything it deletes by walking the keyset of each orphan commit it is removing. Blobs, HAMT nodes, and chunks that the orphan owned are reclaimed; anything shared with a reachable commit — or with a young orphan inside the `min_age` window, which protects in-flight writers — is left alone. Because candidates come only from orphan keysets and never from a namespace scan, a commit made by another writer *while the sweep is running* can never contribute a deletion candidate.
 
-You can also call `clean_orphans()` manually:
+You can call it manually:
 
 ```python
 v = VersionedKV(store)
 cleaned = v.clean_orphans()            # default: only orphans older than 1 hour
-cleaned = v.clean_orphans(min_age=0)   # immediate (only safe without concurrent writers)
+cleaned = v.clean_orphans(min_age=0)   # delete unreachable commits immediately
 ```
 
 The cleanup is safe for shared commit histories (e.g., forked branches). Blobs referenced by any reachable commit are never deleted.
+
+#### `deep_clean()` — reclaiming commit-less artifacts
+
+The flip side of orphan-scoped collection: a HAMT node or chunk that *no* commit references has no keyset to be found through, so `clean_orphans()` leaves it. These arise from interrupted writes, from crashes between a write and its CAS, and from stores swept by an earlier kvgit. `deep_clean()` does everything `clean_orphans()` does and then scans the whole `kvgit:keyset:` and `kvgit:chunk:` namespaces, deleting anything not reachable from a live branch head or a young orphan.
+
+```python
+v = VersionedKV(store)
+v.deep_clean()   # or kvgit.versioned.kv.deep_clean(store)
+```
+
+**`deep_clean()` is not safe against concurrent writers.** The namespace scan runs after the mark phase, so it sees — and deletes — nodes and chunks written by any commit that landed in between, including one that has since become a live branch HEAD. The result is a HEAD whose keyset cannot be loaded. Run it only on a quiescent store: no other process or thread writing, for the whole call. `min_age` does not help here; it governs commit deletion, not the namespace scan.
 
 ---
 

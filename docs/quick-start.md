@@ -301,12 +301,20 @@ For periodic background cleanup -- or after a batch of deletions -- call it dire
 
 ```python
 s.versioned.clean_orphans()           # default: skip commits younger than 1 hour
-s.versioned.clean_orphans(min_age=0)  # immediate (only safe without concurrent writers)
+s.versioned.clean_orphans(min_age=0)  # sweep unreachable commits immediately
 ```
 
-The default `min_age=3600` guards against concurrent writers: a commit created by another thread while the sweep is running could look like an orphan if you don't give it a chance to settle. Leave the default unless you're certain no one else is committing.
+`clean_orphans()` is safe to run while other writers are committing. Everything it deletes is found by walking the keysets of the orphan commits it is removing, so a commit that lands mid-sweep is never a candidate. The `min_age=3600` default is a separate, softer guard: it decides how long an unreachable commit gets to settle before it counts as an orphan at all.
 
-Cleanup is safe for shared commit histories -- blobs and keyset nodes referenced by any reachable commit are never deleted. See [Orphan Cleanup in the API reference](api.md#orphan-cleanup) for details.
+Cleanup is safe for shared commit histories -- blobs, keyset nodes, and chunks referenced by any reachable commit are never deleted.
+
+The tradeoff of orphan-scoped collection is that a keyset node or chunk that *no* commit references -- left behind by an interrupted write, or by a store swept by an earlier kvgit -- has no orphan to be found through, so `clean_orphans()` leaves it in place. `deep_clean()` also scans those namespaces directly and reclaims them, **but it is not safe against concurrent writers** and must be run on a quiescent store:
+
+```python
+s.versioned.deep_clean()   # no other writers, for the whole call
+```
+
+See [Orphan Cleanup in the API reference](api.md#orphan-cleanup) for details.
 
 ---
 

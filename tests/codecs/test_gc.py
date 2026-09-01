@@ -73,28 +73,31 @@ class TestChunkSweepOnDeleteBranch:
         assert len(chunk_keys(store)) == 1
 
 
-class TestMinAgeGuard:
-    def test_young_orphan_chunks_protected(self):
-        """Chunks from commits inside the min_age window are protected."""
+class TestCommitlessChunks:
+    def test_commitless_chunk_needs_a_deep_clean(self):
+        """A chunk no commit references is only reclaimed by deep_clean.
+
+        ``clean_orphans`` reaches chunks by walking the keysets of the
+        commits it is deleting. A chunk that belongs to no commit at
+        all — an interrupted write, a store swept by an older kvgit —
+        has no keyset to be found through, so the safe sweep leaves it
+        and the deep sweep takes it.
+        """
         s, store = make_staged()
         s["x"] = np.arange(2048, dtype="float64")
         s.commit()
 
-        # Create an orphan chunk by writing one directly under the
-        # chunk namespace as if some in-flight writer staged it.
+        # A chunk written directly under the chunk namespace, as an
+        # in-flight writer would have staged it.
         rogue_hash = "deadbeef" * 5  # 40 chars
         store.set(CHUNK_PREFIX + rogue_hash, b"unreferenced bytes")
 
-        # min_age large enough to protect: any orphan commits / chunks
-        # younger than 1 hour stay. Our rogue chunk has no commit
-        # association, so it would be a candidate for sweep — but the
-        # test is that referenced chunks are NOT swept. We verify the
-        # rogue chunk goes away with min_age=0 to confirm GC reaches
-        # the chunk namespace, then re-add and check it stays with the
-        # default guard.
         s.versioned.clean_orphans(min_age=0)
+        assert (CHUNK_PREFIX + rogue_hash) in store.keys()
+
+        s.versioned.deep_clean(min_age=0)
         assert (CHUNK_PREFIX + rogue_hash) not in store.keys()
-        # Real referenced chunk still there.
+        # The referenced chunk survives both sweeps.
         assert len(chunk_keys(store)) == 1
 
 
