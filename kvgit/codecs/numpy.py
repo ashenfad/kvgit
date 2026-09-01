@@ -33,7 +33,7 @@ storing each unique buffer once instead of N times.)
 
 from __future__ import annotations
 
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import numpy as np
@@ -66,7 +66,7 @@ def _descr_to_dtype(descr):
     return npf.descr_to_dtype(descr)
 
 
-def _root_and_offset(arr: "np.ndarray") -> tuple["np.ndarray", int]:
+def _root_and_offset(arr: np.ndarray) -> tuple[np.ndarray, int]:
     """Walk ``.base`` to the root buffer; return (root, byte_offset).
 
     Returns ``(arr, 0)`` if the .base chain leads somewhere we can't

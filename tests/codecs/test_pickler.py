@@ -2,16 +2,14 @@
 
 from __future__ import annotations
 
+import pickle
 from typing import Any
 
-import pickle
-
 import pytest
+from conftest import DictSink, reader_for
 
 from kvgit.codecs import compose
 from kvgit.codecs.base import ChunkSink
-
-from conftest import DictSink, reader_for
 
 
 class TaggedThing:
@@ -103,7 +101,7 @@ class TestPicklerBasics:
 
     def test_dedup_by_content(self):
         """Two distinct objects with identical bytes share one chunk."""
-        encoder, decoder = compose(FakeCodec())
+        encoder, _decoder = compose(FakeCodec())
         sink = DictSink()
         # Two FakeBigBlob instances with identical payload.
         a = FakeBigBlob(b"identical")
@@ -175,7 +173,7 @@ class TestComposeOrdering:
             def materialize(self, token, reader):
                 return FakeBigBlob(reader.get(token["ref"]))
 
-        encoder, decoder = compose(CodecA(), CodecB())
+        encoder, _decoder = compose(CodecA(), CodecB())
         sink = DictSink()
         encoder(FakeBigBlob(b"data"), sink)
         assert events == ["a"]

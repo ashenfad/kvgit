@@ -13,11 +13,11 @@ import pytest
 np = pytest.importorskip("numpy")
 pd = pytest.importorskip("pandas")
 
+from conftest import DictSink, reader_for
+
 from kvgit.codecs import compose
 from kvgit.codecs.numpy import NumpyCodec
 from kvgit.codecs.pandas import PandasCodec  # alias-of-NumpyCodec
-
-from conftest import DictSink, reader_for
 
 
 @pytest.fixture
@@ -65,7 +65,7 @@ class TestDataFrame:
         df = pd.DataFrame(
             {
                 "x": np.arange(1024, dtype="float64"),
-                "label": ["row_%d" % i for i in range(1024)],
+                "label": [f"row_{i}" for i in range(1024)],
             }
         )
         sink = DictSink()

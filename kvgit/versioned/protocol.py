@@ -1,8 +1,8 @@
 """Versioned protocol and types."""
 
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import Callable, Iterable, Protocol, runtime_checkable
-
+from typing import Protocol, runtime_checkable
 
 BytesMergeFn = Callable[[bytes | None, bytes | None, bytes | None], bytes]
 """Merge function: (old_value, our_value, their_value) -> merged_value.

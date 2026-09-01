@@ -1,6 +1,7 @@
 """Merge functions for typed values."""
 
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 MergeFn = Callable[[Any | None, Any, Any], Any]
 """Merge function: (old_value | None, our_value, their_value) -> merged_value.

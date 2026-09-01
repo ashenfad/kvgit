@@ -43,7 +43,11 @@ all = ["diskcache", "numpy>=1.24", "pandas>=2.0"]
 dev = [
     "pytest",
     "diskcache",
-    "ruff",
+    # Pinned to the minor line the [tool.ruff.lint] config below was
+    # written against. Ruff's rule *defaults* move between minors, so a
+    # floating pin makes "lint passes" mean something different on each
+    # upgrade.
+    "ruff>=0.16,<0.17",
     "numpy>=1.24",
     "pandas>=2.0",
 ]
@@ -61,9 +65,78 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
+[tool.ruff.lint]
+# Every rule this project enforces is named here. Ruff's *default*
+# selection is not stable across releases — 0.15 defaulted to
+# `E4,E7,E9,F`, 0.16 replaced that with a far wider recommended set — so
+# relying on the default let "lint passes" change meaning on an upgrade
+# with no code change at all. Naming the linters means a ruff bump can
+# only add rules inside families we opted into, and the `ruff` pin in
+# the `dev` extra keeps even that from arriving unannounced.
+select = [
+    "E4",      # pycodestyle: import placement
+    "E7",      # pycodestyle: statement and comparison errors
+    "E9",      # pycodestyle: syntax and IO errors
+    "W",       # pycodestyle warnings
+    "F",       # pyflakes
+    "I",       # isort
+    "UP",      # pyupgrade
+    "B",       # flake8-bugbear
+    "C4",      # flake8-comprehensions
+    "PIE",     # flake8-pie
+    "SIM",     # flake8-simplify
+    "ASYNC",   # flake8-async
+    "BLE",     # flake8-blind-except
+    "RUF",     # ruff-specific rules
+]
+# E501 is deliberately absent: `ruff format` owns line width, and the
+# two disagree on long strings and comments.
+#
+# PERF is absent for the same reason SIM118 is ignored below: it assumes
+# a dict. Three of its four PERF102 hits sit inside the *definitions* of
+# `Hamt.keys`, `Hamt.values` and `Keyset.values`, where "use the keys()
+# method" is infinite recursion rather than a speedup; the fourth is a
+# KVStore. PERF203/401/403 are style calls we don't want enforced.
+
+ignore = [
+    # SIM118 reads any `x.keys()` as a dict and rewrites `k in x.keys()`
+    # to `k in x`. Every one of the ~37 hits here is `.keys()` on a
+    # KVStore or a Versioned — this project's own protocol, which
+    # deliberately does not implement `__iter__`: `iter(Memory())`,
+    # `iter(Disk(...))` and `iter(VersionedKV(...))` all raise
+    # TypeError. The suggested rewrite is a runtime error at every
+    # site, so the rule is switched off rather than papered over with
+    # three dozen individual noqas.
+    "SIM118",
+    # SIM105 wants `contextlib.suppress` instead of try/except/pass.
+    # Both sites are per-key paths in the store layer (Disk.remove,
+    # Namespaced.get_many), where building a context manager per key
+    # costs more than the bare handler it would replace.
+    "SIM105",
+    # RUF001/2/3 flag en dashes, em dashes and curly quotes as
+    # "ambiguous unicode". The prose in this repo uses them on purpose.
+    "RUF001",
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.isort]
+# Keep `from x import a, b as c` on one statement rather than exploding
+# an aliased name into its own import block.
+combine-as-imports = true
+
 [tool.ruff.lint.per-file-ignores]
 # Codec tests gate themselves with `pytest.importorskip(...)` before
 # importing optional deps (numpy, pandas) and the matching codec modules,
 # which forces module-level imports to follow the skip call. E402 is the
 # wrong rule here — the pattern is the official pytest idiom.
 "tests/codecs/*.py" = ["E402"]
+# The Pyodide FS probes exist to prove that ordinary blocking Python
+# file I/O — exactly what diskcache issues — works over an IDBFS/OPFS
+# mount. ASYNC230 objects to `open()` inside an async def, but the
+# blocking call *is* the thing under test.
+"tests/kv/test_pyodide_fs.py" = ["ASYNC230"]
+# Crash-injection stress harness: it kills workers mid-write and then
+# pokes at whatever survived. Catching Exception at every probe is the
+# design, not an oversight.
+"tests/stress_kill.py" = ["BLE001"]

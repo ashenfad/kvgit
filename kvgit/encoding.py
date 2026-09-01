@@ -28,5 +28,6 @@ def safe_loads(raw: bytes):
     """
     try:
         return json.loads(raw)
-    except Exception:
+    except Exception:  # noqa: BLE001 — the point of the function: any
+        # decode failure (garbage, partial write, version skew) is a miss.
         return None

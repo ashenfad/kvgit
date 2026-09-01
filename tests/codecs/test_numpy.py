@@ -8,18 +8,18 @@ np = pytest.importorskip("numpy")
 
 from dataclasses import dataclass
 
+from conftest import DictSink, reader_for
+
 from kvgit.codecs import compose
 from kvgit.codecs.numpy import NumpyCodec
-
-from conftest import DictSink, reader_for
 
 
 @dataclass
 class _Bundle:
     """Module-scope so pickle can resolve it during round-trip tests."""
 
-    features: "np.ndarray"
-    labels: "np.ndarray"
+    features: np.ndarray
+    labels: np.ndarray
 
 
 @pytest.fixture

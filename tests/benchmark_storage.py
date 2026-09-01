@@ -30,10 +30,10 @@ import time
 # Make `kvgit` importable from the repo root
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from kvgit.kv.disk import Disk  # noqa: E402
-from kvgit.kv.memory import Memory  # noqa: E402
-from kvgit.versioned.keyset import Keyset  # noqa: E402
-from kvgit.versioned.kv import VersionedKV, _load_root  # noqa: E402
+from kvgit.kv.disk import Disk
+from kvgit.kv.memory import Memory
+from kvgit.versioned.keyset import Keyset
+from kvgit.versioned.kv import VersionedKV, _load_root
 
 
 class _LatencyMemory(Memory):

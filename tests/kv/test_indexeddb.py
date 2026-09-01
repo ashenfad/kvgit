@@ -299,7 +299,7 @@ async def test_type_error_on_non_bytes(selenium_jspi):
     store = IndexedDB(db_name="test_type_error")
     try:
         store.set("k", "not bytes")
-        assert False, "should have raised"
+        raise AssertionError("should have raised")
     except TypeError:
         pass
 

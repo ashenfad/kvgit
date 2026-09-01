@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`clean_orphans` no longer reclaims chunks, at all.** Routine GC — including the implicit sweep in `delete_branch` and `kvgit.delete_branches` — now leaves every chunk in place, even ones a deleted orphan uniquely owned. Commits, blobs and HAMT nodes are collected exactly as before. This matters if you use chunked codecs, because chunks are where the bytes are: numpy and pandas buffers from deleted branches accumulate on disk until a maintenance pass runs. Stores that never use a chunked codec have no chunks and are unaffected. To reclaim the space, schedule `deep_clean()` during a window when nothing else is writing to the store.
 - **`clean_orphans` no longer collects commit-less nodes.** HAMT nodes that no commit points at — leftovers from an interrupted write, or from a store swept by an earlier kvgit — now survive `clean_orphans` and need the same `deep_clean` pass.
+- **Lint configuration is now explicit** — `[tool.ruff.lint]` names the rules the project enforces instead of inheriting ruff's default selection (which changed shape in 0.16), and `ruff` is pinned to `>=0.16,<0.17` in the `dev` extra.
 
 ## [0.3.2] - 2026-07-20
 

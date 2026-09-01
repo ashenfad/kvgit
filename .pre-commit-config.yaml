@@ -1,6 +1,10 @@
 repos:
+  # Keep this rev inside the `ruff` range in pyproject's `dev` extra.
+  # It was v0.12.4 while CI ran whatever `pip install ruff` resolved to,
+  # so the hook and CI disagreed about both the rules and the isort
+  # classification of `micropip`/`pyodide`.
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.12.4
+    rev: v0.16.5
     hooks:
       - id: ruff
         args: [--fix]

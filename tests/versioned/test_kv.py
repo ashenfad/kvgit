@@ -3,9 +3,9 @@
 import pytest
 
 from kvgit import MergeConflict, MergeResult, VersionedKV as Versioned
+from kvgit.encoding import dumps
 from kvgit.kv.memory import Memory
 from kvgit.versioned.kv import BRANCH_HEAD
-from kvgit.encoding import dumps
 
 
 class TestVersionedBasic:
@@ -1252,8 +1252,8 @@ class TestHeadRecovery:
 
     def test_reset_to_saves_prev_head(self):
         """reset_to() preserves prev HEAD for recovery."""
-        from kvgit.versioned.kv import BRANCH_HEAD_PREV
         from kvgit.encoding import loads
+        from kvgit.versioned.kv import BRANCH_HEAD_PREV
 
         store = Memory()
         v = Versioned(store)
