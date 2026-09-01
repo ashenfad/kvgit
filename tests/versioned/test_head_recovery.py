@@ -1,8 +1,24 @@
 """HEAD backup, recovery, and repair semantics.
 
+Three contracts live here.
+
+**prev-HEAD names a real, immediately-prior HEAD.**
+``__branch_head_prev__<branch>`` is the input to ``_resolve_head``'s
+recovery fallback, so what it names decides what a damaged branch
+recovers *to*. It must only ever name a value the
+``__branch_head__<branch>`` key actually held, and specifically the one
+it held immediately before its current value. Naming an older real HEAD
+silently drops commits; naming a commit that was never HEAD hands the
+branch a lineage it never had — the resurrection class that
+``delete_branch`` leaving its prev-HEAD behind produced in v0.3.1.
+
 **Reading never writes.** Recovery on a read path is in-memory only.
 Persisting it is either an explicit ``repair_head`` call or a side
 effect of a write that has to move HEAD anyway.
+
+**A lost CAS leaves its writes alone.** Its commit is garbage, but the
+nodes and chunks under it may be shared with the winner, so nothing is
+deleted inline; ordinary GC reclaims it.
 
 Every race here is a seam, not a sleep. ``HookStore`` runs a one-shot
 callback at a chosen point in a chosen store operation, so "the winner
@@ -12,13 +28,23 @@ exactly and repeats identically.
 
 from __future__ import annotations
 
-from kvgit import VersionedKV
-from kvgit.encoding import loads
+import time
+
+import pytest
+
+from kvgit import ConcurrencyError, VersionedKV
+from kvgit.encoding import dumps, loads
 from kvgit.kv.memory import Memory
+from kvgit.versioned.keyset import Keyset
 from kvgit.versioned.kv import (
     BRANCH_HEAD,
     BRANCH_HEAD_PREV,
     COMMIT_ROOT,
+    COMMIT_TIME,
+    PARENT_COMMIT,
+    _load_root,
+    _resolve_head,
+    clean_orphans,
     repair_head,
 )
 
@@ -99,6 +125,155 @@ class HookStore(Memory):
         if won:
             self._record(key, value)
         return won
+
+
+def age_commits(store, seconds: float) -> None:
+    """Backdate every ``__commit_time__`` so orphans clear ``min_age``."""
+    now = time.time()
+    prefix = COMMIT_TIME.replace("%s", "")
+    for key in list(store.keys()):
+        if key.startswith(prefix):
+            store.set(key, dumps(now - seconds))
+
+
+def node_hashes(store, commit_hash: str) -> set[str]:
+    """Every HAMT node hash reachable from a commit's keyset root."""
+    root = _load_root(store, commit_hash)
+    if root is None:
+        return set()
+    _, nodes = Keyset(store, root=root).walk()
+    return set(nodes)
+
+
+class TestPrevHeadInvariant:
+    """``__branch_head_prev__`` must name a real, immediately-prior HEAD."""
+
+    def test_prev_head_never_names_a_commit_that_was_never_head(self):
+        """A losing CAS must not plant a foreign lineage in prev-HEAD.
+
+        Main's HEAD is damaged and its backup is gone, so head
+        resolution falls through to the commit scan, which picks the
+        newest unclaimed tip — here the surviving tip of a deleted
+        branch. That value is a *recovery candidate*, not a HEAD:
+        nothing has written it to ``__branch_head__main``. Writing it
+        into main's prev-HEAD on the way into a CAS that then fails
+        makes the candidate durable, and every later read short-circuits
+        the scan and 'recovers' main onto a branch it never had.
+        """
+        store = HookStore()
+        v = VersionedKV(store)
+        v.commit({"a": b"1"})
+
+        # A commit that is never main's HEAD: a branch tip that outlives
+        # its branch (young orphans survive the min_age guard).
+        v.create_branch("tmp")
+        tmp = VersionedKV(store, branch="tmp")
+        tmp.commit({"t": b"tmp-only"})
+        tmp_tip = tmp.current_commit
+        v.delete_branch("tmp")
+
+        # The damage the recovery path exists for: unreadable HEAD, and
+        # no backup to fall back on.
+        store.set(BRANCH_HEAD % "main", b"")
+        store.remove(BRANCH_HEAD_PREV % "main")
+
+        try:
+            v.commit({"a": b"2"})
+        except ConcurrencyError:
+            pass
+
+        prev = loads(store.get(BRANCH_HEAD_PREV % "main"))
+        history = store.head_history["main"]
+        assert prev in history, (
+            f"prev-HEAD names {prev}, which was never main's HEAD "
+            f"(history: {history}). It is the deleted branch's tip "
+            f"({tmp_tip}), so recovery would resurrect that branch onto "
+            f"main."
+        )
+        assert prev == history[-2], (
+            f"prev-HEAD is {prev}, not the immediately-previous HEAD "
+            f"{history[-2]} (history: {history})"
+        )
+
+    def test_prev_head_is_not_overwritten_by_a_losing_writer(self):
+        """A loser's stale backup must not clobber the winner's.
+
+        The loser reads HEAD, builds its commit, and only then reaches
+        the CAS. Two commits land in that window. Writing the backup on
+        the way *into* the CAS makes the loser's stale value the last
+        one written, so prev-HEAD ends up two commits behind HEAD
+        instead of one — recovery from here silently drops the winner's
+        first commit as well as its second.
+        """
+        store = HookStore()
+        v = VersionedKV(store)
+        v.commit({"a": b"1"})
+        first = v.current_commit
+
+        loser = VersionedKV(store, commit_hash=first)
+        winner = VersionedKV(store, commit_hash=first)
+
+        def winner_lands_twice() -> None:
+            winner.commit({"w": b"1"})
+            winner.commit({"w": b"2"})
+
+        store.arm_commit_batch(winner_lands_twice)
+
+        with pytest.raises(ConcurrencyError):
+            loser.commit({"a": b"2"})
+
+        history = store.head_history["main"]
+        prev = loads(store.get(BRANCH_HEAD_PREV % "main"))
+        assert prev == history[-2], (
+            f"prev-HEAD is {prev}, the loser's stale value; the "
+            f"immediately-previous HEAD is {history[-2]} "
+            f"(history: {history})"
+        )
+
+    def test_crash_between_cas_and_backup_degrades_to_an_older_head(self):
+        """The crash window costs a commit, never an invented lineage.
+
+        Writing the backup after the CAS opens a window where HEAD has
+        advanced but the backup has not. Recovery from that state lands
+        on the *previous* previous HEAD — one commit further back than
+        ideal, but a commit that really was HEAD, with real ancestry.
+        That is the trade this ordering buys, and the store offers no
+        multi-key atomicity that would avoid the trade.
+        """
+        store = HookStore()
+        v = VersionedKV(store)
+        v.commit({"a": b"1"})
+        first = v.current_commit
+        v.commit({"a": b"2"})
+        second = v.current_commit
+
+        class Died(Exception):
+            """Stands in for the process dying mid-commit."""
+
+        prev_key = BRANCH_HEAD_PREV % "main"
+        real_set = store.set
+
+        def dying_set(key, value):
+            if key == prev_key:
+                raise Died
+            real_set(key, value)
+
+        store.set = dying_set  # type: ignore[method-assign]
+        with pytest.raises(Died):
+            v.commit({"a": b"3"})
+        store.set = real_set  # type: ignore[method-assign]
+
+        third = loads(store.get(BRANCH_HEAD % "main"))
+        assert third not in (first, second), "the CAS should have landed"
+        assert loads(store.get(prev_key)) == first, (
+            "the backup should still hold its pre-crash value"
+        )
+
+        # HEAD is then damaged; recovery lands on a real, older HEAD.
+        store.set(BRANCH_HEAD % "main", b"")
+        recovered = _resolve_head(store, "main")
+        assert recovered == first
+        assert recovered in store.head_history["main"]
 
 
 class TestReadsDoNotWrite:
@@ -191,3 +366,165 @@ class TestReadsDoNotWrite:
         assert history[-1] == result.commit
         assert history[-2] == good, "the heal is itself a recorded HEAD write"
         assert loads(store.get(BRANCH_HEAD_PREV % "main")) == good
+
+
+class TestLostCasGarbage:
+    """A lost CAS leaves its writes for GC, and must not delete them."""
+
+    def test_lost_cas_leaves_collectable_garbage(self):
+        """The loser's commit is garbage the ordinary sweep reclaims.
+
+        Nothing is deleted inline. The loser's HAMT nodes are keyed by
+        content, so the winner may legitimately share them, and blowing
+        them away is the resurrection hazard the scoped sweep exists to
+        avoid. The orphan is collected on the normal path once it ages
+        past ``min_age``; chunks wait for ``deep_clean`` (see
+        ``clean_orphans``).
+        """
+        store = HookStore()
+        v = VersionedKV(store)
+        v.commit({"a": b"1"})
+        first = v.current_commit
+
+        loser = VersionedKV(store, commit_hash=first)
+        winner = VersionedKV(store, commit_hash=first)
+        store.arm_commit_batch(lambda: winner.commit({"a": b"winner"}))
+
+        with pytest.raises(ConcurrencyError):
+            loser.commit({"a": b"loser"})
+
+        # The loser's writes are still there, untouched.
+        live_history = set(winner.history())
+        orphan = next(
+            key[len(ROOT_PREFIX) :]
+            for key in store.keys()
+            if key.startswith(ROOT_PREFIX)
+            and key[len(ROOT_PREFIX) :] not in live_history
+        )
+        orphan_nodes = node_hashes(store, orphan)
+        assert store.get(f"{orphan}:a") == b"loser"
+        assert store.get(PARENT_COMMIT % orphan) is not None
+
+        # The winner is unaffected, and ordinary GC reclaims the orphan.
+        assert VersionedKV(store).get("a") == b"winner"
+        age_commits(store, 10_000)
+        assert clean_orphans(store, min_age=3600) == 1
+        assert store.get(COMMIT_ROOT % orphan) is None
+        assert store.get(f"{orphan}:a") is None
+
+        live = VersionedKV(store)
+        unshared = orphan_nodes - node_hashes(store, live.current_commit)
+        assert unshared, "the orphan should own at least one node of its own"
+        assert not [
+            n for n in unshared if store.get(Keyset.DEFAULT_PREFIX + n) is not None
+        ], "the orphan's own HAMT nodes were not reclaimed"
+        assert live.get("a") == b"winner"
+
+
+class TestAgedOutOrphanResurrection:
+    """A recreated orphan can be swept out from under a live HEAD.
+
+    ``content_hash`` has no nonce, so rolling a branch back and redoing
+    the same change byte-for-byte mints the *same* commit hash. If that
+    happens while a sweep is in flight — after the sweep has read the
+    orphan's ``__commit_time__`` and decided it is old, before it
+    deletes — the sweep deletes commit metadata that is now live.
+
+    Closing that properly needs a lock, which is out of scope here.
+    What is pinned is the fallout: HEAD names a commit whose metadata is
+    gone, and head resolution lands on the immediately-previous HEAD.
+    Both fixes in this module make that outcome *better*. The backup is
+    reliably one commit back rather than an arbitrary older one, and a
+    read no longer makes the loss durable behind the operator's back.
+    """
+
+    def _resurrect_under_a_sweep(self):
+        store = HookStore()
+        v = VersionedKV(store)
+        v.commit({"a": b"1"})
+        first = v.current_commit
+        v.commit({"a": b"2"})
+        second = v.current_commit
+
+        v.reset_to(first)
+        age_commits(store, 10_000)
+
+        # Fire once the sweep has read the orphan's age and believes it
+        # old: the writer then recreates it byte-identically and CASes
+        # HEAD onto it.
+        store.arm_get(COMMIT_TIME % second, lambda: v.commit({"a": b"2"}))
+        cleaned = clean_orphans(store, min_age=3600)
+        return store, first, second, cleaned
+
+    def test_the_hash_collision_is_real(self):
+        """Rollback-then-redo mints the same commit hash."""
+        store = Memory()
+        v = VersionedKV(store)
+        v.commit({"a": b"1"})
+        first = v.current_commit
+        v.commit({"a": b"2"})
+        second = v.current_commit
+
+        v.reset_to(first)
+        v.commit({"a": b"2"})
+        assert v.current_commit == second
+
+        # Differing info breaks it, which is why commits carrying
+        # distinct metadata never collide this way.
+        v.reset_to(first)
+        v.commit({"a": b"2"}, info={"who": "someone else"})
+        assert v.current_commit != second
+
+    def test_ordinary_interleavings_do_not_corrupt(self):
+        """A resurrection that lands before the age check is safe.
+
+        Recreating the commit rewrites ``__commit_time__`` under the
+        same key, so the orphan reads as young and ``min_age`` protects
+        it. Only a writer landing between the age read and the delete
+        gets through.
+        """
+        store = HookStore()
+        v = VersionedKV(store)
+        v.commit({"a": b"1"})
+        first = v.current_commit
+        v.commit({"a": b"2"})
+        second = v.current_commit
+        v.reset_to(first)
+        age_commits(store, 10_000)
+        v.commit({"a": b"2"})  # resurrects before the sweep starts
+
+        assert clean_orphans(store, min_age=3600) == 0
+        assert store.get(COMMIT_ROOT % second) is not None
+        assert VersionedKV(store).get("a") == b"2"
+
+    def test_resurrection_under_a_sweep_degrades_to_a_lost_commit(self):
+        """The narrow window costs the newest commit, not readability."""
+        store, first, second, cleaned = self._resurrect_under_a_sweep()
+
+        assert cleaned == 1
+        assert loads(store.get(BRANCH_HEAD % "main")) == second
+        assert store.get(COMMIT_ROOT % second) is None, (
+            "the sweep should have deleted the resurrected commit"
+        )
+
+        # Head resolution falls back, and lands exactly one commit back.
+        recovered = _resolve_head(store, "main")
+        assert recovered == first
+        assert recovered == store.head_history["main"][-2]
+        assert VersionedKV(store).get("a") == b"1"
+
+    def test_the_fallback_does_not_make_the_loss_durable(self):
+        """Reading the damaged branch leaves the evidence in place."""
+        store, first, second, _ = self._resurrect_under_a_sweep()
+
+        before = dict(store.items())
+        assert VersionedKV(store).get("a") == b"1"
+        assert dict(store.items()) == before
+        assert loads(store.get(BRANCH_HEAD % "main")) == second, (
+            "a read overwrote the damaged HEAD, discarding the only "
+            "record of which commit went missing"
+        )
+
+        # The operator decides when to make it durable.
+        assert repair_head(store, "main") == first
+        assert loads(store.get(BRANCH_HEAD % "main")) == first
