@@ -9,13 +9,13 @@ np = pytest.importorskip("numpy")
 from kvgit import Staged, VersionedKV
 from kvgit.codecs import compose
 from kvgit.codecs.numpy import NumpyCodec
+from kvgit.encoding import safe_loads
 from kvgit.kv.memory import Memory
 from kvgit.versioned.kv import (
     CHUNK_PREFIX,
     STORAGE_VERSION,
     STORAGE_VERSION_KEY,
 )
-from kvgit.encoding import safe_loads
 
 
 @pytest.fixture

@@ -1,8 +1,8 @@
 """Store factory function."""
 
 import pickle
-from collections.abc import Iterable
-from typing import Any, Callable, Literal
+from collections.abc import Callable, Iterable
+from typing import Any, Literal
 
 from .kv.base import KVStore
 from .kv.memory import Memory

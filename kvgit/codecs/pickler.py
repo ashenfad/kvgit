@@ -16,7 +16,8 @@ from __future__ import annotations
 
 import io
 import pickle
-from typing import Any, Iterable
+from collections.abc import Iterable
+from typing import Any
 
 from .base import ChunkReader, ChunkSink, Codec
 

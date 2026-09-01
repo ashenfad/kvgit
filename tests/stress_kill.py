@@ -159,7 +159,7 @@ def run_one_round(store_dir: str, num_branches: int, num_writers: int) -> list[s
     # Create branches for this round
     write_branches = []
     delete_branches = []
-    for i in range(num_branches):
+    for _ in range(num_branches):
         name = f"wb-{random.randint(0, 10000)}"
         if name not in existing:
             try:
@@ -176,7 +176,7 @@ def run_one_round(store_dir: str, num_branches: int, num_writers: int) -> list[s
                 pass
         write_branches.append(name)
 
-    for i in range(num_branches):
+    for _ in range(num_branches):
         name = f"db-{random.randint(0, 10000)}"
         if name not in existing:
             try:

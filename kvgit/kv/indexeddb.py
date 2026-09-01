@@ -47,8 +47,8 @@ the handler is set, causing a deadlock.
 
 from collections.abc import Iterable, Mapping
 
-from pyodide.ffi import create_proxy, run_sync, to_js  # type: ignore[import-not-found]
 from js import Promise, indexedDB, undefined  # type: ignore[import-not-found]
+from pyodide.ffi import create_proxy, run_sync, to_js  # type: ignore[import-not-found]
 
 from .base import KVStore
 
@@ -155,8 +155,9 @@ def _to_bytes(js_value) -> bytes | None:
         return None
     try:
         return js_value.to_py().tobytes()
-    except Exception:
-        # Corrupted or unexpected JS value — treat as missing
+    except Exception:  # noqa: BLE001 — a JS->Python conversion can fail
+        # with anything the FFI decides to raise; there is no narrower
+        # type to name. Corrupted or unexpected JS value — treat as missing.
         return None
 
 

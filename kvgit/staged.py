@@ -2,8 +2,8 @@
 
 import inspect
 import pickle
-from collections.abc import Iterable, Iterator, MutableMapping
-from typing import Any, Callable
+from collections.abc import Callable, Iterable, Iterator, MutableMapping
+from typing import Any
 
 from .codecs._hash import hash_bytes
 from .content_types import MergeFn

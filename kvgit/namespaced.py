@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, MutableMapping
-from typing import Any, Iterable
+from collections.abc import Iterable, Iterator, MutableMapping
+from typing import Any
 
 
 class Namespaced(MutableMapping[str, Any]):

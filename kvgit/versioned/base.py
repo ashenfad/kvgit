@@ -1,7 +1,7 @@
 """Shared commit/merge orchestration for versioned stores."""
 
 from abc import ABC, abstractmethod
-from typing import Iterable
+from collections.abc import Iterable
 
 from ..errors import ConcurrencyError, MergeConflict
 from .helpers import diff_keysets, walk_history

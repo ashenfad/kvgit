@@ -258,7 +258,8 @@ async def test_probe_diskcache_on_idbfs(selenium):
 
     try:
         await micropip.install("diskcache")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — a browser probe: any
+        # micropip failure means "unavailable here", so skip rather than error.
         print(f"  micropip install diskcache: FAILED — {e}")
         pytest.skip(f"diskcache install failed: {e}")
     print("  micropip install diskcache: ok")

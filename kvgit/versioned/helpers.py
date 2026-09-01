@@ -1,7 +1,7 @@
 """Shared diff and history helpers."""
 
 from collections import deque
-from typing import Callable, Iterable
+from collections.abc import Callable, Iterable
 
 from .protocol import DiffResult
 

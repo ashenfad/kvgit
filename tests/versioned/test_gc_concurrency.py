@@ -30,6 +30,7 @@ from kvgit import Staged, VersionedKV
 from kvgit.encoding import dumps
 from kvgit.hamt import EMPTY_HASH
 from kvgit.kv.memory import Memory
+from kvgit.versioned.keyset import Keyset
 from kvgit.versioned.kv import (
     CHUNK_PREFIX,
     COMMIT_ROOT,
@@ -39,7 +40,6 @@ from kvgit.versioned.kv import (
     clean_orphans,
     deep_clean,
 )
-from kvgit.versioned.keyset import Keyset
 
 NODE_PREFIX = Keyset.DEFAULT_PREFIX
 

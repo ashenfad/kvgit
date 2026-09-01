@@ -215,7 +215,9 @@ def _scan_for_best_commit(store: KVStore, branch: str) -> str | None:
                 val = safe_loads(time_bytes)
                 if isinstance(val, (int, float)):
                     ts = float(val)
-            except Exception:
+            except Exception:  # noqa: BLE001 — recovery scan over a store
+                # already known to be damaged; an unreadable timestamp
+                # must degrade to 0.0, never abort the scan.
                 pass
         all_commits[h] = ts
 
@@ -472,9 +474,10 @@ def _sweep(store: KVStore, min_age: float, *, deep: bool) -> int:
                 orphan_entries, orphan_nodes = Keyset(store, root=orphan_root).walk(
                     skip_nodes=reachable_nodes
                 )
-            except Exception:
-                # A damaged orphan must not stall the sweep; drop its
-                # payload and still reclaim its commit metadata.
+            except Exception:  # noqa: BLE001 — deliberate: a damaged
+                # orphan must not stall the sweep; drop its payload and
+                # still reclaim its commit metadata. Narrowing this would
+                # let one corrupt keyset block GC for the whole store.
                 orphan_entries, orphan_nodes = {}, set()
             for entry in orphan_entries.values():
                 if entry.blob not in reachable_blobs:
@@ -899,7 +902,7 @@ class VersionedKV(VersionedBase):
         """Reload state from HEAD."""
         commit_hash = _resolve_head(self.store, self._branch)
         if commit_hash is None:
-            raise ValueError("No HEAD commit found for branch %s" % self._branch)
+            raise ValueError(f"No HEAD commit found for branch {self._branch}")
         self._load_commit(commit_hash, update_base=True)
 
     def checkout(

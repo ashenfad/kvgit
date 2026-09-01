@@ -1,11 +1,10 @@
 """Shared three-way merge resolution."""
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 from ..errors import MergeConflict
 from .protocol import BytesMergeFn, DiffResult
-
 
 BlobReader = Callable[[str], bytes | None]
 """Read a blob by its content identifier (versioned key or hex SHA)."""
@@ -117,7 +116,8 @@ def resolve_merge(
             result_val = fn(old_val, our_val, their_val)
             merged_values[key] = result_val
             auto_merged.append(key)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — `fn` is caller-supplied;
+            # any failure it raises is reported as a merge conflict.
             conflicts.add(key)
             merge_errors[key] = e
 

@@ -12,14 +12,13 @@ from __future__ import annotations
 
 import statistics
 import time
-from typing import Callable
+from collections.abc import Callable
 
 import numpy as np
 import pandas as pd
 
 import kvgit
 from kvgit.versioned.kv import CHUNK_PREFIX
-
 
 # ---------- helpers ----------
 
@@ -63,7 +62,7 @@ def fmt_ms(s: float) -> str:
 # ---------- workload ----------
 
 
-def base_df(rows: int = 1_000_000) -> "pd.DataFrame":
+def base_df(rows: int = 1_000_000) -> pd.DataFrame:
     rng = np.random.default_rng(0)
     return pd.DataFrame(
         {
@@ -74,7 +73,7 @@ def base_df(rows: int = 1_000_000) -> "pd.DataFrame":
     )
 
 
-def workload_slicing_only(df: "pd.DataFrame") -> dict[str, object]:
+def workload_slicing_only(df: pd.DataFrame) -> dict[str, object]:
     """Pure agent-style derivation: every variable is a view of df."""
     n = len(df)
     return {
@@ -86,7 +85,7 @@ def workload_slicing_only(df: "pd.DataFrame") -> dict[str, object]:
     }
 
 
-def workload_column_slicing(df: "pd.DataFrame") -> dict[str, object]:
+def workload_column_slicing(df: pd.DataFrame) -> dict[str, object]:
     """Column subsets. For a single-block float DataFrame, contiguous
     column selections like ``df[['x','y']]`` produce C-contig views of
     the parent block — they dedup just like row slices. Single-column
@@ -100,7 +99,7 @@ def workload_column_slicing(df: "pd.DataFrame") -> dict[str, object]:
     }
 
 
-def workload_mixed(df: "pd.DataFrame") -> dict[str, object]:
+def workload_mixed(df: pd.DataFrame) -> dict[str, object]:
     """Realistic mix: some views, some copies. The boolean filter and
     column-subset copies are independent buffers that don't dedup."""
     n = len(df)
@@ -114,7 +113,7 @@ def workload_mixed(df: "pd.DataFrame") -> dict[str, object]:
     }
 
 
-def workload_duplicates(df: "pd.DataFrame") -> dict[str, object]:
+def workload_duplicates(df: pd.DataFrame) -> dict[str, object]:
     """Pathological: the same DataFrame written N times under different
     keys. Plain pickle pays N× storage; chunked codec dedups to 1×."""
     return {f"copy_{i}": df for i in range(5)}

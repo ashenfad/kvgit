@@ -8,7 +8,6 @@ import pytest
 from kvgit.hamt import EMPTY_HASH, Hamt, HamtDiff
 from kvgit.kv.memory import Memory
 
-
 # ---- helpers ----
 
 
@@ -315,7 +314,7 @@ def test_batch_update_filters_orphan_intermediates():
     superseded intermediate leaves to pending."""
     store = _store()
     h = Hamt(store, bucket_max=8)
-    new_h, pending = h.updated({f"k{i}": b"v" for i in range(5)})
+    _new_h, pending = h.updated({f"k{i}": b"v" for i in range(5)})
 
     # Only the final leaf should be in pending — no orphans from intermediate steps
     assert len(pending) == 1
@@ -545,7 +544,7 @@ def test_large_random_with_deletes():
 def test_chained_updated_calls_accumulate_pending():
     store = _store()
     h0 = Hamt(store, bucket_max=4)
-    h1, pending1 = h0.updated({f"k{i}": b"v" for i in range(3)})
+    h1, _pending1 = h0.updated({f"k{i}": b"v" for i in range(3)})
     h2, pending2 = h1.updated({f"k{i}": b"w" for i in range(3, 6)})
 
     # Nothing in store yet
@@ -587,7 +586,7 @@ def test_flush_clears_pending():
 def test_pending_not_visible_to_separate_hamt_instance():
     store = _store()
     h0 = Hamt(store, bucket_max=4)
-    new_h, pending = h0.updated({"a": b"1"})
+    new_h, _pending = h0.updated({"a": b"1"})
 
     # A fresh Hamt opened on the same store at the new root cannot see
     # the value, because the underlying nodes haven't been flushed.
@@ -864,7 +863,7 @@ def test_walk_skip_nodes_cumulative_across_shared_subtree():
 
     # First walk seeds the seen-set.
     seen: set[str] = set()
-    items1, nodes1 = h1.walk(skip_nodes=seen)
+    _items1, nodes1 = h1.walk(skip_nodes=seen)
     seen |= nodes1
 
     # Second walk: only the path from h2.root down to the changed
