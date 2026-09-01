@@ -123,6 +123,11 @@ def delete_branches(
     not swept out from under it; an admin who knows the store is quiet
     can pass ``0`` to reclaim young commits immediately.
 
+    That sweep does not reclaim chunks — the content-addressed bytes a
+    chunked codec writes — because a chunk key is not the deleted
+    branch's to give away. On a store using chunked codecs, follow up
+    with ``deep_clean`` on a quiescent store to get that space back.
+
     Args:
         names: Branch names to delete — one name or an iterable of
             them. Missing names are no-ops. (A bare string is treated
