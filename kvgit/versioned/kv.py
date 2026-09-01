@@ -146,12 +146,22 @@ def _load_root(store: KVStore, commit_hash: str) -> str | None:
     return val if isinstance(val, str) else None
 
 
-def _resolve_head(store: KVStore, branch: str, *, repair: bool = True) -> str | None:
+def _resolve_head(store: KVStore, branch: str) -> str | None:
     """Resolve a branch HEAD, falling back to prev HEAD or commit scan.
 
-    When *repair* is True (default), a corrupt HEAD is automatically
-    healed by writing the recovered commit hash back to the store.
-    Pass ``repair=False`` for side-effect-free reads (e.g. properties).
+    **Never writes.** Every read path in the library goes through here,
+    so healing the damage in place would make an ordinary ``get`` a
+    mutation — impossible for a read-only consumer, and a race between
+    two readers repairing the same branch to different answers. The
+    recovery is returned to the caller and forgotten; :func:`repair_head`
+    is the explicit call that makes it durable, and the write path heals
+    HEAD itself as part of the CAS that has to move it anyway.
+
+    The cost of not persisting is paid per read on a damaged store: two
+    extra ``get`` calls for the prev-HEAD tier, and a full store scan
+    for the tier below it. That scan already ran per *write* before this
+    change (``latest_head`` never repaired), and a store sitting on a
+    corrupt HEAD has a bigger problem than read latency.
 
     Returns a valid commit hash, or None if unrecoverable.
     """
@@ -176,8 +186,6 @@ def _resolve_head(store: KVStore, branch: str, *, repair: bool = True) -> str | 
             logger.warning(
                 "Branch '%s': HEAD corrupt, recovered from prev HEAD", branch
             )
-            if repair:
-                store.set(BRANCH_HEAD % branch, dumps(commit_hash))
             return commit_hash
 
     # 3. HEAD existed but is corrupt and no prev — scan for best commit
@@ -187,8 +195,6 @@ def _resolve_head(store: KVStore, branch: str, *, repair: bool = True) -> str | 
             logger.warning(
                 "Branch '%s': HEAD corrupt, recovered via commit scan", branch
             )
-            if repair:
-                store.set(BRANCH_HEAD % branch, dumps(commit_hash))
             return commit_hash
 
     return None
@@ -273,6 +279,68 @@ def _scan_for_best_commit(store: KVStore, branch: str) -> str | None:
         tips = candidates
 
     return max(tips, key=lambda h: all_commits.get(h, 0))
+
+
+def _heal_head(store: KVStore, branch: str, recovered: bytes) -> bool:
+    """Atomically replace an unresolvable HEAD with a recovered value.
+
+    Returns True only when HEAD was damaged *and* this call is the one
+    that replaced it. Three cases are deliberately left alone:
+
+    * HEAD resolves fine — it did not break, it *moved*, and another
+      writer won a legitimate race. Overwriting it would destroy a good
+      commit to make a losing CAS succeed.
+    * HEAD already holds ``recovered`` — nothing to do.
+    * HEAD is absent — the branch was deleted. Re-creating the key is
+      exactly the resurrection ``delete_branch`` drops the prev-HEAD
+      backup to prevent.
+
+    The replacement is a CAS against the exact damaged bytes, so two
+    processes healing the same branch cannot both win, and a HEAD that
+    someone else repaired (or advanced) in the meantime is never
+    clobbered.
+    """
+    branch_key = BRANCH_HEAD % branch
+    raw = store.get(branch_key)
+    if raw is None or raw == recovered:
+        return False
+    commit_hash = safe_loads(raw)
+    if (
+        isinstance(commit_hash, str)
+        and store.get(COMMIT_ROOT % commit_hash) is not None
+    ):
+        return False
+    if not store.cas(branch_key, recovered, expected=raw):
+        return False
+    logger.warning("Branch '%s': corrupt HEAD replaced with recovered commit", branch)
+    return True
+
+
+def repair_head(store: KVStore, branch: str = "main") -> str | None:
+    """Persist a recovered HEAD for a damaged branch.
+
+    Read paths recover a corrupt ``__branch_head__`` in memory and leave
+    the store untouched, so the damage stays visible until someone
+    decides what to do about it. This is that decision: resolve the
+    branch the way a read would, and write the answer back.
+
+    Handle-independent, like :func:`clean_orphans` — it takes a raw
+    ``KVStore`` and touches nothing else, so it works with or without a
+    ``VersionedKV`` anchored on the branch.
+
+    Idempotent, and a no-op on a healthy branch. The write is a CAS
+    against the damaged bytes, so it cannot overwrite a HEAD another
+    process fixed, or advanced, in the meantime.
+
+    Returns:
+        The commit HEAD now names, or None if the branch does not exist
+        or nothing recoverable was found.
+    """
+    commit_hash = _resolve_head(store, branch)
+    if commit_hash is None:
+        return None
+    _heal_head(store, branch, dumps(commit_hash))
+    return commit_hash
 
 
 def clean_orphans(store: KVStore, min_age: float = 3600) -> int:
@@ -592,7 +660,7 @@ class VersionedKV(VersionedBase):
     @property
     def latest_head(self) -> str | None:
         """Read HEAD directly from the KV store (reflects other writers)."""
-        return _resolve_head(self.store, self._branch, repair=False)
+        return _resolve_head(self.store, self._branch)
 
     # -- Read operations --
 
@@ -826,11 +894,24 @@ class VersionedKV(VersionedBase):
 
         Saves the current HEAD as prev HEAD before advancing, so a
         corrupt write can be recovered from.
+
+        A CAS that fails against a *damaged* HEAD is retried once
+        through :func:`_heal_head`, which repairs it atomically. That is
+        the only place a corrupt HEAD is written back, now that reads do
+        not — and without it a branch nobody explicitly repaired would
+        be permanently unwritable, since every CAS against corrupt bytes
+        fails.
         """
         branch_key = BRANCH_HEAD % self._branch
         prev_key = BRANCH_HEAD_PREV % self._branch
-        self.store.set(prev_key, dumps(expected))
-        return self.store.cas(branch_key, dumps(new_head), expected=dumps(expected))
+        expected_bytes = dumps(expected)
+        new_bytes = dumps(new_head)
+
+        self.store.set(prev_key, expected_bytes)
+        won = self.store.cas(branch_key, new_bytes, expected=expected_bytes)
+        if not won and _heal_head(self.store, self._branch, expected_bytes):
+            won = self.store.cas(branch_key, new_bytes, expected=expected_bytes)
+        return won
 
     def _load_keyset(self, commit_hash: str) -> dict[str, str]:
         """Load just the keyset for a commit (key -> versioned_key mapping).
@@ -1006,6 +1087,21 @@ class VersionedKV(VersionedBase):
         if info_bytes is None:
             return None
         return loads(info_bytes)
+
+    # -- Recovery --
+
+    def repair_head(self) -> str | None:
+        """Persist a recovered HEAD for this branch.
+
+        Thin instance wrapper over :func:`repair_head`. Reads recover a
+        damaged HEAD without writing it back; this is the explicit call
+        that makes the recovery durable.
+
+        Returns:
+            The commit HEAD now names, or None if nothing was
+            recoverable.
+        """
+        return repair_head(self.store, self._branch)
 
     # -- Orphan cleanup --
 
