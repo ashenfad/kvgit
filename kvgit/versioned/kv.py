@@ -13,6 +13,11 @@ Storage layout (v3):
 - ``kvgit:chunk:<chunk_hash>``         — content-addressed chunk bytes (v3)
 - ``<commit_hash>:<user_key>``         — blob value bytes
 
+``__branch_head_prev__`` is written only after a HEAD swap succeeds, so
+it always names a commit ``__branch_head__`` really held. Recovery reads
+it, so a value that was never HEAD would graft onto the branch a lineage
+it never had.
+
 The keyset (key -> blob_pointer + meta) is stored as a content-addressable
 HAMT, so unchanged subtrees are shared across commits by hash equality. A
 single-key change writes O(log N) new nodes instead of rewriting a full
@@ -175,7 +180,7 @@ def _resolve_head(store: KVStore, branch: str) -> str | None:
         ):
             return commit_hash
 
-    # 2. Try previous HEAD (backup written before each CAS)
+    # 2. Try previous HEAD (backup written after each successful CAS)
     prev_bytes = store.get(BRANCH_HEAD_PREV % branch)
     if prev_bytes is not None:
         commit_hash = safe_loads(prev_bytes)
@@ -892,25 +897,37 @@ class VersionedKV(VersionedBase):
     def _cas_head(self, expected: str, new_head: str) -> bool:
         """Atomically advance branch HEAD via KVStore CAS.
 
-        Saves the current HEAD as prev HEAD before advancing, so a
-        corrupt write can be recovered from.
+        The prev-HEAD backup is written **after** the swap succeeds,
+        never before. Written first, it lands whether or not the CAS
+        does, so a writer that loses the race still leaves its own stale
+        ``expected`` as the branch's recovery target — clobbering the
+        winner's backup, and, when ``expected`` came from the commit
+        scan, naming a commit that was never HEAD at all. Writing it
+        afterwards makes it always a value ``__branch_head__`` really
+        held.
+
+        A crash between the CAS and the backup write leaves the backup
+        one commit further behind than ideal. That degrades to
+        "recovery loses an extra commit", not to "recovery invents a
+        lineage", which is the trade this ordering buys. There is no
+        way to do better with what the store offers: ``KVStore.cas``
+        takes a single key and no backend exposes a transaction
+        spanning two, so HEAD and its backup cannot move in one step.
 
         A CAS that fails against a *damaged* HEAD is retried once
         through :func:`_heal_head`, which repairs it atomically. That is
-        the only place a corrupt HEAD is written back, now that reads do
-        not — and without it a branch nobody explicitly repaired would
-        be permanently unwritable, since every CAS against corrupt bytes
-        fails.
+        the only place a corrupt HEAD is written back, now that reads
+        do not.
         """
         branch_key = BRANCH_HEAD % self._branch
-        prev_key = BRANCH_HEAD_PREV % self._branch
         expected_bytes = dumps(expected)
         new_bytes = dumps(new_head)
 
-        self.store.set(prev_key, expected_bytes)
         won = self.store.cas(branch_key, new_bytes, expected=expected_bytes)
         if not won and _heal_head(self.store, self._branch, expected_bytes):
             won = self.store.cas(branch_key, new_bytes, expected=expected_bytes)
+        if won:
+            self.store.set(BRANCH_HEAD_PREV % self._branch, expected_bytes)
         return won
 
     def _load_keyset(self, commit_hash: str) -> dict[str, str]:
