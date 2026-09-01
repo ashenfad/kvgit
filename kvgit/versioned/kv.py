@@ -240,12 +240,30 @@ def _resolve_head(
     # read — only to guess. Guessing is the caller's call, not ours.
     if recover_from_corrupt_head is not None and head_bytes is not None:
         commit_hash = recover_from_corrupt_head(store, branch)
-        if commit_hash is not None:
+        # Validated exactly as tiers 1 and 2 validate what they read. This
+        # tier used to be an internal scan whose answer came straight off a
+        # ``__commit_root__`` key, so it was trustworthy by construction;
+        # a caller-supplied recoverer is not, and the promise of this
+        # function is a *valid* commit or None. An unchecked answer is
+        # worse than no answer: ``repair_head`` would make it durable,
+        # replacing obviously-corrupt HEAD bytes with a plausible hash
+        # naming nothing — harder to diagnose than the damage it replaced.
+        if (
+            isinstance(commit_hash, str)
+            and store.get(COMMIT_ROOT % commit_hash) is not None
+        ):
             logger.warning(
                 "Branch '%s': HEAD corrupt, recovered via injected recoverer",
                 branch,
             )
             return commit_hash
+        if commit_hash is not None:
+            logger.warning(
+                "Branch '%s': recoverer returned %r, which is not a commit in "
+                "this store; treating the branch as unrecoverable",
+                branch,
+                commit_hash,
+            )
 
     return None
 
