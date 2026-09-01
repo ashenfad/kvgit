@@ -7,7 +7,13 @@ from typing import Any, Literal
 from .kv.base import KVStore
 from .kv.memory import Memory
 from .staged import Staged
-from .versioned.kv import BRANCH_HEAD, BRANCH_HEAD_PREV, VersionedKV, clean_orphans
+from .versioned.kv import (
+    BRANCH_HEAD,
+    BRANCH_HEAD_PREV,
+    CorruptHeadRecoverer,
+    VersionedKV,
+    clean_orphans,
+)
 
 
 def _make_backend(
@@ -46,6 +52,7 @@ def store(
     encoder: Callable[..., bytes] = pickle.dumps,
     decoder: Callable[..., Any] = pickle.loads,
     codecs: str | None = None,
+    recover_from_corrupt_head: CorruptHeadRecoverer | None = None,
 ) -> Staged:
     """Create a Staged store with sensible defaults.
 
@@ -62,6 +69,13 @@ def store(
             ``"scientific"`` — numpy/pandas chunked codecs (requires
             numpy; install with ``pip install kvgit[scientific]``).
             Mutually exclusive with explicit ``encoder`` / ``decoder``.
+        recover_from_corrupt_head: Optional last-resort recovery for a
+            branch whose HEAD is unresolvable *and* whose prev-HEAD
+            backup is gone. Off by default: with both gone the store
+            does not know what the branch pointed at, so the honest
+            answer is to fail rather than guess. Pass
+            ``kvgit.versioned.kv.recover_by_commit_scan`` to opt into
+            the scan, having read what it can return.
 
     Returns:
         A ``Staged`` store instance.
@@ -85,7 +99,15 @@ def store(
 
     backend = _make_backend(kind, path=path, db_name=db_name)
 
-    return Staged(VersionedKV(backend, branch=branch), encoder=encoder, decoder=decoder)
+    return Staged(
+        VersionedKV(
+            backend,
+            branch=branch,
+            recover_from_corrupt_head=recover_from_corrupt_head,
+        ),
+        encoder=encoder,
+        decoder=decoder,
+    )
 
 
 def delete_branches(
