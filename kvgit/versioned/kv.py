@@ -180,8 +180,22 @@ def _resolve_head(store: KVStore, branch: str) -> str | None:
         ):
             return commit_hash
 
-    # 2. Try previous HEAD (backup written after each successful CAS)
-    prev_bytes = store.get(BRANCH_HEAD_PREV % branch)
+    # 2. HEAD is present but unusable — try the backup.
+    #
+    # Gated on HEAD *existing*, the same condition tier 3 below already
+    # applies. An absent HEAD does not mean damage, it means the branch
+    # is gone: ``delete_branch`` removes the key. A backup that outlives
+    # it — a writer descheduled between its CAS and its backup write,
+    # resuming after the delete and recreating only the backup — must
+    # not resurrect the branch through this tier. Recovering from a
+    # lone backup is the v0.3.1 failure class, reached by a new route.
+    #
+    # Nothing legitimate needs the ungated form: ``_cas_head`` writes
+    # the backup only after a successful CAS, so HEAD exists whenever
+    # the backup means anything.
+    prev_bytes = (
+        store.get(BRANCH_HEAD_PREV % branch) if head_bytes is not None else None
+    )
     if prev_bytes is not None:
         commit_hash = safe_loads(prev_bytes)
         if (

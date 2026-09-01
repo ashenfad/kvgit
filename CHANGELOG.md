@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **A backup outliving its branch could resurrect it.** Recovery tiers exist for a HEAD that is present and unusable; `delete_branch` removes the key, so an *absent* HEAD means the branch is gone. The prev-HEAD tier did not check that, and writing the backup after the CAS (v0.3.3) opened a route to a lone backup: a writer descheduled between its CAS and its backup write, resuming after a concurrent `delete_branch`, recreated only the backup — and the deleted branch's state became readable again. This is the v0.3.1 failure class reached from a new direction. The tier is now gated on HEAD existing, the same condition the commit-scan tier below it already applied. A corrupt-but-present HEAD recovers exactly as before.
+
 ## [0.3.3] - 2026-08-31
 
 ### Fixed

@@ -434,6 +434,58 @@ class TestLostCasGarbage:
         assert live.get("a") == b"winner"
 
 
+class TestAbsentHeadCannotRecover:
+    """A branch with no HEAD is deleted, not damaged.
+
+    Recovery tiers exist for a HEAD that is *present and unusable*.
+    ``delete_branch`` removes the key, so an absent HEAD means the
+    branch is gone — and a backup that outlives it must not bring it
+    back. Writing the backup after the CAS opened a route to exactly
+    that: a writer descheduled between the two, resuming after a
+    concurrent delete, recreates only the backup.
+
+    Reviving a branch from a lone backup is the v0.3.1 failure class,
+    reached from a new direction.
+    """
+
+    def test_a_delayed_backup_does_not_resurrect_a_deleted_branch(self):
+        store = HookStore()
+        VersionedKV(store).commit({"anchor": b"1"})
+        doomed = VersionedKV(store, branch="doomed")
+        doomed.commit({"secret": b"classified"})
+
+        def delete_it_mid_write():
+            VersionedKV(store).delete_branch("doomed")
+
+        # Pause the winner between its CAS and its backup write.
+        store.arm_set(BRANCH_HEAD_PREV % "doomed", delete_it_mid_write)
+        doomed.commit({"secret": b"classified-v2"})
+
+        assert store.get(BRANCH_HEAD % "doomed") is None, "the delete should have won"
+        assert store.get(BRANCH_HEAD_PREV % "doomed") is not None, (
+            "this test is only meaningful while the delayed write recreates "
+            "the backup; if that stops happening, the seam has drifted"
+        )
+        assert _resolve_head(store, "doomed") is None, (
+            "a backup outliving its branch resurrected it — the deleted "
+            "branch's state is readable again"
+        )
+
+    def test_a_corrupt_but_present_head_still_recovers(self):
+        """The gate must not cost the tier its actual purpose."""
+        store = HookStore()
+        v = VersionedKV(store)
+        first = v.commit({"k": b"1"}).commit
+        v.commit({"k": b"2"})
+        store.set(BRANCH_HEAD % "main", b"")
+        assert _resolve_head(store, "main") == first
+
+    def test_a_healthy_branch_is_unaffected(self):
+        store = HookStore()
+        head = VersionedKV(store).commit({"k": b"1"}).commit
+        assert _resolve_head(store, "main") == head
+
+
 class TestConcurrencyLimitsOfTheBackup:
     """What writing the backup after the CAS does *not* buy.
 
