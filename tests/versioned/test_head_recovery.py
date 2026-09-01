@@ -485,6 +485,34 @@ class TestAbsentHeadCannotRecover:
         head = VersionedKV(store).commit({"k": b"1"}).commit
         assert _resolve_head(store, "main") == head
 
+    def test_creating_a_branch_drops_any_stale_backup(self):
+        """Installing an anchor means that name has no previous HEAD.
+
+        A backup can outlive ``delete_branch`` (the delayed write above).
+        While the name is unclaimed the gate makes it harmless — but
+        re-installing an anchor would make it reachable again, since the
+        prev-HEAD tier only requires HEAD to *exist*, and a fresh branch's
+        HEAD can be corrupted before its first successful CAS.
+        """
+        store = HookStore()
+        vk = VersionedKV(store)
+        vk.commit({"anchor": b"1"})
+        store.set(BRANCH_HEAD_PREV % "revived", dumps("deadbeef" * 5))
+
+        vk.create_branch("revived")
+        assert store.get(BRANCH_HEAD_PREV % "revived") is None, (
+            "create_branch left a stale backup the new branch could recover onto"
+        )
+
+    def test_fresh_initialization_drops_any_stale_backup(self):
+        """The other path that installs an anchor for an unclaimed name."""
+        store = HookStore()
+        VersionedKV(store).commit({"anchor": b"1"})
+        store.set(BRANCH_HEAD_PREV % "revived", dumps("deadbeef" * 5))
+
+        VersionedKV(store, branch="revived")
+        assert store.get(BRANCH_HEAD_PREV % "revived") is None
+
 
 class TestConcurrencyLimitsOfTheBackup:
     """What writing the backup after the CAS does *not* buy.

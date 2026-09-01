@@ -653,6 +653,11 @@ class VersionedKV(VersionedBase):
                     BRANCH_HEAD % branch: dumps(commit_hash),
                 }
                 store.set_many(initial)
+                # Same reasoning as ``create_branch``: this name had no HEAD
+                # a moment ago, so it has no previous HEAD either, and a
+                # backup that outlived a delete must not become reachable
+                # again through the anchor we just installed.
+                store.remove(BRANCH_HEAD_PREV % branch)
 
         if not isinstance(commit_hash, str):
             raise TypeError(
@@ -1055,6 +1060,16 @@ class VersionedKV(VersionedBase):
             raise ValueError(f"Commit '{at}' does not exist")
         if not self.store.cas(branch_key, dumps(target), expected=None):
             raise ValueError(f"Branch '{name}' already exists")
+        # A branch that has just been created has no previous HEAD, so any
+        # backup under this name is stale by definition. One can outlive a
+        # ``delete_branch`` — a writer descheduled between its CAS and its
+        # backup write, resuming after the delete — and while the name is
+        # unclaimed head resolution ignores it, but re-installing an anchor
+        # would make it reachable again: corrupt this branch's fresh HEAD
+        # before its first successful CAS and the prev-HEAD tier would serve
+        # the *deleted* branch's tip. Dropped after the CAS, so a losing
+        # attempt cannot take out the existing branch's real backup.
+        self.store.remove(BRANCH_HEAD_PREV % name)
         return VersionedKV(self.store, commit_hash=target, branch=name)
 
     def delete_branch(self, name: str) -> None:
