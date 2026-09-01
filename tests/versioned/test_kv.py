@@ -1234,8 +1234,13 @@ class TestHeadRecovery:
         v.switch_branch("dev")
         assert v.get("d") == b"1"
 
-    def test_scan_recovery_when_no_prev_head(self):
-        """Falls back to commit scan when prev HEAD doesn't exist."""
+    def test_no_recovery_when_no_prev_head(self):
+        """Corrupt HEAD with no backup is unrecoverable by default.
+
+        The commit scan that used to answer here is opt-in as of
+        v0.3.4 — see ``TestScanRecoveryIsOptIn`` in
+        ``test_head_recovery.py``.
+        """
         from kvgit.versioned.kv import BRANCH_HEAD_PREV
 
         store = Memory()
@@ -1246,8 +1251,22 @@ class TestHeadRecovery:
         store.set(BRANCH_HEAD % "main", b"")
         store.remove(BRANCH_HEAD_PREV % "main")
 
-        # Should still recover via commit scan
-        v2 = Versioned(store)
+        with pytest.raises(ValueError, match="corrupt and unrecoverable"):
+            Versioned(store)
+
+    def test_scan_recovery_when_no_prev_head_if_asked_for(self):
+        """The scan still recovers when handed in explicitly."""
+        from kvgit.versioned.kv import BRANCH_HEAD_PREV, recover_by_commit_scan
+
+        store = Memory()
+        v = Versioned(store)
+        v.commit({"x": b"1"})
+
+        # Corrupt HEAD and remove prev
+        store.set(BRANCH_HEAD % "main", b"")
+        store.remove(BRANCH_HEAD_PREV % "main")
+
+        v2 = Versioned(store, recover_from_corrupt_head=recover_by_commit_scan)
         assert v2.get("x") == b"1"
 
     def test_reset_to_saves_prev_head(self):

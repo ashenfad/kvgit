@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Recovering a corrupt HEAD by scanning the store is no longer the default — it is opt-in.** When a branch's HEAD is unreadable *and* its `__branch_head_prev__` backup is missing or equally broken, head resolution used to scan every `__commit_root__` and return the newest tip no healthy branch claimed. That answer could be another branch's deleted data: a deleted branch's commits are unclaimed by definition until `clean_orphans` collects them, so an ordinary `delete_branch` followed by damage to an *unrelated* branch made the survivor resolve onto the deleted branch's tip — no race, no concurrency, nothing louder than a `logger.warning`. Such a branch now resolves to `None`, and opening a handle on it raises. **This affects you if** you relied on that automatic recovery: reads that used to return a plausible commit now report the branch unrecoverable. The scan is kept and exported as `recover_by_commit_scan`; pass it back in to restore the old behaviour:
+
+  ```python
+  from kvgit.versioned.kv import recover_by_commit_scan
+
+  v = VersionedKV(store, recover_from_corrupt_head=recover_by_commit_scan)
+  ```
+
+  `repair_head(store, branch, recover_from_corrupt_head=...)` takes the same argument. A corrupt HEAD that still has a usable backup recovers exactly as before, and healthy branches are untouched. `clean_orphans` and `deep_clean` never use a recoverer, even one your handle carries — GC must not decide reachability from a guess.
+
 ### Fixed
 - **A backup outliving its branch could resurrect it.** Recovery tiers exist for a HEAD that is present and unusable; `delete_branch` removes the key, so an *absent* HEAD means the branch is gone. The prev-HEAD tier did not check that, and writing the backup after the CAS (v0.3.3) opened a route to a lone backup: a writer descheduled between its CAS and its backup write, resuming after a concurrent `delete_branch`, recreated only the backup — and the deleted branch's state became readable again. This is the v0.3.1 failure class reached from a new direction. The tier is now gated on HEAD existing, the same condition the commit-scan tier below it already applied. A corrupt-but-present HEAD recovers exactly as before. Installing a branch anchor — `create_branch`, or the initial commit minted for an unclaimed name — now also drops any backup under that name, since a branch that has just been created has no previous HEAD and a stale backup would otherwise become reachable again the moment the fresh HEAD was damaged.
 
