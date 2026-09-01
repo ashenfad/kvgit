@@ -210,13 +210,12 @@ def _resolve_head(
 
     # 2. HEAD is present but unusable — try the backup.
     #
-    # Gated on HEAD *existing*, the same condition tier 3 below already
-    # applies. An absent HEAD does not mean damage, it means the branch
-    # is gone: ``delete_branch`` removes the key. A backup that outlives
-    # it — a writer descheduled between its CAS and its backup write,
-    # resuming after the delete and recreating only the backup — must
-    # not resurrect the branch through this tier. Recovering from a
-    # lone backup is the v0.3.1 failure class, reached by a new route.
+    # Only reached when HEAD exists. An absent HEAD does not mean
+    # damage, it means the branch is gone — ``delete_branch`` removes
+    # the key — and a backup that outlives its branch must not bring
+    # the branch back. One can outlive it: a writer descheduled between
+    # its CAS and its backup write, resuming after a concurrent delete,
+    # recreates only the backup.
     #
     # Nothing legitimate needs the ungated form: ``_cas_head`` writes
     # the backup only after a successful CAS, so HEAD exists whenever
@@ -240,14 +239,14 @@ def _resolve_head(
     # read — only to guess. Guessing is the caller's call, not ours.
     if recover_from_corrupt_head is not None and head_bytes is not None:
         commit_hash = recover_from_corrupt_head(store, branch)
-        # Validated exactly as tiers 1 and 2 validate what they read. This
-        # tier used to be an internal scan whose answer came straight off a
-        # ``__commit_root__`` key, so it was trustworthy by construction;
-        # a caller-supplied recoverer is not, and the promise of this
-        # function is a *valid* commit or None. An unchecked answer is
-        # worse than no answer: ``repair_head`` would make it durable,
-        # replacing obviously-corrupt HEAD bytes with a plausible hash
-        # naming nothing — harder to diagnose than the damage it replaced.
+        # A recoverer is caller-supplied, so its answer is checked the
+        # same way anything else read out of the store is: a string
+        # naming a commit whose root is present. This function promises
+        # a valid commit or None, and an unchecked answer is worse than
+        # no answer — ``repair_head`` makes it durable, replacing
+        # obviously-corrupt HEAD bytes with a plausible hash naming
+        # nothing, which is harder to diagnose than the damage it
+        # replaced.
         if (
             isinstance(commit_hash, str)
             and store.get(COMMIT_ROOT % commit_hash) is not None
