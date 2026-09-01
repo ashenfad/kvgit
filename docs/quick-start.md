@@ -333,7 +333,17 @@ See [Orphan Cleanup in the API reference](api.md#orphan-cleanup) for details.
 
 ## Recovering a damaged HEAD
 
-If a branch's HEAD key is unreadable, kvgit falls back to a backup of the previous HEAD, and below that to a scan for the newest unclaimed commit. Reads use that fallback but never write it back: opening a handle on a damaged store gets you the recovered state without mutating anything, which is what a read-only consumer needs and what keeps two readers from racing each other.
+If a branch's HEAD key is unreadable, kvgit falls back to a backup of the previous HEAD. Reads use that fallback but never write it back: opening a handle on a damaged store gets you the recovered state without mutating anything, which is what a read-only consumer needs and what keeps two readers from racing each other.
+
+If the backup is gone too, the branch is reported unrecoverable — `None` from head resolution, and a `ValueError` from opening a handle on it. At that point the store no longer holds the answer, so any recovery is a guess. You can opt into one:
+
+```python
+from kvgit.versioned.kv import recover_by_commit_scan
+
+v = VersionedKV(store, recover_from_corrupt_head=recover_by_commit_scan)
+```
+
+`recover_by_commit_scan` is what kvgit ran by default through v0.3.3: the newest commit no healthy branch claims. It is a heuristic, and on a store where branches get deleted it can hand one branch another branch's deleted data — a deleted branch's commits are unclaimed until GC collects them. Fine on a single-branch store; think twice elsewhere. See [HEAD Recovery in the API reference](api.md#head-recovery).
 
 Making the recovery durable is a separate, explicit step:
 

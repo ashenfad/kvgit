@@ -451,6 +451,7 @@ v = VersionedKV(store, commit_hash="a1b2c3...")         # resume
 | `store` | `KVStore \| None` | `None` | Backend. Creates `Memory()` if None. |
 | `commit_hash` | `str \| None` | `None` | Resume from this commit. Reads HEAD if None. |
 | `branch` | `str` | `"main"` | Branch name. |
+| `recover_from_corrupt_head` | `CorruptHeadRecoverer \| None` | `None` | Last-resort HEAD recovery, applied to every resolve this handle makes. `None` means a HEAD that is corrupt with no usable backup is unrecoverable. See [HEAD Recovery](#head-recovery). |
 
 All methods from the `Versioned` protocol are implemented. Additional:
 
@@ -464,11 +465,30 @@ All methods from the `Versioned` protocol are implemented. Additional:
 
 ### HEAD Recovery
 
-A branch HEAD lives in one key, `__branch_head__<branch>`, and a backup of the value it held before its current one lives in `__branch_head_prev__<branch>`. If HEAD is unreadable — truncated bytes, a hash whose commit metadata is gone — head resolution falls back in three tiers: the backup first, then a scan of every `__commit_root__` in the store for the newest tip not claimed by a healthy branch, then nothing.
+A branch HEAD lives in one key, `__branch_head__<branch>`, and a backup of the value it held before its current one lives in `__branch_head_prev__<branch>`. If HEAD is unreadable — truncated bytes, a hash whose commit metadata is gone — head resolution tries the backup, and if that does not resolve either, reports `None`: the branch is unrecoverable.
 
-Two rules govern this.
+There is a third tier below the backup, and it is **off by default**. When HEAD is unresolvable *and* the backup is missing or equally broken, the information needed is no longer in the store, so nothing kvgit can do is correct — only lucky. `recover_from_corrupt_head` is the seam for a caller who decides a guess beats losing the branch:
 
-**Reads never write.** Resolving a damaged branch on a read path — opening a handle, `peek`, `switch_branch`, `refresh`, the mark phase of a sweep — recovers in memory and leaves the store exactly as it found it. A read-only consumer can therefore read a damaged store, two concurrent readers cannot race each other repairing the same branch to different answers, and the damage stays visible instead of being quietly papered over. The cost is that the fallback runs on each read until someone repairs it: the backup tier is a couple of extra `get` calls and is flat in store size, but the scan tier is O(store) and is genuinely slow on a large store.
+```python
+from kvgit.versioned.kv import recover_by_commit_scan
+
+v = VersionedKV(store, recover_from_corrupt_head=recover_by_commit_scan)
+```
+
+The recoverer is `(store, branch) -> str | None`, fired only when HEAD is present and both tiers above have failed. It applies to every resolve the handle makes — opening, `latest_head`, `refresh`, `switch_branch`, `peek`, `repair_head` — and is inherited by handles from `checkout()` and `create_branch()`. The module-level `repair_head(store, branch, recover_from_corrupt_head=...)` takes the same argument.
+
+`recover_by_commit_scan` is the implementation kvgit used to run by default, kept and exported. It scans every `__commit_root__` and returns the newest tip not claimed by a healthy branch. Know what you are buying:
+
+* **It can serve another branch's deleted data.** "Unclaimed" is its only signal for whose commit a commit is, and a deleted branch's commits are unclaimed until `clean_orphans()` collects them. Delete a branch, damage an unrelated branch's HEAD, lose its backup, and the survivor resolves onto the deleted branch's tip.
+* **It is O(store)**, per unresolved read, until `repair_head()` runs.
+
+It is a reasonable trade on a single-branch store, or one where branches are never deleted — neither hazard is in play there.
+
+`clean_orphans()` and `deep_clean()` never use a recoverer, even one your handle carries. GC must not decide reachability from a guess: a wrong answer marks the wrong commits live, so real garbage survives and another branch's ancestry gets pinned into this one's mark set. The sweep marks only from branches whose HEAD actually resolves.
+
+Two further rules govern this.
+
+**Reads never write.** Resolving a damaged branch on a read path — opening a handle, `peek`, `switch_branch`, `refresh`, the mark phase of a sweep — recovers in memory and leaves the store exactly as it found it. A read-only consumer can therefore read a damaged store, two concurrent readers cannot race each other repairing the same branch to different answers, and the damage stays visible instead of being quietly papered over. The cost is that the fallback runs on each read until someone repairs it: the backup tier is a couple of extra `get` calls and is flat in store size, and an injected recoverer costs whatever it costs.
 
 Two things persist a recovery:
 
@@ -481,7 +501,7 @@ v.repair_head()                                  # or:
 kvgit.versioned.kv.repair_head(store, "main")    # no handle needed
 ```
 
-**The backup only ever names a commit HEAD really held.** `__branch_head_prev__` is written after a HEAD swap succeeds, never before. Written first it would land whether or not the swap did, so a writer losing a race would leave its own stale value as the branch's recovery target — and where that value came from the scan tier, a commit that was never HEAD at all, which recovery would then graft onto the branch as a lineage it never had. It does **not** guarantee a backup exactly one commit back. The swap and the backup write are two steps, and anything that separates them — a crash, or simply losing the CPU while another writer completes both of its own — lets the older writer's backup land last, leaving HEAD two or more commits ahead of it. Recovery then skips whatever came between. That is the deliberate trade: recovering to an older real HEAD loses commits, recovering to a commit that was never HEAD loses the branch. No backend offers a CAS spanning two keys, so the two writes cannot be made one.
+**The backup only ever names a commit HEAD really held.** `__branch_head_prev__` is written after a HEAD swap succeeds, never before. Written first it would land whether or not the swap did, so a writer losing a race would leave its own stale value as the branch's recovery target — and where that value came from a recoverer, a commit that was never HEAD at all, which recovery would then graft onto the branch as a lineage it never had. It does **not** guarantee a backup exactly one commit back. The swap and the backup write are two steps, and anything that separates them — a crash, or simply losing the CPU while another writer completes both of its own — lets the older writer's backup land last, leaving HEAD two or more commits ahead of it. Recovery then skips whatever came between. That is the deliberate trade: recovering to an older real HEAD loses commits, recovering to a commit that was never HEAD loses the branch. No backend offers a CAS spanning two keys, so the two writes cannot be made one.
 
 ### Orphan Cleanup
 

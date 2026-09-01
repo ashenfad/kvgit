@@ -53,6 +53,7 @@ import hashlib
 import json
 import logging
 import time
+from collections.abc import Callable
 
 from ..encoding import dumps, loads, safe_loads
 from ..hamt import EMPTY_HASH
@@ -151,8 +152,30 @@ def _load_root(store: KVStore, commit_hash: str) -> str | None:
     return val if isinstance(val, str) else None
 
 
-def _resolve_head(store: KVStore, branch: str) -> str | None:
-    """Resolve a branch HEAD, falling back to prev HEAD or commit scan.
+CorruptHeadRecoverer = Callable[[KVStore, str], "str | None"]
+"""Last-resort recovery for a HEAD that is present but unresolvable.
+
+Called with the store and the branch name; returns a commit hash to
+treat as that branch's HEAD, or ``None`` if it cannot say. Mirrors the
+TypeScript port's ``CorruptHeadRecoverer`` so the two implementations
+read the same.
+
+There is **no default**. When HEAD is unresolvable and the prev-HEAD
+backup is missing or equally broken, the information needed is not in
+the store, so no implementation can be correct — only lucky. kvgit
+reports ``None`` and leaves the guess to a caller who has decided the
+trade is worth it. :func:`recover_by_commit_scan` is the implementation
+to hand in if that caller is you.
+"""
+
+
+def _resolve_head(
+    store: KVStore,
+    branch: str,
+    *,
+    recover_from_corrupt_head: CorruptHeadRecoverer | None = None,
+) -> str | None:
+    """Resolve a branch HEAD, falling back to prev HEAD then an injected recoverer.
 
     **Never writes.** Every read path in the library goes through here,
     so healing the damage in place would make an ordinary ``get`` a
@@ -163,10 +186,15 @@ def _resolve_head(store: KVStore, branch: str) -> str | None:
     HEAD itself as part of the CAS that has to move it anyway.
 
     The cost of not persisting is paid per read on a damaged store: two
-    extra ``get`` calls for the prev-HEAD tier, and a full store scan
-    for the tier below it. That scan already ran per *write* before this
-    change (``latest_head`` never repaired), and a store sitting on a
-    corrupt HEAD has a bigger problem than read latency.
+    extra ``get`` calls for the prev-HEAD tier, plus whatever the
+    injected recoverer costs below it. A store sitting on a corrupt HEAD
+    has a bigger problem than read latency.
+
+    Args:
+        recover_from_corrupt_head: Optional third tier, fired only when
+            HEAD exists, is unusable, and the backup did not save it.
+            Unset — the default — means such a branch resolves to None.
+            See :data:`CorruptHeadRecoverer`.
 
     Returns a valid commit hash, or None if unrecoverable.
     """
@@ -207,23 +235,57 @@ def _resolve_head(store: KVStore, branch: str) -> str | None:
             )
             return commit_hash
 
-    # 3. HEAD existed but is corrupt and no prev — scan for best commit
-    if head_bytes is not None:
-        commit_hash = _scan_for_best_commit(store, branch)
+    # 3. HEAD existed, is corrupt, and the backup did not save it. The
+    # store no longer holds the answer, so there is nothing left to
+    # read — only to guess. Guessing is the caller's call, not ours.
+    if recover_from_corrupt_head is not None and head_bytes is not None:
+        commit_hash = recover_from_corrupt_head(store, branch)
         if commit_hash is not None:
             logger.warning(
-                "Branch '%s': HEAD corrupt, recovered via commit scan", branch
+                "Branch '%s': HEAD corrupt, recovered via injected recoverer",
+                branch,
             )
             return commit_hash
 
     return None
 
 
-def _scan_for_best_commit(store: KVStore, branch: str) -> str | None:
-    """Scan the store for the best valid commit for a corrupt branch.
+def recover_by_commit_scan(store: KVStore, branch: str) -> str | None:
+    """Guess a corrupt branch's HEAD by scanning every commit. Opt-in.
 
-    Finds all valid commits, excludes those reachable from healthy branches,
-    and returns the most recent tip (by ``__commit_time__``).
+    Finds all valid commits, excludes those reachable from healthy
+    branches, and returns the most recent remaining tip (by
+    ``__commit_time__``). A :data:`CorruptHeadRecoverer`, so it is
+    passed in rather than reached for::
+
+        from kvgit.versioned.kv import recover_by_commit_scan
+
+        v = VersionedKV(store, recover_from_corrupt_head=recover_by_commit_scan)
+
+    kvgit's default through v0.3.3, and **not** the default any more.
+    The name says what it does rather than what it is for, because what
+    it is for is the part that cannot be guaranteed: this is a heuristic
+    over a store that has already lost the answer.
+
+    Two things to weigh before wiring it in.
+
+    **It can serve another branch's deleted data.** "Not claimed by a
+    healthy branch" is the only signal it has for whose commit a commit
+    is, and a deleted branch's commits are unclaimed by definition until
+    :func:`clean_orphans` collects them. Delete a branch, damage an
+    unrelated branch's HEAD, lose its backup, and this returns the
+    deleted branch's tip — grafting onto the survivor a lineage it never
+    had, behind a ``logger.warning``. No race, no concurrency, no
+    unusual store required.
+
+    **It is O(store).** Every ``__commit_root__`` and every branch
+    ancestry, walked per unresolved read until someone calls
+    :func:`repair_head`.
+
+    It is worth it when losing the branch outright is worse than
+    recovering it to a plausible commit — a single-branch store, or one
+    where branches are never deleted, has neither hazard in play. That
+    judgement belongs to whoever owns the data.
     """
     root_prefix = COMMIT_ROOT.replace("%s", "")
     all_commits: dict[str, float] = {}
@@ -335,7 +397,12 @@ def _heal_head(store: KVStore, branch: str, recovered: bytes) -> bool:
     return True
 
 
-def repair_head(store: KVStore, branch: str = "main") -> str | None:
+def repair_head(
+    store: KVStore,
+    branch: str = "main",
+    *,
+    recover_from_corrupt_head: CorruptHeadRecoverer | None = None,
+) -> str | None:
     """Persist a recovered HEAD for a damaged branch.
 
     Read paths recover a corrupt ``__branch_head__`` in memory and leave
@@ -357,16 +424,28 @@ def repair_head(store: KVStore, branch: str = "main") -> str | None:
     commit than HEAD actually holds. The branch is re-resolved instead,
     so the answer describes the store rather than the attempt.
 
+    Args:
+        recover_from_corrupt_head: Optional last-resort recovery, used
+            only for a HEAD that is present, unusable, and has no usable
+            backup. Unset — the default — means such a branch is
+            reported unrecoverable rather than guessed at. See
+            :data:`CorruptHeadRecoverer` and
+            :func:`recover_by_commit_scan`.
+
     Returns:
         The commit HEAD now names, or None if the branch does not exist
         or nothing recoverable was found.
     """
-    commit_hash = _resolve_head(store, branch)
+    commit_hash = _resolve_head(
+        store, branch, recover_from_corrupt_head=recover_from_corrupt_head
+    )
     if commit_hash is None:
         return None
     if _heal_head(store, branch, dumps(commit_hash)):
         return commit_hash
-    return _resolve_head(store, branch)
+    return _resolve_head(
+        store, branch, recover_from_corrupt_head=recover_from_corrupt_head
+    )
 
 
 def clean_orphans(store: KVStore, min_age: float = 3600) -> int:
@@ -487,6 +566,19 @@ def _sweep(store: KVStore, min_age: float, *, deep: bool) -> int:
         if not (isinstance(key, str) and key.startswith(branch_prefix)):
             continue
         branch_name = key[len(branch_prefix) :]
+        # No ``recover_from_corrupt_head`` here, deliberately, even when
+        # the caller has one wired into their handles. GC must not
+        # decide reachability from a guess. A wrong answer from a
+        # last-resort recoverer marks the wrong commits live — real
+        # garbage survives forever, and a guessed tip gets walked as
+        # though it were this branch's own history, so another branch's
+        # ancestry can be pinned into this one's mark set. The sweep
+        # should see only what the store actually claims: a branch whose
+        # HEAD resolves is marked from its real HEAD, and one whose HEAD
+        # does not resolve marks nothing and keeps its commits as young
+        # orphans until ``min_age`` and an explicit ``repair_head``
+        # settle what it points at. The inconsistency with the read
+        # paths is the point, not an oversight.
         branch_head = _resolve_head(store, branch_name)
         if branch_head is None:
             continue
@@ -624,6 +716,13 @@ class VersionedKV(VersionedBase):
     - ``commit()`` to atomically write changes and advance HEAD
     - ``refresh()`` to reload from HEAD
     - ``checkout()`` / ``history()`` for navigating commits
+
+    ``recover_from_corrupt_head`` is the optional last-resort tier of
+    HEAD resolution, for a HEAD that is present, unusable, and has no
+    usable backup. Unset by default, which makes such a branch
+    unrecoverable rather than guessed at; pass
+    :func:`recover_by_commit_scan` to restore kvgit's pre-0.3.4
+    behaviour. See :data:`CorruptHeadRecoverer`.
     """
 
     def __init__(
@@ -632,15 +731,23 @@ class VersionedKV(VersionedBase):
         *,
         commit_hash: str | None = None,
         branch: str = "main",
+        recover_from_corrupt_head: CorruptHeadRecoverer | None = None,
     ) -> None:
         if store is None:
             store = Memory()
         self.store = store
+        # Applies to every resolve this handle makes — opening, reading
+        # HEAD, refreshing, switching, peeking, repairing — and is
+        # inherited by the handles ``checkout`` and ``create_branch``
+        # hand back, so a caller opts in once rather than per call.
+        self._recover_from_corrupt_head = recover_from_corrupt_head
 
         _check_storage_version(store)
 
         if commit_hash is None:
-            commit_hash = _resolve_head(store, branch)
+            commit_hash = _resolve_head(
+                store, branch, recover_from_corrupt_head=recover_from_corrupt_head
+            )
             if commit_hash is None and store.get(BRANCH_HEAD % branch) is not None:
                 raise ValueError(f"Branch '{branch}' HEAD is corrupt and unrecoverable")
             if commit_hash is None:
@@ -691,7 +798,11 @@ class VersionedKV(VersionedBase):
     @property
     def latest_head(self) -> str | None:
         """Read HEAD directly from the KV store (reflects other writers)."""
-        return _resolve_head(self.store, self._branch)
+        return _resolve_head(
+            self.store,
+            self._branch,
+            recover_from_corrupt_head=self._recover_from_corrupt_head,
+        )
 
     # -- Read operations --
 
@@ -927,8 +1038,8 @@ class VersionedKV(VersionedBase):
         never before. Written first, it lands whether or not the CAS
         does, so a writer that loses the race still leaves its own stale
         ``expected`` as the branch's recovery target — clobbering the
-        winner's backup, and, when ``expected`` came from the commit
-        scan, naming a commit that was never HEAD at all. Writing it
+        winner's backup, and, when ``expected`` came from an injected
+        recoverer, naming a commit that was never HEAD at all. Writing it
         afterwards makes it always a value ``__branch_head__`` really
         held.
 
@@ -1032,7 +1143,11 @@ class VersionedKV(VersionedBase):
 
     def refresh(self) -> None:
         """Reload state from HEAD."""
-        commit_hash = _resolve_head(self.store, self._branch)
+        commit_hash = _resolve_head(
+            self.store,
+            self._branch,
+            recover_from_corrupt_head=self._recover_from_corrupt_head,
+        )
         if commit_hash is None:
             raise ValueError(f"No HEAD commit found for branch {self._branch}")
         self._load_commit(commit_hash, update_base=True)
@@ -1047,6 +1162,7 @@ class VersionedKV(VersionedBase):
             self.store,
             commit_hash=commit_hash,
             branch=branch or self._branch,
+            recover_from_corrupt_head=self._recover_from_corrupt_head,
         )
 
     def create_branch(self, name: str, *, at: str | None = None) -> "VersionedKV":
@@ -1070,7 +1186,12 @@ class VersionedKV(VersionedBase):
         # the *deleted* branch's tip. Dropped after the CAS, so a losing
         # attempt cannot take out the existing branch's real backup.
         self.store.remove(BRANCH_HEAD_PREV % name)
-        return VersionedKV(self.store, commit_hash=target, branch=name)
+        return VersionedKV(
+            self.store,
+            commit_hash=target,
+            branch=name,
+            recover_from_corrupt_head=self._recover_from_corrupt_head,
+        )
 
     def delete_branch(self, name: str) -> None:
         """Delete a branch and clean up orphaned commits."""
@@ -1089,7 +1210,11 @@ class VersionedKV(VersionedBase):
 
     def switch_branch(self, name: str) -> None:
         """Switch this instance to a different branch in-place."""
-        commit_hash = _resolve_head(self.store, name)
+        commit_hash = _resolve_head(
+            self.store,
+            name,
+            recover_from_corrupt_head=self._recover_from_corrupt_head,
+        )
         if commit_hash is None:
             if self.store.get(BRANCH_HEAD % name) is not None:
                 raise ValueError(f"Branch '{name}' HEAD is corrupt and unrecoverable")
@@ -1099,7 +1224,11 @@ class VersionedKV(VersionedBase):
 
     def peek(self, key: str, *, branch: str) -> bytes | None:
         """Read a key from another branch's HEAD without switching."""
-        commit_hash = _resolve_head(self.store, branch)
+        commit_hash = _resolve_head(
+            self.store,
+            branch,
+            recover_from_corrupt_head=self._recover_from_corrupt_head,
+        )
         if commit_hash is None:
             return None
         root = _load_root(self.store, commit_hash)
@@ -1162,7 +1291,11 @@ class VersionedKV(VersionedBase):
             The commit HEAD now names, or None if nothing was
             recoverable.
         """
-        return repair_head(self.store, self._branch)
+        return repair_head(
+            self.store,
+            self._branch,
+            recover_from_corrupt_head=self._recover_from_corrupt_head,
+        )
 
     # -- Orphan cleanup --
 

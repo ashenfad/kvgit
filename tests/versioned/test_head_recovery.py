@@ -45,6 +45,7 @@ from kvgit.versioned.kv import (
     _load_root,
     _resolve_head,
     clean_orphans,
+    recover_by_commit_scan,
     repair_head,
 )
 
@@ -172,9 +173,13 @@ class TestPrevHeadInvariant:
         into main's prev-HEAD on the way into a CAS that then fails
         makes the candidate durable, and every later read short-circuits
         the scan and 'recovers' main onto a branch it never had.
+
+        The scan is opt-in since v0.3.4, so the handle asks for it. The
+        invariant is unchanged: whatever a recoverer returns is still a
+        candidate, and prev-HEAD must not be where it becomes durable.
         """
         store = HookStore()
-        v = VersionedKV(store)
+        v = VersionedKV(store, recover_from_corrupt_head=recover_by_commit_scan)
         v.commit({"a": b"1"})
 
         # A commit that is never main's HEAD: a branch tip that outlives
@@ -715,3 +720,212 @@ class TestAgedOutOrphanResurrection:
         # The operator decides when to make it durable.
         assert repair_head(store, "main") == first
         assert loads(store.get(BRANCH_HEAD % "main")) == first
+
+
+class TestScanRecoveryIsOptIn:
+    """The commit scan is a capability, not a default.
+
+    When HEAD is unresolvable *and* the prev-HEAD backup is gone, the
+    information needed to answer "what did this branch point at" is not
+    in the store. The scan tier answered anyway, by picking the newest
+    tip no healthy branch claims — and a deleted branch's commits are
+    unclaimed by definition until ``clean_orphans`` collects them. So
+    the scan could serve one branch another branch's deleted data, with
+    nothing but a ``logger.warning`` to say so.
+
+    ``None`` — "this branch is unrecoverable" — is honest and
+    actionable. The scan is still available to anyone who wants it,
+    passed in explicitly.
+    """
+
+    @staticmethod
+    def _leaky_store():
+        """A deleted branch's tip, and an unrelated doubly-damaged HEAD.
+
+        No race and no seam: an ordinary ``delete_branch``, then main's
+        HEAD corrupted with its backup removed. ``tmp``'s commits are
+        young orphans, so the sweep inside ``delete_branch`` leaves them
+        in place — unclaimed, and therefore scan candidates.
+        """
+        store = Memory()
+        v = VersionedKV(store)
+        v.commit({"anchor": b"1"})
+
+        v.create_branch("tmp")
+        tmp = VersionedKV(store, branch="tmp")
+        tmp.commit({"classified": b"top-secret-payload"})
+        tmp_tip = tmp.current_commit
+        v.delete_branch("tmp")
+
+        store.set(BRANCH_HEAD % "main", b"")
+        store.remove(BRANCH_HEAD_PREV % "main")
+        return store, tmp_tip
+
+    def test_a_doubly_damaged_branch_does_not_inherit_deleted_data(self):
+        """The leak: main resolving onto a deleted branch's tip."""
+        store, tmp_tip = self._leaky_store()
+
+        resolved = _resolve_head(store, "main")
+        assert resolved is None, (
+            f"main resolved to {resolved}, which is the deleted branch "
+            f"'tmp''s tip ({tmp_tip}) — a branch main never had. The "
+            f"commit scan served another branch's deleted data."
+            if resolved == tmp_tip
+            else f"main resolved to {resolved}; an unresolvable HEAD with "
+            f"no backup must report None"
+        )
+
+        with pytest.raises(ValueError, match="corrupt and unrecoverable"):
+            VersionedKV(store)
+        assert repair_head(store, "main") is None
+
+    def test_the_scan_still_recovers_when_it_is_asked_for(self):
+        """Relocation, not removal: the capability is one argument away."""
+        store, tmp_tip = self._leaky_store()
+
+        assert (
+            _resolve_head(
+                store, "main", recover_from_corrupt_head=recover_by_commit_scan
+            )
+            == tmp_tip
+        )
+
+        v = VersionedKV(store, recover_from_corrupt_head=recover_by_commit_scan)
+        assert v.get("anchor") == b"1"
+        assert (
+            repair_head(store, "main", recover_from_corrupt_head=recover_by_commit_scan)
+            == tmp_tip
+        )
+        assert loads(store.get(BRANCH_HEAD % "main")) == tmp_tip
+
+    def test_a_healthy_branch_resolves_without_a_recoverer(self):
+        """Tier 1 is untouched."""
+        store = Memory()
+        head = VersionedKV(store).commit({"k": b"1"}).commit
+        assert _resolve_head(store, "main") == head
+        assert VersionedKV(store).current_commit == head
+
+    def test_a_corrupt_head_still_recovers_from_its_backup(self):
+        """Tier 2 is untouched — the backup is real information."""
+        store = Memory()
+        v = VersionedKV(store)
+        first = v.commit({"k": b"1"}).commit
+        v.commit({"k": b"2"})
+        store.set(BRANCH_HEAD % "main", b"")
+
+        assert store.get(BRANCH_HEAD_PREV % "main") is not None
+        assert _resolve_head(store, "main") == first
+        assert VersionedKV(store).get("k") == b"1"
+
+
+class TestRecovererThreading:
+    """A handle's recoverer applies to every resolve the handle makes."""
+
+    @staticmethod
+    def _spy():
+        """A recoverer that records its calls and defers to the scan."""
+        calls: list[tuple[str, ...]] = []
+
+        def recoverer(store, branch):
+            calls.append(branch)
+            return recover_by_commit_scan(store, branch)
+
+        return recoverer, calls
+
+    @staticmethod
+    def _damaged(branch: str):
+        """A store with a healthy ``main`` and ``branch`` doubly damaged."""
+        store = Memory()
+        v = VersionedKV(store)
+        v.commit({"anchor": b"1"})
+        if branch != "main":
+            v.create_branch(branch)
+            other = VersionedKV(store, branch=branch)
+            other.commit({"k": b"payload"})
+            tip = other.current_commit
+        else:
+            tip = v.current_commit
+        store.set(BRANCH_HEAD % branch, b"")
+        store.remove(BRANCH_HEAD_PREV % branch)
+        return store, tip
+
+    def test_latest_head_uses_the_recoverer(self):
+        store, tip = self._damaged("main")
+        recoverer, calls = self._spy()
+
+        v = VersionedKV(store, commit_hash=tip, recover_from_corrupt_head=recoverer)
+        assert v.latest_head == tip
+        assert calls == ["main"]
+
+        assert VersionedKV(store, commit_hash=tip).latest_head is None
+
+    def test_refresh_uses_the_recoverer(self):
+        store, tip = self._damaged("main")
+        recoverer, calls = self._spy()
+
+        v = VersionedKV(store, commit_hash=tip, recover_from_corrupt_head=recoverer)
+        v.refresh()
+        assert v.current_commit == tip
+        assert calls == ["main"]
+
+        with pytest.raises(ValueError, match="No HEAD commit found"):
+            VersionedKV(store, commit_hash=tip).refresh()
+
+    def test_switch_branch_uses_the_recoverer(self):
+        store, _ = self._damaged("dev")
+        recoverer, calls = self._spy()
+
+        v = VersionedKV(store, recover_from_corrupt_head=recoverer)
+        v.switch_branch("dev")
+        assert v.get("k") == b"payload"
+        assert calls == ["dev"]
+
+        with pytest.raises(ValueError, match="corrupt and unrecoverable"):
+            VersionedKV(store).switch_branch("dev")
+
+    def test_peek_uses_the_recoverer(self):
+        store, _ = self._damaged("dev")
+        recoverer, calls = self._spy()
+
+        v = VersionedKV(store, recover_from_corrupt_head=recoverer)
+        assert v.peek("k", branch="dev") == b"payload"
+        assert calls == ["dev"]
+
+        assert VersionedKV(store).peek("k", branch="dev") is None
+
+    def test_derived_handles_inherit_it(self):
+        """``checkout`` and ``create_branch`` hand back the same setting."""
+        store, tip = self._damaged("main")
+        recoverer, _ = self._spy()
+
+        v = VersionedKV(store, commit_hash=tip, recover_from_corrupt_head=recoverer)
+
+        # ``checkout`` stays on the damaged branch, so this is behaviour:
+        # only an inherited recoverer resolves it.
+        assert v.checkout(tip).latest_head == tip
+        assert VersionedKV(store, commit_hash=tip).checkout(tip).latest_head is None
+
+        assert v.create_branch("forked")._recover_from_corrupt_head is recoverer
+
+    def test_clean_orphans_never_uses_it(self):
+        """GC must not decide reachability from a guess.
+
+        Deliberate, not an oversight: a wrong answer here marks the
+        wrong commits live, so real garbage survives and a guessed tip
+        gets walked as though it were the branch's own history. The
+        sweep sees only what the store actually claims, even when the
+        caller's handle carries a recoverer.
+        """
+        store, dev_tip = self._damaged("dev")
+        recoverer, calls = self._spy()
+        age_commits(store, 7200)
+
+        v = VersionedKV(store, recover_from_corrupt_head=recoverer)
+        assert v.clean_orphans() == 1
+        assert calls == [], (
+            f"clean_orphans consulted the recoverer for {calls} — the mark "
+            f"phase must not resolve a branch by guessing"
+        )
+        assert store.get(COMMIT_ROOT % dev_tip) is None, (
+            "the unresolvable branch's tip was marked live off a guess"
+        )
