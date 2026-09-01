@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Orphan cleanup could delete a live commit's HAMT nodes and chunks.** `clean_orphans` reached its delete list through several independent `store.keys()` scans. Anything a concurrent writer committed between the commit-metadata scan and the later node/chunk scans was invisible to the mark phase but visible to the sweep, so its keyset nodes and chunks were deleted while its `__commit_root__` survived — leaving a live branch HEAD whose keyset could not be loaded and whose data was silently gone. Affects anyone running `clean_orphans` (including implicitly via `delete_branch` or `kvgit.delete_branches`) on a store with another writer active; single-writer stores were never at risk. `clean_orphans` now finds every deletion candidate by walking the keysets of the orphan commits it is deleting, and is safe to run against a live store.
+
+### Added
+
+- **`deep_clean(min_age=3600)`**, on `VersionedKV` and as `kvgit.versioned.kv.deep_clean(store, ...)` — the previous full-namespace sweep, now opt-in and labelled. It is the only way to reclaim keyset nodes and chunks that no commit references, and it is **not safe against concurrent writers**: run it only on a quiescent store.
+
+### Changed
+
+- **`clean_orphans` no longer collects commit-less nodes and chunks.** Artifacts that no commit points at — leftovers from an interrupted write, or from a store swept by an earlier kvgit — now survive `clean_orphans` and need a `deep_clean` pass. If you relied on `clean_orphans` to reclaim those, call `deep_clean` from a maintenance window instead. Commits, blobs, nodes, and chunks owned by orphan commits are collected exactly as before.
+
 ## [0.3.2] - 2026-07-20
 
 ### Added
