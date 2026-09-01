@@ -460,12 +460,40 @@ All methods from the `Versioned` protocol are implemented. Additional:
 | `branches(store)` | Static method: list branch names for a store |
 | `clean_orphans(min_age=3600)` | Remove orphaned commits unreachable from any branch HEAD, along with the blobs and HAMT nodes they uniquely owned. **Does not reclaim chunks** — see below. Returns count of cleaned orphans. Only deletes commits older than `min_age` seconds. Safe under concurrent writers. |
 | `deep_clean(min_age=3600)` | `clean_orphans` plus a full scan of the `kvgit:keyset:` and `kvgit:chunk:` namespaces. The only pass that reclaims chunks, orphan-owned ones included. **Requires a quiescent store** — see below. |
+| `repair_head()` | Persist a recovered HEAD for this branch. Reads recover a damaged HEAD in memory without writing it back; this is the explicit call that makes the recovery durable. Returns the commit HEAD now names, or `None` if nothing was recoverable. See [HEAD Recovery](#head-recovery). |
+
+### HEAD Recovery
+
+A branch HEAD lives in one key, `__branch_head__<branch>`, and a backup of the value it held before its current one lives in `__branch_head_prev__<branch>`. If HEAD is unreadable — truncated bytes, a hash whose commit metadata is gone — head resolution falls back in three tiers: the backup first, then a scan of every `__commit_root__` in the store for the newest tip not claimed by a healthy branch, then nothing.
+
+Two rules govern this.
+
+**Reads never write.** Resolving a damaged branch on a read path — opening a handle, `peek`, `switch_branch`, `refresh`, the mark phase of a sweep — recovers in memory and leaves the store exactly as it found it. A read-only consumer can therefore read a damaged store, two concurrent readers cannot race each other repairing the same branch to different answers, and the damage stays visible instead of being quietly papered over. The cost is that the fallback runs on each read until someone repairs it: the backup tier is a couple of extra `get` calls and is flat in store size, but the scan tier is O(store) and is genuinely slow on a large store.
+
+Two things persist a recovery:
+
+* `repair_head()` — the explicit maintenance call, and the one to reach for.
+* A successful write. A CAS against a damaged HEAD always fails, which would leave the branch permanently unwritable, so a writer that finds HEAD unresolvable replaces it with the recovered commit and retries once. The replacement is itself a CAS against the exact damaged bytes, so two writers racing it cannot both win, and a HEAD that merely *moved* — an ordinary lost race — is never touched.
+
+```python
+v = VersionedKV(store, branch="main")
+v.repair_head()                                  # or:
+kvgit.versioned.kv.repair_head(store, "main")    # no handle needed
+```
+
+**The backup only ever names a commit HEAD really held.** `__branch_head_prev__` is written after a HEAD swap succeeds, never before. Written first it would land whether or not the swap did, so a writer losing a race would leave its own stale value as the branch's recovery target — and where that value came from the scan tier, a commit that was never HEAD at all, which recovery would then graft onto the branch as a lineage it never had. The remaining window is a crash between the swap and the backup write, which leaves the backup one commit further behind than ideal. That is deliberate: recovering to an older real HEAD loses a commit, recovering to a commit that was never HEAD loses the branch. No backend offers a CAS spanning two keys, so the two writes cannot be made one.
 
 ### Orphan Cleanup
 
 When branches are deleted, the commits they referenced may become unreachable ("orphaned"). `delete_branch()` automatically calls `clean_orphans()` after removing the branch HEAD. The default `min_age=3600` (1 hour) decides which unreachable commits are old enough to delete; orphans from deleted branches are cleaned up by subsequent `clean_orphans()` calls once they age past the guard.
 
 `clean_orphans()` finds everything it deletes by walking the keyset of each orphan commit it is removing. Blobs and HAMT nodes that the orphan owned are reclaimed; anything shared with a reachable commit — or with a young orphan inside the `min_age` window, which protects in-flight writers — is left alone. Because candidates come only from orphan keysets and never from a namespace scan, a commit made by another writer *while the sweep is running* can never contribute a deletion candidate.
+
+#### A lost CAS leaves garbage, and that is the safe outcome
+
+A commit writes its blobs, HAMT nodes, chunks and metadata *before* it attempts the CAS that advances HEAD. A writer that loses that race leaves all of it behind, and nothing deletes it inline. That is deliberate, not an oversight: the loser's nodes and chunks are content-addressed, so the winning commit may legitimately share them, and deleting what a loser wrote is the same resurrection hazard that keeps `clean_orphans()` off chunks entirely.
+
+The leftovers are ordinary orphans and are collected on the ordinary path. Commit metadata, blobs and HAMT nodes go once the commit ages past `min_age`; chunks wait for `deep_clean()`, like every other chunk. There is no retry loop and no inline cleanup, so a store under heavy CAS contention accumulates orphan commits between sweeps.
 
 You can call it manually:
 
