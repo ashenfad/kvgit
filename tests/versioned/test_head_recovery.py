@@ -947,3 +947,60 @@ class TestRecovererThreading:
         assert s.versioned._recover_from_corrupt_head is recover_by_commit_scan
 
         assert kvgit.store().versioned._recover_from_corrupt_head is None
+
+    def test_a_recoverer_returning_a_dangling_hash_is_rejected(self):
+        """A pluggable tier is not a trusted tier.
+
+        Tiers 1 and 2 validate what they read: a string naming a commit
+        whose root exists. The scan used to satisfy that by construction
+        — its answer came straight off a ``__commit_root__`` key — but a
+        caller-supplied recoverer does not, and ``_resolve_head``
+        promises a *valid* commit or None.
+
+        An unchecked answer is worse than no answer: ``repair_head``
+        makes it durable, replacing obviously-corrupt HEAD bytes with a
+        plausible hash naming nothing — harder to diagnose than the
+        damage it replaced.
+        """
+        store = HookStore()
+        VersionedKV(store).commit({"k": b"1"})
+        store.set(BRANCH_HEAD % "main", b"")
+        store.remove(BRANCH_HEAD_PREV % "main")
+        dangling = "deadbeef" * 5
+
+        assert (
+            _resolve_head(
+                store, "main", recover_from_corrupt_head=lambda s, b: dangling
+            )
+            is None
+        )
+        assert (
+            repair_head(store, "main", recover_from_corrupt_head=lambda s, b: dangling)
+            is None
+        )
+        assert store.get(BRANCH_HEAD % "main") == b"", (
+            "a rejected candidate was written into HEAD, replacing visible "
+            "damage with a plausible hash that names nothing"
+        )
+
+    def test_a_recoverer_returning_a_non_string_is_rejected(self):
+        store = HookStore()
+        VersionedKV(store).commit({"k": b"1"})
+        store.set(BRANCH_HEAD % "main", b"")
+        store.remove(BRANCH_HEAD_PREV % "main")
+        assert (
+            _resolve_head(store, "main", recover_from_corrupt_head=lambda s, b: 12345)
+            is None
+        )
+
+    def test_a_valid_recoverer_is_still_honoured(self):
+        """The check must not cost the tier its purpose."""
+        store = HookStore()
+        v = VersionedKV(store)
+        head = v.commit({"k": b"1"}).commit
+        store.set(BRANCH_HEAD % "main", b"")
+        store.remove(BRANCH_HEAD_PREV % "main")
+        assert (
+            _resolve_head(store, "main", recover_from_corrupt_head=lambda s, b: head)
+            == head
+        )
