@@ -32,8 +32,22 @@ def chunk_keys(store):
     return [k for k in store.keys() if k.startswith(CHUNK_PREFIX)]
 
 
+def fresh_reader(store):
+    """A cache-free view of ``store``, so reads really hit the chunks."""
+    return make_staged(store)[0]
+
+
 class TestChunkSweepOnDeleteBranch:
-    def test_unreferenced_chunk_swept_after_branch_delete(self):
+    def test_unreferenced_chunk_needs_a_deep_clean_after_branch_delete(self):
+        """Deleting a branch does not reclaim its chunks; deep_clean does.
+
+        Chunk keys are ``kvgit:chunk:<content_hash>`` with nothing
+        commit-derived in them, so a chunk the orphan owns may be the
+        very key a concurrent writer's new commit just deduped onto.
+        The incremental sweep therefore leaves chunks alone and
+        ``deep_clean``, which requires a quiescent store, reclaims
+        them.
+        """
         s, store = make_staged()
         s["base"] = np.arange(2048, dtype="float64")
         s.commit()
@@ -52,8 +66,15 @@ class TestChunkSweepOnDeleteBranch:
         # just-created commits in the test window.
         s.versioned.clean_orphans(min_age=0)
 
-        remaining = chunk_keys(store)
-        assert len(remaining) == 1
+        assert len(chunk_keys(store)) == 2, (
+            "the incremental sweep must not delete chunks"
+        )
+
+        s.versioned.deep_clean(min_age=0)
+        assert len(chunk_keys(store)) == 1
+        assert np.array_equal(
+            fresh_reader(store)["base"], np.arange(2048, dtype="float64")
+        )
 
     def test_shared_chunk_survives_branch_delete(self):
         """A chunk referenced by another live branch must survive delete."""
@@ -131,16 +152,36 @@ class TestOrphanCommitChunks:
         # Default GC with a generous min_age — the commit's chunks
         # should be retained because the commit is still young.
         before = chunk_keys(store)
+        assert before
         # The dev chunk is unique to the dev branch (different content),
         # so without protection it would be swept.
         s.versioned.clean_orphans(min_age=3600)
-        after = chunk_keys(store)
-        assert set(after) == set(before), (
+        assert set(chunk_keys(store)) == set(before), (
             "young orphan commit's chunks were swept; this defeats the "
             "in-flight writer protection"
         )
 
-    def test_old_orphan_commit_chunks_are_swept(self):
+        # The protection that actually does the work now lives in
+        # deep_clean: its namespace scan would otherwise take any chunk
+        # not reachable from a live head, including one an in-flight
+        # writer has staged but not yet linked to a branch.
+        s.versioned.deep_clean(min_age=3600)
+        assert set(chunk_keys(store)) == set(before), (
+            "deep_clean swept a young orphan commit's chunks"
+        )
+
+        # Once the commit ages out, the deep sweep is free to take them.
+        store.set(COMMIT_TIME % dev_commit, dumps(time.time() - 7200))
+        s.versioned.deep_clean(min_age=3600)
+        assert chunk_keys(store) == []
+
+    def test_old_orphan_commit_chunks_wait_for_deep_clean(self):
+        """Even an aged-out orphan does not get its chunks swept.
+
+        Age is what makes the *commit* collectable. It says nothing
+        about the chunk, whose key a commit made one microsecond ago
+        may share.
+        """
         s, store = make_staged()
 
         dev = s.create_branch("dev")
@@ -153,6 +194,12 @@ class TestOrphanCommitChunks:
         store.set(COMMIT_TIME % dev_commit, dumps(time.time() - 7200))
 
         s.versioned.clean_orphans(min_age=3600)
+        assert store.get(COMMIT_TIME % dev_commit) is None, "commit not collected"
+        assert len(chunk_keys(store)) == 1, (
+            "the incremental sweep must not delete chunks"
+        )
+
+        s.versioned.deep_clean(min_age=0)
         assert chunk_keys(store) == []
 
 

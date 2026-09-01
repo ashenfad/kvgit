@@ -20,11 +20,15 @@ keyset snapshot per commit.
 
 Chunks (v3) are content-addressed bytes referenced by per-key
 ``MetaEntry.chunks``. They let chunked codecs (numpy, pandas, ...) share
-large buffers across keys, commits, and branches. ``clean_orphans``
-reclaims a chunk when the orphan commit that referenced it is deleted
-and nothing reachable still refers to it; ``deep_clean`` additionally
-scans the whole chunk namespace, which no concurrent writer may
-survive.
+large buffers across keys, commits, and branches.
+
+Chunks are the *only* class above keyed purely by content. Blobs carry
+the commit hash in the key; HAMT nodes embed that blob pointer, so a
+node hash is commit-scoped too. That difference decides who may delete
+what: ``clean_orphans`` never deletes chunks, because a chunk an orphan
+owns may be the same key a commit made a moment ago just deduped onto,
+and the sweep has no way to know. Only ``deep_clean``, which requires a
+quiescent store, reclaims chunks.
 
 v3 is a strict superset of v2:
 
@@ -273,8 +277,8 @@ def clean_orphans(store: KVStore, min_age: float = 3600) -> int:
     """Remove orphaned commits unreachable from any branch HEAD.
 
     Traces all reachable commits from live branch HEADs, then deletes
-    the commit metadata, blobs, HAMT nodes, and chunks owned by the
-    orphaned commits and not shared with anything still reachable.
+    the commit metadata, blobs and HAMT nodes owned by the orphaned
+    commits and not shared with anything still reachable.
 
     Handle-independent by design: it marks from ALL live branch HEADs
     and touches nothing but ``store``, so it works with or without a
@@ -283,10 +287,20 @@ def clean_orphans(store: KVStore, min_age: float = 3600) -> int:
     share this one implementation.
 
     Safe under concurrent writers: every deletion candidate is
-    discovered by walking an orphan commit's own keyset, so a commit
-    that lands mid-sweep can never contribute one. See
-    :func:`deep_clean` for the stricter, quiescent-store-only sweep
-    that also reclaims nodes and chunks no commit points at.
+    discovered by walking an orphan commit's own keyset, and every
+    class it deletes is commit-scoped (blob keys carry the commit
+    hash; HAMT nodes embed that pointer), so a commit that lands
+    mid-sweep can never contribute one.
+
+    **Does not reclaim chunks.** Chunk keys are pure content hashes,
+    so an orphan's chunk and a brand-new commit's chunk are the same
+    key whenever the bytes match — "the orphan owned it" does not
+    imply "safe to delete", at any window size. Chunks are the large
+    objects (numpy and pandas buffers), so on a store using chunked
+    codecs they accumulate between maintenance passes; a store that
+    never uses a chunked codec has none and loses nothing here. Run
+    :func:`deep_clean` on a quiescent store to reclaim them, along
+    with nodes and chunks no commit points at.
 
     The ``min_age`` guard (default 1 hour) still applies: it decides
     which unreachable commits are old enough to delete at all.
@@ -307,6 +321,11 @@ def deep_clean(store: KVStore, min_age: float = 3600) -> int:
     nodes and chunks that no commit references any more — leftovers
     from a crash, from an interrupted write, or from a store swept by
     an earlier kvgit — because no orphan keyset points at them.
+
+    It is also the only way to reclaim **any** chunk at all, including
+    ones a deleted orphan uniquely owned: the incremental sweep leaves
+    every chunk in place, so on a store using chunked codecs this is
+    the maintenance pass that gives the space back.
 
     **Not safe against concurrent writers.** The scan runs after the
     mark phase, so it sees, and deletes, artifacts written by any
@@ -343,6 +362,11 @@ def _sweep(store: KVStore, min_age: float, *, deep: bool) -> int:
     reachable_commits: set[str] = set()
     reachable_blobs: set[str] = set()
     reachable_nodes: set[str] = set()
+    # Only the deep path deletes chunks, and it is the only consumer of
+    # this set. The incremental path leaves it empty on purpose rather
+    # than paying to accumulate every chunk hash in the store — if you
+    # ever add a chunk deletion outside the ``if deep:`` block below,
+    # you must populate this unconditionally first.
     reachable_chunks: set[str] = set()
 
     def _walk_commit_for_marks(commit_hash: str) -> None:
@@ -358,7 +382,7 @@ def _sweep(store: KVStore, min_age: float, *, deep: bool) -> int:
         entries, new_nodes = Keyset(store, root=root).walk(skip_nodes=reachable_nodes)
         for entry in entries.values():
             reachable_blobs.add(entry.blob)
-            if entry.meta.chunks:
+            if deep and entry.meta.chunks:
                 reachable_chunks.update(entry.meta.chunks)
         reachable_nodes.update(new_nodes)
 
@@ -407,8 +431,11 @@ def _sweep(store: KVStore, min_age: float, *, deep: bool) -> int:
         except (TypeError, ValueError):
             continue
 
-    # Protect chunks referenced by young orphan commits — those
-    # may belong to in-flight writers whose CAS has not landed yet.
+    # Protect what young orphan commits reference — they may belong to
+    # in-flight writers whose CAS has not landed yet. Their nodes and
+    # blobs matter to both paths (an aged orphan sharing a subtree with
+    # a young one must not take it down); their chunks matter to
+    # ``deep_clean``, whose namespace scan would otherwise eat them.
     for young in young_orphan_commits:
         _walk_commit_for_marks(young)
 
@@ -427,6 +454,17 @@ def _sweep(store: KVStore, min_age: float, *, deep: bool) -> int:
     # the cheap thing (shared structure is walked once, not per
     # orphan). Two orphans sharing a subtree may each name the same
     # hash; ``remove_many`` tolerates duplicates.
+    #
+    # Chunks are deliberately absent here. Blob keys are
+    # ``<commit_hash>:<key>`` and HAMT nodes embed that pointer, so
+    # both are commit-scoped: an orphan's node hash can only collide
+    # with a commit in its own ancestry, which the mark phase already
+    # covered. A chunk key is ``kvgit:chunk:<content_hash>`` and
+    # carries nothing commit-derived, so an orphan's chunk and a
+    # brand-new commit's chunk are the *same key* whenever the bytes
+    # match. "In the orphan's tree" therefore does not imply "safe to
+    # delete", and no amount of scoping fixes that — the new commit
+    # was never marked. Chunk reclamation lives in ``deep_clean``.
     for orphan_hash in orphans:
         orphan_root = _load_root(store, orphan_hash)
         if orphan_root is not None and orphan_root != EMPTY_HASH:
@@ -441,9 +479,6 @@ def _sweep(store: KVStore, min_age: float, *, deep: bool) -> int:
             for entry in orphan_entries.values():
                 if entry.blob not in reachable_blobs:
                     all_removals.append(entry.blob)
-                for chunk_ref in entry.meta.chunks or ():
-                    if chunk_ref not in reachable_chunks:
-                        all_removals.append(CHUNK_PREFIX + chunk_ref)
             all_removals.extend(keyset_prefix + node for node in orphan_nodes)
         all_removals.extend(
             [
@@ -455,11 +490,12 @@ def _sweep(store: KVStore, min_age: float, *, deep: bool) -> int:
         )
 
     if deep:
-        # Namespace scans. These reclaim nodes and chunks that no
-        # orphan keyset points at, and only these can — but they are
-        # also the part that is unsafe against a concurrent writer,
-        # because anything committed since the mark phase looks
-        # unreferenced here. Quiescent stores only.
+        # Namespace scans. The node scan reclaims nodes no orphan
+        # keyset points at; the chunk scan is the *only* place chunks
+        # are ever deleted, orphan-owned ones included. Both are
+        # unsafe against a concurrent writer, because anything
+        # committed since the mark phase looks unreferenced here.
+        # Quiescent stores only.
         for key in store.keys():
             if not (isinstance(key, str) and key.startswith(keyset_prefix)):
                 continue
@@ -977,6 +1013,10 @@ class VersionedKV(VersionedBase):
         mark-and-sweep against ``self.store``. Kept as a method so
         existing callers (and ``delete_branch``) read naturally.
 
+        Reclaims commit metadata, blobs and HAMT nodes, but **not
+        chunks** — see :func:`clean_orphans` for why, and
+        :meth:`deep_clean` for the pass that reclaims them.
+
         Returns:
             Number of orphaned commits removed.
         """
@@ -989,8 +1029,10 @@ class VersionedKV(VersionedBase):
         quiescent store** — the namespace scan will delete artifacts
         written by a concurrent writer, including ones a live branch
         HEAD has since come to depend on. Use :meth:`clean_orphans`
-        unless you specifically need to reclaim nodes and chunks that
-        no commit references.
+        for routine cleanup; schedule this one when you can quiesce
+        the store, since it is the only pass that reclaims chunks —
+        both the ones no commit references and the ones deleted
+        orphans owned.
 
         Returns:
             Number of orphaned commits removed.

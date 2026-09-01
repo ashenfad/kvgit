@@ -12,6 +12,12 @@ calls and runs a callback after the Nth one. ``clean_orphans`` makes
 its scans in a fixed order, so "commit between the commit-root scan
 and the node scan" is expressible as "run the writer after keys()
 call #2" with no sleeps and no real threads.
+
+Scoping the sweep to orphan keysets closed that for nodes and blobs,
+which are commit-scoped, but not for chunks: a chunk key is a bare
+content hash, so an orphan's chunk and a new commit's chunk are the
+same key. ``TestChunkDedupRace`` pins that, and the fix — the
+incremental sweep does not delete chunks at all.
 """
 
 from __future__ import annotations
@@ -320,7 +326,14 @@ class TestDamagedOrphans:
 
 class TestOrdinaryGarbage:
     def test_orphan_payload_is_still_collected(self):
-        """The fix must not turn GC into a no-op."""
+        """The fix must not turn GC into a no-op.
+
+        Every commit-scoped class an orphan owns — commit metadata,
+        blob, HAMT nodes — is still reclaimed by the incremental
+        sweep. Only the content-addressed chunk is left for
+        ``deep_clean``; both directions of that contract are asserted
+        here so a regression in either shows up.
+        """
         store = Memory()
         s = Staged(VersionedKV(store), encoder=chunky_encoder, decoder=chunky_decoder)
         s["live"] = "keep me"
@@ -348,12 +361,23 @@ class TestOrdinaryGarbage:
             "orphan HAMT root not collected"
         )
         assert missing_nodes(store, dev_commit, dev_nodes) == sorted(dev_nodes)
-        assert [k for k in dev_chunks if store.get(k) is not None] == [], (
-            "orphan chunk not collected"
+        assert [k for k in dev_chunks if store.get(k) is None] == [], (
+            "the incremental sweep must not delete chunks — another "
+            "commit's identical bytes hash to the same key"
         )
 
         reader = Staged(
             VersionedKV(store), encoder=chunky_encoder, decoder=chunky_decoder
+        )
+        assert reader["live"] == "keep me"
+
+        # The other direction: a maintenance pass does reclaim them.
+        deep_clean(store, min_age=0)
+        assert [k for k in dev_chunks if store.get(k) is not None] == [], (
+            "deep_clean must reclaim what the incremental sweep left"
+        )
+        assert [k for k in live_chunks if store.get(k) is None] == [], (
+            "deep_clean took a chunk the live branch still references"
         )
         assert reader["live"] == "keep me"
 
@@ -447,3 +471,100 @@ class TestDeepClean:
         )
         with pytest.raises(KeyError):
             Staged(VersionedKV(store))["late"]
+
+
+class TestChunkDedupRace:
+    """Chunks are content-addressed, so "the orphan owns it" is not enough.
+
+    Blobs are keyed ``<commit_hash>:<key>`` and HAMT leaf nodes embed
+    that blob pointer, so both are commit-scoped: two unrelated commits
+    holding identical data still get distinct keys. Chunks are keyed
+    ``kvgit:chunk:<content_hash>`` with nothing commit-derived in them,
+    so an orphan's chunk and a brand-new commit's chunk are literally
+    the same key. Scoping the sweep to orphan keysets does not help —
+    the key really is in the orphan's tree, and the new commit that
+    also points at it was never marked.
+    """
+
+    def test_chunk_deduped_by_a_mid_sweep_commit_survives(self):
+        """A live HEAD must not lose a chunk an orphan happened to own."""
+        store = ScanHookStore()
+        s = Staged(VersionedKV(store), encoder=chunky_encoder, decoder=chunky_decoder)
+        s["live"] = "keep me"
+        s.commit()
+        live_chunks = set(chunk_keys(store))
+
+        # The orphan owns a chunk nothing live references (yet).
+        shared_value = "a payload two unrelated commits both store"
+        dev = s.create_branch("dev")
+        dev["dev_only"] = shared_value
+        dev.commit()
+        orphan_chunks = set(chunk_keys(store)) - live_chunks
+        assert len(orphan_chunks) == 1, "test needs exactly one orphan-owned chunk"
+        (shared_chunk,) = orphan_chunks
+        s.delete_branch("dev")
+        age_commits(store, 10_000)
+
+        landed: dict[str, object] = {}
+
+        def concurrent_writer():
+            """Commit content that dedups to the orphan's chunk."""
+            other = Staged(
+                VersionedKV(store), encoder=chunky_encoder, decoder=chunky_decoder
+            )
+            other["late"] = shared_value
+            landed["commit"] = other.commit().commit
+
+        store.arm(AFTER_COMMIT_ROOT_SCAN, concurrent_writer)
+        clean_orphans(store, min_age=3600)
+
+        head = _resolve_head(store, "main")
+        assert head == landed["commit"], "the concurrent commit should be HEAD"
+        assert store.get(shared_chunk) is not None, (
+            f"live HEAD {head} on branch 'main' references chunk "
+            f"{shared_chunk}, which the sweep deleted as an orphan's — "
+            f"its value for 'late' is unreadable"
+        )
+
+        reader = Staged(
+            VersionedKV(store), encoder=chunky_encoder, decoder=chunky_decoder
+        )
+        assert reader["late"] == shared_value
+
+    def test_deep_clean_reclaims_the_orphan_chunk_left_behind(self):
+        """The other half of the contract: the space is not lost forever.
+
+        ``clean_orphans`` deletes the orphan's commit metadata, blob
+        and nodes but leaves its chunk, because the chunk key is not
+        the orphan's to give away. ``deep_clean``, which requires a
+        quiescent store, is where that space comes back.
+        """
+        store = Memory()
+        s = Staged(VersionedKV(store), encoder=chunky_encoder, decoder=chunky_decoder)
+        s["live"] = "keep me"
+        s.commit()
+        live_chunks = set(chunk_keys(store))
+
+        dev = s.create_branch("dev")
+        dev["dev_only"] = "orphan payload"
+        dev_commit = dev.commit().commit
+        orphan_chunks = set(chunk_keys(store)) - live_chunks
+        assert orphan_chunks
+
+        s.delete_branch("dev")
+        age_commits(store, 10_000)
+        assert clean_orphans(store, min_age=3600) == 1
+
+        assert store.get(COMMIT_ROOT % dev_commit) is None, "commit metadata kept"
+        assert [k for k in orphan_chunks if store.get(k) is None] == [], (
+            "the incremental sweep deleted a chunk"
+        )
+
+        assert deep_clean(store, min_age=0) == 0
+        assert [k for k in orphan_chunks if store.get(k) is not None] == []
+        assert [k for k in live_chunks if store.get(k) is None] == []
+
+        reader = Staged(
+            VersionedKV(store), encoder=chunky_encoder, decoder=chunky_decoder
+        )
+        assert reader["live"] == "keep me"
