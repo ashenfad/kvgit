@@ -327,7 +327,23 @@ s.versioned.deep_clean()   # no other writers, for the whole call
 
 So: `clean_orphans()` (or plain `delete_branch()`) is your routine, always-safe cleanup, and `deep_clean()` is a scheduled maintenance pass during a quiet window. If you store large arrays, you want both.
 
+A commit that loses a CAS race leaves garbage too — it writes its blobs, nodes and metadata before attempting the swap, and nothing deletes them inline, because the winner may legitimately share the content-addressed ones. They are ordinary orphans and the ordinary sweep collects them.
+
 See [Orphan Cleanup in the API reference](api.md#orphan-cleanup) for details.
+
+## Recovering a damaged HEAD
+
+If a branch's HEAD key is unreadable, kvgit falls back to a backup of the previous HEAD, and below that to a scan for the newest unclaimed commit. Reads use that fallback but never write it back: opening a handle on a damaged store gets you the recovered state without mutating anything, which is what a read-only consumer needs and what keeps two readers from racing each other.
+
+Making the recovery durable is a separate, explicit step:
+
+```python
+s.versioned.repair_head()   # writes the recovered commit back to HEAD
+```
+
+Writes heal it on their own, since a CAS against a damaged HEAD would otherwise fail forever. So in practice a damaged branch that anyone still commits to fixes itself, and `repair_head()` is for the read-only case and for maintenance.
+
+See [HEAD Recovery in the API reference](api.md#head-recovery) for the full contract.
 
 ---
 
