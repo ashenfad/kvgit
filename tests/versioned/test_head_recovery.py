@@ -66,7 +66,9 @@ class HookStore(Memory):
     * ``arm_commit_batch`` fires when a commit's write batch is written
       — after its writer has read HEAD, before it reaches its CAS.
     * ``arm_get`` fires after a chosen key's value has been read but
-      before the caller sees it.
+      before the caller sees it, on the *nth* read of that key.
+    * ``arm_set`` fires before a chosen key is written, so a writer can
+      be paused mid-sequence while another completes.
 
     Both are points every version of the code passes through, so a test
     written against them means the same thing before and after a fix.
@@ -77,6 +79,7 @@ class HookStore(Memory):
         self.head_history: dict[str, list[str]] = {}
         self._on_commit_batch = None
         self._on_get: dict[str, object] = {}
+        self._on_set: dict[str, object] = {}
 
     # -- seams --
 
@@ -84,9 +87,13 @@ class HookStore(Memory):
         """Fire ``fn`` once, on the next commit write batch."""
         self._on_commit_batch = fn
 
-    def arm_get(self, key: str, fn) -> None:
-        """Fire ``fn`` once, after ``key`` has been read."""
-        self._on_get[key] = fn
+    def arm_get(self, key: str, fn, *, nth: int = 1) -> None:
+        """Fire ``fn`` once, after the ``nth`` read of ``key``."""
+        self._on_get[key] = [fn, nth]
+
+    def arm_set(self, key: str, fn) -> None:
+        """Fire ``fn`` once, immediately before ``key`` is written."""
+        self._on_set[key] = fn
 
     # -- recording --
 
@@ -101,12 +108,18 @@ class HookStore(Memory):
 
     def get(self, key: str) -> bytes | None:
         value = super().get(key)
-        fn = self._on_get.pop(key, None)
-        if fn is not None:
-            fn()
+        armed = self._on_get.get(key)
+        if armed is not None:
+            armed[1] -= 1
+            if armed[1] <= 0:
+                del self._on_get[key]
+                armed[0]()
         return value
 
     def set(self, key: str, value: bytes) -> None:
+        fn = self._on_set.pop(key, None)
+        if fn is not None:
+            fn()
         super().set(key, value)
         self._record(key, value)
 
@@ -421,6 +434,96 @@ class TestLostCasGarbage:
         assert live.get("a") == b"winner"
 
 
+class TestConcurrencyLimitsOfTheBackup:
+    """What writing the backup after the CAS does *not* buy.
+
+    The swap and the backup write are two steps. Anything that separates
+    them — a crash, or simply losing the CPU while another writer
+    completes both of its own — lets the older writer's backup land
+    last. The invariant that survives is the narrower one: the backup
+    names a commit HEAD really held. "Exactly one commit back" is not a
+    guarantee, and these pin that so the docs are not quietly re-widened.
+    """
+
+    def test_a_paused_winner_can_clobber_a_newer_backup(self):
+        store = HookStore()
+        writer = VersionedKV(store)
+        first = writer.commit({"k": b"1"}).commit
+
+        landed = {}
+
+        def other_writer_advances():
+            other = VersionedKV(store)
+            landed["third"] = other.commit({"k2": b"3"}).commit
+
+        # Pause the winner between its successful CAS and its backup write.
+        store.arm_set(BRANCH_HEAD_PREV % "main", other_writer_advances)
+        second = writer.commit({"k": b"2"}).commit
+
+        head = loads(store.get(BRANCH_HEAD % "main"))
+        prev = loads(store.get(BRANCH_HEAD_PREV % "main"))
+        history = store.head_history["main"]
+
+        assert head == landed["third"], "the later writer should hold HEAD"
+        assert prev != second, (
+            "this pins the limitation, not the ideal: the paused winner's "
+            "backup landed last"
+        )
+        assert prev == first
+        # The guarantee that does survive.
+        assert prev in history, (
+            f"prev-HEAD {prev} was never HEAD (history: {history}) — the "
+            f"invariant this ordering exists to protect is broken"
+        )
+        assert history.index(prev) < history.index(head), (
+            "the backup must name a commit older than HEAD, not a sibling"
+        )
+
+
+class TestRepairHeadReturnValue:
+    """``repair_head`` reports the store, not its own attempt."""
+
+    def test_returns_what_head_names_when_another_process_wins(self):
+        store = HookStore()
+        v = VersionedKV(store)
+        v.commit({"k": b"1"})
+        second = v.commit({"k": b"2"}).commit
+        store.set(BRANCH_HEAD % "main", b"")  # corrupt -> resolves to `first`
+
+        def another_process_repairs_it_differently():
+            store.set(BRANCH_HEAD % "main", dumps(second))
+
+        # Fire between _resolve_head's read and _heal_head's, so the heal
+        # CAS finds a HEAD it must not touch and declines.
+        store.arm_get(
+            BRANCH_HEAD % "main", another_process_repairs_it_differently, nth=2
+        )
+
+        returned = repair_head(store, "main")
+        actual = loads(store.get(BRANCH_HEAD % "main"))
+
+        assert actual == second, "the other process should hold HEAD"
+        assert returned == actual, (
+            f"repair_head returned {returned}, but HEAD names {actual}; its "
+            f"contract is 'the commit HEAD now names', and returning the "
+            f"stale candidate hands the caller an older commit than the store has"
+        )
+
+    def test_healthy_branch_is_a_no_op_that_still_reports_head(self):
+        store = HookStore()
+        v = VersionedKV(store)
+        v.commit({"k": b"1"})
+        head = v.commit({"k": b"2"}).commit
+        assert repair_head(store, "main") == head
+
+    def test_missing_branch_returns_none(self):
+        store = HookStore()
+        VersionedKV(store).commit({"k": b"1"})
+        store.remove(BRANCH_HEAD % "main")
+        store.remove(BRANCH_HEAD_PREV % "main")
+        assert repair_head(store, "nonexistent") is None
+
+
 class TestAgedOutOrphanResurrection:
     """A recreated orphan can be swept out from under a live HEAD.
 
@@ -434,8 +537,11 @@ class TestAgedOutOrphanResurrection:
     What is pinned is the fallout: HEAD names a commit whose metadata is
     gone, and head resolution lands on the immediately-previous HEAD.
     Both fixes in this module make that outcome *better*. The backup is
-    reliably one commit back rather than an arbitrary older one, and a
-    read no longer makes the loss durable behind the operator's back.
+    a commit that really was HEAD rather than a losing writer's stale
+    guess, and a read no longer makes the loss durable behind the
+    operator's back. It lands one commit back here because this scenario
+    has a single writer; under concurrent writers the backup can sit
+    further behind (see ``test_a_paused_winner_can_clobber_a_newer_backup``).
     """
 
     def _resurrect_under_a_sweep(self):
@@ -507,7 +613,8 @@ class TestAgedOutOrphanResurrection:
             "the sweep should have deleted the resurrected commit"
         )
 
-        # Head resolution falls back, and lands exactly one commit back.
+        # Head resolution falls back — one commit back, this being a
+        # single-writer scenario.
         recovered = _resolve_head(store, "main")
         assert recovered == first
         assert recovered == store.head_history["main"][-2]

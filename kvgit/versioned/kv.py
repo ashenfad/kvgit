@@ -337,6 +337,12 @@ def repair_head(store: KVStore, branch: str = "main") -> str | None:
     against the damaged bytes, so it cannot overwrite a HEAD another
     process fixed, or advanced, in the meantime.
 
+    When that CAS does not win — another process repaired the branch,
+    advanced it, or deleted it between resolving and healing — the
+    recovery candidate is stale, and returning it would name an older
+    commit than HEAD actually holds. The branch is re-resolved instead,
+    so the answer describes the store rather than the attempt.
+
     Returns:
         The commit HEAD now names, or None if the branch does not exist
         or nothing recoverable was found.
@@ -344,8 +350,9 @@ def repair_head(store: KVStore, branch: str = "main") -> str | None:
     commit_hash = _resolve_head(store, branch)
     if commit_hash is None:
         return None
-    _heal_head(store, branch, dumps(commit_hash))
-    return commit_hash
+    if _heal_head(store, branch, dumps(commit_hash)):
+        return commit_hash
+    return _resolve_head(store, branch)
 
 
 def clean_orphans(store: KVStore, min_age: float = 3600) -> int:
@@ -906,13 +913,21 @@ class VersionedKV(VersionedBase):
         afterwards makes it always a value ``__branch_head__`` really
         held.
 
-        A crash between the CAS and the backup write leaves the backup
-        one commit further behind than ideal. That degrades to
-        "recovery loses an extra commit", not to "recovery invents a
-        lineage", which is the trade this ordering buys. There is no
-        way to do better with what the store offers: ``KVStore.cas``
-        takes a single key and no backend exposes a transaction
-        spanning two, so HEAD and its backup cannot move in one step.
+        What this does **not** buy is a backup that is always exactly
+        one commit back. The swap and the backup write are two steps,
+        and anything that separates them — a crash, or simply losing
+        the CPU while another writer completes both of its own — lets
+        the older writer's backup land last. HEAD then sits two or more
+        commits ahead of a backup that is still a real former HEAD, and
+        recovery skips whatever came between.
+
+        So the guarantee is the narrower one: the backup always names a
+        commit ``__branch_head__`` really held, never a commit invented
+        by a losing writer. Recovery may lose more than one commit; it
+        cannot graft on a lineage the branch never had. There is no way
+        to do better with what the store offers — ``KVStore.cas`` takes
+        a single key and no backend exposes a transaction spanning two,
+        so HEAD and its backup cannot move in one step.
 
         A CAS that fails against a *damaged* HEAD is retried once
         through :func:`_heal_head`, which repairs it atomically. That is
