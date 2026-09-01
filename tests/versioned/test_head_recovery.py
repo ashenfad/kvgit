@@ -929,3 +929,21 @@ class TestRecovererThreading:
         assert store.get(COMMIT_ROOT % dev_tip) is None, (
             "the unresolvable branch's tip was marked live off a guess"
         )
+
+    def test_the_documented_entry_point_can_opt_in(self):
+        """A seam unreachable through ``kvgit.store()`` is not a seam.
+
+        ``store()`` is how the docs tell people to build a store, so the
+        opt-in has to be expressible there and not only by constructing
+        a ``VersionedKV`` by hand.
+        """
+        import kvgit
+        from kvgit.versioned.kv import recover_by_commit_scan
+
+        s = kvgit.store(recover_from_corrupt_head=recover_by_commit_scan)
+        s["k"] = 1
+        s.commit()
+        assert s["k"] == 1
+        assert s.versioned._recover_from_corrupt_head is recover_by_commit_scan
+
+        assert kvgit.store().versioned._recover_from_corrupt_head is None
