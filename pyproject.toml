@@ -65,6 +65,16 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
+[tool.ruff]
+# ruff 0.16 formats Python code blocks inside Markdown. This project's docs
+# align trailing comments by hand, so letting the formatter at them produces
+# churn unrelated to whatever change is being made, on any commit touching
+# docs/ -- including docs-only ones. `force-exclude` is required because
+# pre-commit passes filenames explicitly, and ruff ignores `extend-exclude`
+# for explicitly-passed paths without it.
+extend-exclude = ["*.md"]
+force-exclude = true
+
 [tool.ruff.lint]
 # Every rule this project enforces is named here. Ruff's *default*
 # selection is not stable across releases — 0.15 defaulted to
