@@ -1,6 +1,6 @@
 """KVStore-backed versioned state.
 
-Storage layout (v3):
+Storage layout (v4):
 
 - ``__kvgit_version__``                — storage version sentinel
 - ``__branch_head__<branch>``          — current HEAD commit hash
@@ -9,6 +9,8 @@ Storage layout (v3):
 - ``__parent_commit__<commit>``        — list of parent commit hashes
 - ``__commit_time__<commit>``          — wall time the commit was created
 - ``__info__<commit>``                 — optional caller-supplied info dict
+- ``__tag__<tag>``                     — commit a tag names (v4)
+- ``__tag_info__<tag>``                — tag creation time + info (v4)
 - ``kvgit:keyset:<node_hash>``         — HAMT node bytes
 - ``kvgit:chunk:<chunk_hash>``         — content-addressed chunk bytes (v3)
 - ``<commit_hash>:<user_key>``         — blob value bytes
@@ -35,15 +37,20 @@ owns may be the same key a commit made a moment ago just deduped onto,
 and the sweep has no way to know. Only ``deep_clean``, which requires a
 quiescent store, reclaims chunks.
 
-v3 is a strict superset of v2:
+Each version is a strict superset of the one below it, and the stamp
+names the layout a store *actually uses* rather than the newest one its
+writer understands:
 
-* Opening a v2 store with v3 code is allowed; the version stamp is left
-  unchanged until a chunked write actually occurs.
-* The first commit that includes ``chunks`` lazily stamps the store as
-  v3. From then on, older code refuses to open it (intentional: it
-  cannot decode chunked blobs).
-* A v3 store with no chunks ever written is byte-identical to a v2
-  store except for the version sentinel.
+* Opening a lower-version store is allowed; the stamp is left unchanged
+  until a write that needs the higher layout actually occurs.
+* The first commit that includes ``chunks`` lazily stamps the store v3;
+  the first tag lazily stamps it v4. From then on, code that predates
+  that version refuses to open it — intentional in both cases. v2 code
+  cannot decode chunked blobs, and v3 code sweeping a v4 store would
+  treat every tagged commit as garbage, because it does not know tags
+  are GC roots.
+* A store that never writes a chunk or a tag stays byte-identical to
+  the older layout except for the version sentinel.
 
 The pre-v2 layout is **not** supported. Stores written by an earlier
 version raise on open and need to be rebuilt fresh.
@@ -63,6 +70,7 @@ from .base import VersionedBase
 from .helpers import walk_history
 from .keyset import Keyset, KeysetEntry, MetaEntry
 from .merge import MergeResolution
+from .protocol import TagInfo
 
 PARENT_COMMIT = "__parent_commit__%s"
 COMMIT_ROOT = "__commit_root__%s"
@@ -70,14 +78,45 @@ COMMIT_TIME = "__commit_time__%s"
 BRANCH_HEAD = "__branch_head__%s"
 BRANCH_HEAD_PREV = "__branch_head_prev__%s"
 INFO_KEY = "__info__%s"
+# ``__tag_info__`` does not start with ``__tag__`` (they diverge at the
+# sixth character), so a prefix scan for one never picks up the other,
+# whatever the tag is called.
+TAG_KEY = "__tag__%s"
+TAG_INFO_KEY = "__tag_info__%s"
 
 CHUNK_PREFIX = "kvgit:chunk:"
 
 STORAGE_VERSION_KEY = "__kvgit_version__"
-STORAGE_VERSION = 3
-# Lower versions accepted as input. v3 code reads v2 stores transparently
-# and only stamps the store as v3 once a chunked write actually happens.
-SUPPORTED_READ_VERSIONS = frozenset({2, 3})
+STORAGE_VERSION = 4
+"""Highest layout this code knows how to write."""
+
+FRESH_STORE_VERSION = 3
+"""Stamped on a store that does not have a stamp yet.
+
+A stamp names the layout the store actually uses, not the newest one
+its writer understands. A fresh store holds neither chunks nor tags, so
+stamping the highest version here would lock out readers that could
+serve it perfectly well. Each feature that needs a higher layout raises
+the stamp itself, the first time it is used.
+"""
+
+CHUNK_STORAGE_VERSION = 3
+"""Lowest layout that can read a store containing chunks."""
+
+TAG_STORAGE_VERSION = 4
+"""Lowest layout that can read a store containing tags.
+
+Tags are GC roots. Older code sweeping a store with tags would walk
+branch heads only, find every tagged-but-unbranched commit unreachable,
+and delete it. Stamping the store v4 on its first tag makes that older
+code refuse to open the store at all, which is the only defence
+available: it cannot be taught the rule after the fact.
+"""
+
+# Lower versions accepted as input. Newer code reads older stores
+# transparently and only raises the stamp once a write that needs the
+# higher layout actually happens.
+SUPPORTED_READ_VERSIONS = frozenset({2, 3, 4})
 
 
 def content_hash(
@@ -108,6 +147,41 @@ def content_hash(
 logger = logging.getLogger("kvgit")
 
 
+def _assert_supported_version(store: KVStore) -> None:
+    """Raise if the store's version stamp is one this code cannot read.
+
+    Read-only, and silent on an unstamped store — it answers "may this
+    code touch what is here", not "is this store initialized". Every
+    entry point that mutates a store it did not open through
+    ``VersionedKV`` calls it first, the sweep above all: a store stamped
+    higher than this code understands may hold roots this code cannot
+    see, and sweeping it would delete live data.
+    """
+    raw = store.get(STORAGE_VERSION_KEY)
+    if raw is None:
+        return
+    version = safe_loads(raw)
+    if version not in SUPPORTED_READ_VERSIONS:
+        raise ValueError(
+            f"Store has kvgit storage version {version!r}, "
+            f"this code supports {sorted(SUPPORTED_READ_VERSIONS)}. "
+            "Use a fresh store."
+        )
+
+
+def _stamp_version_at_least(store: KVStore, version: int) -> None:
+    """Raise the store's version stamp to ``version`` if it is lower.
+
+    Called from any path that writes an artifact older layouts cannot
+    handle: a chunk (v3), a tag (v4). Stamps are sticky and are never
+    lowered — a v4 store that gains a chunk stays v4.
+    """
+    raw = store.get(STORAGE_VERSION_KEY)
+    current = safe_loads(raw) if raw is not None else None
+    if not isinstance(current, int) or isinstance(current, bool) or current < version:
+        store.set(STORAGE_VERSION_KEY, dumps(version))
+
+
 def _check_storage_version(store: KVStore) -> None:
     """Verify the store's kvgit version is compatible.
 
@@ -115,18 +189,12 @@ def _check_storage_version(store: KVStore) -> None:
     :data:`SUPPORTED_READ_VERSIONS`; the on-disk stamp is left
     untouched on open so that opening a v2 store with v3 code does not
     silently upgrade it to v3 (which would lock out older readers).
-    The upgrade happens lazily inside ``_create_commit`` the first
-    time a chunked write occurs.
+    The upgrade happens lazily, the first time a chunked write or a tag
+    write actually occurs.
     """
     raw = store.get(STORAGE_VERSION_KEY)
     if raw is not None:
-        version = safe_loads(raw)
-        if version not in SUPPORTED_READ_VERSIONS:
-            raise ValueError(
-                f"Store has kvgit storage version {version!r}, "
-                f"this code supports {sorted(SUPPORTED_READ_VERSIONS)}. "
-                "Use a fresh store."
-            )
+        _assert_supported_version(store)
         return
 
     # No version sentinel. Either fresh, or pre-v2.
@@ -140,7 +208,7 @@ def _check_storage_version(store: KVStore) -> None:
             f"This version requires storage v{min(SUPPORTED_READ_VERSIONS)} "
             "or higher. Use a fresh store."
         )
-    store.set(STORAGE_VERSION_KEY, dumps(STORAGE_VERSION))
+    store.set(STORAGE_VERSION_KEY, dumps(FRESH_STORE_VERSION))
 
 
 def _load_root(store: KVStore, commit_hash: str) -> str | None:
@@ -465,16 +533,90 @@ def repair_head(
     )
 
 
-def clean_orphans(store: KVStore, min_age: float = 3600) -> int:
-    """Remove orphaned commits unreachable from any branch HEAD.
+def _validate_tag_name(name: str) -> None:
+    """Reject tag names that cannot be stored, or cannot be read back.
 
-    Traces all reachable commits from live branch HEADs, then deletes
-    the commit metadata, blobs and HAMT nodes owned by the orphaned
-    commits and not shared with anything still reachable.
+    Branch names are unvalidated, so this is deliberately close to
+    unvalidated too: any non-empty string, ``/`` included, so embedders
+    can namespace their own tags (``pub/v1``). ``%`` is the one
+    exclusion — tag keys are built with ``%``-formatting, and a name
+    carrying its own format specifier turns the key template into
+    something other than a template.
+    """
+    if not isinstance(name, str) or not name:
+        raise ValueError("Tag name must be a non-empty string")
+    if "%" in name:
+        raise ValueError(f"Tag name must not contain '%': {name!r}")
+
+
+def tags(store: KVStore) -> dict[str, str]:
+    """Map every tag in the store to the commit it names.
+
+    Dangling tags — ones whose commit is no longer in the store — are
+    included, because leaving them out would make a damaged tag look
+    deleted. :func:`tag_info` says which is which.
+    """
+    prefix = TAG_KEY.replace("%s", "")
+    found: dict[str, str] = {}
+    for key in store.keys():
+        if not (isinstance(key, str) and key.startswith(prefix)):
+            continue
+        name = key[len(prefix) :]
+        if not name:
+            continue
+        raw = store.get(key)
+        if raw is None:
+            continue
+        commit_hash = safe_loads(raw)
+        if isinstance(commit_hash, str):
+            found[name] = commit_hash
+    return dict(sorted(found.items()))
+
+
+def tag_info(store: KVStore, name: str) -> TagInfo | None:
+    """Describe one tag, or None if the store has no such tag."""
+    raw = store.get(TAG_KEY % name)
+    if raw is None:
+        return None
+    commit_hash = safe_loads(raw)
+    if not isinstance(commit_hash, str):
+        return None
+
+    created: float | None = None
+    info: dict | None = None
+    record_bytes = store.get(TAG_INFO_KEY % name)
+    if record_bytes is not None:
+        record = safe_loads(record_bytes)
+        if isinstance(record, dict):
+            ts = record.get("time")
+            if isinstance(ts, (int, float)) and not isinstance(ts, bool):
+                created = float(ts)
+            stored_info = record.get("info")
+            if isinstance(stored_info, dict):
+                info = stored_info
+
+    return TagInfo(
+        name=name,
+        commit=commit_hash,
+        time=created,
+        info=info,
+        dangling=store.get(COMMIT_ROOT % commit_hash) is None,
+    )
+
+
+def clean_orphans(store: KVStore, min_age: float = 3600) -> int:
+    """Remove orphaned commits unreachable from any branch HEAD or tag.
+
+    Traces all reachable commits from live branch HEADs and from every
+    tag, then deletes the commit metadata, blobs and HAMT nodes owned
+    by the orphaned commits and not shared with anything still
+    reachable. A tag keeps its commit's whole ancestry alive exactly as
+    a branch head does, so a commit is collectable only when neither
+    kind of root reaches it.
 
     Handle-independent by design: it marks from ALL live branch HEADs
-    and touches nothing but ``store``, so it works with or without a
-    ``VersionedKV`` anchored on it. :meth:`VersionedKV.clean_orphans`
+    and ALL tags, and touches nothing but ``store``, so it works with or
+    without a ``VersionedKV`` anchored on it. :meth:`VersionedKV.clean_orphans`
     and the anchor-free admin path (:func:`kvgit.delete_branches`)
     share this one implementation.
 
@@ -508,8 +650,8 @@ def deep_clean(store: KVStore, min_age: float = 3600) -> int:
 
     Does everything :func:`clean_orphans` does, then additionally scans
     the whole ``kvgit:keyset:`` and ``kvgit:chunk:`` namespaces and
-    deletes anything not reachable from a live branch head or a young
-    orphan commit. That namespace scan is the only way to reclaim
+    deletes anything not reachable from a live branch head, a tag, or a
+    young orphan commit. That namespace scan is the only way to reclaim
     nodes and chunks that no commit references any more — leftovers
     from a crash, from an interrupted write, or from a store swept by
     an earlier kvgit — because no orphan keyset points at them.
@@ -536,6 +678,13 @@ def deep_clean(store: KVStore, min_age: float = 3600) -> int:
 def _sweep(store: KVStore, min_age: float, *, deep: bool) -> int:
     """Shared mark-and-sweep behind ``clean_orphans`` / ``deep_clean``."""
     gc_logger = logging.getLogger("kvgit.orphans")
+    # Reachability is decided from the roots this code knows about, so
+    # a store stamped above what this code reads must not be swept: its
+    # roots may be a kind that did not exist here, and everything hanging
+    # off them would look like garbage. The check belongs on this side of
+    # the call rather than only in the handle constructors, because the
+    # admin entry points sweep a raw store with no handle at all.
+    _assert_supported_version(store)
     cutoff_time = time.time() - min_age
 
     def _parent_loader(commit_hash: str) -> tuple[str, ...]:
@@ -578,11 +727,36 @@ def _sweep(store: KVStore, min_age: float, *, deep: bool) -> int:
                 reachable_chunks.update(entry.meta.chunks)
         reachable_nodes.update(new_nodes)
 
+    def _mark_from(root_commit: str) -> None:
+        """Mark a root's commit and everything it descends from."""
+        for commit in walk_history(root_commit, _parent_loader, all_parents=True):
+            if commit in reachable_commits:
+                continue
+            reachable_commits.add(commit)
+            _walk_commit_for_marks(commit)
+
+    # Roots are branch heads and tags, gathered in one pass. Two scans
+    # would take two snapshots of a store that may be moving underneath,
+    # and cost a second full pass over a large one. ``__branch_head__``,
+    # ``__branch_head_prev__``, ``__tag__`` and ``__tag_info__`` all
+    # diverge before their prefixes end, so no key matches two of them.
     branch_prefix = BRANCH_HEAD.replace("%s", "")
+    tag_prefix = TAG_KEY.replace("%s", "")
+    branch_names: list[str] = []
+    tag_names: list[str] = []
     for key in store.keys():
-        if not (isinstance(key, str) and key.startswith(branch_prefix)):
+        if not isinstance(key, str):
             continue
-        branch_name = key[len(branch_prefix) :]
+        if key.startswith(branch_prefix):
+            name = key[len(branch_prefix) :]
+            if name:
+                branch_names.append(name)
+        elif key.startswith(tag_prefix):
+            name = key[len(tag_prefix) :]
+            if name:
+                tag_names.append(name)
+
+    for branch_name in branch_names:
         # No ``recover_from_corrupt_head`` here, deliberately, even when
         # the caller has one wired into their handles. GC must not
         # decide reachability from a guess. A wrong answer from a
@@ -599,11 +773,29 @@ def _sweep(store: KVStore, min_age: float, *, deep: bool) -> int:
         branch_head = _resolve_head(store, branch_name)
         if branch_head is None:
             continue
-        for commit in walk_history(branch_head, _parent_loader, all_parents=True):
-            if commit in reachable_commits:
-                continue
-            reachable_commits.add(commit)
-            _walk_commit_for_marks(commit)
+        _mark_from(branch_head)
+
+    # Tags are the second class of root, walked exactly like branch
+    # heads: a tag keeps its commit's whole ancestry, so a commit whose
+    # every branch has been deleted is still live while a tag names it.
+    #
+    # A tag whose commit does not resolve marks nothing, for the same
+    # reason an unresolvable branch head marks nothing: the store no
+    # longer says what that root pointed at, and a sweep must not guess.
+    for tag_name in tag_names:
+        raw = store.get(TAG_KEY % tag_name)
+        tagged_commit = safe_loads(raw) if raw is not None else None
+        if (
+            not isinstance(tagged_commit, str)
+            or store.get(COMMIT_ROOT % tagged_commit) is None
+        ):
+            gc_logger.debug(
+                "Tag '%s' does not name a commit in this store; "
+                "marking nothing from it",
+                tag_name,
+            )
+            continue
+        _mark_from(tagged_commit)
 
     # Sweep phase: find orphaned commits via __commit_root__ scan.
     # Also identify "young orphans" — commits inside the min_age
@@ -921,7 +1113,7 @@ class VersionedKV(VersionedBase):
         # save a roundtrip on idempotent rewrites; the dedup property
         # holds either way because the key is the hash.
         if chunks:
-            self._stamp_v3_if_needed()
+            _stamp_version_at_least(self.store, CHUNK_STORAGE_VERSION)
             for chunk_hash, chunk_bytes in chunks.items():
                 diffs[CHUNK_PREFIX + chunk_hash] = chunk_bytes
 
@@ -953,19 +1145,6 @@ class VersionedKV(VersionedBase):
         self._meta = new_meta
 
         return new_hash
-
-    def _stamp_v3_if_needed(self) -> None:
-        """Lazily upgrade an opened v2 store to v3.
-
-        Called from any code path that writes a v3-only artifact (a
-        chunk under ``kvgit:chunk:*``). v3 stamps are sticky: once
-        upgraded, the store can no longer be opened by code that
-        only knows v2.
-        """
-        raw = self.store.get(STORAGE_VERSION_KEY)
-        current = safe_loads(raw) if raw is not None else None
-        if current != STORAGE_VERSION:
-            self.store.set(STORAGE_VERSION_KEY, dumps(STORAGE_VERSION))
 
     def _create_merge_commit(
         self,
@@ -1170,10 +1349,32 @@ class VersionedKV(VersionedBase):
         self._load_commit(commit_hash, update_base=True)
 
     def checkout(
-        self, commit_hash: str, *, branch: str | None = None
+        self,
+        commit_hash: str | None = None,
+        *,
+        branch: str | None = None,
+        tag: str | None = None,
     ) -> "VersionedKV | None":
-        """Return a new VersionedKV at a specific commit."""
-        if self.store.get(COMMIT_ROOT % commit_hash) is None:
+        """Return a new VersionedKV at a specific commit or tag.
+
+        Name the commit positionally or name a ``tag``, not both.
+
+        The handle comes back on this handle's branch (or ``branch``),
+        not on a branch of its own — there is no read-only mode. A
+        commit made from it goes through the ordinary HEAD CAS, so it
+        fast-forwards when the branch has not moved since, and conflicts
+        exactly as any other stale handle does when it has.
+
+        Returns None when the commit, or the tag, is not in the store.
+        """
+        if (commit_hash is None) == (tag is None):
+            raise ValueError("Pass exactly one of commit_hash or tag")
+        if tag is not None:
+            record = tag_info(self.store, tag)
+            if record is None or record.dangling:
+                return None
+            commit_hash = record.commit
+        elif self.store.get(COMMIT_ROOT % commit_hash) is None:
             return None
         return VersionedKV(
             self.store,
@@ -1239,13 +1440,26 @@ class VersionedKV(VersionedBase):
         self._branch = name
         self._load_commit(commit_hash, update_base=True)
 
-    def peek(self, key: str, *, branch: str) -> bytes | None:
-        """Read a key from another branch's HEAD without switching."""
-        commit_hash = _resolve_head(
-            self.store,
-            branch,
-            recover_from_corrupt_head=self._recover_from_corrupt_head,
-        )
+    def peek(
+        self, key: str, *, branch: str | None = None, tag: str | None = None
+    ) -> bytes | None:
+        """Read a key from another branch's HEAD, or from a tag.
+
+        Pass exactly one of ``branch`` or ``tag``. Returns None when the
+        key, the branch, or the tag is not there.
+        """
+        if (branch is None) == (tag is None):
+            raise ValueError("Pass exactly one of branch or tag")
+        commit_hash: str | None
+        if branch is not None:
+            commit_hash = _resolve_head(
+                self.store,
+                branch,
+                recover_from_corrupt_head=self._recover_from_corrupt_head,
+            )
+        else:
+            record = tag_info(self.store, tag or "")
+            commit_hash = None if record is None or record.dangling else record.commit
         if commit_hash is None:
             return None
         root = _load_root(self.store, commit_hash)
@@ -1286,6 +1500,90 @@ class VersionedKV(VersionedBase):
     def list_branches(self) -> list[str]:
         """List all branch names in the store."""
         return VersionedKV.branches(self.store)
+
+    # -- Tags --
+
+    def tag(self, name: str, *, at: str | None = None, info: dict | None = None) -> str:
+        """Name a commit permanently, and keep it (and its ancestry) alive.
+
+        A tag is immutable: creating one over an existing name raises,
+        and there is no move. Point a name somewhere else by deleting
+        the tag and creating it again, so that the history of the name
+        is at least visible in the calling code. Tags and branches are
+        separate namespaces — ``v1`` can be both, and they are unrelated.
+
+        The tagged commit and everything it descends from survive
+        garbage collection for as long as the tag exists, exactly as a
+        branch head's ancestry does.
+
+        Args:
+            at: Commit to tag. Defaults to this handle's current commit,
+                which for a ``Staged`` wrapper means the last *committed*
+                state — staged changes are not part of any commit yet and
+                are not tagged.
+            info: Optional caller metadata, stored beside the tag. Must
+                be JSON-serializable, like commit info.
+
+        Returns:
+            The commit hash the tag names.
+
+        Raises:
+            ValueError: if the name is unusable, already taken, or the
+                commit does not exist.
+
+        There is one race, and it is narrow: tagging a commit that is
+        *already* an orphan older than ``min_age`` can lose to a sweep
+        running concurrently, which was free to collect that commit
+        before the tag existed. Callers tag a commit they are holding —
+        a head, or something a head descends from — and a commit a
+        branch reaches is never a sweep candidate.
+        """
+        _validate_tag_name(name)
+        target = at or self._current_commit
+        if self.store.get(COMMIT_ROOT % target) is None:
+            raise ValueError(f"Commit '{target}' does not exist")
+        # Encoded before anything is written, so info that cannot be
+        # serialized raises without leaving a tag behind.
+        record = dumps({"time": time.time(), "info": info})
+
+        # Stamped before the tag lands, never after. A crash between the
+        # two would otherwise leave a tag in a store still claiming the
+        # older layout, which is precisely the store older code is
+        # willing to open and sweep.
+        _stamp_version_at_least(self.store, TAG_STORAGE_VERSION)
+
+        # CAS against absence: two writers racing the same name cannot
+        # both win, and an existing tag is never silently overwritten.
+        if not self.store.cas(TAG_KEY % name, dumps(target), expected=None):
+            raise ValueError(f"Tag '{name}' already exists")
+        # The record is a second write, so a crash in between leaves a
+        # tag with no time and no info. That is why the tag key alone is
+        # what GC and resolution read.
+        self.store.set(TAG_INFO_KEY % name, record)
+        return target
+
+    def tags(self) -> dict[str, str]:
+        """Map every tag in the store to the commit it names."""
+        return tags(self.store)
+
+    def tag_info(self, name: str) -> TagInfo | None:
+        """Describe one tag, or None if the store has no such tag."""
+        return tag_info(self.store, name)
+
+    def delete_tag(self, name: str) -> None:
+        """Remove a tag, then sweep the commits nothing else reaches.
+
+        Both keys go — the tag and its info record — and then
+        :meth:`clean_orphans` runs, matching :meth:`delete_branch`. A
+        commit the tag was the last root for becomes collectable at that
+        point, subject to the sweep's ``min_age`` guard.
+        """
+        _validate_tag_name(name)
+        if self.store.get(TAG_KEY % name) is None:
+            raise ValueError(f"Tag '{name}' does not exist")
+        self.store.remove(TAG_KEY % name)
+        self.store.remove(TAG_INFO_KEY % name)
+        self.clean_orphans()
 
     def commit_info(self, commit_hash: str | None = None) -> dict | None:
         """Retrieve the info dict for a commit, or None if none was stored."""
