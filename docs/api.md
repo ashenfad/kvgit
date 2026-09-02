@@ -60,7 +60,26 @@ kvgit.delete_branches(
 | `db_name` | `str` | `"kvgit"` | IndexedDB database name. Only used with `"indexeddb"`. |
 | `min_age` | `float` | `3600` | Passed to the orphan sweep — commits younger than this many seconds survive. `0` reclaims immediately (only when no concurrent writers). |
 
-Each name's `__branch_head__` and its `__branch_head_prev__` recovery backup are removed (the backup too, so a later same-named branch can't resurrect the deleted state), then a single [`clean_orphans`](#orphan-cleanup) sweep — at `min_age` (default: the one-hour concurrent-writer guard) — reclaims commits only the deleted branches referenced. That sweep does not reclaim chunks (see [Orphan Cleanup](#orphan-cleanup)); follow with `deep_clean` on a quiescent store if the store uses chunked codecs. Deleting every branch is legal; the store mints a fresh empty `main` on next open.
+Each name's `__branch_head__` and its `__branch_head_prev__` recovery backup are removed (the backup too, so a later same-named branch can't resurrect the deleted state), then a single [`clean_orphans`](#orphan-cleanup) sweep — at `min_age` (default: the one-hour concurrent-writer guard) — reclaims commits only the deleted branches referenced. That sweep does not reclaim chunks (see [Orphan Cleanup](#orphan-cleanup)); follow with `deep_clean` on a quiescent store if the store uses chunked codecs. Deleting every branch is legal; the store mints a fresh empty `main` on next open. [Tags](#tags) are roots for that sweep, so a tagged commit survives the deletion of every branch that reached it.
+
+---
+
+## `kvgit.delete_tags()`
+
+The tag counterpart of `delete_branches`, anchor-free for the same reason: teardown shouldn't need a handle, and a handle always has a current branch to open on.
+
+```python
+kvgit.delete_tags(
+    names,               # one tag name, or an iterable of them
+    *,
+    kind="disk",         # "memory", "disk", or "indexeddb"
+    path=None,           # required for "disk"
+    db_name="kvgit",     # IndexedDB database name (only for "indexeddb")
+    min_age=3600,        # sweep guard: commits younger than this survive
+)
+```
+
+Each name's `__tag__` and `__tag_info__` keys are removed, then one [`clean_orphans`](#orphan-cleanup) sweep reclaims commits that only the deleted tags kept alive. Missing names are no-ops, and a bare string is one name rather than one per character — both matching `delete_branches`.
 
 ---
 
@@ -159,12 +178,23 @@ Register a fallback merge function for any key without a specific registration.
 | Method | Signature | Description |
 |--------|-----------|-------------|
 | `create_branch` | `(name, *, at=None) -> Staged` | Fork onto a new branch. Returns a new `Staged`. |
-| `checkout` | `(commit_hash, *, branch=None) -> Staged \| None` | Open a specific commit. Returns `None` if not found. |
+| `checkout` | `(commit_hash=None, *, branch=None, tag=None) -> Staged \| None` | Open a specific commit, or a [tag](#tags). Exactly one of `commit_hash` / `tag`. Returns `None` if not found. |
 | `switch_branch` | `(name) -> None` | Switch to an existing branch (clears staged buffer). |
 | `delete_branch` | `(name) -> None` | Delete a branch and clean up orphaned commits. Cannot delete the current branch. |
 | `list_branches` | `() -> list[str]` | All branch names in the store. |
-| `peek` | `(key, *, branch) -> Any \| None` | Read a decoded value from another branch's HEAD. |
+| `peek` | `(key, *, branch=None, tag=None) -> Any \| None` | Read a decoded value from another branch's HEAD, or from a [tag](#tags). Exactly one of `branch` / `tag`. |
 | `reset_to` | `(commit_hash) -> bool` | Force HEAD to a specific commit. Returns `False` if not found. |
+
+### Tagging
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `tag` | `(name, *, at=None, info=None) -> str` | Name a commit permanently. Returns the tagged commit hash. Raises `ValueError` if the name is taken. |
+| `tags` | `() -> dict[str, str]` | Every tag in the store, name -> commit hash. |
+| `tag_info` | `(name) -> TagInfo \| None` | Details for one tag, or `None` if there is no such tag. |
+| `delete_tag` | `(name) -> None` | Remove a tag, then sweep orphans. Raises `ValueError` if the tag does not exist. |
+
+`s.tag("v1")` names the **current commit** — the last committed state. The staging buffer is not part of any commit yet, so it is never what gets tagged; commit first if you meant to name those changes. See [Tags](#tags) for the semantics and their effect on garbage collection.
 
 ### History
 
@@ -192,6 +222,42 @@ s.versioned.parents()                  # parent hashes of current commit
 | `initial_commit` | `str` | Root commit (oldest in linear history) |
 | `last_merge_result` | `MergeResult \| None` | Result of the last `commit()` |
 | `has_changes` | `bool` | Whether the staging buffer is non-empty |
+
+---
+
+## Tags
+
+A tag is an immutable name for a commit, available on both `Staged` and `VersionedKV`.
+
+```python
+s.tag("v1")                                # names the current commit
+s.tag("v1", at=some_hash, info={"by": "ann"})
+s.tags()                                   # {"v1": "a1b2c3..."}
+s.tag_info("v1")                           # TagInfo(name=..., commit=..., dangling=False)
+s.checkout(tag="v1")["config"]             # read the tagged state
+s.peek("config", tag="v1")                 # one key, without a handle
+s.delete_tag("v1")
+```
+
+**Tags never move.** Creating one over an existing name raises `ValueError`; pointing a name somewhere else is `delete_tag` then `tag`, so the move is visible in the calling code. Tags and branches are separate namespaces — `release` can be both, and the two are unrelated.
+
+**Names** follow branch names, which are unvalidated: any non-empty string, `/` included, so embedders can namespace their own (`pub/v1`). The single exclusion is `%`, since tag keys are built by `%`-formatting a template. `info` must be JSON-serializable, like commit info.
+
+**A tag is a garbage collection root.** [`clean_orphans`](#orphan-cleanup) and `deep_clean` mark from branch heads *and* tags, walking each tag's ancestry exactly as they walk a branch's. A commit is collectable only when neither kind of root reaches it, so tagging a commit and deleting every branch that reached it leaves the commit — and everything it descends from — alive until the tag goes. `delete_tag` removes both keys and then runs the orphan sweep, matching `delete_branch`.
+
+A tag whose commit is not in the store (`dangling=True`) marks **nothing**. That is damage rather than an ordinary state — a tag cannot be created for a commit that does not exist — and the store no longer says what the root pointed at, so the sweep has nothing to walk, the same rule an unresolvable branch HEAD gets.
+
+**`checkout(tag=...)` is not a read-only mode.** The handle comes back on the caller's branch, so a commit made from it goes through the ordinary HEAD CAS: it fast-forwards if the branch has not moved since the tag, and merges or raises `MergeConflict` if it has.
+
+**One race, and it is narrow.** Tagging a commit that is *already* an orphan older than `min_age` can lose to a sweep running concurrently, which was free to collect that commit before the tag existed. In practice callers tag a commit they are holding — a head, or something a head descends from — and a commit a branch reaches is never a sweep candidate.
+
+### Storage version 4
+
+The first tag written to a store lazily stamps it `__kvgit_version__ = 4`. From then on, kvgit versions that predate tags refuse to open it.
+
+That refusal is the point. Older code sweeping a store with tags would walk branch heads only, find every tagged-but-unbranched commit unreachable, and delete it — silently, and with no way to be taught the rule after the fact. Locking it out of the store entirely is the only defence available.
+
+The stamp names the layout a store actually uses, not the newest one its writer understands. A store that never writes a tag stays at the version it had: fresh stores are stamped v3, [chunked writes](#chunked-codecs) stamp v3, and neither locks out a reader that could serve the store correctly. Every path that sweeps checks the stamp before marking — including the anchor-free [`delete_branches`](#kvgitdelete_branches) and [`delete_tags`](#kvgitdelete_tags), which open a raw backend with no handle to check it for them, and which check before removing anything.
 
 ---
 
@@ -263,6 +329,18 @@ Frozen dataclass returned by `commit()`. Truthy when merge succeeded.
 | `strategy` | `str` | `"no_op"`, `"fast_forward"`, or `"three_way"` |
 | `auto_merged_keys` | `tuple[str, ...]` | Keys resolved by merge functions |
 | `carried_keys` | `tuple[str, ...]` | Keys carried forward from the other side |
+
+### TagInfo
+
+Frozen dataclass returned by `tag_info()`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | `str` | The tag name |
+| `commit` | `str` | Commit the tag names |
+| `time` | `float \| None` | When the tag was created. `None` if the tag's info record is missing. |
+| `info` | `dict \| None` | Caller metadata passed to `tag()`, if any |
+| `dangling` | `bool` | Whether the tagged commit is absent from the store — damage, not an ordinary state |
 
 ### DiffResult
 
@@ -459,7 +537,8 @@ All methods from the `Versioned` protocol are implemented. Additional:
 |--------------------|-------------|
 | `store` | Direct access to the underlying `KVStore` |
 | `branches(store)` | Static method: list branch names for a store |
-| `clean_orphans(min_age=3600)` | Remove orphaned commits unreachable from any branch HEAD, along with the blobs and HAMT nodes they uniquely owned. **Does not reclaim chunks** — see below. Returns count of cleaned orphans. Only deletes commits older than `min_age` seconds. Safe under concurrent writers. |
+| `tag(name, *, at=None, info=None)` | Name a commit permanently — see [Tags](#tags). Also `tags()`, `tag_info(name)`, `delete_tag(name)`. Module-level `kvgit.versioned.kv.tags(store)` and `tag_info(store, name)` do the same without a handle. |
+| `clean_orphans(min_age=3600)` | Remove orphaned commits unreachable from any branch HEAD or tag, along with the blobs and HAMT nodes they uniquely owned. **Does not reclaim chunks** — see below. Returns count of cleaned orphans. Only deletes commits older than `min_age` seconds. Safe under concurrent writers. |
 | `deep_clean(min_age=3600)` | `clean_orphans` plus a full scan of the `kvgit:keyset:` and `kvgit:chunk:` namespaces. The only pass that reclaims chunks, orphan-owned ones included. **Requires a quiescent store** — see below. |
 | `repair_head()` | Persist a recovered HEAD for this branch. Reads recover a damaged HEAD in memory without writing it back; this is the explicit call that makes the recovery durable. Returns the commit HEAD now names, or `None` if nothing was recoverable. See [HEAD Recovery](#head-recovery). |
 
@@ -506,6 +585,8 @@ kvgit.versioned.kv.repair_head(store, "main")    # no handle needed
 ### Orphan Cleanup
 
 When branches are deleted, the commits they referenced may become unreachable ("orphaned"). `delete_branch()` automatically calls `clean_orphans()` after removing the branch HEAD. The default `min_age=3600` (1 hour) decides which unreachable commits are old enough to delete; orphans from deleted branches are cleaned up by subsequent `clean_orphans()` calls once they age past the guard.
+
+Reachability is decided from two kinds of root: live branch heads and [tags](#tags). A tag keeps its commit's whole ancestry alive exactly as a branch head does, so a commit is orphaned only when neither reaches it.
 
 `clean_orphans()` finds everything it deletes by walking the keyset of each orphan commit it is removing. Blobs and HAMT nodes that the orphan owned are reclaimed; anything shared with a reachable commit — or with a young orphan inside the `min_age` window, which protects in-flight writers — is left alone. Because candidates come only from orphan keysets and never from a namespace scan, a commit made by another writer *while the sweep is running* can never contribute a deletion candidate.
 

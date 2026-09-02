@@ -126,6 +126,40 @@ print(len(clean))  # 0 (forked from empty root)
 
 ---
 
+## Tags
+
+A tag is an immutable name for a commit. Unlike a branch head, it never moves:
+
+```python
+s = kvgit.store()
+s["config"] = "v1"
+s.commit()
+
+s.tag("release-1", info={"by": "ann"})   # names the current commit
+
+s["config"] = "v2"
+s.commit()
+
+s["config"]                              # "v2" (the branch moved on)
+s.peek("config", tag="release-1")        # "v1" (the tag did not)
+
+old = s.checkout(tag="release-1")        # a handle at the tagged commit
+old["config"]                            # "v1"
+
+s.tags()                                 # {"release-1": "a1b2c3..."}
+s.delete_tag("release-1")
+```
+
+Tagging again under the same name raises -- moving a tag is `delete_tag` then `tag`, spelled out. Tags and branches are separate namespaces, so the same name can be both.
+
+A tag is also a garbage collection root: the tagged commit and everything it descends from survive [cleanup](#cleaning-up-unreachable-commits) for as long as the tag exists, even after every branch that reached them is gone. That is what makes a tag a safe place to leave a release, an experiment worth keeping, or a checkpoint an agent may want to come back to.
+
+`checkout(tag=...)` is not a read-only mode. The handle sits on your current branch, so committing from it advances the branch if nothing else has moved it, and merges (or raises) if something has.
+
+The first tag written to a store raises its storage version to 4, and kvgit versions predating tags then refuse to open it -- deliberately, since they would sweep tagged commits as garbage. See [Storage version 4](api.md#storage-version-4).
+
+---
+
 ## Merging
 
 When you commit on a branch that's behind HEAD (because another branch or writer committed first), kvgit performs a three-way merge automatically.
@@ -286,7 +320,7 @@ s.get("agent/worker/task")  # "fetch"
 
 ## Cleaning up unreachable commits
 
-Committing creates history. When a branch is deleted, the commits it referenced may become unreachable -- no branch HEAD can walk to them anymore -- but they still occupy storage along with any blobs and keyset nodes they uniquely owned. kvgit reclaims this with reachability-based garbage collection via `clean_orphans()`. This is not LRU eviction: nothing is ever removed just because it's old or infrequently accessed. Only truly unreachable commits are swept.
+Committing creates history. When a branch is deleted, the commits it referenced may become unreachable -- no branch HEAD and no [tag](#tags) can walk to them anymore -- but they still occupy storage along with any blobs and keyset nodes they uniquely owned. kvgit reclaims this with reachability-based garbage collection via `clean_orphans()`. This is not LRU eviction: nothing is ever removed just because it's old or infrequently accessed. Only truly unreachable commits are swept.
 
 `delete_branch()` calls `clean_orphans()` automatically, so in the common case you don't need to think about it:
 

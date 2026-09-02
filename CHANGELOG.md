@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Tags: immutable names for commits, and a second class of GC root.** `s.tag("v1")` names the current commit (or another, with `at=`), `s.tags()` lists them, `s.tag_info("v1")` returns a `TagInfo`, and `s.delete_tag("v1")` removes one and sweeps. Available on `Staged` and `VersionedKV`, with `checkout(tag="v1")` and `peek(key, tag="v1")` reading a tagged commit without a branch. A tag never moves — creating one over an existing name raises, so pointing a name elsewhere is `delete_tag` then `tag` — and tags live in their own namespace, unrelated to branches.
+
+  A tag is a garbage collection root: `clean_orphans` and `deep_clean` mark from branch heads *and* tags, walking each tag's ancestry the way they walk a branch's. A tagged commit therefore survives the deletion of every branch that reached it, until the tag goes. A tag whose commit is missing from the store keeps nothing alive — the store no longer says what that root pointed at, and a sweep must not guess — and reports `dangling=True`. `Staged.tag()` names the last *committed* state; the staging buffer is not part of any commit and is never what gets tagged.
+- **`kvgit.delete_tags(names, ...)`**, the anchor-free admin counterpart of `delete_branches`: removes each tag's two keys directly on the backend, then sweeps once. Missing names are no-ops, and a bare string is one name.
+- **`TagInfo`**, exported from `kvgit` — `name`, `commit`, `time`, `info`, `dangling`.
+
+### Changed
+
+- **`STORAGE_VERSION` 3 → 4, stamped lazily on the first tag.** A store gets the v4 stamp the first time a tag is written to it, and kvgit versions that predate tags then refuse to open it. That refusal is the feature: older code sweeping a store with tags would walk branch heads only, see every tagged-but-unbranched commit as unreachable, and delete it — silently, with no way to learn the rule after the fact. Locking it out of the store is the only defence available. **This affects you if** you open one store from two kvgit versions: once anything tags it, the older one raises on open. A store that is never tagged is unaffected.
+
+  The stamp now names the layout a store actually uses rather than the newest one its writer understands. Fresh stores are stamped v3 and chunked writes stamp v3, so neither locks out a v3 reader that could serve the store correctly; only a tag raises the stamp to 4. `CHUNK_STORAGE_VERSION` and `TAG_STORAGE_VERSION` name the two feature minimums, and `STORAGE_VERSION` is the highest layout this code writes.
+- **Every sweep now checks the storage version before marking.** `clean_orphans` and `deep_clean` refuse a store stamped above what they can read, rather than treating its unknown roots' commits as garbage. The anchor-free `kvgit.delete_branches` and `kvgit.delete_tags` check before their first removal, so such a store comes out of the call untouched instead of half-edited — they open a raw backend with no `VersionedKV` to check it for them.
+
 ## [0.3.4] - 2026-09-01
 
 ### Changed
