@@ -7,6 +7,7 @@ Git-style versioning for your data. Commits, branches, and merges -- backed by a
 | **Dict interface** | `MutableMapping[str, Any]` -- reads and writes work like a dict |
 | **Commits** | Immutable, content-addressable snapshots with rollback |
 | **Branches** | Cheap forks with CAS-based optimistic concurrency |
+| **Tags** | Immutable names for commits; a tagged commit outlives every branch that reached it |
 | **Three-way merge** | Auto-merges non-overlapping changes; pluggable merge fns for conflicts |
 | **Pluggable backends** | In-memory, disk (diskcache), IndexedDB (Pyodide/browser), or bring your own `KVStore` |
 | **Chunked codecs** | Optional content-addressed dedup for large numpy arrays and pandas DataFrames -- equal buffers stored once across keys, commits, and branches |
@@ -38,6 +39,10 @@ dev.commit()
 
 print(main["score"])  # 0   (main unchanged)
 print(dev["score"])   # 999 (dev branch)
+
+# Tag a commit by name -- immutable, and safe from garbage collection
+main.tag("v1")
+print(main.peek("score", tag="v1"))  # 0
 ```
 
 ## Chunked codecs (numpy / pandas)
