@@ -23,7 +23,7 @@ from kvgit.encoding import dumps, safe_loads
 from kvgit.kv.memory import Memory
 from kvgit.versioned.kv import (
     CHUNK_PREFIX,
-    STORAGE_VERSION,
+    CHUNK_STORAGE_VERSION,
     STORAGE_VERSION_KEY,
 )
 
@@ -61,7 +61,7 @@ class TestV2StoreOpenedByV3Code:
         s2 = Staged(VersionedKV(store), encoder=encoder, decoder=decoder)
         s2["arr"] = np.arange(2048, dtype="float64")
         s2.commit()
-        assert safe_loads(store.get(STORAGE_VERSION_KEY)) == STORAGE_VERSION
+        assert safe_loads(store.get(STORAGE_VERSION_KEY)) == CHUNK_STORAGE_VERSION
 
     def test_mixed_pickle_and_chunked_entries_coexist(self):
         encoder, decoder = chunked_pair()

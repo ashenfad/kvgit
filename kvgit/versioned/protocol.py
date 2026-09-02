@@ -21,6 +21,27 @@ class DiffResult:
 
 
 @dataclass(frozen=True)
+class TagInfo:
+    """What a store records about one tag.
+
+    ``time`` and ``info`` come from a record written just after the tag
+    itself, so both are ``None`` for a tag whose record is missing —
+    a crash between the two writes, or a store written by hand.
+
+    ``dangling`` means the tagged commit is not in the store. A tag
+    cannot be created for a commit that does not exist, so this is
+    damage rather than an ordinary state, and a dangling tag keeps
+    nothing alive: garbage collection marks nothing from it.
+    """
+
+    name: str
+    commit: str
+    time: float | None
+    info: dict | None
+    dangling: bool
+
+
+@dataclass(frozen=True)
 class MergeResult:
     """Result of a merge operation."""
 
@@ -92,7 +113,11 @@ class Versioned(Protocol):
     def refresh(self) -> None: ...
 
     def checkout(
-        self, commit_hash: str, *, branch: str | None = None
+        self,
+        commit_hash: str | None = None,
+        *,
+        branch: str | None = None,
+        tag: str | None = None,
     ) -> "Versioned | None": ...
 
     def create_branch(self, name: str, *, at: str | None = None) -> "Versioned": ...
@@ -101,7 +126,21 @@ class Versioned(Protocol):
 
     def switch_branch(self, name: str) -> None: ...
 
-    def peek(self, key: str, *, branch: str) -> bytes | None: ...
+    def peek(
+        self, key: str, *, branch: str | None = None, tag: str | None = None
+    ) -> bytes | None: ...
+
+    # -- Tags --
+
+    def tag(
+        self, name: str, *, at: str | None = None, info: dict | None = None
+    ) -> str: ...
+
+    def tags(self) -> dict[str, str]: ...
+
+    def tag_info(self, name: str) -> TagInfo | None: ...
+
+    def delete_tag(self, name: str) -> None: ...
 
     def reset_to(self, commit_hash: str) -> bool: ...
 

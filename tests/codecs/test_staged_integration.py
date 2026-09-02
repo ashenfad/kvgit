@@ -13,7 +13,7 @@ from kvgit.encoding import safe_loads
 from kvgit.kv.memory import Memory
 from kvgit.versioned.kv import (
     CHUNK_PREFIX,
-    STORAGE_VERSION,
+    CHUNK_STORAGE_VERSION,
     STORAGE_VERSION_KEY,
 )
 
@@ -191,7 +191,7 @@ class TestStorageVersioning:
         s["x"] = arr
         s.commit()
         version_raw = store.get(STORAGE_VERSION_KEY)
-        assert safe_loads(version_raw) == STORAGE_VERSION
+        assert safe_loads(version_raw) == CHUNK_STORAGE_VERSION
 
     def test_pickle_only_writes_dont_force_v3_on_v2_store(self):
         """Opening a v2 store with v3 code keeps it v2 until a chunk lands."""
@@ -224,7 +224,7 @@ class TestStorageVersioning:
         s_chunked = Staged(VersionedKV(store), encoder=encoder, decoder=decoder)
         s_chunked["arr"] = np.arange(2048, dtype="float64")
         s_chunked.commit()
-        assert safe_loads(store.get(STORAGE_VERSION_KEY)) == STORAGE_VERSION
+        assert safe_loads(store.get(STORAGE_VERSION_KEY)) == CHUNK_STORAGE_VERSION
 
         # Both keys still readable.
         assert s_chunked["plain"] == {"a": 1}
