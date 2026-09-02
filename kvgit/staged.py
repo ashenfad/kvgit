@@ -8,7 +8,7 @@ from typing import Any
 from .codecs._hash import hash_bytes
 from .content_types import MergeFn
 from .versioned.kv import CHUNK_PREFIX, VersionedKV
-from .versioned.protocol import BytesMergeFn, MergeResult, Versioned
+from .versioned.protocol import BytesMergeFn, MergeResult, TagInfo, Versioned
 
 
 class _ChunkSink:
@@ -407,10 +407,22 @@ class Staged(MutableMapping[str, Any]):
         )
 
     def checkout(
-        self, commit_hash: str, *, branch: str | None = None
+        self,
+        commit_hash: str | None = None,
+        *,
+        branch: str | None = None,
+        tag: str | None = None,
     ) -> "Staged | None":
-        """Create a new Staged at a specific commit. Returns None if not found."""
-        v = self._versioned.checkout(commit_hash, branch=branch)
+        """Create a new Staged at a specific commit or tag.
+
+        Pass exactly one of ``commit_hash`` or ``tag``. Returns None if
+        the commit or tag is not in the store.
+
+        The handle is a normal writable one on the caller's branch: a
+        commit from it advances that branch when it has not moved, and
+        conflicts when it has.
+        """
+        v = self._versioned.checkout(commit_hash, branch=branch, tag=tag)
         if v is None:
             return None
         return Staged(v, encoder=self._encoder, decoder=self._decoder)
@@ -430,12 +442,45 @@ class Staged(MutableMapping[str, Any]):
         self._removals.clear()
         self._cache.clear()
 
-    def peek(self, key: str, *, branch: str) -> Any:
-        """Read a key from another branch without switching. Returns None if not found."""
-        raw = self._versioned.peek(key, branch=branch)
+    def peek(
+        self, key: str, *, branch: str | None = None, tag: str | None = None
+    ) -> Any:
+        """Read a key from another branch, or from a tag, without switching.
+
+        Pass exactly one of ``branch`` or ``tag``. Returns None if not
+        found.
+        """
+        raw = self._versioned.peek(key, branch=branch, tag=tag)
         if raw is None:
             return None
         return self._decode(raw)
+
+    # -- Tags --
+
+    def tag(self, name: str, *, at: str | None = None, info: dict | None = None) -> str:
+        """Name a commit permanently. Returns the commit hash tagged.
+
+        Tags the **current commit** — the last committed state — not the
+        staging buffer. Staged changes are not part of any commit yet,
+        so there is nothing there to name; commit first if you meant to
+        tag them.
+
+        Immutable: an existing name raises rather than moving. Tags keep
+        their commit's ancestry alive through garbage collection.
+        """
+        return self._versioned.tag(name, at=at, info=info)
+
+    def tags(self) -> dict[str, str]:
+        """Map every tag in the store to the commit it names."""
+        return self._versioned.tags()
+
+    def tag_info(self, name: str) -> TagInfo | None:
+        """Describe one tag, or None if the store has no such tag."""
+        return self._versioned.tag_info(name)
+
+    def delete_tag(self, name: str) -> None:
+        """Delete a tag, then sweep commits nothing else reaches."""
+        self._versioned.delete_tag(name)
 
     def reset_to(self, commit_hash: str) -> bool:
         """Reset HEAD to a specific commit and clear staged changes.

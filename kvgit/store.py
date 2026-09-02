@@ -10,8 +10,11 @@ from .staged import Staged
 from .versioned.kv import (
     BRANCH_HEAD,
     BRANCH_HEAD_PREV,
+    TAG_INFO_KEY,
+    TAG_KEY,
     CorruptHeadRecoverer,
     VersionedKV,
+    _assert_supported_version,
     clean_orphans,
 )
 
@@ -137,7 +140,9 @@ def delete_branches(
     just mints a fresh empty ``main`` on next open.
 
     One :func:`clean_orphans` sweep runs after all removals, so commits
-    that only the deleted branches referenced are reclaimed. All heads
+    that only the deleted branches referenced are reclaimed. Tags are
+    roots for that sweep like any other caller of it, so a tagged commit
+    survives the deletion of every branch that reached it. All heads
     (and prev-heads) are gone before the sweep, so it can't mistake a
     doomed branch for a live one. ``min_age`` defaults to
     ``clean_orphans``'s one-hour guard (matching ``delete_branch``), so
@@ -169,9 +174,65 @@ def delete_branches(
         return  # nothing asked: skip the backend open and the sweep
     backend = _make_backend(kind, path=path, db_name=db_name)
     try:
+        # No ``VersionedKV`` is constructed here, so nothing else on this
+        # path checks the store's layout version. Checked before the
+        # first removal rather than leaving it to the sweep: a store this
+        # code cannot read must come out of the call untouched, not with
+        # its branch keys already gone.
+        _assert_supported_version(backend)
         for name in doomed:
             backend.remove(BRANCH_HEAD % name)
             backend.remove(BRANCH_HEAD_PREV % name)
+        clean_orphans(backend, min_age=min_age)
+    finally:
+        close = getattr(backend, "close", None)
+        if callable(close):
+            close()
+
+
+def delete_tags(
+    names: str | Iterable[str],
+    *,
+    kind: Literal["memory", "disk", "indexeddb"] = "disk",
+    path: str | None = None,
+    db_name: str = "kvgit",
+    min_age: float = 3600,
+) -> None:
+    """Delete tags with no branch anchor, then sweep orphans.
+
+    The tag counterpart of :func:`delete_branches`, and anchor-free for
+    the same reason: teardown should not need a handle, and a handle
+    always has a current branch to open on. For each name,
+    ``__tag__<name>`` and its ``__tag_info__<name>`` record are removed,
+    then a single :func:`clean_orphans` sweep reclaims commits that only
+    the deleted tags kept alive. A name with no tag is skipped —
+    idempotency beats a ``ValueError`` in teardown.
+
+    That sweep does not reclaim chunks; follow up with ``deep_clean`` on
+    a quiescent store if the store uses chunked codecs.
+
+    Args:
+        names: Tag names to delete — one name or an iterable of them.
+            Missing names are no-ops. (A bare string is treated as ONE
+            name, not iterated per character.)
+        kind: ``"disk"`` (default), ``"memory"``, or ``"indexeddb"``.
+        path: Required when ``kind="disk"``. Store directory.
+        db_name: IndexedDB database name (``kind="indexeddb"`` only).
+        min_age: Passed to :func:`clean_orphans` — commits younger than
+            this many seconds survive the sweep.
+    """
+    doomed = {names} if isinstance(names, str) else set(names)
+    if not doomed:
+        return  # nothing asked: skip the backend open and the sweep
+    backend = _make_backend(kind, path=path, db_name=db_name)
+    try:
+        # Same reasoning as delete_branches: no handle is constructed on
+        # this path, so the layout check has to happen here, before
+        # anything is removed.
+        _assert_supported_version(backend)
+        for name in doomed:
+            backend.remove(TAG_KEY % name)
+            backend.remove(TAG_INFO_KEY % name)
         clean_orphans(backend, min_age=min_age)
     finally:
         close = getattr(backend, "close", None)
