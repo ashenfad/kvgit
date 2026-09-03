@@ -14,14 +14,16 @@ import pytest
 import kvgit
 from kvgit import MergeConflict, VersionedKV as Versioned, store
 from kvgit.encoding import dumps, safe_loads
+from kvgit.kv.disk import Disk
 from kvgit.kv.memory import Memory
-from kvgit.versioned import kv as kv_module
 from kvgit.versioned.kv import (
     BRANCH_HEAD,
+    BRANCH_HEAD_PREV,
     COMMIT_ROOT,
     STORAGE_VERSION_KEY,
+    TAG_BRANCH_PREFIX,
     TAG_INFO_KEY,
-    TAG_KEY,
+    _stamp_version_at_least,
     clean_orphans,
 )
 
@@ -36,6 +38,11 @@ def _blob_keys(backend) -> set[str]:
         and not k.startswith("__")
         and "kvgit:" not in k
     }
+
+
+def _tag_head(name: str) -> str:
+    """The key a tag's commit pointer lives under."""
+    return BRANCH_HEAD % (TAG_BRANCH_PREFIX + name)
 
 
 def _version(backend):
@@ -186,7 +193,7 @@ class TestTagsAsGCRoots:
 
         v.delete_tag("v1")
 
-        assert backend.get(TAG_KEY % "v1") is None
+        assert backend.get(_tag_head("v1")) is None
         assert backend.get(TAG_INFO_KEY % "v1") is None
         assert v.clean_orphans(min_age=0) >= 1
         assert backend.get(COMMIT_ROOT % tagged) is None
@@ -202,7 +209,7 @@ class TestTagsAsGCRoots:
         backend, v, tagged = self._store_with_tagged_orphan()
 
         # Damage the tag: it now names a commit that is not in the store.
-        backend.set(TAG_KEY % "v1", dumps("0" * 40))
+        backend.set(_tag_head("v1"), dumps("0" * 40))
         assert v.tag_info("v1").dangling is True
 
         assert v.clean_orphans(min_age=0) >= 1
@@ -212,7 +219,7 @@ class TestTagsAsGCRoots:
         """Omitting it would make damage look like deletion."""
         v = Versioned()
         v.tag("v1")
-        v.store.set(TAG_KEY % "v1", dumps("0" * 40))
+        v.store.set(_tag_head("v1"), dumps("0" * 40))
         assert v.tags() == {"v1": "0" * 40}
 
     def test_module_sweep_sees_tags_without_a_handle(self):
@@ -329,7 +336,7 @@ class TestCheckoutTag:
     def test_dangling_tag_returns_none(self):
         v = Versioned()
         v.tag("v1")
-        v.store.set(TAG_KEY % "v1", dumps("0" * 40))
+        v.store.set(_tag_head("v1"), dumps("0" * 40))
         assert v.checkout(tag="v1") is None
 
     def test_both_commit_and_tag_raises(self):
@@ -371,72 +378,205 @@ class TestPeekTag:
             Versioned().peek("config")
 
 
-class TestStorageVersionGate:
-    def test_store_stays_v3_until_the_first_tag(self):
+class TestTagKeyLayout:
+    """A tag is a branch head under a reserved name. That is the
+    cross-version contract, so it is asserted directly."""
+
+    def test_a_tag_is_a_branch_head_under_refs_tags(self):
+        """Every kvgit decides reachability by walking branch heads. A
+        tag stored as one is therefore read, and kept alive, by versions
+        that predate tags — including their anchor-free admin sweep,
+        which no version stamp in this repo could have held back. Change
+        this key and that property is gone."""
+        backend = Memory()
+        v = Versioned(backend)
+        tagged = v.tag("v1")
+
+        assert backend.get(BRANCH_HEAD % "refs/tags/v1") == dumps(tagged)
+        assert TAG_BRANCH_PREFIX == "refs/tags/"
+
+    def test_tagging_does_not_change_the_storage_version(self):
+        """A tagged store must still open under versions that predate
+        tags, so nothing about a tag raises the stamp."""
         backend = Memory()
         v = Versioned(backend)
         v.commit({"x": b"1"})
         assert _version(backend) == 3
 
         v.tag("v1")
-        assert _version(backend) == 4
+        assert _version(backend) == 3
 
-    def test_stamp_lands_before_the_tag(self):
-        """A tag in a store still claiming v3 is exactly what older code
-        is willing to open and sweep, so the stamp is never written
-        second."""
+    def test_info_record_survives_a_deep_clean(self):
+        """The record lives under its own key kind that no sweep — this
+        version's or an older one's — scans."""
         backend = Memory()
         v = Versioned(backend)
-        writes: list[str] = []
-        original = backend.set
+        v.tag("v1", info={"by": "ann"})
+        v.deep_clean(min_age=0)
+        assert backend.get(TAG_INFO_KEY % "v1") is not None
+        assert v.tag_info("v1").info == {"by": "ann"}
 
-        def recording_set(key, value):
-            writes.append(key)
-            return original(key, value)
-
-        backend.set = recording_set  # type: ignore[method-assign]
+    def test_delete_tag_removes_head_backup_and_record(self):
+        """The prev-HEAD backup goes too. This code never writes one for
+        a tag, but something treating the tag as an ordinary branch
+        could have, and a backup outliving its head would resurrect the
+        deleted commit under a later tag of the same name."""
+        backend = Memory()
+        v = Versioned(backend)
+        v.commit({"x": b"1"})
         v.tag("v1")
+        # Planted by hand: what an older client leaves behind if it
+        # switches onto the tag and commits.
+        backend.set(BRANCH_HEAD_PREV % "refs/tags/v1", dumps(v.current_commit))
 
-        assert writes.index(STORAGE_VERSION_KEY) < writes.index(TAG_INFO_KEY % "v1")
+        v.delete_tag("v1")
 
-    def test_reader_without_v4_refuses_a_tagged_store(self, monkeypatch):
-        backend = Memory()
-        Versioned(backend).tag("v1")
+        assert backend.get(_tag_head("v1")) is None
+        assert backend.get(BRANCH_HEAD_PREV % "refs/tags/v1") is None
+        assert backend.get(TAG_INFO_KEY % "v1") is None
 
-        monkeypatch.setattr(kv_module, "SUPPORTED_READ_VERSIONS", frozenset({2, 3}))
-        with pytest.raises(ValueError, match="storage version"):
-            Versioned(backend)
-
-    def test_sweep_without_v4_refuses_a_tagged_store(self, monkeypatch):
-        """The whole point of the stamp: an older sweep would see every
-        tagged commit as garbage."""
-        backend = Memory()
-        Versioned(backend).tag("v1")
-
-        monkeypatch.setattr(kv_module, "SUPPORTED_READ_VERSIONS", frozenset({2, 3}))
-        with pytest.raises(ValueError, match="storage version"):
-            clean_orphans(backend, min_age=0)
-
-    def test_anchor_free_delete_without_v4_refuses_a_tagged_store(self, monkeypatch):
-        """No handle is constructed on that path, so it checks the
-        version itself — before removing anything."""
+    def test_anchor_free_delete_tags_removes_the_backup_too(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "store")
             s = store(kind="disk", path=p)
             s.commit()
             s.tag("v1")
+            backend = s.versioned.store
+            backend.set(BRANCH_HEAD_PREV % "refs/tags/v1", dumps(s.current_commit))
+            backend.close()
+
+            kvgit.delete_tags("v1", kind="disk", path=p)
+
+            reopened = store(kind="disk", path=p).versioned.store
+            assert reopened.get(_tag_head("v1")) is None
+            assert reopened.get(BRANCH_HEAD_PREV % "refs/tags/v1") is None
+            assert reopened.get(TAG_INFO_KEY % "v1") is None
+
+
+class TestReservedBranchNames:
+    """Tags hide from the branch API, and the branch API refuses to
+    hand out names inside their namespace."""
+
+    def test_branch_listings_hide_tags(self):
+        store_ = Memory()
+        v = Versioned(store_)
+        v.create_branch("dev")
+        v.tag("v1")
+
+        assert v.list_branches() == ["dev", "main"]
+        assert Versioned.branches(store_) == ["dev", "main"]
+        assert v.tags() == {"v1": v.current_commit}
+
+    def test_constructor_refuses_a_reserved_branch(self):
+        with pytest.raises(ValueError, match="reserved for tags"):
+            Versioned(Memory(), branch="refs/tags/v1")
+
+    def test_create_branch_refuses_a_reserved_name(self):
+        v = Versioned()
+        with pytest.raises(ValueError, match="reserved for tags"):
+            v.create_branch("refs/tags/v1")
+
+    def test_switch_branch_refuses_a_reserved_name(self):
+        v = Versioned()
+        v.tag("v1")
+        with pytest.raises(ValueError, match="reserved for tags"):
+            v.switch_branch("refs/tags/v1")
+
+    def test_delete_branch_refuses_a_reserved_name(self):
+        v = Versioned()
+        v.tag("v1")
+        with pytest.raises(ValueError, match="reserved for tags"):
+            v.delete_branch("refs/tags/v1")
+
+    def test_peek_refuses_a_reserved_branch(self):
+        v = Versioned()
+        v.commit({"x": b"1"})
+        v.tag("v1")
+        with pytest.raises(ValueError, match="reserved for tags"):
+            v.peek("x", branch="refs/tags/v1")
+
+
+class TestVersionStamp:
+    """The stamp helper still guards the v2 -> v3 chunk upgrade."""
+
+    def test_stamping_is_monotonic(self):
+        backend = Memory()
+        backend.set(STORAGE_VERSION_KEY, dumps(3))
+        _stamp_version_at_least(backend, 2)
+        assert _version(backend) == 3
+
+    def test_stamping_an_unstamped_store_writes_the_version(self):
+        backend = Memory()
+        _stamp_version_at_least(backend, 3)
+        assert _version(backend) == 3
+
+    def test_a_stale_writer_cannot_lower_the_stamp(self):
+        """Read-then-set would let two first-time writers interleave so
+        the lower version lands last, leaving a store whose stamp
+        under-describes what is in it — exactly the store older readers
+        are willing to open. The write is a CAS against the bytes the
+        decision was made from, so a stale writer loses and re-reads."""
+
+        class StaleReadStore(Memory):
+            """Serves one stale read of the version stamp.
+
+            Stands in for a writer that read the stamp before another
+            writer raised it and only reached its own write afterwards.
+            """
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.stale_reads = 1
+
+            def get(self, key):
+                if key == STORAGE_VERSION_KEY and self.stale_reads:
+                    self.stale_reads -= 1
+                    return dumps(2)
+                return super().get(key)
+
+        backend = StaleReadStore()
+        backend.set(STORAGE_VERSION_KEY, dumps(4))  # the other writer won
+
+        _stamp_version_at_least(backend, 3)
+
+        assert backend.stale_reads == 0  # the stale value really was served
+        assert _version(backend) == 4
+
+
+class TestUnknownStorageVersionIsRefused:
+    """Version hygiene, no longer what protects tags: code must not
+    sweep a store whose layout it does not know."""
+
+    def test_sweep_refuses_an_unknown_version(self):
+        backend = Memory()
+        Versioned(backend).tag("v1")
+        backend.set(STORAGE_VERSION_KEY, dumps(99))
+
+        with pytest.raises(ValueError, match="storage version"):
+            clean_orphans(backend, min_age=0)
+
+    def test_anchor_free_paths_refuse_an_unknown_version(self):
+        """Checked before the first removal, so the store comes out
+        untouched rather than half-edited."""
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "store")
+            s = store(kind="disk", path=p)
+            s.commit()
+            s.tag("v1")
+            s.versioned.store.set(STORAGE_VERSION_KEY, dumps(99))
             s.versioned.store.close()
 
-            monkeypatch.setattr(kv_module, "SUPPORTED_READ_VERSIONS", frozenset({2, 3}))
             with pytest.raises(ValueError, match="storage version"):
                 kvgit.delete_branches("main", kind="disk", path=p)
             with pytest.raises(ValueError, match="storage version"):
                 kvgit.delete_tags("v1", kind="disk", path=p)
 
-            monkeypatch.undo()
-            reopened = store(kind="disk", path=p)
-            assert reopened.versioned.store.get(BRANCH_HEAD % "main") is not None
-            assert reopened.tags() != {}
+            backend = Disk(p)
+            try:
+                assert backend.get(BRANCH_HEAD % "main") is not None
+                assert backend.get(_tag_head("v1")) is not None
+            finally:
+                backend.close()
 
 
 class TestStagedTagOps:
