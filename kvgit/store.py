@@ -10,8 +10,8 @@ from .staged import Staged
 from .versioned.kv import (
     BRANCH_HEAD,
     BRANCH_HEAD_PREV,
+    TAG_BRANCH_PREFIX,
     TAG_INFO_KEY,
-    TAG_KEY,
     CorruptHeadRecoverer,
     VersionedKV,
     _assert_supported_version,
@@ -140,9 +140,10 @@ def delete_branches(
     just mints a fresh empty ``main`` on next open.
 
     One :func:`clean_orphans` sweep runs after all removals, so commits
-    that only the deleted branches referenced are reclaimed. Tags are
-    roots for that sweep like any other caller of it, so a tagged commit
-    survives the deletion of every branch that reached it. All heads
+    that only the deleted branches referenced are reclaimed. A tag is a
+    head under the reserved ``refs/tags/`` name, so a tagged commit
+    survives the deletion of every ordinary branch that reached it —
+    the sweep marks from it like any other head. All heads
     (and prev-heads) are gone before the sweep, so it can't mistake a
     doomed branch for a live one. ``min_age`` defaults to
     ``clean_orphans``'s one-hour guard (matching ``delete_branch``), so
@@ -202,11 +203,16 @@ def delete_tags(
 
     The tag counterpart of :func:`delete_branches`, and anchor-free for
     the same reason: teardown should not need a handle, and a handle
-    always has a current branch to open on. For each name,
-    ``__tag__<name>`` and its ``__tag_info__<name>`` record are removed,
-    then a single :func:`clean_orphans` sweep reclaims commits that only
-    the deleted tags kept alive. A name with no tag is skipped —
-    idempotency beats a ``ValueError`` in teardown.
+    always has a current branch to open on. A tag is stored as a branch
+    head under the reserved name ``refs/tags/<name>``, so for each name
+    that head, its ``__branch_head_prev__`` backup and its
+    ``__tag_info__<name>`` record are removed, then a single
+    :func:`clean_orphans` sweep reclaims commits that only the deleted
+    tags kept alive. The backup is defensive: this code never writes one
+    for a tag, but something that treated the tag as an ordinary branch
+    could have, and a backup outliving its head would let a later tag of
+    the same name resolve to the deleted commit. A name with no tag is
+    skipped — idempotency beats a ``ValueError`` in teardown.
 
     That sweep does not reclaim chunks; follow up with ``deep_clean`` on
     a quiescent store if the store uses chunked codecs.
@@ -231,7 +237,8 @@ def delete_tags(
         # anything is removed.
         _assert_supported_version(backend)
         for name in doomed:
-            backend.remove(TAG_KEY % name)
+            backend.remove(BRANCH_HEAD % (TAG_BRANCH_PREFIX + name))
+            backend.remove(BRANCH_HEAD_PREV % (TAG_BRANCH_PREFIX + name))
             backend.remove(TAG_INFO_KEY % name)
         clean_orphans(backend, min_age=min_age)
     finally:
