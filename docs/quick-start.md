@@ -152,11 +152,11 @@ s.delete_tag("release-1")
 
 Tagging again under the same name raises -- moving a tag is `delete_tag` then `tag`, spelled out. Tags and branches are separate namespaces, so the same name can be both.
 
-A tag is also a garbage collection root: the tagged commit and everything it descends from survive [cleanup](#cleaning-up-unreachable-commits) for as long as the tag exists, even after every branch that reached them is gone. That is what makes a tag a safe place to leave a release, an experiment worth keeping, or a checkpoint an agent may want to come back to.
+A tag is also a garbage collection root: the tagged commit and everything it descends from survive [cleanup](#cleaning-up-unreachable-commits) for as long as the tag exists, even after every ordinary branch that reached them is gone. That is what makes a tag a safe place to leave a release, an experiment worth keeping, or a checkpoint an agent may want to come back to.
 
 `checkout(tag=...)` is not a read-only mode. The handle sits on your current branch, so committing from it advances the branch if nothing else has moved it, and merges (or raises) if something has.
 
-The first tag written to a store raises its storage version to 4, and kvgit versions predating tags then refuse to open it -- deliberately, since they would sweep tagged commits as garbage. See [Storage version 4](api.md#storage-version-4).
+Under the hood a tag is a branch head under the reserved name `refs/tags/<name>`, hidden from `list_branches()` and refused by the branch API. That is deliberate: reachability is decided by walking branch heads in *every* kvgit version, so a tagged commit is kept alive even by versions written before tags existed. No storage version change ships with tags. See [Compatibility across kvgit versions](api.md#compatibility-across-kvgit-versions).
 
 ---
 
