@@ -173,13 +173,28 @@ def _stamp_version_at_least(store: KVStore, version: int) -> None:
     """Raise the store's version stamp to ``version`` if it is lower.
 
     Called from any path that writes an artifact older layouts cannot
-    handle — currently a chunk, which needs v3. Stamps are sticky and
-    are never lowered.
+    handle — currently a chunk, which needs v3.
+
+    The write is a CAS against the exact bytes the decision was made
+    from, not a plain ``set``: read-then-set lets two writers stamping
+    different versions interleave so that the *lower* one lands last,
+    leaving a store whose stamp under-describes what is in it, which is
+    precisely the state older readers are willing to open. A lost CAS
+    means someone else moved the stamp, so the loop re-reads and decides
+    again. It terminates because a stamp is only ever raised: every
+    iteration either returns or observes a strictly higher value.
     """
-    raw = store.get(STORAGE_VERSION_KEY)
-    current = safe_loads(raw) if raw is not None else None
-    if not isinstance(current, int) or isinstance(current, bool) or current < version:
-        store.set(STORAGE_VERSION_KEY, dumps(version))
+    while True:
+        raw = store.get(STORAGE_VERSION_KEY)
+        current = safe_loads(raw) if raw is not None else None
+        if (
+            isinstance(current, int)
+            and not isinstance(current, bool)
+            and current >= version
+        ):
+            return
+        if store.cas(STORAGE_VERSION_KEY, dumps(version), expected=raw):
+            return
 
 
 def _check_storage_version(store: KVStore) -> None:
