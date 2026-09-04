@@ -65,14 +65,57 @@ def _changes(base: list[str], side: list[str]) -> list[tuple[int, int, list[str]
     ]
 
 
+def _terminate(lines: list[str]) -> list[str]:
+    """Ensure every non-final line ends with a newline.
+
+    A line without a trailing newline glued onto following output would
+    corrupt both; clean regions stay byte-exact (a final line keeps its
+    missing newline), markers pay the newline tax.
+    """
+    fixed: list[str] = []
+    for i, ln in enumerate(lines):
+        if not ln.endswith("\n") and i + 1 < len(lines):
+            ln += "\n"
+        fixed.append(ln)
+    return fixed
+
+
+def _replay(base: list[str], start: int, end: int, events: list[tuple]) -> list[str]:
+    """One side's full content over ``base[start:end]``.
+
+    Base lines outside the side's own hunks, replacement lines inside.
+    Same-side events come from one SequenceMatcher pass, so they are
+    disjoint and the replay is well-defined. Without this, overlapping
+    groups spanning different base ranges would emit only replacement
+    lines and silently drop the base lines between them.
+    """
+    out: list[str] = []
+    pos = start
+    for _, s, e, lines in sorted(events, key=lambda ev: (ev[1], ev[2])):
+        out.extend(base[pos:s])
+        out.extend(lines)
+        pos = max(pos, e)
+    out.extend(base[pos:end])
+    return out
+
+
 def _merge_lines(
     base: list[str],
     ours: list[str],
     theirs: list[str],
     ours_label: str,
     theirs_label: str,
+    ours_deleted: bool = False,
+    theirs_deleted: bool = False,
 ) -> tuple[list[str], bool]:
-    """Three-way line merge. Returns ``(lines, conflicted)``."""
+    """Three-way line merge. Returns ``(lines, conflicted)``.
+
+    The ``*_deleted`` flags record raw ``None`` inputs (a removed side),
+    tracked separately from decoded emptiness: an empty base file that
+    one side deletes and the other writes is a modify/delete conflict,
+    not a clean add. Still-absent on an added/added merge (base itself
+    missing) is not a deletion.
+    """
     if ours == theirs:
         return list(ours), False
 
@@ -81,26 +124,24 @@ def _merge_lines(
     # interval machinery below only sees hunks and would drop the
     # surviving context. (Unchanged-vs-deleted resolves above through
     # the empty-changes fast paths.)
-    if base and not ours and theirs != base:
-        return (
+    if ours_deleted and theirs != base:
+        return _terminate(
             [
                 f"<<<<<<< {ours_label}\n",
                 "=======\n",
                 *theirs,
                 f">>>>>>> {theirs_label}\n",
-            ],
-            True,
-        )
-    if base and not theirs and ours != base:
-        return (
+            ]
+        ), True
+    if theirs_deleted and ours != base:
+        return _terminate(
             [
                 f"<<<<<<< {ours_label}\n",
                 *ours,
                 "=======\n",
                 f">>>>>>> {theirs_label}\n",
-            ],
-            True,
-        )
+            ]
+        ), True
 
     our_changes = _changes(base, ours)
     their_changes = _changes(base, theirs)
@@ -142,38 +183,28 @@ def _merge_lines(
         start = min(ev[1] for ev in group)
         end = max(ev[2] for ev in group)
         out.extend(base[pos:start])
-        sides = {ev[0] for ev in group}
-        ours_lines = [
-            ln for side, _, _, lines in group if side == "ours" for ln in lines
-        ]
-        theirs_lines = [
-            ln for side, _, _, lines in group if side == "theirs" for ln in lines
-        ]
-        if sides == {"ours"}:
-            out.extend(ours_lines)
-        elif sides == {"theirs"}:
-            out.extend(theirs_lines)
-        elif ours_lines == theirs_lines:
-            out.extend(ours_lines)
+        ours_ev = [ev for ev in group if ev[0] == "ours"]
+        theirs_ev = [ev for ev in group if ev[0] == "theirs"]
+        if not theirs_ev:
+            out.extend(_replay(base, start, end, ours_ev))
+        elif not ours_ev:
+            out.extend(_replay(base, start, end, theirs_ev))
         else:
-            conflicted = True
-            out.append(f"<<<<<<< {ours_label}\n")
-            out.extend(ours_lines)
-            out.append("=======\n")
-            out.extend(theirs_lines)
-            out.append(f">>>>>>> {theirs_label}\n")
+            ours_full = _replay(base, start, end, ours_ev)
+            theirs_full = _replay(base, start, end, theirs_ev)
+            if ours_full == theirs_full:
+                out.extend(ours_full)
+            else:
+                conflicted = True
+                out.append(f"<<<<<<< {ours_label}\n")
+                out.extend(ours_full)
+                out.append("=======\n")
+                out.extend(theirs_full)
+                out.append(f">>>>>>> {theirs_label}\n")
         pos = end
     out.extend(base[pos:])
 
-    # A line without a trailing newline glued onto following output
-    # would corrupt both; clean regions stay byte-exact (a final line
-    # keeps its missing newline), markers pay the newline tax.
-    fixed: list[str] = []
-    for i, ln in enumerate(out):
-        if not ln.endswith("\n") and i + 1 < len(out):
-            ln += "\n"
-        fixed.append(ln)
-    return fixed, conflicted
+    return _terminate(out), conflicted
 
 
 def make_text_merge(
@@ -193,10 +224,15 @@ def make_text_merge(
         total = sum(len(d) for d in (old, ours, theirs) if d is not None)
         if total > MAX_MARK_BYTES:
             raise CantMark(f"inputs total {total} bytes over cap {MAX_MARK_BYTES}")
-        base = _decode(old)
-        our_lines = _decode(ours)
-        their_lines = _decode(theirs)
-        merged, _ = _merge_lines(base, our_lines, their_lines, ours_label, theirs_label)
+        merged, _ = _merge_lines(
+            _decode(old),
+            _decode(ours),
+            _decode(theirs),
+            ours_label,
+            theirs_label,
+            ours_deleted=ours is None and old is not None,
+            theirs_deleted=theirs is None and old is not None,
+        )
         return "".join(merged).encode("utf-8")
 
     return merge

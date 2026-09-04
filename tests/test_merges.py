@@ -15,7 +15,7 @@ from kvgit.merges import CantMark, make_text_merge, text
 GIT = shutil.which("git")
 needs_git = pytest.mark.skipif(GIT is None, reason="git binary not available")
 
-_ALPHABET = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"]
+_ALPHABET = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", ""]
 
 BASE = b"a\nb\nc\nd\n"
 
@@ -84,6 +84,32 @@ class TestConflicts:
         assert text(*args) == text(*args)
 
 
+class TestReviewRegression:
+    """Regression tests for PR #34 review findings (all reproduced)."""
+
+    def test_overlapping_groups_keep_full_span(self):
+        """P1: overlapping hunks over different base spans must show each
+        side's full content over the union — resolving to ours must not
+        drop unchanged lines (here: `c`). Verified byte-identical to
+        `git merge-file`."""
+        out = text(b"a\nb\nc\n", b"a\nB\nc\n", b"a\nY\nZ\n")
+        assert out == b"a\n<<<<<<< ours\nB\nc\n=======\nY\nZ\n>>>>>>> theirs\n"
+
+    def test_empty_base_delete_vs_write_conflicts(self):
+        """P2: an empty base file one side deletes and the other writes
+        is modify/delete, not a clean add."""
+        out = text(b"", None, b"x\n")
+        assert out == b"<<<<<<< ours\n=======\nx\n>>>>>>> theirs\n"
+        out = text(b"", b"x\n", None)
+        assert out == b"<<<<<<< ours\nx\n=======\n>>>>>>> theirs\n"
+
+    def test_unterminated_survivor_terminated(self):
+        """P2: whole-file delete/modify where the survivor lacks a trailing
+        newline must not glue content to the closing marker."""
+        assert text(b"a", None, b"B") == b"<<<<<<< ours\n=======\nB\n>>>>>>> theirs\n"
+        assert text(b"a", b"B", None) == b"<<<<<<< ours\nB\n=======\n>>>>>>> theirs\n"
+
+
 class TestDocumentedDivergence:
     def test_adjacent_insert_merges_clean(self):
         """Ours changes line 2, theirs inserts right after it.
@@ -148,7 +174,8 @@ class TestGitDifferential:
 
     The generator keeps edits separated so hunk contexts cannot overlap
     (the zone where both algorithms provably agree); trickier shapes live
-    as pinned cases above. Seed-pinned: failures reproduce deterministically.
+    as pinned cases above or in the adversarial test below. Seed-pinned:
+    failures reproduce deterministically.
     """
 
     def _triple(self, rng: random.Random) -> tuple[bytes, bytes, bytes]:
@@ -195,6 +222,47 @@ class TestGitDifferential:
                 # Conflict: agreement on conflict-hood.
                 assert b"<<<<<<< ours\n" in mine
         assert checked_clean > 50  # generator must exercise clean merges
+
+    def test_adversarial_properties(self):
+        """Where we may legitimately diverge from git (adjacent edits,
+        unterminated lines), assert the sound properties instead: clean
+        git merges still match byte-exactly, and our output never
+        invents lines or emits unbalanced markers."""
+        rng = random.Random(0xBEEF)
+        checked_clean = 0
+        for _ in range(150):
+            old, ours, theirs = self._triple(rng)
+            if rng.random() < 0.5:
+                # Strip a trailing newline: the adjacency trigger.
+                if rng.random() < 0.5 and ours.endswith(b"\n"):
+                    ours = ours.removesuffix(b"\n")
+                elif theirs.endswith(b"\n"):
+                    theirs = theirs.removesuffix(b"\n")
+            git_out, code = _git_merge(old, ours, theirs)
+            mine = text(old, ours, theirs)
+            if code == 0:
+                assert mine == git_out
+                checked_clean += 1
+                continue
+            inputs = {
+                ln.removesuffix("\n")
+                for data in (old, ours, theirs)
+                for ln in data.decode("utf-8").splitlines(keepends=True)
+            }
+            opens = closes = mids = 0
+            for ln in mine.decode("utf-8").splitlines(keepends=True):
+                if ln.startswith("<<<<<<< "):
+                    opens += 1
+                elif ln.startswith(">>>>>>> "):
+                    closes += 1
+                elif ln == "=======\n":
+                    mids += 1
+                else:
+                    # No invented content (modulo the terminator): every
+                    # emitted line comes verbatim from some input.
+                    assert ln.removesuffix("\n") in inputs
+            assert opens == mids == closes
+        assert checked_clean > 0  # the net must catch clean merges too
 
 
 class TestVersionedIntegration:
