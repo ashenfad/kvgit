@@ -6,7 +6,7 @@ from collections.abc import Iterable
 from ..errors import ConcurrencyError, MergeConflict
 from .helpers import diff_keysets, walk_history
 from .merge import MergeResolution, resolve_merge
-from .protocol import BytesMergeFn, DiffResult, MergeResult
+from .protocol import BytesMergeFn, DiffResult, MergeResult, PostCheck
 
 
 class VersionedBase(ABC):
@@ -223,10 +223,19 @@ class VersionedBase(ABC):
         on_conflict: str,
         merge_fns: dict[str, BytesMergeFn] | None,
         default_merge: BytesMergeFn | None,
+        post_check: PostCheck | None = None,
         info: dict | None,
         saved_state: tuple | None = None,
+        cas_from: str | None = None,
     ) -> MergeResult:
-        """Perform a three-way merge between our branch and their HEAD."""
+        """Perform a three-way merge between our branch and their HEAD.
+
+        ``their_head`` is any commit in the store — the moved HEAD of our
+        own branch (the concurrent-write path) or another branch's HEAD
+        (cross-branch merge). ``cas_from`` names the commit the merge
+        commits on top of (defaults to ``their_head``, the concurrent
+        case); cross-branch callers pass their own head.
+        """
         lca = self._find_lca(self._current_commit, their_head)
         if lca is None:
             if saved_state is not None:
@@ -275,6 +284,14 @@ class VersionedBase(ABC):
                 merge_fns=effective_fns,
                 default_merge=effective_default,
             )
+            if post_check is not None:
+                refused = {
+                    key
+                    for key, value in resolution.merged_values.items()
+                    if not post_check(key, value)
+                }
+                if refused:
+                    raise MergeConflict(refused)
         except MergeConflict:
             if saved_state is not None:
                 self._restore_state(saved_state)
@@ -297,8 +314,9 @@ class VersionedBase(ABC):
         merge_hash = self._current_commit
         merged_keyset = self._commit_keys
 
-        # CAS HEAD from their_head to merge_hash
-        if self._cas_head(their_head, merge_hash):
+        # CAS HEAD onto the merge commit: from their_head in the
+        # concurrent-write path, from our own head cross-branch.
+        if self._cas_head(cas_from or their_head, merge_hash):
             self._base_commit = merge_hash
             result = MergeResult(
                 merged=True,
@@ -328,6 +346,41 @@ class VersionedBase(ABC):
             return result
         raise ConcurrencyError(
             "HEAD changed during three-way merge. Refresh and retry."
+        )
+
+    def merge_heads(
+        self,
+        their_head: str,
+        *,
+        on_conflict: str = "raise",
+        merge_fns: dict[str, BytesMergeFn] | None = None,
+        default_merge: BytesMergeFn | None = None,
+        post_check: PostCheck | None = None,
+        info: dict | None = None,
+    ) -> MergeResult:
+        """Merge another head into this branch.
+
+        ``their_head`` is any commit in the store — usually another
+        branch's HEAD. Finds the lowest common ancestor with our head,
+        three-way resolves, and creates a two-parent merge commit,
+        CAS-guarded on our own head (a race raises ``ConcurrencyError``
+        and changes nothing). No common ancestor raises
+        ``ConcurrencyError`` likewise without changing anything; retrying
+        cannot help that case, unlike a race.
+
+        ``post_check`` runs over each merge-function-produced value;
+        a False files that key as conflicted (handled per
+        ``on_conflict`` like any other conflict).
+        """
+        return self._three_way_merge(
+            their_head,
+            on_conflict=on_conflict,
+            merge_fns=merge_fns,
+            default_merge=default_merge,
+            post_check=post_check,
+            info=info,
+            saved_state=self._snapshot_state(),
+            cas_from=self._current_commit,
         )
 
     # -- Abstract methods (implemented by subclasses) --

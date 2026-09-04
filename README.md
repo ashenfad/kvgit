@@ -45,6 +45,38 @@ main.tag("v1")
 print(main.peek("score", tag="v1"))  # 0
 ```
 
+## Merging
+
+`Staged.merge()` merges another head -- usually another branch's HEAD --
+into the current branch: lowest common ancestor, three-way resolve, and
+a two-parent merge commit guarded on your own head:
+
+```python
+dev["score"] = 500
+dev.commit()
+
+result = main.merge(dev.current_commit)  # True when merged
+print(main["score"])  # 500 (fast-forward: main hadn't diverged)
+```
+
+Overlapping changes need a merge function per key, or a `default_merge`
+fallback. `kvgit.merges.text` resolves line-oriented text with git-style
+`<<<<<<<` markers (see `make_text_merge` for custom labels); anything it
+cannot mark -- binary, non-UTF-8, oversized -- raises `CantMark`, filed
+as an ordinary conflict:
+
+```python
+from kvgit.merges import text
+
+result = main.merge(dev.current_commit, default_merge=text)
+```
+
+A `post_check(key, merged_bytes)` predicate runs over every
+merge-produced value; returning `False` files that key as conflicted.
+`on_conflict="abandon"` leaves the branch untouched instead of raising.
+Merging refuses with `ValueError` when the staging buffer holds
+uncommitted changes -- commit or reset first.
+
 ## Chunked codecs (numpy / pandas)
 
 Large numpy arrays and pandas DataFrames -- and any sliced views of them -- can be stored once and shared across keys, commits, and branches:

@@ -10,6 +10,15 @@ BytesMergeFn = Callable[[bytes | None, bytes | None, bytes | None], bytes]
 Any argument can be None (key absent or removed on that side).
 """
 
+PostCheck = Callable[[str, bytes], bool]
+"""Post-merge predicate: (key, merged_bytes) -> accept?
+
+Runs over values a merge function produced. Returning False files the
+key as conflicted, as if no merge function had resolved it. kvgit never
+inspects the bytes itself — callers that know what their values mean
+(marker scans, schema checks) decide.
+"""
+
 
 @dataclass(frozen=True)
 class DiffResult:
@@ -109,6 +118,22 @@ class Versioned(Protocol):
         chunks: dict[str, bytes] | None = None,
         chunk_refs: dict[str, list[str]] | None = None,
     ) -> MergeResult: ...
+
+    def merge_heads(
+        self,
+        their_head: str,
+        *,
+        on_conflict: str = "raise",
+        merge_fns: dict[str, BytesMergeFn] | None = None,
+        default_merge: BytesMergeFn | None = None,
+        post_check: PostCheck | None = None,
+        info: dict | None = None,
+    ) -> MergeResult:
+        """Merge another head (any commit in the store, usually another
+        branch's HEAD) into this branch: LCA + three-way resolve + a
+        two-parent merge commit, CAS-guarded on our own head.
+        """
+        ...
 
     def refresh(self) -> None: ...
 

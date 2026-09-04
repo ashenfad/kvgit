@@ -8,7 +8,13 @@ from typing import Any
 from .codecs._hash import hash_bytes
 from .content_types import MergeFn
 from .versioned.kv import CHUNK_PREFIX, VersionedKV
-from .versioned.protocol import BytesMergeFn, MergeResult, TagInfo, Versioned
+from .versioned.protocol import (
+    BytesMergeFn,
+    MergeResult,
+    PostCheck,
+    TagInfo,
+    Versioned,
+)
 
 
 class _ChunkSink:
@@ -352,6 +358,47 @@ class Staged(MutableMapping[str, Any]):
                 self._removals.clear()
             # Always clear the full read cache — HEAD moved, so cached
             # values from other keys may be stale after a merge.
+            self._cache.clear()
+        return result
+
+    def merge(
+        self,
+        their_head: str,
+        *,
+        on_conflict: str = "raise",
+        merge_fns: dict[str, MergeFn] | None = None,
+        default_merge: MergeFn | None = None,
+        post_check: PostCheck | None = None,
+        info: dict | None = None,
+    ) -> MergeResult:
+        """Merge another head (usually another branch's HEAD) into this branch.
+
+        Lowest common ancestor + three-way resolve + a two-parent merge
+        commit, CAS-guarded on our own head. Refuses with ``ValueError``
+        when the staging buffer holds uncommitted changes — commit or
+        reset first, so the merge reads committed heads on both sides.
+
+        ``merge_fns`` / ``default_merge`` take decoded values (wrapped
+        like :meth:`commit`); ``post_check`` takes merged bytes.
+        """
+        if self._updates or self._removals:
+            raise ValueError("cannot merge with staged changes; commit or reset first")
+        bytes_merge_fns = (
+            {key: self._wrap_merge_fn(fn) for key, fn in merge_fns.items()}
+            if merge_fns
+            else None
+        )
+        bytes_default = self._wrap_merge_fn(default_merge) if default_merge else None
+        result = self._versioned.merge_heads(
+            their_head,
+            on_conflict=on_conflict,
+            merge_fns=bytes_merge_fns,
+            default_merge=bytes_default,
+            post_check=post_check,
+            info=info,
+        )
+        if result.merged:
+            # HEAD moved: cached values may be stale after a merge.
             self._cache.clear()
         return result
 
