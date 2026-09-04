@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`kvgit.merges`: text merge with conflict markers.** `text` (usable as
+  `default_merge` directly) and `make_text_merge(*, ours_label=,
+  theirs_label=)` (custom marker labels) resolve disjoint line changes
+  cleanly and emit git-style `<<<<<<<` markers for overlapping ones.
+  Anything unmarkable — non-UTF-8 bytes, NUL bytes, inputs over the 1 MiB
+  cap — raises `CantMark`, which the merge machinery files as an ordinary
+  conflict. Marker output is verified byte-identical to
+  `git merge-file` on the agreement zone (plus a pinned, documented,
+  safe-direction divergence where adjacent edits merge clean).
+
 ## [0.3.5] - 2026-09-02
 
 ### Added
