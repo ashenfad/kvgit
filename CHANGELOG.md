@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Cross-branch merge.** `Staged.merge(their_head)` (and
+  `VersionedKV.merge_heads`) merges any commit in the store — usually
+  another branch's HEAD — into the current branch: lowest common
+  ancestor, three-way resolve, two-parent merge commit guarded on your
+  own head. A generic `post_check(key, merged_bytes)` predicate files
+  merge-produced values as conflicted; `on_conflict="abandon"` leaves
+  the branch untouched instead of raising. Merging with staged changes
+  present refuses — commit or reset first. See the new "Merging" README
+  section.
+
 ## [0.3.6] - 2026-09-04
 
 ### Added
