@@ -383,12 +383,20 @@ class Staged(MutableMapping[str, Any]):
         """
         if self._updates or self._removals:
             raise ValueError("cannot merge with staged changes; commit or reset first")
+        # Same assembly as commit(): registered fns first, per-call
+        # overrides on top — a configured Staged merges without repeats.
+        effective_fns = dict(self._merge_fns)
+        if merge_fns:
+            effective_fns.update(merge_fns)
+        effective_default = default_merge or self._default_merge
         bytes_merge_fns = (
-            {key: self._wrap_merge_fn(fn) for key, fn in merge_fns.items()}
-            if merge_fns
+            {key: self._wrap_merge_fn(fn) for key, fn in effective_fns.items()}
+            if effective_fns
             else None
         )
-        bytes_default = self._wrap_merge_fn(default_merge) if default_merge else None
+        bytes_default = (
+            self._wrap_merge_fn(effective_default) if effective_default else None
+        )
         result = self._versioned.merge_heads(
             their_head,
             on_conflict=on_conflict,

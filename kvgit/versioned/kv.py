@@ -1182,14 +1182,19 @@ class VersionedKV(VersionedBase):
             diffs[vk] = value
 
         # Build merged meta from the parents' meta. ``self._meta`` is
-        # already our parent's meta (in memory). Their parent's meta
-        # we have to walk via the HAMT.
-        their_root = _load_root(self.store, parents[0])
-        their_meta: dict[str, MetaEntry] = {}
-        if their_root is not None:
-            their_ks = Keyset(self.store, root=their_root)
-            for key, entry in their_ks.items():
-                their_meta[key] = entry.meta
+        # already our parent's meta (in memory). Any other parent's meta
+        # we walk via the HAMT — position-independent, since merge
+        # commits record ours-first: union every parent so their-side
+        # keys resolve however the tuple is ordered. Ties keep ours
+        # (checked first below), matching the old parents[0]-is-theirs
+        # behavior exactly.
+        parent_meta: dict[str, MetaEntry] = {}
+        for parent in parents:
+            parent_root = _load_root(self.store, parent)
+            if parent_root is None:
+                continue
+            for key, entry in Keyset(self.store, root=parent_root).items():
+                parent_meta.setdefault(key, entry.meta)
 
         merged_meta: dict[str, MetaEntry] = {}
         for key in merged_keyset:
@@ -1200,8 +1205,8 @@ class VersionedKV(VersionedBase):
                 )
             elif key in self._meta:
                 merged_meta[key] = self._meta[key]
-            elif key in their_meta:
-                merged_meta[key] = their_meta[key]
+            elif key in parent_meta:
+                merged_meta[key] = parent_meta[key]
 
         # Apply the merge result on top of our parent's HAMT. We compute
         # the minimal updates and removals so structural sharing kicks in

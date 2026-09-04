@@ -175,6 +175,45 @@ class TestStagedMerge:
         assert main["n"] == 50
 
 
+class TestReviewRegression35:
+    """Regression tests for PR #35 review findings (all reproduced)."""
+
+    def test_merge_parents_put_ours_first(self):
+        """Linear history must stay on the merging branch: the merge
+        commit's first parent is our pre-merge head (git convention),
+        so history() doesn't divert onto the source branch."""
+        main, worker = _branched_versioned()
+        main.commit({"a": b"1"})
+        worker.commit({"b": b"2"})
+        our_head = main.current_commit
+
+        main.merge_heads(worker.current_commit)
+        assert main.parents() == (our_head, worker.current_commit)
+        assert our_head in list(main.history())
+
+    def test_staged_uses_registered_fns(self):
+        """set_default_merge applies to merge() without per-call args."""
+        main, worker = _branched()
+        main["doc"] = b"a\nB\nc\nd\n"
+        main.commit()
+        worker["doc"] = b"a\nY\nc\nd\n"
+        worker.commit()
+
+        main.set_default_merge(lambda old, ours, theirs: ours)
+        result = main.merge(worker.versioned.current_commit)
+        assert result.merged
+        assert main["doc"] == b"a\nB\nc\nd\n"
+
+    def test_bogus_on_conflict_rejected_before_mutating(self):
+        main, worker = _branched_versioned()
+        worker.commit({"b": b"2"})
+        before = main.current_commit
+
+        with pytest.raises(ValueError, match="on_conflict"):
+            main.merge_heads(worker.current_commit, on_conflict="bogus")
+        assert main.current_commit == before
+
+
 class TestVersionedMergeParity:
     def test_versioned_level_merge(self):
         """The engine verb works directly on VersionedKV too."""

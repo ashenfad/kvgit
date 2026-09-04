@@ -227,6 +227,7 @@ class VersionedBase(ABC):
         info: dict | None,
         saved_state: tuple | None = None,
         cas_from: str | None = None,
+        parents: tuple[str, str] | None = None,
     ) -> MergeResult:
         """Perform a three-way merge between our branch and their HEAD.
 
@@ -308,7 +309,11 @@ class VersionedBase(ABC):
             raise
 
         auto_merged = resolution.auto_merged_keys
-        parents = (their_head, self._current_commit)
+        if parents is None:
+            # Concurrent-write default: keep following the moved HEAD, as
+            # before. Cross-branch callers pass (our_head, their_head) so
+            # linear history stays on the merging branch (git convention).
+            parents = (their_head, self._current_commit)
 
         self._create_merge_commit(resolution, parents, info)
         merge_hash = self._current_commit
@@ -372,6 +377,11 @@ class VersionedBase(ABC):
         a False files that key as conflicted (handled per
         ``on_conflict`` like any other conflict).
         """
+        if on_conflict not in ("raise", "abandon"):
+            raise ValueError(
+                f"on_conflict must be 'raise' or 'abandon', got {on_conflict!r}"
+            )
+        our_head = self._current_commit
         return self._three_way_merge(
             their_head,
             on_conflict=on_conflict,
@@ -380,7 +390,8 @@ class VersionedBase(ABC):
             post_check=post_check,
             info=info,
             saved_state=self._snapshot_state(),
-            cas_from=self._current_commit,
+            cas_from=our_head,
+            parents=(our_head, their_head),
         )
 
     # -- Abstract methods (implemented by subclasses) --
