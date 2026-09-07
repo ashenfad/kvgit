@@ -7,7 +7,13 @@ from .namespaced import Namespaced
 from .staged import Staged
 from .store import delete_branches, delete_tags, store
 from .versioned.kv import VersionedKV
-from .versioned.protocol import MergeChoice, MergeResult, TagInfo, Versioned
+from .versioned.protocol import (
+    MergeChoice,
+    MergePolicy,
+    MergeResult,
+    TagInfo,
+    Versioned,
+)
 
 __all__ = [
     "CantMark",
@@ -15,6 +21,7 @@ __all__ = [
     "MergeChoice",
     "MergeConflict",
     "MergeFn",
+    "MergePolicy",
     "MergeResult",
     "Namespaced",
     "Staged",

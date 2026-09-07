@@ -9,23 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Merge policy by key prefix.** `set_merge_prefix(prefix, fn)` (on
-  `Staged` and `VersionedKV`) registers one merge function for every key
-  under a prefix, for keys whose names are not known when the policy is
-  set — `"runs/"` covering `runs/<id>`. A contested key takes the most
-  specific registration that applies: its exact key, else the longest
-  registered prefix it starts with, else `default_merge`, else it is a
-  conflict as before. `commit()`, `merge()` and `merge_heads()` take a
-  matching `merge_prefixes=` argument for one call, layered over the
+- **Merge policy by key prefix.** `set_merge_prefix(prefix, policy)` (on
+  `Staged` and `VersionedKV`) registers one policy for every key under a
+  prefix, for keys whose names are not known when it is set — `"runs/"`
+  covering `runs/<id>`. A key takes the most specific registration that
+  applies: its exact key, else the longest registered prefix it starts
+  with, else `default_merge`, else a contested key is a conflict as
+  before. `commit()`, `merge()` and `merge_heads()` take a matching
+  `merge_prefixes=` argument for one call, layered over the
   instance-level registrations the same way `merge_fns=` already is.
 
-- **`ours` / `theirs`: pick-a-side merges that keep the stored value.**
-  `kvgit.merges.ours` and `kvgit.merges.theirs` resolve a contested key
-  to one side's committed value. They answer with a `MergeChoice` rather
-  than bytes, so the merge carries that side's existing blob pointer
-  instead of writing a new copy of a value the store already holds; if
-  the chosen side removed the key, the merge removes it. Either way the
-  key counts as auto-merged. Merge functions written by hand may return
+- **A registration may be a `MergeChoice` instead of a function, giving
+  one side a whole namespace.** `set_merge_prefix("__agno__/",
+  MergeChoice.OURS)` — also accepted by `set_merge_fn`, `merge_fns=`,
+  `merge_prefixes=` and `default_merge=` — is a standing policy rather
+  than a conflict resolver, and that is the difference that matters: a
+  merge function is consulted only where both sides changed a key, so it
+  can never stop a key the other branch merely *added* from arriving. A
+  registered choice governs every key either side changed under it, so
+  `OURS` drops their added key, keeps a key they removed, ignores their
+  modification, and leaves a key we removed removed; `THEIRS` is the
+  mirror image. Nothing is read or decoded for those keys, and they
+  count as auto-merged. Merge functions keep their contested-only reach
+  exactly as before.
+
+- **`ours` / `theirs`: pick-a-side merge functions that keep the stored
+  value.** `kvgit.merges.ours` and `kvgit.merges.theirs` resolve a
+  contested key to one side's committed value. They answer with a
+  `MergeChoice` rather than bytes, so the merge carries that side's
+  existing blob pointer instead of writing a new copy of a value the
+  store already holds; if the chosen side removed the key, the merge
+  removes it. Merge functions written by hand may return
   `MergeChoice.OURS` / `MergeChoice.THEIRS` too, at the bytes level or
   from a `Staged` merge function over decoded values. A key resolved
   this way produces no new value, so `post_check` does not run for it.

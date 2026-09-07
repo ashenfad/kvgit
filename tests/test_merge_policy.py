@@ -1,5 +1,7 @@
 """Tests for merge policy by prefix, side-picking merges, and byte equality."""
 
+import pickle
+
 import pytest
 
 from kvgit import MergeChoice, MergeConflict, Staged, VersionedKV as Versioned
@@ -473,3 +475,272 @@ class TestStagedMergePolicy:
         with pytest.raises(MergeConflict) as exc_info:
             main.merge(worker.current_commit)
         assert exc_info.value.conflicting_keys == {"k"}
+
+
+class TestMergeChoicePolicy:
+    """A registered MergeChoice governs every key either side changed."""
+
+    def test_their_added_key_is_dropped_under_an_ours_prefix(self):
+        main, worker = _branched_versioned()
+        main.set_merge_prefix("runs/", MergeChoice.OURS)
+        main.commit({"runs/mine": b"ours"})
+        worker.commit({"runs/theirs": b"theirs"})
+
+        result = main.merge_heads(worker.current_commit)
+        assert result.merged
+        assert "runs/theirs" not in main
+        assert main.get("runs/mine") == b"ours"
+        assert "runs/theirs" in result.auto_merged_keys
+
+    def test_their_removed_key_survives_under_an_ours_prefix(self):
+        main, worker = _branched_versioned({"runs/1": b"base"})
+        main.set_merge_prefix("runs/", MergeChoice.OURS)
+        main.commit({"other": b"1"})
+        worker.commit(removals={"runs/1"})
+
+        result = main.merge_heads(worker.current_commit)
+        assert result.merged
+        assert main.get("runs/1") == b"base"
+
+    def test_their_modified_key_is_ignored_under_an_ours_prefix(self):
+        main, worker = _branched_versioned({"runs/1": b"base"})
+        main.set_merge_prefix("runs/", MergeChoice.OURS)
+        main.commit({"other": b"1"})
+        worker.commit({"runs/1": b"theirs"})
+
+        result = main.merge_heads(worker.current_commit)
+        assert result.merged
+        assert main.get("runs/1") == b"base"
+
+    def test_our_removal_stays_removed_under_an_ours_prefix(self):
+        main, worker = _branched_versioned({"runs/1": b"base"})
+        main.set_merge_prefix("runs/", MergeChoice.OURS)
+        main.commit(removals={"runs/1"})
+        worker.commit({"runs/1": b"theirs"})
+
+        result = main.merge_heads(worker.current_commit)
+        assert result.merged
+        assert "runs/1" not in main
+
+    def test_our_added_key_is_dropped_under_a_theirs_prefix(self):
+        main, worker = _branched_versioned()
+        main.set_merge_prefix("runs/", MergeChoice.THEIRS)
+        main.commit({"runs/mine": b"ours"})
+        worker.commit({"runs/theirs": b"theirs"})
+
+        result = main.merge_heads(worker.current_commit)
+        assert result.merged
+        assert "runs/mine" not in main
+        assert main.get("runs/theirs") == b"theirs"
+
+    def test_their_removal_removes_under_a_theirs_prefix(self):
+        main, worker = _branched_versioned({"runs/1": b"base"})
+        main.set_merge_prefix("runs/", MergeChoice.THEIRS)
+        main.commit({"runs/1": b"ours"})
+        worker.commit(removals={"runs/1"})
+
+        result = main.merge_heads(worker.current_commit)
+        assert result.merged
+        assert "runs/1" not in main
+
+    def test_our_modification_is_discarded_under_a_theirs_prefix(self):
+        main, worker = _branched_versioned({"runs/1": b"base"})
+        main.set_merge_prefix("runs/", MergeChoice.THEIRS)
+        main.commit({"runs/1": b"ours"})
+        worker.commit({"other": b"1"})
+
+        result = main.merge_heads(worker.current_commit)
+        assert result.merged
+        assert main.get("runs/1") == b"base"
+
+    def test_policy_keys_are_never_read(self):
+        main, worker = _branched_versioned()
+        main.set_merge_prefix("runs/", MergeChoice.OURS)
+        main.commit({"runs/1": b"ours"})
+        worker.commit({"runs/1": b"theirs", "runs/2": b"theirs"})
+
+        reads: list[str] = []
+        original = main._read_blob
+        main._read_blob = lambda cid: (reads.append(cid), original(cid))[1]
+        try:
+            result = main.merge_heads(worker.current_commit)
+        finally:
+            main._read_blob = original
+        assert result.merged
+        assert reads == []
+
+    def test_policy_writes_no_blob_and_keeps_our_pointer(self):
+        main, worker = _branched_versioned()
+        main.set_merge_prefix("runs/", MergeChoice.OURS)
+        main.commit({"runs/1": b"ours"})
+        worker.commit({"runs/1": b"theirs"})
+        our_pointer = main._load_keyset(main.current_commit)["runs/1"]
+
+        result = main.merge_heads(worker.current_commit)
+        assert main._load_keyset(result.commit)["runs/1"] == our_pointer
+        assert f"{result.commit}:runs/1" not in main.store.keys()
+
+    def test_untouched_keys_outside_the_prefix_are_unaffected(self):
+        main, worker = _branched_versioned({"kept": b"base"})
+        main.set_merge_prefix("runs/", MergeChoice.OURS)
+        main.commit({"runs/1": b"ours"})
+        worker.commit({"outside": b"theirs"})
+
+        result = main.merge_heads(worker.current_commit)
+        assert result.merged
+        assert main.get("kept") == b"base"
+        assert main.get("outside") == b"theirs"
+
+    def test_exact_key_choice_beats_prefix_fn(self):
+        main, worker = _branched_versioned()
+        main.set_merge_prefix("runs/", _mark(b"by-prefix"))
+        main.set_merge_fn("runs/1", MergeChoice.OURS)
+        main.commit({"runs/1": b"ours", "runs/2": b"ours"})
+        worker.commit({"runs/1": b"theirs", "runs/2": b"theirs"})
+
+        result = main.merge_heads(worker.current_commit)
+        assert main.get("runs/1") == b"ours"
+        assert main.get("runs/2") == b"by-prefix"
+        assert result.merged
+
+    def test_longer_fn_prefix_beats_shorter_choice_prefix(self):
+        main, worker = _branched_versioned()
+        main.set_merge_prefix("runs/", MergeChoice.OURS)
+        main.set_merge_prefix("runs/hot/", _mark(b"by-fn"))
+        main.commit({"runs/cold/1": b"ours", "runs/hot/1": b"ours"})
+        worker.commit({"runs/cold/1": b"theirs", "runs/hot/1": b"theirs"})
+
+        result = main.merge_heads(worker.current_commit)
+        assert result.merged
+        assert main.get("runs/cold/1") == b"ours"
+        assert main.get("runs/hot/1") == b"by-fn"
+
+    def test_longer_choice_prefix_beats_shorter_fn_prefix(self):
+        main, worker = _branched_versioned()
+        main.set_merge_prefix("runs/", _mark(b"by-fn"))
+        main.set_merge_prefix("runs/hot/", MergeChoice.THEIRS)
+        main.commit({"runs/cold/1": b"ours", "runs/hot/1": b"ours"})
+        worker.commit({"runs/cold/1": b"theirs", "runs/hot/1": b"theirs"})
+
+        result = main.merge_heads(worker.current_commit)
+        assert result.merged
+        assert main.get("runs/cold/1") == b"by-fn"
+        assert main.get("runs/hot/1") == b"theirs"
+
+    def test_a_longer_fn_prefix_still_sees_only_contested_keys(self):
+        main, worker = _branched_versioned()
+        main.set_merge_prefix("runs/", MergeChoice.OURS)
+        main.set_merge_prefix("runs/hot/", _mark(b"by-fn"))
+        main.commit({"other": b"1"})
+        worker.commit({"runs/hot/new": b"theirs"})
+
+        result = main.merge_heads(worker.current_commit)
+        assert result.merged
+        # Their-only add under a fn prefix lands as it always has.
+        assert main.get("runs/hot/new") == b"theirs"
+
+    def test_per_call_prefixes_accept_a_choice(self):
+        main, worker = _branched_versioned()
+        main.commit({"other": b"1"})
+        worker.commit({"runs/1": b"theirs"})
+
+        result = main.merge_heads(
+            worker.current_commit,
+            merge_prefixes={"runs/": MergeChoice.OURS},
+        )
+        assert result.merged
+        assert "runs/1" not in main
+
+    def test_per_call_choice_overrides_an_instance_fn(self):
+        main, worker = _branched_versioned()
+        main.set_merge_prefix("runs/", _mark(b"by-fn"))
+        main.commit({"runs/1": b"ours"})
+        worker.commit({"runs/1": b"theirs"})
+
+        result = main.merge_heads(
+            worker.current_commit,
+            merge_prefixes={"runs/": MergeChoice.THEIRS},
+        )
+        assert result.merged
+        assert main.get("runs/1") == b"theirs"
+
+    def test_choice_as_default_merge_hands_over_every_changed_key(self):
+        main, worker = _branched_versioned()
+        main.commit({"mine": b"ours"})
+        worker.commit({"theirs": b"theirs"})
+
+        result = main.merge_heads(worker.current_commit, default_merge=MergeChoice.OURS)
+        assert result.merged
+        assert main.get("mine") == b"ours"
+        assert "theirs" not in main
+
+    def test_policy_applies_on_the_concurrent_commit_path(self):
+        first, second = _concurrent_versioned()
+        second.set_merge_prefix("runs/", MergeChoice.OURS)
+        first.commit({"runs/1": b"theirs", "elsewhere": b"theirs"})
+
+        result = second.commit({"other": b"1"})
+        assert result.merged
+        assert "runs/1" not in second
+        assert second.get("elsewhere") == b"theirs"
+
+
+class TestStagedMergeChoicePolicy:
+    def test_their_added_key_is_dropped_under_an_ours_prefix(self):
+        main, worker = _branched_staged()
+        main.set_merge_prefix("runs/", MergeChoice.OURS)
+        main["runs/mine"] = "ours"
+        main.commit()
+        worker["runs/theirs"] = "theirs"
+        worker.commit()
+
+        result = main.merge(worker.current_commit)
+        assert result.merged
+        assert "runs/theirs" not in main
+        assert main["runs/mine"] == "ours"
+
+    def test_their_added_key_is_dropped_on_the_commit_path(self):
+        first, second = _concurrent_staged()
+        second.set_merge_prefix("runs/", MergeChoice.OURS)
+        first["runs/theirs"] = "theirs"
+        first.commit()
+
+        second["other"] = 1
+        result = second.commit()
+        assert result.merged
+        assert "runs/theirs" not in second
+
+    def test_choice_registration_is_not_decoded(self):
+        """A MergeChoice must reach the resolver without the decode wrapper."""
+        main, worker = _branched_staged()
+        decoded: list[bytes] = []
+
+        def spy_decoder(raw):
+            decoded.append(raw)
+            return pickle.loads(raw)
+
+        main = Staged(main.versioned, decoder=spy_decoder)
+        main.set_merge_prefix("runs/", MergeChoice.THEIRS)
+        main["runs/1"] = "ours"
+        main.commit()
+        worker["runs/1"] = "theirs"
+        worker.commit()
+
+        decoded.clear()
+        result = main.merge(worker.current_commit)
+        assert result.merged
+        assert decoded == []
+        assert main["runs/1"] == "theirs"
+
+    def test_per_call_prefixes_accept_a_choice(self):
+        main, worker = _branched_staged()
+        main["other"] = 1
+        main.commit()
+        worker["runs/1"] = "theirs"
+        worker.commit()
+
+        result = main.merge(
+            worker.current_commit, merge_prefixes={"runs/": MergeChoice.OURS}
+        )
+        assert result.merged
+        assert "runs/1" not in main
