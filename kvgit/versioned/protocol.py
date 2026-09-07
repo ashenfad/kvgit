@@ -7,12 +7,22 @@ from typing import Protocol, runtime_checkable
 
 
 class MergeChoice(Enum):
-    """A merge function's answer of "keep one side's value as it stands".
+    """One side of a merge, named as the answer for a key.
 
-    A merge function returns ``OURS`` or ``THEIRS`` in place of bytes to
-    say the merged value is that side's committed value, unchanged. The
-    merge then keeps that side's existing blob pointer, so no new blob
-    is written; when that side removed the key, the merge removes it.
+    Two ways to use it, with deliberately different reach:
+
+    * **Returned by a merge function**, in place of bytes: the merged
+      value for that contested key is that side's committed value,
+      unchanged. The merge keeps that side's existing blob pointer, so
+      no new blob is written; when that side removed the key, the merge
+      removes it.
+    * **Registered in place of a merge function** (``set_merge_prefix``,
+      ``set_merge_fn``, or the per-call maps): a standing policy that
+      hands the key to one side outright. Unlike a merge function, which
+      is consulted only where both sides changed a key, a registered
+      choice governs *every* key either side changed under it — so
+      ``OURS`` also drops a key the other side added and keeps one the
+      other side removed. Nothing is read or decoded for those keys.
     """
 
     OURS = "ours"
@@ -27,6 +37,13 @@ BytesMergeFn = Callable[
 Any argument can be None (key absent or removed on that side). Returning
 a :class:`MergeChoice` instead of bytes keeps that side's existing value
 without writing a new blob.
+"""
+
+MergePolicy = BytesMergeFn | MergeChoice
+"""What a merge registration holds.
+
+Either a :data:`BytesMergeFn`, consulted for keys both sides changed, or
+a :class:`MergeChoice`, which gives one side every key it covers.
 """
 
 PostCheck = Callable[[str, bytes], bool]
@@ -123,11 +140,11 @@ class Versioned(Protocol):
 
     # -- Merge function registry --
 
-    def set_merge_fn(self, key: str, fn: BytesMergeFn) -> None: ...
+    def set_merge_fn(self, key: str, fn: MergePolicy) -> None: ...
 
-    def set_merge_prefix(self, prefix: str, fn: BytesMergeFn) -> None: ...
+    def set_merge_prefix(self, prefix: str, fn: MergePolicy) -> None: ...
 
-    def set_default_merge(self, fn: BytesMergeFn) -> None: ...
+    def set_default_merge(self, fn: MergePolicy) -> None: ...
 
     # -- Write operations --
 
@@ -137,9 +154,9 @@ class Versioned(Protocol):
         removals: set[str] | None = None,
         *,
         on_conflict: str = "raise",
-        merge_fns: dict[str, BytesMergeFn] | None = None,
-        merge_prefixes: dict[str, BytesMergeFn] | None = None,
-        default_merge: BytesMergeFn | None = None,
+        merge_fns: dict[str, MergePolicy] | None = None,
+        merge_prefixes: dict[str, MergePolicy] | None = None,
+        default_merge: MergePolicy | None = None,
         info: dict | None = None,
         chunks: dict[str, bytes] | None = None,
         chunk_refs: dict[str, list[str]] | None = None,
@@ -150,9 +167,9 @@ class Versioned(Protocol):
         their_head: str,
         *,
         on_conflict: str = "raise",
-        merge_fns: dict[str, BytesMergeFn] | None = None,
-        merge_prefixes: dict[str, BytesMergeFn] | None = None,
-        default_merge: BytesMergeFn | None = None,
+        merge_fns: dict[str, MergePolicy] | None = None,
+        merge_prefixes: dict[str, MergePolicy] | None = None,
+        default_merge: MergePolicy | None = None,
         post_check: PostCheck | None = None,
         info: dict | None = None,
     ) -> MergeResult:

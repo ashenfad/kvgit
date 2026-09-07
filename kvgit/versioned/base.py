@@ -6,7 +6,7 @@ from collections.abc import Iterable
 from ..errors import ConcurrencyError, MergeConflict
 from .helpers import diff_keysets, walk_history
 from .merge import MergeResolution, resolve_merge
-from .protocol import BytesMergeFn, DiffResult, MergeResult, PostCheck
+from .protocol import DiffResult, MergePolicy, MergeResult, PostCheck
 
 
 class VersionedBase(ABC):
@@ -24,9 +24,9 @@ class VersionedBase(ABC):
         self._current_commit: str = commit_hash
         self._base_commit: str = commit_hash
         self._commit_keys: dict[str, str] = {}
-        self._merge_fns: dict[str, BytesMergeFn] = {}
-        self._merge_prefixes: dict[str, BytesMergeFn] = {}
-        self._default_merge: BytesMergeFn | None = None
+        self._merge_fns: dict[str, MergePolicy] = {}
+        self._merge_prefixes: dict[str, MergePolicy] = {}
+        self._default_merge: MergePolicy | None = None
         self.last_merge_result: MergeResult | None = None
 
     # -- Properties --
@@ -72,21 +72,28 @@ class VersionedBase(ABC):
 
     # -- Merge function registry --
 
-    def set_merge_fn(self, key: str, fn: BytesMergeFn) -> None:
-        """Register a merge function for a specific key."""
+    def set_merge_fn(self, key: str, fn: MergePolicy) -> None:
+        """Register a merge function, or a ``MergeChoice``, for one key."""
         self._merge_fns[key] = fn
 
-    def set_merge_prefix(self, prefix: str, fn: BytesMergeFn) -> None:
-        """Register a merge function for every key under a prefix.
+    def set_merge_prefix(self, prefix: str, fn: MergePolicy) -> None:
+        """Register a merge function, or a ``MergeChoice``, under a prefix.
 
         Prefixes cover keys whose names are not known when the policy is
-        set (``"runs/"`` for ``runs/<id>``). A contested key takes the
-        most specific registration: its exact key fn, else the longest
-        registered prefix it starts with, else the default merge fn.
+        set (``"runs/"`` for ``runs/<id>``). A key takes the most
+        specific registration: its exact key, else the longest
+        registered prefix it starts with, else the default.
+
+        What the registration holds decides how far it reaches. A merge
+        function is consulted only where both sides changed a key. A
+        ``MergeChoice`` is a standing policy over the whole prefix: it
+        gives that side every key either side changed under it, so
+        ``OURS`` also drops a key the other side added and keeps one the
+        other side removed.
         """
         self._merge_prefixes[prefix] = fn
 
-    def set_default_merge(self, fn: BytesMergeFn) -> None:
+    def set_default_merge(self, fn: MergePolicy) -> None:
         """Register a default merge function for unregistered keys."""
         self._default_merge = fn
 
@@ -119,9 +126,9 @@ class VersionedBase(ABC):
         removals: set[str] | None = None,
         *,
         on_conflict: str = "raise",
-        merge_fns: dict[str, BytesMergeFn] | None = None,
-        merge_prefixes: dict[str, BytesMergeFn] | None = None,
-        default_merge: BytesMergeFn | None = None,
+        merge_fns: dict[str, MergePolicy] | None = None,
+        merge_prefixes: dict[str, MergePolicy] | None = None,
+        default_merge: MergePolicy | None = None,
         info: dict | None = None,
         chunks: dict[str, bytes] | None = None,
         chunk_refs: dict[str, list[str]] | None = None,
@@ -135,8 +142,10 @@ class VersionedBase(ABC):
             updates: Key-value pairs to add or update (bytes values).
             removals: Keys to remove.
             on_conflict: ``'raise'`` (default) or ``'abandon'`` for CAS failures.
-            merge_fns: Per-key merge functions (override instance-level).
-            merge_prefixes: Merge functions by key prefix, layered over
+            merge_fns: Per-key registrations (override instance-level).
+                A merge function, or a ``MergeChoice`` giving one side
+                every key it covers.
+            merge_prefixes: Registrations by key prefix, layered over
                 the instance-level prefix registrations.
             default_merge: Default merge function (override instance-level).
             info: Optional metadata dict for the commit.
@@ -236,9 +245,9 @@ class VersionedBase(ABC):
         their_head: str,
         *,
         on_conflict: str,
-        merge_fns: dict[str, BytesMergeFn] | None,
-        default_merge: BytesMergeFn | None,
-        merge_prefixes: dict[str, BytesMergeFn] | None = None,
+        merge_fns: dict[str, MergePolicy] | None,
+        default_merge: MergePolicy | None,
+        merge_prefixes: dict[str, MergePolicy] | None = None,
         post_check: PostCheck | None = None,
         info: dict | None,
         saved_state: tuple | None = None,
@@ -329,6 +338,10 @@ class VersionedBase(ABC):
             raise
 
         auto_merged = resolution.auto_merged_keys
+        # Membership set for the carried-keys scan below: a MergeChoice
+        # policy can auto-merge as many keys as the prefix covers, and a
+        # list would make that scan quadratic.
+        auto_merged_keys = set(auto_merged)
         if parents is None:
             # Concurrent-write default: keep following the moved HEAD, as
             # before. Cross-branch callers pass (our_head, their_head) so
@@ -351,7 +364,7 @@ class VersionedBase(ABC):
                 carried_keys=tuple(
                     k
                     for k in merged_keyset
-                    if k not in auto_merged and k not in resolution.merged_values
+                    if k not in auto_merged_keys and k not in resolution.merged_values
                 ),
             )
             self.last_merge_result = result
@@ -378,9 +391,9 @@ class VersionedBase(ABC):
         their_head: str,
         *,
         on_conflict: str = "raise",
-        merge_fns: dict[str, BytesMergeFn] | None = None,
-        merge_prefixes: dict[str, BytesMergeFn] | None = None,
-        default_merge: BytesMergeFn | None = None,
+        merge_fns: dict[str, MergePolicy] | None = None,
+        merge_prefixes: dict[str, MergePolicy] | None = None,
+        default_merge: MergePolicy | None = None,
         post_check: PostCheck | None = None,
         info: dict | None = None,
     ) -> MergeResult:

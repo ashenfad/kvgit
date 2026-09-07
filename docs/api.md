@@ -142,9 +142,9 @@ Encode staged changes and flush as a single atomic commit. If HEAD has diverged,
 |-----------|------|---------|-------------|
 | `keys` | `set[str] \| None` | `None` | If provided, only commit these keys. Uncommitted keys remain staged. |
 | `on_conflict` | `str` | `"raise"` | `"raise"` or `"abandon"` |
-| `merge_fns` | `dict[str, MergeFn] \| None` | `None` | Per-key merge functions for this commit |
-| `merge_prefixes` | `dict[str, MergeFn] \| None` | `None` | Merge functions by key prefix for this commit |
-| `default_merge` | `MergeFn \| None` | `None` | Fallback merge function for this commit |
+| `merge_fns` | `dict[str, MergeFn \| MergeChoice] \| None` | `None` | Per-key registrations for this commit |
+| `merge_prefixes` | `dict[str, MergeFn \| MergeChoice] \| None` | `None` | Registrations by key prefix for this commit |
+| `default_merge` | `MergeFn \| MergeChoice \| None` | `None` | Fallback registration for this commit |
 | `info` | `dict \| None` | `None` | Metadata attached to the commit |
 
 Per-call `merge_fns` / `merge_prefixes` / `default_merge` layer over the registrations made with [`set_merge_fn`](#merge-functions) and friends.
@@ -166,9 +166,9 @@ Merge another head — any commit in the store, usually another branch's HEAD �
 |-----------|------|---------|-------------|
 | `their_head` | `str` | — | Commit to merge in |
 | `on_conflict` | `str` | `"raise"` | `"raise"` or `"abandon"` (leaves the branch untouched) |
-| `merge_fns` | `dict[str, MergeFn] \| None` | `None` | Per-key merge functions for this merge |
-| `merge_prefixes` | `dict[str, MergeFn] \| None` | `None` | Merge functions by key prefix for this merge |
-| `default_merge` | `MergeFn \| None` | `None` | Fallback merge function for this merge |
+| `merge_fns` | `dict[str, MergeFn \| MergeChoice] \| None` | `None` | Per-key registrations for this merge |
+| `merge_prefixes` | `dict[str, MergeFn \| MergeChoice] \| None` | `None` | Registrations by key prefix for this merge |
+| `default_merge` | `MergeFn \| MergeChoice \| None` | `None` | Fallback registration for this merge |
 | `post_check` | `PostCheck \| None` | `None` | `(key, merged_bytes) -> bool` over each merge-produced value; `False` files that key as conflicted. A key resolved by a [`MergeChoice`](#mergechoice) produces no new value, so nothing is checked for it. |
 | `info` | `dict \| None` | `None` | Metadata attached to the merge commit |
 
@@ -182,27 +182,27 @@ Reload from HEAD and discard staged changes. Use this to see writes from other b
 
 ### Merge functions
 
+Each registration holds either a merge function — `fn(old, ours, theirs) -> merged`, over decoded values — or a [`MergeChoice`](#mergechoice). See [MergePolicy](#mergepolicy) for how far each kind reaches.
+
 #### `set_merge_fn(key, fn) -> None`
 
-Register a persistent merge function for a key. `fn` receives decoded values: `(old, ours, theirs) -> merged`.
+Register a persistent merge function, or a `MergeChoice`, for one key.
 
 #### `set_merge_prefix(prefix, fn) -> None`
 
-Register a persistent merge function for every key starting with `prefix`. Use it for keys whose names are not known when the policy is set (`"runs/"` covering `runs/<id>`).
+Register a persistent merge function, or a `MergeChoice`, for every key starting with `prefix`. Use it for keys whose names are not known when the policy is set (`"runs/"` covering `runs/<id>`).
 
 #### `set_default_merge(fn) -> None`
 
-Register a fallback merge function for any key no exact-key or prefix registration covers.
+Register a fallback for any key no exact-key or prefix registration covers.
 
-**Resolution order.** A contested key takes the most specific registration that applies: its exact key, else the longest registered prefix it starts with, else the default. Nothing at all files the key as a conflict.
+**Resolution order.** A key takes the most specific registration that applies: its exact key, else the longest registered prefix it starts with, else the default. Merge functions and `MergeChoice` policies compete in that one order, so a longer prefix wins whichever kind each holds. A contested key no registration covers is a conflict.
 
 ```python
-s.set_merge_prefix("runs/", ours)              # every key under runs/
+s.set_merge_prefix("runs/", MergeChoice.OURS)  # this branch owns runs/
 s.set_merge_prefix("runs/counts/", counter())  # except these
 s.set_merge_fn("runs/counts/total", theirs)    # and this one exactly
 ```
-
-A merge function may return a [`MergeChoice`](#mergechoice) instead of a value to keep one side's stored value untouched.
 
 ### Branching
 
@@ -411,14 +411,50 @@ BytesMergeFn = Callable[
 
 ### MergeChoice
 
-Enum a merge function returns in place of a value, at either level, to say the merged value is one side's committed value as it stands.
+One side of a merge, named as the answer for a key.
 
 | Member | Meaning |
 |--------|---------|
-| `MergeChoice.OURS` | Keep our side's value |
-| `MergeChoice.THEIRS` | Keep their side's value |
+| `MergeChoice.OURS` | Our side's state stands |
+| `MergeChoice.THEIRS` | Their side's state stands |
 
-The merge carries that side's existing blob pointer, so no new blob is written for the key — and if the chosen side removed the key, the merge removes it. Either way the key counts as auto-merged.
+Either way the merge carries that side's existing blob pointer, so no new blob is written for the key, and if that side does not have the key the merge does not either. The key counts as auto-merged.
+
+It has two uses, with deliberately different reach:
+
+**Returned by a merge function**, in place of bytes — the merged value for that *contested* key is that side's stored value, unchanged:
+
+```python
+def keep_the_longer(old, ours, theirs):
+    return MergeChoice.OURS if len(ours) >= len(theirs) else MergeChoice.THEIRS
+```
+
+`kvgit.merges.ours` and `kvgit.merges.theirs` are the two constant cases. A key resolved this way produces no new value, so `post_check` does not run for it.
+
+**Registered in place of a merge function** — a standing policy, described under [MergePolicy](#mergepolicy).
+
+### MergePolicy
+
+What a merge registration holds, at the bytes level:
+
+```python
+MergePolicy = BytesMergeFn | MergeChoice
+```
+
+The two kinds differ in how far a registration reaches:
+
+| Registration | Applies to |
+|--------------|-----------|
+| merge function | Keys **both** sides changed. A change only one side made is applied untouched, as with no registration at all. |
+| `MergeChoice` | **Every** key either side changed under it. Nothing is read or decoded for those keys. |
+
+That difference is the point of the `MergeChoice` form: a merge function cannot express "this branch owns this namespace", because a key the other branch merely *added* is not contested and never reaches a function. Under `MergeChoice.OURS`, a key the other side added is dropped, a key it removed survives, a key it modified keeps our value, and a key we removed stays removed. `MergeChoice.THEIRS` is the mirror image, discarding our-only changes under the prefix.
+
+```python
+# The conversation on this branch is never overwritten by a merge, and a
+# merged-in branch's new __agno__/runs/<id> keys do not come along.
+s.set_merge_prefix("__agno__/", MergeChoice.OURS)
+```
 
 ---
 
@@ -442,7 +478,7 @@ Marker merge for line-oriented text: disjoint line changes merge cleanly, overla
 
 ### `ours(old, our, their) -> MergeChoice`
 
-Take our side. Returns [`MergeChoice.OURS`](#mergechoice): our stored value is kept as it stands, so no new blob is written, and if we removed the key the merge removes it.
+Take our side on a *contested* key. Returns [`MergeChoice.OURS`](#mergechoice): our stored value is kept as it stands, so no new blob is written, and if we removed the key the merge removes it. Being a merge function, it is consulted only where both sides changed the key — register `MergeChoice.OURS` itself for a policy that also governs one-sided changes.
 
 ### `theirs(old, our, their) -> MergeChoice`
 

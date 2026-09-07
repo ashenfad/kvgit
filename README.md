@@ -71,22 +71,35 @@ from kvgit.merges import text
 result = main.merge(dev.current_commit, default_merge=text)
 ```
 
-`kvgit.merges.ours` and `kvgit.merges.theirs` pick a side outright, for
-keys one branch simply owns. They keep that side's stored value as it
-stands rather than rewriting it, so the merge writes no new blob -- and
-if the chosen side removed the key, the merge removes it.
-
-Merge functions register three ways, and a contested key takes the most
-specific one that applies: its exact key, else the longest registered
-prefix it starts with, else `default_merge`. Prefixes cover keys whose
-names are not known when the policy is set:
+Registrations resolve most-specific-first: a key takes its exact-key
+registration, else the longest registered prefix it starts with, else
+`default_merge`. Prefixes cover keys whose names are not known when the
+policy is set:
 
 ```python
-from kvgit.merges import ours, text
+from kvgit import MergeChoice
+from kvgit.merges import text
 
-main.set_merge_prefix("runs/", ours)  # every key under runs/
-main.set_merge_fn("runs/index", text)  # except this one
+main.set_merge_prefix("runs/", MergeChoice.OURS)  # this branch owns runs/
+main.set_merge_fn("runs/index", text)             # except this one key
 ```
+
+A registration holds either a merge function or a `MergeChoice`, and the
+two reach differently:
+
+* A **merge function** is consulted only where both sides changed a key.
+  A change only one side made is applied as it always was.
+* A **`MergeChoice`** is a standing policy: it hands that side every key
+  either side changed under it. So `OURS` also drops a key the other
+  side added and keeps one the other side removed -- what a branch that
+  owns a whole namespace needs. Nothing is read or decoded for those
+  keys.
+
+`kvgit.merges.ours` and `kvgit.merges.theirs` are the merge-function
+form, for keys where one side wins only when both sides collide. They
+keep that side's stored value as it stands rather than rewriting it, so
+the merge writes no new blob -- and if the chosen side removed the key,
+the merge removes it.
 
 `commit()` and `merge()` take `merge_fns=` / `merge_prefixes=` /
 `default_merge=` for one call, layered over what is registered.

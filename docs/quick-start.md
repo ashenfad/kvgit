@@ -244,13 +244,18 @@ Cover a whole family of keys with one registration, for names you cannot
 know in advance:
 
 ```python
+from kvgit import MergeChoice
 from kvgit.merges import ours
 
-s.set_merge_prefix("runs/", ours)   # every key under runs/
+s.set_merge_prefix("counts/", counter())        # every key under counts/
+s.set_merge_prefix("notes/", MergeChoice.OURS)  # this branch owns notes/
 ```
 
-`ours` and `theirs` take a side outright, keeping that side's stored
-value rather than rewriting it.
+Registering a `MergeChoice` rather than a function is a policy, not a
+conflict resolver: it hands that side *every* key either side changed
+under the prefix, so `OURS` also drops a key the other side added and
+keeps one the other side removed. A merge function -- including
+`kvgit.merges.ours` -- only ever sees keys both sides changed.
 
 Set a default fallback for any key without a registered function:
 

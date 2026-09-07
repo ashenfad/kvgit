@@ -4,7 +4,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
 from ..errors import MergeConflict
-from .protocol import BytesMergeFn, DiffResult, MergeChoice
+from .protocol import DiffResult, MergeChoice, MergePolicy
 
 BlobReader = Callable[[str], bytes | None]
 """Read a blob by its content identifier (versioned key or hex SHA)."""
@@ -24,31 +24,33 @@ class MergeResolution:
     auto_merged_keys: list[str]
 
 
-def pick_merge_fn(
+def pick_merge_policy(
     key: str,
-    merge_fns: Mapping[str, BytesMergeFn],
-    merge_prefixes: Mapping[str, BytesMergeFn],
-    default_merge: BytesMergeFn | None,
-) -> BytesMergeFn | None:
-    """Choose the merge function for one contested key.
+    merge_fns: Mapping[str, MergePolicy],
+    merge_prefixes: Mapping[str, MergePolicy],
+    default_merge: MergePolicy | None,
+) -> MergePolicy | None:
+    """Choose the registration that governs one key.
 
     The most specific registration wins: an exact key match first, then
     the longest registered prefix the key starts with, then the default.
-    ``None`` means nothing is registered for the key, which the caller
-    files as a conflict.
+    Merge functions and ``MergeChoice`` policies compete in that one
+    order, so a longer prefix beats a shorter one whichever kind each
+    holds. ``None`` means nothing is registered for the key, which
+    leaves a contested key to be filed as a conflict.
     """
-    fn = merge_fns.get(key)
-    if fn is not None:
-        return fn
+    policy = merge_fns.get(key)
+    if policy is not None:
+        return policy
 
-    best_fn: BytesMergeFn | None = None
+    best: MergePolicy | None = None
     best_len = -1
     for prefix, candidate in merge_prefixes.items():
         if key.startswith(prefix) and len(prefix) > best_len:
-            best_fn = candidate
+            best = candidate
             best_len = len(prefix)
-    if best_fn is not None:
-        return best_fn
+    if best is not None:
+        return best
 
     return default_merge
 
@@ -60,9 +62,9 @@ def resolve_merge(
     our_diff: DiffResult,
     their_diff: DiffResult,
     blob_reader: BlobReader,
-    merge_fns: dict[str, BytesMergeFn],
-    default_merge: BytesMergeFn | None,
-    merge_prefixes: dict[str, BytesMergeFn] | None = None,
+    merge_fns: dict[str, MergePolicy],
+    default_merge: MergePolicy | None,
+    merge_prefixes: dict[str, MergePolicy] | None = None,
 ) -> MergeResolution:
     """Resolve a three-way merge between two diverged keysets.
 
@@ -76,11 +78,14 @@ def resolve_merge(
         our_diff: DiffResult from LCA to our commit.
         their_diff: DiffResult from LCA to their commit.
         blob_reader: Callable to read blob bytes by content ID.
-        merge_fns: Per-key merge functions (exact key match).
-        default_merge: Fallback merge function for unregistered keys.
-        merge_prefixes: Merge functions by key prefix, consulted when
-            no exact key match applies. The longest matching prefix
-            wins.
+        merge_fns: Per-key registrations (exact key match).
+        default_merge: Fallback registration for unregistered keys.
+        merge_prefixes: Registrations by key prefix, consulted when no
+            exact key match applies. The longest matching prefix wins.
+
+    A registration holds either a merge function, consulted only where
+    both sides changed a key, or a ``MergeChoice``, which gives one side
+    every key it covers.
 
     Returns:
         MergeResolution with the merged keyset, values that need
@@ -100,6 +105,27 @@ def resolve_merge(
     conflicts: set[str] = set()
     merge_errors: dict[str, Exception] = {}
 
+    policies = {
+        key: pick_merge_policy(key, merge_fns, prefixes, default_merge)
+        for key in all_changed
+    }
+
+    # Keys a MergeChoice governs: that side's state stands as it is,
+    # whether or not the other side touched the key. Reading the pointer
+    # straight out of the chosen side's keyset says all of it — a key
+    # absent there was either added by the other side (dropped) or
+    # removed by the chosen side (stays removed), and either way it has
+    # no pointer to carry. These keys never reach a merge function, so
+    # nothing is read or decoded for them.
+    chosen = {
+        key for key, policy in policies.items() if isinstance(policy, MergeChoice)
+    }
+    for key in chosen:
+        side = our_keyset if policies[key] is MergeChoice.OURS else their_keyset
+        if key in side:
+            merged_keyset[key] = side[key]
+        auto_merged.append(key)
+
     # Unchanged keys: carry from their keyset (HEAD)
     all_keys = set(our_keyset.keys()) | set(their_keyset.keys())
     for key in all_keys - all_changed:
@@ -109,18 +135,20 @@ def resolve_merge(
             merged_keyset[key] = our_keyset[key]
 
     # Changed only by us
-    for key in our_changed - their_changed:
+    for key in our_changed - their_changed - chosen:
         if key not in our_diff.removed:
             merged_keyset[key] = our_keyset[key]
             auto_merged.append(key)
 
     # Changed only by them
-    for key in their_changed - our_changed:
+    for key in their_changed - our_changed - chosen:
         if key not in their_diff.removed:
             merged_keyset[key] = their_keyset[key]
 
-    # Contested: changed by both sides
-    contested = our_changed & their_changed
+    # Contested: changed by both sides. A merge function is consulted
+    # here and nowhere else, so registering one never disturbs a change
+    # only one side made.
+    contested = (our_changed & their_changed) - chosen
     for key in contested:
         our_removed = key in our_diff.removed
         their_removed = key in their_diff.removed
@@ -156,7 +184,7 @@ def resolve_merge(
             merged_keyset[key] = their_keyset[key]
             continue
 
-        fn = pick_merge_fn(key, merge_fns, prefixes, default_merge)
+        fn = policies[key]
         if fn is None:
             conflicts.add(key)
             continue

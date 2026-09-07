@@ -141,9 +141,9 @@ class Staged(MutableMapping[str, Any]):
         self._updates: dict[str, Any] = {}
         self._removals: set[str] = set()
         self._cache: dict[str, Any] = {}
-        self._merge_fns: dict[str, MergeFn] = {}
-        self._merge_prefixes: dict[str, MergeFn] = {}
-        self._default_merge: MergeFn | None = None
+        self._merge_fns: dict[str, MergeFn | MergeChoice] = {}
+        self._merge_prefixes: dict[str, MergeFn | MergeChoice] = {}
+        self._default_merge: MergeFn | MergeChoice | None = None
 
     def _decode(self, raw: bytes) -> Any:
         if self._decoder_chunked:
@@ -228,21 +228,28 @@ class Staged(MutableMapping[str, Any]):
 
     # -- Merge function registry --
 
-    def set_merge_fn(self, key: str, fn: MergeFn) -> None:
-        """Register a merge function for a specific key."""
+    def set_merge_fn(self, key: str, fn: MergeFn | MergeChoice) -> None:
+        """Register a merge function, or a ``MergeChoice``, for one key."""
         self._merge_fns[key] = fn
 
-    def set_merge_prefix(self, prefix: str, fn: MergeFn) -> None:
-        """Register a merge function for every key under a prefix.
+    def set_merge_prefix(self, prefix: str, fn: MergeFn | MergeChoice) -> None:
+        """Register a merge function, or a ``MergeChoice``, under a prefix.
 
         Prefixes cover keys whose names are not known when the policy is
-        set (``"runs/"`` for ``runs/<id>``). A contested key takes the
-        most specific registration: its exact key fn, else the longest
-        registered prefix it starts with, else the default merge fn.
+        set (``"runs/"`` for ``runs/<id>``). A key takes the most
+        specific registration: its exact key, else the longest
+        registered prefix it starts with, else the default.
+
+        What the registration holds decides how far it reaches. A merge
+        function is consulted only where both sides changed a key. A
+        ``MergeChoice`` is a standing policy over the whole prefix: it
+        gives that side every key either side changed under it, so
+        ``OURS`` also drops a key the other side added and keeps one the
+        other side removed.
         """
         self._merge_prefixes[prefix] = fn
 
-    def set_default_merge(self, fn: MergeFn) -> None:
+    def set_default_merge(self, fn: MergeFn | MergeChoice) -> None:
         """Register a default merge function."""
         self._default_merge = fn
 
@@ -277,6 +284,18 @@ class Staged(MutableMapping[str, Any]):
 
         return wrapped
 
+    def _wrap_rule(self, rule: MergeFn | MergeChoice) -> BytesMergeFn | MergeChoice:
+        """Prepare one merge registration for the bytes-level merge.
+
+        A ``MergeChoice`` names a side rather than computing a value, so
+        it goes down untouched — there is nothing to decode for the keys
+        it governs, and wrapping it would hide that from the resolver.
+        A merge function gets the decode/encode wrapper.
+        """
+        if isinstance(rule, MergeChoice):
+            return rule
+        return self._wrap_merge_fn(rule)
+
     # -- Commit / reset --
 
     def commit(
@@ -284,9 +303,9 @@ class Staged(MutableMapping[str, Any]):
         *,
         keys: set[str] | None = None,
         on_conflict: str = "raise",
-        merge_fns: dict[str, MergeFn] | None = None,
-        merge_prefixes: dict[str, MergeFn] | None = None,
-        default_merge: MergeFn | None = None,
+        merge_fns: dict[str, MergeFn | MergeChoice] | None = None,
+        merge_prefixes: dict[str, MergeFn | MergeChoice] | None = None,
+        default_merge: MergeFn | MergeChoice | None = None,
         info: dict | None = None,
     ) -> MergeResult:
         """Flush staged changes to the underlying Versioned store.
@@ -350,22 +369,22 @@ class Staged(MutableMapping[str, Any]):
             effective_prefixes.update(merge_prefixes)
         effective_default = default_merge or self._default_merge
 
-        bytes_merge_fns: dict[str, BytesMergeFn] | None = None
+        bytes_merge_fns: dict[str, BytesMergeFn | MergeChoice] | None = None
         if effective_fns:
             bytes_merge_fns = {
-                key: self._wrap_merge_fn(fn) for key, fn in effective_fns.items()
+                key: self._wrap_rule(rule) for key, rule in effective_fns.items()
             }
 
-        bytes_prefixes: dict[str, BytesMergeFn] | None = None
+        bytes_prefixes: dict[str, BytesMergeFn | MergeChoice] | None = None
         if effective_prefixes:
             bytes_prefixes = {
-                prefix: self._wrap_merge_fn(fn)
-                for prefix, fn in effective_prefixes.items()
+                prefix: self._wrap_rule(rule)
+                for prefix, rule in effective_prefixes.items()
             }
 
-        bytes_default: BytesMergeFn | None = None
-        if effective_default:
-            bytes_default = self._wrap_merge_fn(effective_default)
+        bytes_default: BytesMergeFn | MergeChoice | None = None
+        if effective_default is not None:
+            bytes_default = self._wrap_rule(effective_default)
 
         result = self._versioned.commit(
             encoded_updates,
@@ -397,9 +416,9 @@ class Staged(MutableMapping[str, Any]):
         their_head: str,
         *,
         on_conflict: str = "raise",
-        merge_fns: dict[str, MergeFn] | None = None,
-        merge_prefixes: dict[str, MergeFn] | None = None,
-        default_merge: MergeFn | None = None,
+        merge_fns: dict[str, MergeFn | MergeChoice] | None = None,
+        merge_prefixes: dict[str, MergeFn | MergeChoice] | None = None,
+        default_merge: MergeFn | MergeChoice | None = None,
         post_check: PostCheck | None = None,
         info: dict | None = None,
     ) -> MergeResult:
@@ -411,8 +430,9 @@ class Staged(MutableMapping[str, Any]):
         reset first, so the merge reads committed heads on both sides.
 
         ``merge_fns`` / ``merge_prefixes`` / ``default_merge`` take
-        decoded values (wrapped like :meth:`commit`); ``post_check``
-        takes merged bytes.
+        merge functions over decoded values (wrapped like
+        :meth:`commit`) or a ``MergeChoice``; ``post_check`` takes
+        merged bytes.
         """
         if self._updates or self._removals:
             raise ValueError("cannot merge with staged changes; commit or reset first")
@@ -426,20 +446,22 @@ class Staged(MutableMapping[str, Any]):
             effective_prefixes.update(merge_prefixes)
         effective_default = default_merge or self._default_merge
         bytes_merge_fns = (
-            {key: self._wrap_merge_fn(fn) for key, fn in effective_fns.items()}
+            {key: self._wrap_rule(rule) for key, rule in effective_fns.items()}
             if effective_fns
             else None
         )
         bytes_prefixes = (
             {
-                prefix: self._wrap_merge_fn(fn)
-                for prefix, fn in effective_prefixes.items()
+                prefix: self._wrap_rule(rule)
+                for prefix, rule in effective_prefixes.items()
             }
             if effective_prefixes
             else None
         )
         bytes_default = (
-            self._wrap_merge_fn(effective_default) if effective_default else None
+            self._wrap_rule(effective_default)
+            if effective_default is not None
+            else None
         )
         result = self._versioned.merge_heads(
             their_head,
