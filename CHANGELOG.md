@@ -59,7 +59,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   New keyword arguments: `deep_clean(store, min_age=3600, *, grace=5.0, lease_ttl=600.0)`, and the same on `VersionedKV.deep_clean`. Both have defaults, so existing calls are unchanged apart from the five-second pause.
 
-  **The one assumption the guarantee rests on:** a writer's window between reading the lease and finishing its write batch is shorter than `grace`. A writer slower than that can still lose its nodes and chunks. Five seconds covers an in-memory or local-disk store with room to spare; raise it for a slow or remote backend. `lease_ttl` bounds what a crashed holder costs — writers wait out a lease's remaining term and no longer — and a sweep that outlives its own lease is not extended silently: it finishes and logs a warning at `kvgit.orphans` naming the overrun.
+  **Waiting covers every write that a sweep can invalidate**, not just the commit batch: the commit and merge-commit `set_many`s, `tag`, and every branch-head write — the HEAD advance behind `commit`, `create_branch`, `reset_to`, and the corrupt-HEAD repair. The head writes wait *before* checking their target commit exists, so the check and the write see the same store; `create_branch(at=...)`, `reset_to` and `tag` on a commit a concurrent sweep collects now report it gone instead of installing a head that names nothing.
+
+  **A commit is also protected between its write batch and the CAS that publishes it.** Those are two steps, and in between the commit is fully written and completely unreachable — indistinguishable from garbage, and at `min_age=0` fair game. The sweep therefore keeps every unreachable commit stamped at or after `lease acquisition - grace`, marking its payload and leaving its metadata, whatever `min_age` says. The two guards answer different questions: `min_age` is the caller's policy on how long abandoned work lingers, this bound is the lease's own correctness rule.
+
+  **The one assumption the guarantee rests on:** a writer's whole window, from reading the lease to the CAS that advances HEAD, is shorter than `grace`. A writer slower than that can still lose its nodes and chunks. Five seconds covers an in-memory or local-disk store with room to spare; raise it for a slow or remote backend. `lease_ttl` bounds what a crashed holder costs — writers wait out a lease's remaining term and no longer — and a sweep that outlives its own lease is not extended silently: it finishes and logs a warning at `kvgit.orphans` naming the overrun.
 
   A writer that does not read the lease is still exposed, which is the same hazard in its original shape: an older kvgit, or a process editing the backend directly, commits mid-sweep and the namespace scan takes its nodes. Every process touching a store you deep-clean needs a version that honours the lease.
 - **`kvgit.GcBusy`**, raised by `deep_clean` when another deep clean holds a live lease. Nothing is swept and the holder's lease is left untouched; retry later.
@@ -67,7 +71,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **`clean_orphans` waits out a deep clean's lease before its own removals.** It takes no lease and needs none — everything it deletes is found by walking an orphan's own keyset, and every class it deletes is commit-scoped — but two sweeps deleting at once reclaim nothing extra and make a store under maintenance harder to reason about.
-- **Docs no longer describe `deep_clean` as requiring a quiescent store.** What it requires now is that `grace` exceeds a writer's check-then-write window, and that every writer on the store honours the lease.
+- **`deep_clean` validates the storage version before taking the lease.** A store stamped above the layout this code reads now comes out of the call with nothing written to it at all; checking after acquisition left an expired lease record behind in a store kvgit had no business writing to. `clean_orphans` keeps its own check inside the sweep.
+- **Docs no longer describe `deep_clean` as requiring a quiescent store.** What it requires now is that `grace` exceeds a writer's whole check-write-publish window, and that every writer on the store honours the lease.
 
 ### Fixed
 

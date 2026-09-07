@@ -662,7 +662,7 @@ All methods from the `Versioned` protocol are implemented. Additional:
 | `branches(store)` | Static method: list branch names for a store. Excludes the reserved `refs/tags/` names that hold [tags](#tags). |
 | `tag(name, *, at=None, info=None)` | Name a commit permanently — see [Tags](#tags). Also `tags()`, `tag_info(name)`, `delete_tag(name)`. Module-level `kvgit.versioned.kv.tags(store)` and `tag_info(store, name)` do the same without a handle. |
 | `clean_orphans(min_age=3600)` | Remove orphaned commits unreachable from any branch HEAD, along with the blobs and HAMT nodes they uniquely owned. **Does not reclaim chunks** — see below. Returns count of cleaned orphans. Only deletes commits older than `min_age` seconds. Safe under concurrent writers. |
-| `deep_clean(min_age=3600, *, grace=5.0, lease_ttl=600.0)` | `clean_orphans` plus a full scan of the `kvgit:keyset:` and `kvgit:chunk:` namespaces. The only pass that reclaims chunks, orphan-owned ones included. Runs under the store's GC lease, which writers honour; raises [`GcBusy`](#gcbusy) if another deep clean holds one. See below. |
+| `deep_clean(min_age=3600, *, grace=5.0, lease_ttl=600.0)` | `clean_orphans` plus a full scan of the `kvgit:keyset:` and `kvgit:chunk:` namespaces. The only pass that reclaims chunks, orphan-owned ones included. Runs under the store's GC lease, which every write path honours; raises [`GcBusy`](#gcbusy) if another deep clean holds one, and `ValueError` (writing nothing at all) for a store stamped too high. See below. |
 | `repair_head()` | Persist a recovered HEAD for this branch. Reads recover a damaged HEAD in memory without writing it back; this is the explicit call that makes the recovery durable. Returns the commit HEAD now names, or `None` if nothing was recoverable. See [HEAD Recovery](#head-recovery). |
 
 ### HEAD Recovery
@@ -757,14 +757,34 @@ The lease lives in one reserved key, `__gc_lease__`, holding `{"owner": <opaque 
 
 | Step | What happens |
 |------|--------------|
+| Version check | Refuse a store stamped above the layout this code reads, *before* touching the lease key, so such a store comes out of the call with nothing written to it. |
 | Acquire | CAS the lease key. A live lease held by someone else raises [`GcBusy`](#gcbusy) and sweeps nothing. |
-| Grace | Sleep `grace` seconds (default 5). Batches that read the lease just before it was taken land during this pause. |
-| Sweep | Mark and sweep, namespace scans included. |
+| Grace | Sleep `grace` seconds (default 5). Writes that read the lease just before it was taken land during this pause. |
+| Sweep | Mark and sweep, namespace scans included, protecting commits stamped within `grace` of acquisition (below). |
 | Release | In a `finally`: CAS our own bytes to an expired record. A failed release means the lease was already reclaimed by someone else, and theirs is left alone. |
 
-Writers hold up their end with one `get`. `commit()`, a merge commit, and `tag()` each read the lease immediately before their write batch and, if a live one is held, poll until it is released or its term runs out. `clean_orphans()` takes no lease — it is safe beside a writer by construction — but it does wait one out before its own removals, since two sweeps deleting at once reclaim nothing extra.
+Writers hold up their end with one `get`. Every path that writes something the scan can delete — or that makes a commit reachable — reads the lease immediately before its write and, if a live one is held, polls until it is released or its term runs out:
 
-**The one assumption:** a writer's window between reading the lease and finishing its write batch is shorter than `grace`. A writer slower than that — descheduled, or on a backend where one `set_many` can stall for seconds — can still lose its nodes and chunks. Five seconds is generous for an in-memory or local-disk store; raise it for a slow or remote backend.
+| Path | What it writes |
+|------|----------------|
+| `commit()` fast-forward and merge batches | Nodes, blobs, chunks, commit metadata |
+| `commit()` / `merge()` HEAD advance | `__branch_head__<branch>` |
+| `create_branch(name, at=...)` | `__branch_head__<name>` |
+| `reset_to(commit)` | `__branch_head__<branch>` |
+| `tag(name, at=...)` | `__branch_head__refs/tags/<name>` |
+| corrupt-HEAD repair (`repair_head()`, and the retry inside a losing CAS) | `__branch_head__<branch>` |
+
+The head writes wait *before* checking their target commit exists, so the check and the write see the same store. `create_branch(at=...)`, `reset_to` and `tag` aimed at a commit a concurrent sweep collects therefore report it gone rather than installing a head that names nothing.
+
+`clean_orphans()` takes no lease — it is safe beside a writer by construction — but it does wait one out before its own removals, since two sweeps deleting at once reclaim nothing extra.
+
+##### Commits between their write batch and their HEAD advance
+
+A commit lands in two steps: the `set_many` that writes its nodes, blobs, chunks and metadata, and — later — the CAS that makes it a branch HEAD, or the three-way merge that folds it into one. In between it is fully written and completely unreachable, which is indistinguishable from garbage; at `min_age=0` a mark phase landing in that gap would delete a commit whose writer is about to publish it.
+
+So the sweep keeps every unreachable commit stamped at or after `lease acquisition - grace`: its nodes, blobs and chunks are marked and its metadata left in place, regardless of `min_age`. The two guards answer different questions — `min_age` is the caller's policy on how long abandoned work lingers, this bound is the lease's own correctness rule — so the bound applies even at `min_age=0`.
+
+**The one assumption:** a writer's whole window, from reading the lease to the CAS that advances HEAD, is shorter than `grace`. A writer slower than that — descheduled, or on a backend where one `set_many` can stall for seconds — can still lose its nodes and chunks. Five seconds is generous for an in-memory or local-disk store; raise it for a slow or remote backend.
 
 `lease_ttl` (default 600 seconds) bounds what a crashed holder costs: writers wait out a lease's remaining term and no longer, so a process that dies mid-sweep stalls the store until its expiry and then no further. A sweep that outlives its own lease is **not** extended silently — it finishes, logs a warning at `kvgit.orphans` naming the overrun, and during that window writers are free to write. Set `lease_ttl` above the longest sweep this store has taken.
 
