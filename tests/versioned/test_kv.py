@@ -1284,3 +1284,75 @@ class TestHeadRecovery:
         v.reset_to(first)
         prev = loads(store.get(BRANCH_HEAD_PREV % "main"))
         assert prev == second
+
+
+class TestMergeCommitMeta:
+    """A merge commit's metadata must describe the blob it kept."""
+
+    @staticmethod
+    def _entry(store, commit, key):
+        from kvgit.versioned.kv import Keyset, _load_root
+
+        return dict(Keyset(store, root=_load_root(store, commit)).items())[key]
+
+    def test_their_side_key_keeps_their_size(self):
+        store = Memory()
+        other = Versioned(store)
+        other.commit({"k": b"aaaa"})
+        merger = Versioned(store)
+
+        other.commit({"k": b"bbbbbbbbbb"})
+        result = merger.commit({"other": b"1"})
+
+        entry = self._entry(store, result.commit, "k")
+        assert entry.meta.size == len(store.get(entry.blob)) == 10
+
+    def test_their_side_key_keeps_their_chunk_refs(self):
+        store = Memory()
+        other = Versioned(store)
+        other.commit(
+            {"k": b"base-blob"},
+            chunks={"base-chunk": b"base chunk bytes"},
+            chunk_refs={"k": ["base-chunk"]},
+        )
+        merger = Versioned(store)
+
+        other.commit(
+            {"k": b"their-blob"},
+            chunks={"their-chunk": b"their chunk bytes"},
+            chunk_refs={"k": ["their-chunk"]},
+        )
+        result = merger.commit({"other": b"1"})
+
+        entry = self._entry(store, result.commit, "k")
+        assert store.get(entry.blob) == b"their-blob"
+        assert entry.meta.chunks == ["their-chunk"]
+
+    def test_our_side_key_keeps_our_meta(self):
+        store = Memory()
+        merger = Versioned(store)
+        merger.commit({"k": b"aaaa"})
+        other = Versioned(store)
+
+        other.commit({"other": b"1"})
+        result = merger.commit({"k": b"bbbbbbbbbb"})
+
+        entry = self._entry(store, result.commit, "k")
+        assert entry.meta.size == len(store.get(entry.blob)) == 10
+
+    def test_merged_value_gets_fresh_meta(self):
+        store = Memory()
+        other = Versioned(store)
+        other.commit({"k": b"base"})
+        merger = Versioned(store)
+
+        other.commit({"k": b"theirs"})
+        result = merger.commit(
+            {"k": b"ours"},
+            default_merge=lambda old, our, their: b"merged value",
+        )
+
+        entry = self._entry(store, result.commit, "k")
+        assert store.get(entry.blob) == b"merged value"
+        assert entry.meta.size == len(b"merged value")
+        assert entry.meta.chunks is None

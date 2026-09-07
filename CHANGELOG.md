@@ -32,6 +32,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A merge commit's metadata now describes the blob it kept.** Merged
+  entries took our side's `MetaEntry` whenever we had one, even where
+  the merge kept the other side's blob pointer, leaving `size` and the
+  `chunks` list describing a blob the entry no longer pointed at. Since
+  `deep_clean` traces live chunks through `MetaEntry.chunks`, a chunked
+  value carried in from the other side could have its chunks reclaimed
+  while still referenced. Metadata is now indexed by blob pointer, so it
+  travels with the pointer that won.
+
 - **Both sides writing the same bytes no longer conflicts.** A blob
   identifier is scoped to the commit that wrote it, so two writers
   making the identical change from the same base ended up with different
