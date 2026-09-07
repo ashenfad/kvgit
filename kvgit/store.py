@@ -154,7 +154,7 @@ def delete_branches(
     That sweep does not reclaim chunks — the content-addressed bytes a
     chunked codec writes — because a chunk key is not the deleted
     branch's to give away. On a store using chunked codecs, follow up
-    with ``deep_clean`` on a quiescent store to get that space back.
+    with ``deep_clean`` to get that space back.
 
     Args:
         names: Branch names to delete — one name or an iterable of
@@ -214,8 +214,8 @@ def delete_tags(
     the same name resolve to the deleted commit. A name with no tag is
     skipped — idempotency beats a ``ValueError`` in teardown.
 
-    That sweep does not reclaim chunks; follow up with ``deep_clean`` on
-    a quiescent store if the store uses chunked codecs.
+    That sweep does not reclaim chunks; follow up with ``deep_clean``
+    if the store uses chunked codecs.
 
     Args:
         names: Tag names to delete — one name or an iterable of them.

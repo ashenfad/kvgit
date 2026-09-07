@@ -184,7 +184,7 @@ class TestTagsAsGCRoots:
     def test_deep_clean_keeps_a_tagged_commit(self):
         backend, v, tagged = self._store_with_tagged_orphan()
 
-        assert v.deep_clean(min_age=0) == 0
+        assert v.deep_clean(min_age=0, grace=0) == 0
         assert backend.get(COMMIT_ROOT % tagged) is not None
         assert v.checkout(tag="v1").get("secret") == b"tagged value"
 
@@ -412,7 +412,7 @@ class TestTagKeyLayout:
         backend = Memory()
         v = Versioned(backend)
         v.tag("v1", info={"by": "ann"})
-        v.deep_clean(min_age=0)
+        v.deep_clean(min_age=0, grace=0)
         assert backend.get(TAG_INFO_KEY % "v1") is not None
         assert v.tag_info("v1").info == {"by": "ann"}
 

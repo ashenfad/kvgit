@@ -45,8 +45,8 @@ class TestChunkSweepOnDeleteBranch:
         commit-derived in them, so a chunk the orphan owns may be the
         very key a concurrent writer's new commit just deduped onto.
         The incremental sweep therefore leaves chunks alone and
-        ``deep_clean``, which requires a quiescent store, reclaims
-        them.
+        ``deep_clean``, which sweeps under a lease writers honour,
+        reclaims them.
         """
         s, store = make_staged()
         s["base"] = np.arange(2048, dtype="float64")
@@ -70,7 +70,7 @@ class TestChunkSweepOnDeleteBranch:
             "the incremental sweep must not delete chunks"
         )
 
-        s.versioned.deep_clean(min_age=0)
+        s.versioned.deep_clean(min_age=0, grace=0)
         assert len(chunk_keys(store)) == 1
         assert np.array_equal(
             fresh_reader(store)["base"], np.arange(2048, dtype="float64")
@@ -116,7 +116,7 @@ class TestCommitlessChunks:
         s.versioned.clean_orphans(min_age=0)
         assert (CHUNK_PREFIX + rogue_hash) in store.keys()
 
-        s.versioned.deep_clean(min_age=0)
+        s.versioned.deep_clean(min_age=0, grace=0)
         assert (CHUNK_PREFIX + rogue_hash) not in store.keys()
         # The referenced chunk survives both sweeps.
         assert len(chunk_keys(store)) == 1
@@ -165,14 +165,14 @@ class TestOrphanCommitChunks:
         # deep_clean: its namespace scan would otherwise take any chunk
         # not reachable from a live head, including one an in-flight
         # writer has staged but not yet linked to a branch.
-        s.versioned.deep_clean(min_age=3600)
+        s.versioned.deep_clean(min_age=3600, grace=0)
         assert set(chunk_keys(store)) == set(before), (
             "deep_clean swept a young orphan commit's chunks"
         )
 
         # Once the commit ages out, the deep sweep is free to take them.
         store.set(COMMIT_TIME % dev_commit, dumps(time.time() - 7200))
-        s.versioned.deep_clean(min_age=3600)
+        s.versioned.deep_clean(min_age=3600, grace=0)
         assert chunk_keys(store) == []
 
     def test_old_orphan_commit_chunks_wait_for_deep_clean(self):
@@ -199,7 +199,7 @@ class TestOrphanCommitChunks:
             "the incremental sweep must not delete chunks"
         )
 
-        s.versioned.deep_clean(min_age=0)
+        s.versioned.deep_clean(min_age=0, grace=0)
         assert chunk_keys(store) == []
 
 

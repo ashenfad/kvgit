@@ -13,6 +13,7 @@ Storage layout (v3):
 - ``__tag_info__<tag>``                — tag creation time + info
 - ``kvgit:keyset:<node_hash>``         — HAMT node bytes
 - ``kvgit:chunk:<chunk_hash>``         — content-addressed chunk bytes (v3)
+- ``__gc_lease__``                     — lease a deep clean sweeps under
 - ``<commit_hash>:<user_key>``         — blob value bytes
 
 A tag is deliberately not a key kind of its own. It is a branch head
@@ -40,8 +41,9 @@ the commit hash in the key; HAMT nodes embed that blob pointer, so a
 node hash is commit-scoped too. That difference decides who may delete
 what: ``clean_orphans`` never deletes chunks, because a chunk an orphan
 owns may be the same key a commit made a moment ago just deduped onto,
-and the sweep has no way to know. Only ``deep_clean``, which requires a
-quiescent store, reclaims chunks.
+and the sweep has no way to know. Only ``deep_clean`` reclaims chunks,
+and it does so under the ``__gc_lease__`` key: it holds the lease for
+the sweep, and every write path waits while a live lease is held.
 
 v3 is a strict superset of v2:
 
@@ -60,10 +62,13 @@ version raise on open and need to be rebuilt fresh.
 import hashlib
 import json
 import logging
+import os
 import time
+import uuid
 from collections.abc import Callable
 
 from ..encoding import dumps, loads, safe_loads
+from ..errors import GcBusy
 from ..hamt import EMPTY_HASH
 from ..kv.base import KVStore
 from ..kv.memory import Memory
@@ -95,6 +100,25 @@ shipped.
 """
 
 CHUNK_PREFIX = "kvgit:chunk:"
+
+GC_LEASE_KEY = "__gc_lease__"
+"""Reserved key holding the store-wide lease a deep clean runs under.
+
+The value is ``{"owner": <opaque id>, "expires": <unix time>}`` encoded
+with :func:`kvgit.encoding.dumps`. A record whose ``expires`` is in the
+past — or whose bytes do not decode — is not a lease: it may be taken
+over by CAS against those exact bytes. Absent, unreadable and expired
+all mean "no live lease", so a holder that dies mid-sweep blocks the
+store only until its expiry passes.
+"""
+
+GC_WAIT_POLL = 0.05
+"""Seconds a writer sleeps between checks while a GC lease is live.
+
+The store offers no wait primitive, so waiting is polling. Short enough
+that release is noticed promptly, long enough that a writer blocked on a
+ten-minute sweep is not hammering the backend.
+"""
 
 STORAGE_VERSION_KEY = "__kvgit_version__"
 STORAGE_VERSION = 3
@@ -653,6 +677,92 @@ def tag_info(store: KVStore, name: str) -> TagInfo | None:
     )
 
 
+def _lease_expiry(raw: bytes | None) -> float:
+    """Unix time the lease in ``raw`` runs out; 0.0 if there is no lease.
+
+    Bytes that do not decode to a record with a numeric ``expires`` are
+    treated as already expired rather than as an error. A lease is a
+    hint about who is sweeping right now, so garbage under the key must
+    not wedge the store forever — CAS against those exact bytes takes it
+    over.
+    """
+    if raw is None:
+        return 0.0
+    record = safe_loads(raw)
+    if not isinstance(record, dict):
+        return 0.0
+    expires = record.get("expires")
+    if isinstance(expires, (int, float)) and not isinstance(expires, bool):
+        return float(expires)
+    return 0.0
+
+
+def _wait_for_gc(store: KVStore) -> None:
+    """Block until no live GC lease is held, then return.
+
+    Every path that writes an artifact a deep clean's namespace scan can
+    delete — keyset nodes, chunks, and the commit metadata that keeps
+    them reachable — calls this immediately before its write batch, so
+    that no batch is in flight while a sweep deletes.
+
+    Costs one ``get`` when no lease exists, which is the common case.
+    While a lease is live this polls, sleeping at most until that
+    lease's own expiry, so a holder that died without releasing delays a
+    writer by the remainder of its term and no longer. A fresh lease
+    taken by a different sweep is waited out in turn.
+    """
+    raw = store.get(GC_LEASE_KEY)
+    while raw is not None:
+        remaining = _lease_expiry(raw) - time.time()
+        if remaining <= 0:
+            return
+        time.sleep(min(GC_WAIT_POLL, remaining))
+        raw = store.get(GC_LEASE_KEY)
+
+
+def _acquire_gc_lease(store: KVStore, lease_ttl: float) -> tuple[bytes, float]:
+    """Take the GC lease by CAS, or raise :class:`GcBusy`.
+
+    The CAS expects exactly the bytes the liveness decision was made
+    from: absent, or an expired/undecodable record. Two sweeps racing
+    the same expired lease therefore cannot both win, and a live lease
+    held by someone else is never overwritten.
+
+    Returns:
+        The lease bytes written and the unix time they expire at.
+    """
+    raw = store.get(GC_LEASE_KEY)
+    now = time.time()
+    expiry = _lease_expiry(raw)
+    if expiry > now:
+        holder = safe_loads(raw)
+        owner = holder.get("owner") if isinstance(holder, dict) else None
+        raise GcBusy(
+            f"A deep clean holds the GC lease (owner {owner!r}, "
+            f"expires in {expiry - now:.1f}s)"
+        )
+    expires = now + lease_ttl
+    owner = f"{os.getpid()}-{uuid.uuid4().hex[:12]}"
+    ours = dumps({"owner": owner, "expires": expires})
+    if not store.cas(GC_LEASE_KEY, ours, expected=raw):
+        raise GcBusy("Another deep clean took the GC lease first")
+    return ours, expires
+
+
+def _release_gc_lease(store: KVStore, ours: bytes) -> None:
+    """Give up a lease this call took, if the store still holds it.
+
+    ``KVStore`` has no delete-if-equal, so release is a CAS overwriting
+    our own bytes with the same record expired (``expires: 0``). A
+    failed CAS means the lease under the key is no longer ours — it ran
+    out and another sweep claimed it — and that sweep's lease must not
+    be cleared, so the failure is ignored.
+    """
+    record = safe_loads(ours)
+    owner = record.get("owner") if isinstance(record, dict) else None
+    store.cas(GC_LEASE_KEY, dumps({"owner": owner, "expires": 0}), expected=ours)
+
+
 def clean_orphans(store: KVStore, min_age: float = 3600) -> int:
     """Remove orphaned commits unreachable from any branch HEAD.
 
@@ -682,8 +792,13 @@ def clean_orphans(store: KVStore, min_age: float = 3600) -> int:
     objects (numpy and pandas buffers), so on a store using chunked
     codecs they accumulate between maintenance passes; a store that
     never uses a chunked codec has none and loses nothing here. Run
-    :func:`deep_clean` on a quiescent store to reclaim them, along
-    with nodes and chunks no commit points at.
+    :func:`deep_clean` to reclaim them, along with nodes and chunks no
+    commit points at.
+
+    This sweep takes no GC lease, because it needs none. It does wait
+    out a lease another sweep holds before deleting anything: two
+    sweeps deleting at once reclaim nothing extra and make the store's
+    behaviour under maintenance harder to reason about.
 
     The ``min_age`` guard (default 1 hour) still applies: it decides
     which unreachable commits are old enough to delete at all.
@@ -694,8 +809,14 @@ def clean_orphans(store: KVStore, min_age: float = 3600) -> int:
     return _sweep(store, min_age, deep=False)
 
 
-def deep_clean(store: KVStore, min_age: float = 3600) -> int:
-    """Sweep orphans *and* every unreferenced node and chunk. Unsafe.
+def deep_clean(
+    store: KVStore,
+    min_age: float = 3600,
+    *,
+    grace: float = 5.0,
+    lease_ttl: float = 600.0,
+) -> int:
+    """Sweep orphans *and* every unreferenced node and chunk, under a lease.
 
     Does everything :func:`clean_orphans` does, then additionally scans
     the whole ``kvgit:keyset:`` and ``kvgit:chunk:`` namespaces and
@@ -710,18 +831,60 @@ def deep_clean(store: KVStore, min_age: float = 3600) -> int:
     every chunk in place, so on a store using chunked codecs this is
     the maintenance pass that gives the space back.
 
-    **Not safe against concurrent writers.** The scan runs after the
-    mark phase, so it sees, and deletes, artifacts written by any
-    commit that landed in between — including a commit that has since
-    become a live branch HEAD. Run it only on a quiescent store: no
-    other process or thread writing, for the whole call. ``min_age``
-    does not protect you here; it governs commit deletion, not the
-    namespace scan.
+    The namespace scan deletes anything not seen by the mark phase, so
+    it is only correct while nothing else is writing. This call makes
+    that condition hold rather than asking the caller for it:
+
+    1. It takes the ``__gc_lease__`` key by CAS, raising :class:`GcBusy`
+       if another sweep holds an unexpired one.
+    2. It sleeps ``grace`` seconds. Every writer reads the lease
+       immediately before its write batch and waits while a live one is
+       held, so after this pause the only batches that can still be in
+       flight are ones that read the lease before step 1 and found it
+       free.
+    3. It marks and sweeps.
+    4. It releases the lease, in a ``finally``.
+
+    **The one assumption:** a writer's window between reading the lease
+    and finishing its write batch is shorter than ``grace``. A writer
+    that takes longer than that — descheduled, or on a backend where one
+    ``set_many`` can stall for seconds — can still have its nodes and
+    chunks deleted. Five seconds covers an in-memory or local-disk
+    store with room to spare; raise it for a slow or remote backend.
+
+    A ``lease_ttl`` shorter than the sweep takes is not extended
+    silently: the sweep finishes and logs a warning naming the overrun,
+    during which writers are free to write. Set it above the longest
+    sweep this store has taken.
+
+    Args:
+        min_age: Unreachable commits younger than this many seconds are
+            kept, along with everything they reference.
+        grace: Seconds to wait after taking the lease, before marking.
+        lease_ttl: Seconds the lease stays live. A holder that crashes
+            blocks writers for at most this long.
 
     Returns:
         Number of orphaned commits removed.
+
+    Raises:
+        GcBusy: if another deep clean holds a live lease.
     """
-    return _sweep(store, min_age, deep=True)
+    gc_logger = logging.getLogger("kvgit.orphans")
+    ours, expires = _acquire_gc_lease(store, lease_ttl)
+    try:
+        time.sleep(grace)
+        return _sweep(store, min_age, deep=True)
+    finally:
+        overrun = time.time() - expires
+        if overrun > 0:
+            gc_logger.warning(
+                "deep_clean ran %.1fs past its %.1fs GC lease; writers were "
+                "free to write during that window. Raise lease_ttl.",
+                overrun,
+                lease_ttl,
+            )
+        _release_gc_lease(store, ours)
 
 
 def _sweep(store: KVStore, min_age: float, *, deep: bool) -> int:
@@ -918,6 +1081,14 @@ def _sweep(store: KVStore, min_age: float, *, deep: bool) -> int:
             chunk_hash = key[len(CHUNK_PREFIX) :]
             if chunk_hash and chunk_hash not in reachable_chunks:
                 all_removals.append(key)
+
+    if not deep:
+        # The incremental sweep is safe beside a writer, but not worth
+        # running beside another sweep: both would compute delete lists
+        # from the same store and race each other's removals for no
+        # extra space back. Wait the lease holder out, then delete.
+        # The deep path skips this — it holds the lease itself.
+        _wait_for_gc(store)
 
     if all_removals:
         store.remove_many(*all_removals)
@@ -1148,6 +1319,15 @@ class VersionedKV(VersionedBase):
         if info is not None:
             diffs[INFO_KEY % new_hash] = dumps(info)
 
+        # Everything this commit writes that a deep clean's namespace
+        # scan could delete — chunks, HAMT nodes, blobs, commit
+        # metadata — is in this one batch, so one lease check covers it
+        # all. It goes immediately before the write so the window
+        # between "no sweep is running" and "the batch has landed" is as
+        # short as the backend allows. (The version stamp above is not
+        # covered and needs no cover: no sweep deletes it.)
+        _wait_for_gc(self.store)
+
         # Write everything atomically
         self.store.set_many(diffs)
 
@@ -1247,6 +1427,12 @@ class VersionedKV(VersionedBase):
         diffs[COMMIT_TIME % merge_hash] = dumps(time.time())
         if info is not None:
             diffs[INFO_KEY % merge_hash] = dumps(info)
+
+        # A deep clean deletes any node or chunk its mark phase did not
+        # see, so no write batch may be in flight while one sweeps.
+        # Checked immediately before the batch, which is the whole of
+        # what this commit writes.
+        _wait_for_gc(self.store)
 
         self.store.set_many(diffs)
 
@@ -1604,6 +1790,13 @@ class VersionedKV(VersionedBase):
         # serialized raises without leaving a tag behind.
         record = dumps({"time": time.time(), "info": info})
 
+        # A tag is a GC root, so it must not be planted while a sweep is
+        # deciding what is reachable: a mark phase that ran before this
+        # head key landed treats the tagged commit as unreachable.
+        # Waiting out a live lease puts the whole tag write after the
+        # sweep that holds it.
+        _wait_for_gc(self.store)
+
         # CAS against absence: two writers racing the same name cannot
         # both win, and an existing tag is never silently overwritten.
         head_key = BRANCH_HEAD % _tag_branch(name)
@@ -1699,22 +1892,29 @@ class VersionedKV(VersionedBase):
         """
         return clean_orphans(self.store, min_age)
 
-    def deep_clean(self, min_age: float = 3600) -> int:
+    def deep_clean(
+        self,
+        min_age: float = 3600,
+        *,
+        grace: float = 5.0,
+        lease_ttl: float = 600.0,
+    ) -> int:
         """Orphan sweep plus a full unreferenced-node/chunk scan.
 
-        Thin instance wrapper over :func:`deep_clean`. **Requires a
-        quiescent store** — the namespace scan will delete artifacts
-        written by a concurrent writer, including ones a live branch
-        HEAD has since come to depend on. Use :meth:`clean_orphans`
-        for routine cleanup; schedule this one when you can quiesce
-        the store, since it is the only pass that reclaims chunks —
-        both the ones no commit references and the ones deleted
-        orphans owned.
+        Thin instance wrapper over :func:`deep_clean`, which takes the
+        store's GC lease, pauses for ``grace`` so in-flight write
+        batches finish, sweeps, and releases. Use :meth:`clean_orphans`
+        for routine cleanup and this one as a maintenance pass, since it
+        is the only pass that reclaims chunks — both the ones no commit
+        references and the ones deleted orphans owned.
 
         Returns:
             Number of orphaned commits removed.
+
+        Raises:
+            GcBusy: if another deep clean holds a live lease.
         """
-        return deep_clean(self.store, min_age)
+        return deep_clean(self.store, min_age, grace=grace, lease_ttl=lease_ttl)
 
     # -- Internal --
 

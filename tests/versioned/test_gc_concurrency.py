@@ -35,6 +35,7 @@ from kvgit.versioned.kv import (
     CHUNK_PREFIX,
     COMMIT_ROOT,
     COMMIT_TIME,
+    GC_LEASE_KEY,
     _load_root,
     _resolve_head,
     clean_orphans,
@@ -78,6 +79,22 @@ class ScanHookStore(Memory):
         if hook is not None:
             hook()  # type: ignore[operator]
         return snapshot
+
+
+class LeaseBlindStore(ScanHookStore):
+    """Scan-hook store whose ``get`` never reports the GC lease.
+
+    Stands in for a writer that does not honour the lease — an older
+    kvgit, or anything editing the backend directly. ``cas`` still sees
+    the real value, so a deep clean takes and releases the lease
+    normally; only the pre-write check that would make a writer wait
+    comes back empty.
+    """
+
+    def get(self, key: str) -> bytes | None:
+        if key == GC_LEASE_KEY:
+            return None
+        return super().get(key)
 
 
 def node_hashes(store, commit_hash: str) -> set[str]:
@@ -372,7 +389,7 @@ class TestOrdinaryGarbage:
         assert reader["live"] == "keep me"
 
         # The other direction: a maintenance pass does reclaim them.
-        deep_clean(store, min_age=0)
+        deep_clean(store, min_age=0, grace=0)
         assert [k for k in dev_chunks if store.get(k) is not None] == [], (
             "deep_clean must reclaim what the incremental sweep left"
         )
@@ -404,7 +421,7 @@ class TestDeepClean:
         )
         assert store.get(stray_chunk) is not None
 
-        assert deep_clean(store, min_age=0) == 0
+        assert deep_clean(store, min_age=0, grace=0) == 0
         assert store.get(stray_node) is None
         assert store.get(stray_chunk) is None
         assert not missing_nodes(store, live_commit, live_nodes)
@@ -434,19 +451,23 @@ class TestDeepClean:
         )
         assert stranded, "test needs the orphan to have children below its root"
 
-        assert deep_clean(store, min_age=0) == 0
+        assert deep_clean(store, min_age=0, grace=0) == 0
         assert [n for n in stranded if store.get(NODE_PREFIX + n)] == []
         assert Staged(VersionedKV(store))["live"] == "keep me"
 
-    def test_deep_clean_is_the_unsafe_one(self):
-        """Documented hazard, pinned: deep_clean loses a mid-sweep commit.
+    def test_deep_clean_still_eats_a_writer_that_ignores_the_lease(self):
+        """The namespace scan has no defence of its own; the lease is it.
 
-        Not a bug report — this is the reason deep_clean is opt-in and
-        the reason clean_orphans no longer does this. If this ever
-        starts passing cleanly, deep_clean has become safe and the
-        docs should say so.
+        A writer that reads the GC lease before its write batch waits
+        one out, so the mid-sweep commit this pins cannot happen through
+        the ordinary API. Blind that one read and the hazard is exactly
+        what it always was: the scan deletes every node the mark phase
+        did not see, including a live HEAD's. That is what makes the
+        lease load-bearing rather than advisory decoration, and what an
+        older kvgit — or anything editing the backend directly — is
+        still exposed to.
         """
-        store = ScanHookStore()
+        store = LeaseBlindStore()
         s = Staged(VersionedKV(store))
         for i in range(20):
             s[f"key{i}"] = i
@@ -462,12 +483,12 @@ class TestDeepClean:
             landed["nodes"] = node_hashes(store, landed["commit"])
 
         store.arm(AFTER_COMMIT_ROOT_SCAN, concurrent_writer)
-        deep_clean(store, min_age=3600)
+        deep_clean(store, min_age=3600, grace=0)
 
         head = _resolve_head(store, "main")
         assert head == landed["commit"]
         assert missing_nodes(store, head, landed["nodes"]), (  # type: ignore[arg-type]
-            "deep_clean is documented as unsafe under concurrent writers"
+            "the namespace scan deletes whatever the mark phase missed"
         )
         with pytest.raises(KeyError):
             Staged(VersionedKV(store))["late"]
@@ -536,8 +557,8 @@ class TestChunkDedupRace:
 
         ``clean_orphans`` deletes the orphan's commit metadata, blob
         and nodes but leaves its chunk, because the chunk key is not
-        the orphan's to give away. ``deep_clean``, which requires a
-        quiescent store, is where that space comes back.
+        the orphan's to give away. ``deep_clean``, which sweeps under a
+        lease writers honour, is where that space comes back.
         """
         store = Memory()
         s = Staged(VersionedKV(store), encoder=chunky_encoder, decoder=chunky_decoder)
@@ -560,7 +581,7 @@ class TestChunkDedupRace:
             "the incremental sweep deleted a chunk"
         )
 
-        assert deep_clean(store, min_age=0) == 0
+        assert deep_clean(store, min_age=0, grace=0) == 0
         assert [k for k in orphan_chunks if store.get(k) is not None] == []
         assert [k for k in live_chunks if store.get(k) is None] == []
 
