@@ -60,7 +60,7 @@ kvgit.delete_branches(
 | `db_name` | `str` | `"kvgit"` | IndexedDB database name. Only used with `"indexeddb"`. |
 | `min_age` | `float` | `3600` | Passed to the orphan sweep — commits younger than this many seconds survive. `0` reclaims immediately (only when no concurrent writers). |
 
-Each name's `__branch_head__` and its `__branch_head_prev__` recovery backup are removed (the backup too, so a later same-named branch can't resurrect the deleted state), then a single [`clean_orphans`](#orphan-cleanup) sweep — at `min_age` (default: the one-hour concurrent-writer guard) — reclaims commits only the deleted branches referenced. That sweep does not reclaim chunks (see [Orphan Cleanup](#orphan-cleanup)); follow with `deep_clean` on a quiescent store if the store uses chunked codecs. Deleting every branch is legal; the store mints a fresh empty `main` on next open. [Tags](#tags) are branch heads under a reserved name, so a tagged commit survives the deletion of every ordinary branch that reached it — the sweep marks from it like any other head.
+Each name's `__branch_head__` and its `__branch_head_prev__` recovery backup are removed (the backup too, so a later same-named branch can't resurrect the deleted state), then a single [`clean_orphans`](#orphan-cleanup) sweep — at `min_age` (default: the one-hour concurrent-writer guard) — reclaims commits only the deleted branches referenced. That sweep does not reclaim chunks (see [Orphan Cleanup](#orphan-cleanup)); follow with `deep_clean` if the store uses chunked codecs. Deleting every branch is legal; the store mints a fresh empty `main` on next open. [Tags](#tags) are branch heads under a reserved name, so a tagged commit survives the deletion of every ordinary branch that reached it — the sweep marks from it like any other head.
 
 ---
 
@@ -517,6 +517,10 @@ Both sides writing the *same* bytes to a key is not a conflict, and needs no mer
 | `conflicting_keys` | `set[str]` | Keys that could not be resolved |
 | `merge_errors` | `dict[str, Exception]` | Per-key exceptions from merge functions that raised |
 
+### GcBusy
+
+Raised by `deep_clean()` when another deep clean holds an unexpired lease on the store. Nothing is swept and the holder's lease is left alone. Retry later; the lease carries an expiry, so a holder that dies without releasing it blocks nothing past that point. See [Orphan Cleanup](#orphan-cleanup).
+
 ---
 
 ## Chunked codecs
@@ -658,7 +662,7 @@ All methods from the `Versioned` protocol are implemented. Additional:
 | `branches(store)` | Static method: list branch names for a store. Excludes the reserved `refs/tags/` names that hold [tags](#tags). |
 | `tag(name, *, at=None, info=None)` | Name a commit permanently — see [Tags](#tags). Also `tags()`, `tag_info(name)`, `delete_tag(name)`. Module-level `kvgit.versioned.kv.tags(store)` and `tag_info(store, name)` do the same without a handle. |
 | `clean_orphans(min_age=3600)` | Remove orphaned commits unreachable from any branch HEAD, along with the blobs and HAMT nodes they uniquely owned. **Does not reclaim chunks** — see below. Returns count of cleaned orphans. Only deletes commits older than `min_age` seconds. Safe under concurrent writers. |
-| `deep_clean(min_age=3600)` | `clean_orphans` plus a full scan of the `kvgit:keyset:` and `kvgit:chunk:` namespaces. The only pass that reclaims chunks, orphan-owned ones included. **Requires a quiescent store** — see below. |
+| `deep_clean(min_age=3600, *, grace=5.0, lease_ttl=600.0)` | `clean_orphans` plus a full scan of the `kvgit:keyset:` and `kvgit:chunk:` namespaces. The only pass that reclaims chunks, orphan-owned ones included. Runs under the store's GC lease, which writers honour; raises [`GcBusy`](#gcbusy) if another deep clean holds one. See below. |
 | `repair_head()` | Persist a recovered HEAD for this branch. Reads recover a damaged HEAD in memory without writing it back; this is the explicit call that makes the recovery durable. Returns the commit HEAD now names, or `None` if nothing was recoverable. See [HEAD Recovery](#head-recovery). |
 
 ### HEAD Recovery
@@ -734,7 +738,7 @@ So `clean_orphans()` deletes no chunks at all. This is correctness by constructi
 The cost is real. Chunks are the large objects — the numpy and pandas buffers — so on a store using chunked codecs, deleted branches leave their unique buffers on disk and routine GC accumulates them. Two mitigations:
 
 * Chunks only exist when a chunked codec is in use. A store on plain pickle has none and gives up nothing.
-* `deep_clean()` reclaims them, on a quiescent store. Schedule one if you store large arrays.
+* `deep_clean()` reclaims them. Schedule one if you store large arrays.
 
 #### `deep_clean()` — reclaiming commit-less artifacts
 
@@ -745,7 +749,26 @@ v = VersionedKV(store)
 v.deep_clean()   # or kvgit.versioned.kv.deep_clean(store)
 ```
 
-**`deep_clean()` is not safe against concurrent writers.** The namespace scan runs after the mark phase, so it sees — and deletes — nodes and chunks written by any commit that landed in between, including one that has since become a live branch HEAD. The result is a HEAD whose keyset cannot be loaded. Run it only on a quiescent store: no other process or thread writing, for the whole call. `min_age` does not help here; it governs commit deletion, not the namespace scan.
+##### The GC lease
+
+The namespace scan deletes anything the mark phase did not see, so no write batch may be in flight while it runs. `deep_clean()` establishes that itself rather than asking the caller to promise it.
+
+The lease lives in one reserved key, `__gc_lease__`, holding `{"owner": <opaque id>, "expires": <unix time>}`. Absent, expired, or bytes that do not decode all mean "no live lease"; any of those may be taken over by a CAS against exactly those bytes, so two sweeps racing the same dead lease cannot both win.
+
+| Step | What happens |
+|------|--------------|
+| Acquire | CAS the lease key. A live lease held by someone else raises [`GcBusy`](#gcbusy) and sweeps nothing. |
+| Grace | Sleep `grace` seconds (default 5). Batches that read the lease just before it was taken land during this pause. |
+| Sweep | Mark and sweep, namespace scans included. |
+| Release | In a `finally`: CAS our own bytes to an expired record. A failed release means the lease was already reclaimed by someone else, and theirs is left alone. |
+
+Writers hold up their end with one `get`. `commit()`, a merge commit, and `tag()` each read the lease immediately before their write batch and, if a live one is held, poll until it is released or its term runs out. `clean_orphans()` takes no lease — it is safe beside a writer by construction — but it does wait one out before its own removals, since two sweeps deleting at once reclaim nothing extra.
+
+**The one assumption:** a writer's window between reading the lease and finishing its write batch is shorter than `grace`. A writer slower than that — descheduled, or on a backend where one `set_many` can stall for seconds — can still lose its nodes and chunks. Five seconds is generous for an in-memory or local-disk store; raise it for a slow or remote backend.
+
+`lease_ttl` (default 600 seconds) bounds what a crashed holder costs: writers wait out a lease's remaining term and no longer, so a process that dies mid-sweep stalls the store until its expiry and then no further. A sweep that outlives its own lease is **not** extended silently — it finishes, logs a warning at `kvgit.orphans` naming the overrun, and during that window writers are free to write. Set `lease_ttl` above the longest sweep this store has taken.
+
+**A writer that does not read the lease is still exposed**, which is the shape the hazard always had: an older kvgit, or a process editing the backend directly, commits mid-sweep and the scan takes its nodes. Every process touching a store you deep-clean needs a version that honours the lease.
 
 ---
 
@@ -823,3 +846,32 @@ store = IndexedDB(db_name="myapp", store_name="state")
 | `store_name` | `str` | `"kv"` | Object store name within the database. |
 
 Requires JSPI (JavaScript Promise Integration). CAS is atomic across Web Workers sharing the same database.
+
+---
+
+## Composite
+
+N-tier cache composing any number of `KVStore`s, ordered fastest first. The last tier is authoritative.
+
+```python
+from kvgit.kv.composite import Composite
+from kvgit.kv.disk import Disk
+from kvgit.kv.memory import Memory
+
+store = Composite([Memory(), Disk("/path/to/db")])
+```
+
+| Operation | Behaviour |
+|-----------|-----------|
+| `get` / `get_many` / `__contains__` | Check L1, L2, ..., Ln in order; a hit at tier *i* populates L1..L(i-1). **Except for `__`-prefixed keys**, which are read from Ln only and never cached. |
+| `set` / `set_many` / `remove` / `remove_many` / `clear` | Ln first (its failures propagate — durability is the contract), then the cache tiers. |
+| `cas` | Delegated to Ln. On success the new value is written into the cache tiers, unless the key is `__`-prefixed. |
+| `keys` / `items` | Ln only. |
+
+Tier failures that look operational (`OSError`, network errors, a Pyodide `JsException`) are logged at WARNING and the next tier is tried. `TypeError`, `AttributeError` and `AssertionError` are treated as programming bugs and propagate.
+
+### Cache tiers serve only immutable, content-derived keys
+
+A key starting with `__` names a value that changes under a fixed key — a branch head, its `__branch_head_prev__` backup, the `__kvgit_version__` stamp, the `__gc_lease__` record. Cached, those let a process keep serving state another process has already replaced: the handle takes a `ConcurrencyError` on commit, calls `refresh()`, and reads the same stale head back out of L1, forever. So they are read from the authoritative tier alone.
+
+Everything else is keyed by its own content — `kvgit:keyset:<hash>`, `kvgit:chunk:<hash>`, `<commit>:<key>` — so the same key always holds the same bytes and a hit at any tier is the right answer. Those are what the cache tiers are for, and they are the bulk of the reads. Commit metadata (`__commit_root__`, `__parent_commit__`, `__commit_time__`, `__info__`) is immutable too, but it is small and `__`-prefixed, so it rides the same read-through rule rather than earning an exception.
