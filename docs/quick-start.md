@@ -384,16 +384,18 @@ The cost is real, because chunks are the large objects -- the numpy and pandas b
 
 `deep_clean()` does everything `clean_orphans()` does, then scans the `kvgit:keyset:` and `kvgit:chunk:` namespaces directly. That scan is the only way to reclaim chunks, and also the only way to reach a keyset node or chunk that *no* commit references -- left behind by an interrupted write, or by a store swept by an earlier kvgit -- since those have no orphan to be found through.
 
-The scan deletes anything the mark phase did not see, so nothing else may be writing while it runs. You do not have to arrange that yourself: `deep_clean()` takes a lease on the store under the reserved key `__gc_lease__`, and every write path -- `commit()`, a merge commit, `tag()` -- reads that lease immediately before its write batch and waits while a live one is held.
+The scan deletes anything the mark phase did not see, so nothing else may be writing while it runs. You do not have to arrange that yourself: `deep_clean()` takes a lease on the store under the reserved key `__gc_lease__`, and every write path reads that lease immediately before its write and waits while a live one is held. That covers the commit and merge-commit write batches and every write that makes a commit reachable -- the HEAD advance behind `commit()`, plus `create_branch()`, `reset_to()`, `tag()` and the corrupt-HEAD repair.
 
 ```python
 s.versioned.deep_clean()                 # takes the lease, sweeps, releases
 s.versioned.deep_clean(grace=30)         # slow backend: allow longer write batches
 ```
 
-Concretely, the call takes the lease by CAS, sleeps `grace` seconds (default 5) so any batch that checked the lease just before it was taken has time to land, marks and sweeps, and releases the lease in a `finally`. `lease_ttl` (default 600 seconds) bounds the damage from a holder that crashes: writers wait out a lease's remaining term and no longer.
+Concretely, the call refuses a store stamped above the layout it reads (writing nothing, the lease key included), takes the lease by CAS, sleeps `grace` seconds (default 5) so any write that checked the lease just before it was taken has time to land, marks and sweeps, and releases the lease in a `finally`. `lease_ttl` (default 600 seconds) bounds the damage from a holder that crashes: writers wait out a lease's remaining term and no longer.
 
-**What this requires of you**, in place of quiescing the store: that a writer's window between checking the lease and finishing its write batch is shorter than `grace`. Five seconds is generous for an in-memory or local-disk store; raise it for a slow or remote backend. Raise `lease_ttl` above the longest sweep this store has taken, too -- an overrun is not extended silently, it just logs a warning and leaves writers free during the overrun.
+A commit's write batch and the CAS that publishes it as a branch HEAD are two steps, and in between the commit is written but unreachable -- which looks exactly like garbage. The sweep therefore keeps every unreachable commit stamped within `grace` of the moment it took the lease, whatever `min_age` says. `min_age` is your policy on how long abandoned work lingers; that bound is the lease's own correctness rule.
+
+**What this requires of you**, in place of quiescing the store: that a writer's whole window -- checking the lease, writing its batch, advancing HEAD -- is shorter than `grace`. Five seconds is generous for an in-memory or local-disk store; raise it for a slow or remote backend. Raise `lease_ttl` above the longest sweep this store has taken, too -- an overrun is not extended silently, it just logs a warning and leaves writers free during the overrun.
 
 If another `deep_clean()` already holds the lease, the call raises `kvgit.GcBusy` rather than sweeping beside it. Retry later.
 
