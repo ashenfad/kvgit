@@ -744,3 +744,53 @@ class TestStagedMergeChoicePolicy:
         )
         assert result.merged
         assert "runs/1" not in main
+
+
+class TestReadmeExamples:
+    """The README's Merging examples, run exactly as they are written."""
+
+    def test_text_merge_example(self):
+        import kvgit
+        from kvgit import text_merge
+
+        main = kvgit.store()
+        main["notes"] = "alpha\nbeta\n"
+        main.commit()
+
+        edits = main.create_branch("edits")
+        edits["notes"] = "alpha\nBETA\n"
+        edits.commit()
+
+        main["notes"] = "ALPHA\nbeta\n"
+        main.commit()
+
+        main.merge(edits.current_commit, default_merge=text_merge())
+        assert main["notes"] == "ALPHA\nBETA\n"
+
+    def test_registration_example(self):
+        import kvgit
+        from kvgit import MergeChoice, text_merge
+
+        main = kvgit.store()
+        main.set_merge_prefix("runs/", MergeChoice.OURS)
+        main.set_merge_fn("runs/index", text_merge())
+
+        main["runs/index"] = "base\n"
+        main["runs/1"] = "ours"
+        main.commit()
+        worker = main.create_branch("worker")
+        worker["runs/index"] = "theirs\n"
+        worker["runs/2"] = "theirs"
+        worker.commit()
+        main["runs/index"] = "ours\n"
+        main.commit()
+
+        result = main.merge(worker.current_commit)
+        assert result.merged
+        # The exact-key text merge marks the contested index...
+        assert main["runs/index"] == (
+            "<<<<<<< ours\nours\n=======\ntheirs\n>>>>>>> theirs\n"
+        )
+        # ...while the prefix policy keeps our runs/ and drops their new key.
+        assert main["runs/1"] == "ours"
+        assert "runs/2" not in main

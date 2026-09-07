@@ -33,6 +33,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   count as auto-merged. Merge functions keep their contested-only reach
   exactly as before.
 
+- **`text_merge()`: the marker text merge at the value level.** `Staged`
+  decodes both sides before calling a merge function, so
+  `kvgit.merges.text` — which reads its arguments as bytes — fits only
+  keys whose stored values are already `bytes`; registered on a key
+  holding `str` it raised, and the key was filed as a conflict.
+  `kvgit.text_merge(*, ours_label=, theirs_label=)` is the factory to
+  register there instead: it encodes `str` sides as UTF-8, marker-merges,
+  and hands back `str` when any side was `str`, leaving a `bytes` key to
+  merge as bytes. `CantMark` propagates as before, so unmarkable values
+  still file as ordinary conflicts. `kvgit.merges.text` is unchanged.
+
 - **`ours` / `theirs`: pick-a-side merge functions that keep the stored
   value.** `kvgit.merges.ours` and `kvgit.merges.theirs` resolve a
   contested key to one side's committed value. They answer with a
@@ -45,6 +56,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   this way produces no new value, so `post_check` does not run for it.
 
 ### Fixed
+
+- **Docs: which built-in merge functions work at which level.** The API
+  reference claimed the `kvgit.merges` functions were all usable at
+  either level. That holds for `ours` and `theirs`, which never inspect
+  the values they are handed, but not for `text` / `make_text_merge`,
+  which read theirs as bytes. The reference and the README now say which
+  is which, and their examples register `text_merge()` where the values
+  are `str`.
 
 - **A merge commit's metadata now describes the blob it kept.** Merged
   entries took our side's `MetaEntry` whenever we had one, even where
