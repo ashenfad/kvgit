@@ -25,6 +25,7 @@ class VersionedBase(ABC):
         self._base_commit: str = commit_hash
         self._commit_keys: dict[str, str] = {}
         self._merge_fns: dict[str, BytesMergeFn] = {}
+        self._merge_prefixes: dict[str, BytesMergeFn] = {}
         self._default_merge: BytesMergeFn | None = None
         self.last_merge_result: MergeResult | None = None
 
@@ -75,6 +76,16 @@ class VersionedBase(ABC):
         """Register a merge function for a specific key."""
         self._merge_fns[key] = fn
 
+    def set_merge_prefix(self, prefix: str, fn: BytesMergeFn) -> None:
+        """Register a merge function for every key under a prefix.
+
+        Prefixes cover keys whose names are not known when the policy is
+        set (``"runs/"`` for ``runs/<id>``). A contested key takes the
+        most specific registration: its exact key fn, else the longest
+        registered prefix it starts with, else the default merge fn.
+        """
+        self._merge_prefixes[prefix] = fn
+
     def set_default_merge(self, fn: BytesMergeFn) -> None:
         """Register a default merge function for unregistered keys."""
         self._default_merge = fn
@@ -109,6 +120,7 @@ class VersionedBase(ABC):
         *,
         on_conflict: str = "raise",
         merge_fns: dict[str, BytesMergeFn] | None = None,
+        merge_prefixes: dict[str, BytesMergeFn] | None = None,
         default_merge: BytesMergeFn | None = None,
         info: dict | None = None,
         chunks: dict[str, bytes] | None = None,
@@ -124,6 +136,8 @@ class VersionedBase(ABC):
             removals: Keys to remove.
             on_conflict: ``'raise'`` (default) or ``'abandon'`` for CAS failures.
             merge_fns: Per-key merge functions (override instance-level).
+            merge_prefixes: Merge functions by key prefix, layered over
+                the instance-level prefix registrations.
             default_merge: Default merge function (override instance-level).
             info: Optional metadata dict for the commit.
             chunks: Optional content-addressed chunks to write under
@@ -211,6 +225,7 @@ class VersionedBase(ABC):
             current_head,
             on_conflict=on_conflict,
             merge_fns=merge_fns,
+            merge_prefixes=merge_prefixes,
             default_merge=default_merge,
             info=info,
             saved_state=saved,
@@ -223,6 +238,7 @@ class VersionedBase(ABC):
         on_conflict: str,
         merge_fns: dict[str, BytesMergeFn] | None,
         default_merge: BytesMergeFn | None,
+        merge_prefixes: dict[str, BytesMergeFn] | None = None,
         post_check: PostCheck | None = None,
         info: dict | None,
         saved_state: tuple | None = None,
@@ -271,6 +287,9 @@ class VersionedBase(ABC):
         effective_fns = dict(self._merge_fns)
         if merge_fns:
             effective_fns.update(merge_fns)
+        effective_prefixes = dict(self._merge_prefixes)
+        if merge_prefixes:
+            effective_prefixes.update(merge_prefixes)
         effective_default = default_merge or self._default_merge
 
         # Resolve the merge
@@ -284,6 +303,7 @@ class VersionedBase(ABC):
                 blob_reader=self._read_blob,
                 merge_fns=effective_fns,
                 default_merge=effective_default,
+                merge_prefixes=effective_prefixes,
             )
             if post_check is not None:
                 refused = {
@@ -359,6 +379,7 @@ class VersionedBase(ABC):
         *,
         on_conflict: str = "raise",
         merge_fns: dict[str, BytesMergeFn] | None = None,
+        merge_prefixes: dict[str, BytesMergeFn] | None = None,
         default_merge: BytesMergeFn | None = None,
         post_check: PostCheck | None = None,
         info: dict | None = None,
@@ -386,6 +407,7 @@ class VersionedBase(ABC):
             their_head,
             on_conflict=on_conflict,
             merge_fns=merge_fns,
+            merge_prefixes=merge_prefixes,
             default_merge=default_merge,
             post_check=post_check,
             info=info,

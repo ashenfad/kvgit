@@ -2,12 +2,31 @@
 
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from enum import Enum
 from typing import Protocol, runtime_checkable
 
-BytesMergeFn = Callable[[bytes | None, bytes | None, bytes | None], bytes]
+
+class MergeChoice(Enum):
+    """A merge function's answer of "keep one side's value as it stands".
+
+    A merge function returns ``OURS`` or ``THEIRS`` in place of bytes to
+    say the merged value is that side's committed value, unchanged. The
+    merge then keeps that side's existing blob pointer, so no new blob
+    is written; when that side removed the key, the merge removes it.
+    """
+
+    OURS = "ours"
+    THEIRS = "theirs"
+
+
+BytesMergeFn = Callable[
+    [bytes | None, bytes | None, bytes | None], "bytes | MergeChoice"
+]
 """Merge function: (old_value, our_value, their_value) -> merged_value.
 
-Any argument can be None (key absent or removed on that side).
+Any argument can be None (key absent or removed on that side). Returning
+a :class:`MergeChoice` instead of bytes keeps that side's existing value
+without writing a new blob.
 """
 
 PostCheck = Callable[[str, bytes], bool]
@@ -17,6 +36,10 @@ Runs over values a merge function produced. Returning False files the
 key as conflicted, as if no merge function had resolved it. kvgit never
 inspects the bytes itself — callers that know what their values mean
 (marker scans, schema checks) decide.
+
+A merge function that answers with a :class:`MergeChoice` produces no
+new value, so there are no bytes to check and the predicate does not run
+for that key.
 """
 
 
@@ -102,6 +125,8 @@ class Versioned(Protocol):
 
     def set_merge_fn(self, key: str, fn: BytesMergeFn) -> None: ...
 
+    def set_merge_prefix(self, prefix: str, fn: BytesMergeFn) -> None: ...
+
     def set_default_merge(self, fn: BytesMergeFn) -> None: ...
 
     # -- Write operations --
@@ -113,6 +138,7 @@ class Versioned(Protocol):
         *,
         on_conflict: str = "raise",
         merge_fns: dict[str, BytesMergeFn] | None = None,
+        merge_prefixes: dict[str, BytesMergeFn] | None = None,
         default_merge: BytesMergeFn | None = None,
         info: dict | None = None,
         chunks: dict[str, bytes] | None = None,
@@ -125,6 +151,7 @@ class Versioned(Protocol):
         *,
         on_conflict: str = "raise",
         merge_fns: dict[str, BytesMergeFn] | None = None,
+        merge_prefixes: dict[str, BytesMergeFn] | None = None,
         default_merge: BytesMergeFn | None = None,
         post_check: PostCheck | None = None,
         info: dict | None = None,
