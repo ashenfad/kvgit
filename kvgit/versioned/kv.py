@@ -1181,32 +1181,45 @@ class VersionedKV(VersionedBase):
             merged_keyset[key] = vk
             diffs[vk] = value
 
-        # Build merged meta from the parents' meta. ``self._meta`` is
-        # already our parent's meta (in memory). Any other parent's meta
-        # we walk via the HAMT — position-independent, since merge
-        # commits record ours-first: union every parent so their-side
-        # keys resolve however the tuple is ordered. Ties keep ours
-        # (checked first below), matching the old parents[0]-is-theirs
-        # behavior exactly.
-        parent_meta: dict[str, MetaEntry] = {}
+        # Build merged meta from the parents' meta, indexed by blob
+        # pointer. Metadata describes the blob, not the key: size is that
+        # blob's length and ``chunks`` lists the chunk references garbage
+        # collection traces from it. A merge that keeps one side's
+        # pointer must keep that side's meta with it, or the entry
+        # describes a blob it no longer points at — and a stale chunk
+        # list makes garbage collection trace the wrong chunks. Indexing
+        # by key instead cannot express that, since the two sides
+        # disagree about the key. A pointer names the commit that wrote
+        # it, so one pointer has one meta and first-seen wins.
+        meta_by_blob: dict[str, MetaEntry] = {}
+        meta_by_key: dict[str, MetaEntry] = {}
         for parent in parents:
             parent_root = _load_root(self.store, parent)
             if parent_root is None:
                 continue
             for key, entry in Keyset(self.store, root=parent_root).items():
-                parent_meta.setdefault(key, entry.meta)
+                meta_by_blob.setdefault(entry.blob, entry.meta)
+                meta_by_key.setdefault(key, entry.meta)
 
         merged_meta: dict[str, MetaEntry] = {}
-        for key in merged_keyset:
+        for key, blob in merged_keyset.items():
             if key in merged_values:
+                # A value the merge itself produced: new blob, new meta.
+                # Merge output is never chunked, so it lists no chunks.
                 merged_meta[key] = MetaEntry(
                     size=len(merged_values[key]),
                     created_at=time.time(),
                 )
-            elif key in self._meta:
-                merged_meta[key] = self._meta[key]
-            elif key in parent_meta:
-                merged_meta[key] = parent_meta[key]
+                continue
+            meta = meta_by_blob.get(blob)
+            if meta is None and blob == self._commit_keys.get(key):
+                meta = self._meta.get(key)
+            if meta is None:
+                # A parent whose keyset would not load: fall back to
+                # whatever the key had rather than dropping the entry.
+                meta = meta_by_key.get(key) or self._meta.get(key)
+            if meta is not None:
+                merged_meta[key] = meta
 
         # Apply the merge result on top of our parent's HAMT. We compute
         # the minimal updates and removals so structural sharing kicks in
