@@ -26,11 +26,16 @@ from kvgit import GcBusy, Staged, VersionedKV
 from kvgit.encoding import dumps
 from kvgit.kv.memory import Memory
 from kvgit.versioned import kv as kv_module
+from kvgit.versioned.keyset import Keyset
 from kvgit.versioned.kv import (
+    BRANCH_HEAD,
     CHUNK_PREFIX,
+    COMMIT_ROOT,
     GC_LEASE_KEY,
+    STORAGE_VERSION_KEY,
     _acquire_gc_lease,
     _lease_expiry,
+    _load_root,
     _release_gc_lease,
     _resolve_head,
     _wait_for_gc,
@@ -180,7 +185,7 @@ class TestWritersUnderTheLease:
         s["seed"] = 1
         s.commit()
 
-        ours, _ = _acquire_gc_lease(store, 60.0)
+        ours, _, _ = _acquire_gc_lease(store, 60.0)
         wrote = threading.Event()
 
         def writer():
@@ -218,7 +223,7 @@ class TestWritersUnderTheLease:
 class TestLeaseArithmetic:
     def test_a_second_deep_clean_is_refused(self):
         store = Memory()
-        ours, _ = _acquire_gc_lease(store, 60.0)
+        ours, _, _ = _acquire_gc_lease(store, 60.0)
         with pytest.raises(GcBusy):
             deep_clean(store, min_age=0, grace=0)
         assert store.get(GC_LEASE_KEY) == ours, (
@@ -276,3 +281,238 @@ class TestLeaseArithmetic:
         s.commit()
         s.versioned.clean_orphans(min_age=0)
         assert store.get(GC_LEASE_KEY) is None
+
+
+class PausedCommitKV(VersionedKV):
+    """VersionedKV that stops between its write batch and publishing it.
+
+    A commit lands in two steps: the ``set_many`` that writes its
+    nodes, blobs, chunks and metadata, and — later — the CAS that makes
+    it a branch HEAD, or the three-way merge that folds it into one.
+    In between it is fully written and completely unreachable, which is
+    indistinguishable from garbage. Holding a writer there turns "a
+    sweep landed in that gap" into an event a test can schedule.
+    """
+
+    def __init__(self, *args, reached, release, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._reached = reached
+        self._release = release
+
+    def _create_commit(self, *args, **kwargs):
+        commit_hash = super()._create_commit(*args, **kwargs)
+        self._reached.set()
+        assert self._release.wait(timeout=10), "test never released the writer"
+        return commit_hash
+
+
+class TestCommitsBetweenWriteAndPublish:
+    """The window between a write batch and the HEAD advance that
+    publishes it. ``grace`` bounds it on the clock, so the sweep keeps
+    every unreachable commit stamped within ``grace`` of the moment it
+    took the lease — whatever ``min_age`` says, since ``min_age`` is
+    about abandoned work and this is about work still in progress.
+    """
+
+    def test_an_unpublished_commit_survives_a_min_age_zero_sweep(self):
+        store = Memory()
+        s = Staged(VersionedKV(store), encoder=chunky_encoder, decoder=chunky_decoder)
+        s["base"] = "base value"
+        s.commit()
+        before = set(chunk_keys(store))
+
+        stray = CHUNK_PREFIX + "f" * 40
+        store.set(stray, b"no commit references this")
+
+        reached, release = threading.Event(), threading.Event()
+        landed: dict[str, object] = {}
+
+        def writer():
+            other = Staged(
+                PausedCommitKV(store, reached=reached, release=release),
+                encoder=chunky_encoder,
+                decoder=chunky_decoder,
+            )
+            other["late"] = "written before the lease, published after"
+            landed["commit"] = other.commit().commit
+            landed["chunks"] = set(chunk_keys(store)) - before - {stray}
+            landed["nodes"] = node_hashes(store, landed["commit"])
+
+        writer_thread = threading.Thread(target=writer)
+        writer_thread.start()
+        assert reached.wait(5), "the writer never reached its HEAD advance"
+
+        # Its batch is on disk and nothing points at it. min_age=0 says
+        # every unreachable commit is fair game; the lease's own time
+        # bound says this one is not.
+        deep_clean(store, min_age=0, grace=0.5)
+        release.set()
+        writer_thread.join(timeout=10)
+        assert not writer_thread.is_alive(), "the writer never finished"
+
+        assert store.get(stray) is None, "the sweep did not actually run"
+
+        commit = landed["commit"]
+        assert _resolve_head(store, "main") == commit
+        assert store.get(COMMIT_ROOT % commit) is not None, (
+            "the sweep deleted a commit whose writer had not published it yet"
+        )
+        assert not missing_nodes(store, commit, landed["nodes"])  # type: ignore[arg-type]
+        Keyset(store, root=str(_load_root(store, commit))).walk()
+        assert [k for k in landed["chunks"] if store.get(k) is None] == []  # type: ignore[union-attr]
+
+        reader = Staged(
+            VersionedKV(store), encoder=chunky_encoder, decoder=chunky_decoder
+        )
+        assert reader["late"] == "written before the lease, published after"
+        assert reader["base"] == "base value"
+
+    def test_the_merge_paths_first_commit_survives_too(self):
+        """A lost race writes a commit the three-way merge reads back.
+
+        On the merge path the write batch is published by folding it
+        into a merge commit rather than by a CAS, so the same gap opens
+        — and the merge cannot be built at all if the sweep took the
+        commit it is supposed to fold.
+        """
+        store = Memory()
+        s = Staged(VersionedKV(store))
+        s["base"] = "base"
+        s.commit()
+
+        reached, release = threading.Event(), threading.Event()
+        # Opened before the other writer moves HEAD, so this handle's
+        # base commit is stale by the time it commits — the merge path.
+        mine = Staged(PausedCommitKV(store, reached=reached, release=release))
+        mine["ours"] = "merged in"
+
+        theirs = Staged(VersionedKV(store))
+        theirs["theirs"] = "landed first"
+        theirs.commit()
+
+        result: dict[str, object] = {}
+        writer_thread = threading.Thread(
+            target=lambda: result.update(merge=mine.commit())
+        )
+        writer_thread.start()
+        assert reached.wait(5), "the writer never reached its merge"
+
+        deep_clean(store, min_age=0, grace=0.5)
+        release.set()
+        writer_thread.join(timeout=10)
+        assert not writer_thread.is_alive(), "the writer never finished"
+
+        assert result["merge"].merged, result["merge"]  # type: ignore[union-attr]
+
+        reader = Staged(VersionedKV(store))
+        assert reader["ours"] == "merged in"
+        assert reader["theirs"] == "landed first"
+        assert reader["base"] == "base"
+
+
+class SlowRemovalStore(LeaseHookStore):
+    """Lease-hook store that dawdles just before it deletes.
+
+    Opens a guaranteed window after the mark phase has decided what is
+    garbage and before any of it is gone — the window in which a
+    branch-root write that did not wait for the lease would install a
+    head on a commit already condemned.
+    """
+
+    def remove_many(self, *args) -> None:
+        time.sleep(0.1)
+        super().remove_many(*args)
+
+
+class TestBranchRootWrites:
+    """Every write that makes a commit reachable waits on the lease.
+
+    A head is what turns a commit into a GC root, so writing one under
+    a running sweep either resurrects something already condemned or
+    contradicts a mark phase that has already run. These paths wait the
+    lease out *before* checking the target commit exists, so the check
+    and the write see the same store: the outcome is a head on a commit
+    that loads, or a refusal, never a head naming nothing.
+    """
+
+    def test_creating_a_branch_on_an_old_orphan_never_dangles(self):
+        store = SlowRemovalStore()
+        s = Staged(VersionedKV(store))
+        s["live"] = "keep me"
+        s.commit()
+
+        dev = s.create_branch("dev")
+        dev["work"] = "abandoned"
+        orphan = dev.commit().commit
+        s.delete_branch("dev")
+        age_commits(store, 10_000)
+
+        outcome: dict[str, object] = {}
+
+        def creator():
+            try:
+                outcome["branch"] = s.versioned.create_branch("revive", at=orphan)
+            except ValueError as exc:
+                outcome["error"] = str(exc)
+
+        creator_thread = threading.Thread(target=creator)
+        store.on_acquire(creator_thread.start)
+        deep_clean(store, min_age=0, grace=0)
+        creator_thread.join(timeout=10)
+        assert not creator_thread.is_alive(), "the branch creation never finished"
+
+        # Two outcomes are legal and which one lands depends on
+        # scheduling: the creation waits out the lease and then reports
+        # the commit gone, or it beat the lease and the head it wrote
+        # made the commit reachable for the mark phase. The illegal
+        # third outcome is a head naming a commit the sweep collected,
+        # which is what this asserts against.
+        head_raw = store.get(BRANCH_HEAD % "revive")
+        if head_raw is None:
+            assert "error" in outcome, outcome
+        else:
+            resolved = _resolve_head(store, "revive")
+            assert resolved == orphan, "branch 'revive' does not resolve"
+            assert store.get(COMMIT_ROOT % orphan) is not None
+            Keyset(store, root=str(_load_root(store, orphan))).walk()
+        assert Staged(VersionedKV(store))["live"] == "keep me"
+
+    def test_reset_to_a_swept_commit_reports_it_rather_than_dangling(self):
+        store = SlowRemovalStore()
+        s = Staged(VersionedKV(store))
+        s["live"] = "keep me"
+        s.commit()
+
+        dev = s.create_branch("dev")
+        dev["work"] = "abandoned"
+        orphan = dev.commit().commit
+        s.delete_branch("dev")
+        age_commits(store, 10_000)
+
+        outcome: dict[str, object] = {}
+        resetter = threading.Thread(
+            target=lambda: outcome.update(ok=s.versioned.reset_to(orphan))
+        )
+        store.on_acquire(resetter.start)
+        deep_clean(store, min_age=0, grace=0)
+        resetter.join(timeout=10)
+        assert not resetter.is_alive()
+
+        assert outcome["ok"] is False, "HEAD was reset onto a collected commit"
+        assert _resolve_head(store, "main") is not None
+        assert Staged(VersionedKV(store))["live"] == "keep me"
+
+
+class TestVersionCheckBeforeTheLease:
+    def test_a_store_stamped_too_high_is_left_untouched(self):
+        """A store this code must not sweep must not be written to.
+
+        Checking after acquisition would leave an expired lease record
+        in a store kvgit had no business writing to at all.
+        """
+        store = Memory()
+        store.set(STORAGE_VERSION_KEY, dumps(99))
+        with pytest.raises(ValueError, match="storage version"):
+            deep_clean(store, min_age=0, grace=0)
+        assert store.get(GC_LEASE_KEY) is None
+        assert sorted(store.keys()) == [STORAGE_VERSION_KEY]

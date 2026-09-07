@@ -515,6 +515,11 @@ def _heal_head(store: KVStore, branch: str, recovered: bytes) -> bool:
         and store.get(COMMIT_ROOT % commit_hash) is not None
     ):
         return False
+    # Installing a recovered HEAD makes a commit reachable that the
+    # store did not claim a moment ago, which is a root appearing under
+    # a sweep that has already decided what is reachable. Wait a live
+    # lease out first.
+    _wait_for_gc(store)
     if not store.cas(branch_key, recovered, expected=raw):
         return False
     logger.warning("Branch '%s': corrupt HEAD replaced with recovered commit", branch)
@@ -720,7 +725,7 @@ def _wait_for_gc(store: KVStore) -> None:
         raw = store.get(GC_LEASE_KEY)
 
 
-def _acquire_gc_lease(store: KVStore, lease_ttl: float) -> tuple[bytes, float]:
+def _acquire_gc_lease(store: KVStore, lease_ttl: float) -> tuple[bytes, float, float]:
     """Take the GC lease by CAS, or raise :class:`GcBusy`.
 
     The CAS expects exactly the bytes the liveness decision was made
@@ -729,7 +734,8 @@ def _acquire_gc_lease(store: KVStore, lease_ttl: float) -> tuple[bytes, float]:
     held by someone else is never overwritten.
 
     Returns:
-        The lease bytes written and the unix time they expire at.
+        The lease bytes written, the unix time the lease was taken, and
+        the unix time it expires at.
     """
     raw = store.get(GC_LEASE_KEY)
     now = time.time()
@@ -746,7 +752,7 @@ def _acquire_gc_lease(store: KVStore, lease_ttl: float) -> tuple[bytes, float]:
     ours = dumps({"owner": owner, "expires": expires})
     if not store.cas(GC_LEASE_KEY, ours, expected=raw):
         raise GcBusy("Another deep clean took the GC lease first")
-    return ours, expires
+    return ours, now, expires
 
 
 def _release_gc_lease(store: KVStore, ours: bytes) -> None:
@@ -835,19 +841,40 @@ def deep_clean(
     it is only correct while nothing else is writing. This call makes
     that condition hold rather than asking the caller for it:
 
-    1. It takes the ``__gc_lease__`` key by CAS, raising :class:`GcBusy`
+    1. It refuses a store stamped above the layout this code reads,
+       before touching the lease key, so such a store comes out of the
+       call with nothing written to it at all.
+    2. It takes the ``__gc_lease__`` key by CAS, raising :class:`GcBusy`
        if another sweep holds an unexpired one.
-    2. It sleeps ``grace`` seconds. Every writer reads the lease
-       immediately before its write batch and waits while a live one is
-       held, so after this pause the only batches that can still be in
-       flight are ones that read the lease before step 1 and found it
-       free.
-    3. It marks and sweeps.
-    4. It releases the lease, in a ``finally``.
+    3. It sleeps ``grace`` seconds. Every writer reads the lease
+       immediately before the write it is about to make and waits while
+       a live one is held, so after this pause the only writes that can
+       still be in flight are ones that read the lease before step 2 and
+       found it free.
+    4. It marks and sweeps, protecting every unreachable commit stamped
+       within ``grace`` of the moment the lease was taken (see below).
+    5. It releases the lease, in a ``finally``.
 
-    **The one assumption:** a writer's window between reading the lease
-    and finishing its write batch is shorter than ``grace``. A writer
-    that takes longer than that — descheduled, or on a backend where one
+    Every path that writes something the scan can delete waits on the
+    lease: the commit and merge-commit write batches, ``tag``, and every
+    branch-head write — the HEAD advance behind ``commit``,
+    ``create_branch``, ``reset_to``, and the corrupt-HEAD repair.
+
+    A commit's write batch and the CAS that makes it a branch HEAD are
+    two separate steps. Between them the commit is written but
+    unreachable, so a mark phase landing in that gap sees garbage, and
+    with a low ``min_age`` it would delete a commit whose writer is
+    about to publish it. The sweep therefore keeps every unreachable
+    commit stamped at or after ``lease acquisition - grace``: its
+    payload is marked and its metadata left in place, regardless of
+    ``min_age``. The two guards answer different questions —
+    ``min_age`` is the caller's policy on how long abandoned work
+    lingers, this bound is the lease's own correctness rule — so the
+    bound applies even at ``min_age=0``.
+
+    **The one assumption:** a writer's whole window, from reading the
+    lease to the CAS that advances HEAD, is shorter than ``grace``. A
+    writer slower than that — descheduled, or on a backend where one
     ``set_many`` can stall for seconds — can still have its nodes and
     chunks deleted. Five seconds covers an in-memory or local-disk
     store with room to spare; raise it for a slow or remote backend.
@@ -861,6 +888,8 @@ def deep_clean(
         min_age: Unreachable commits younger than this many seconds are
             kept, along with everything they reference.
         grace: Seconds to wait after taking the lease, before marking.
+            Also the width of the window before acquisition whose
+            commits are protected from deletion.
         lease_ttl: Seconds the lease stays live. A holder that crashes
             blocks writers for at most this long.
 
@@ -869,12 +898,19 @@ def deep_clean(
 
     Raises:
         GcBusy: if another deep clean holds a live lease.
+        ValueError: if the store is stamped above the layout this code
+            reads. Nothing is written, the lease key included.
     """
     gc_logger = logging.getLogger("kvgit.orphans")
-    ours, expires = _acquire_gc_lease(store, lease_ttl)
+    # Before the lease, not after: a store this code must not touch has
+    # to come out of the call untouched, and an acquire-then-fail would
+    # leave an expired lease record behind in a store kvgit had no
+    # business writing to.
+    _assert_supported_version(store)
+    ours, acquired_at, expires = _acquire_gc_lease(store, lease_ttl)
     try:
         time.sleep(grace)
-        return _sweep(store, min_age, deep=True)
+        return _sweep(store, min_age, deep=True, protect_after=acquired_at - grace)
     finally:
         overrun = time.time() - expires
         if overrun > 0:
@@ -887,8 +923,23 @@ def deep_clean(
         _release_gc_lease(store, ours)
 
 
-def _sweep(store: KVStore, min_age: float, *, deep: bool) -> int:
-    """Shared mark-and-sweep behind ``clean_orphans`` / ``deep_clean``."""
+def _sweep(
+    store: KVStore,
+    min_age: float,
+    *,
+    deep: bool,
+    protect_after: float | None = None,
+) -> int:
+    """Shared mark-and-sweep behind ``clean_orphans`` / ``deep_clean``.
+
+    ``protect_after`` is a unix time below which the ``min_age`` guard
+    is the only thing deciding an orphan's fate. An unreachable commit
+    stamped at or after it is kept and its payload marked, whatever
+    ``min_age`` says, because a commit that new may be one whose writer
+    has not yet run the CAS that publishes it. ``deep_clean`` passes
+    the moment it took the lease, backed off by its grace window;
+    ``clean_orphans`` passes None, having no window to reason from.
+    """
     gc_logger = logging.getLogger("kvgit.orphans")
     # Reachability is decided from the roots this code knows about, so
     # a store stamped above what this code reads must not be swept: its
@@ -995,7 +1046,18 @@ def _sweep(store: KVStore, min_age: float, *, deep: bool) -> int:
             ts_val = safe_loads(time_bytes)
             if not isinstance(ts_val, (int, float)):
                 continue
-            if float(ts_val) < cutoff_time:
+            created = float(ts_val)
+            # A commit's write batch and the CAS that makes it a branch
+            # HEAD are two steps. In between it is written and
+            # unreachable, so it looks exactly like garbage — and a
+            # sweep running with a low min_age would delete a commit
+            # whose writer is about to publish it. Anything stamped
+            # inside the caller's protection window is therefore treated
+            # as in flight no matter how low min_age is: min_age says
+            # how long abandoned work lingers, this says which commits
+            # might still have an owner.
+            in_flight = protect_after is not None and created >= protect_after
+            if not in_flight and created < cutoff_time:
                 orphans.append(commit_hash)
             else:
                 young_orphan_commits.append(commit_hash)
@@ -1480,6 +1542,11 @@ class VersionedKV(VersionedBase):
         expected_bytes = dumps(expected)
         new_bytes = dumps(new_head)
 
+        # A branch head is what makes a commit reachable, so moving one
+        # under a running sweep changes the answer the mark phase
+        # already computed. Wait the lease out and publish afterwards.
+        _wait_for_gc(self.store)
+
         won = self.store.cas(branch_key, new_bytes, expected=expected_bytes)
         if not won and _heal_head(self.store, self._branch, expected_bytes):
             won = self.store.cas(branch_key, new_bytes, expected=expected_bytes)
@@ -1607,6 +1674,15 @@ class VersionedKV(VersionedBase):
         _reject_reserved_branch(name)
         branch_key = BRANCH_HEAD % name
         target = at or self._current_commit
+        # Waited out before the existence check, not just before the
+        # CAS: a sweep in progress is about to change which commits
+        # exist, so a check answered from underneath it can pass for a
+        # commit that is gone by the time the head lands. After the
+        # wait, "the commit is here" and "the head names it" are
+        # decided against the same store, so the outcomes are a branch
+        # on a commit that loads, or a refusal — never a head pointing
+        # at nothing.
+        _wait_for_gc(self.store)
         if at is not None and self.store.get(COMMIT_ROOT % at) is None:
             raise ValueError(f"Commit '{at}' does not exist")
         if not self.store.cas(branch_key, dumps(target), expected=None):
@@ -1698,6 +1774,13 @@ class VersionedKV(VersionedBase):
 
     def reset_to(self, commit_hash: str) -> bool:
         """Reset HEAD to a specific commit."""
+        # Ahead of the existence check for the same reason
+        # ``create_branch`` does it: a sweep is about to change which
+        # commits exist, and a head must never be pointed at one the
+        # sweep has since taken. After the wait the check and the write
+        # see the same store, so this either resets onto a commit that
+        # loads or reports the commit gone.
+        _wait_for_gc(self.store)
         if self.store.get(COMMIT_ROOT % commit_hash) is None:
             return False
         branch_key = BRANCH_HEAD % self._branch
@@ -1775,27 +1858,30 @@ class VersionedKV(VersionedBase):
             ValueError: if the name is unusable, already taken, or the
                 commit does not exist.
 
-        There is one race, and it is narrow: tagging a commit that is
-        *already* an orphan older than ``min_age`` can lose to a sweep
-        running concurrently, which was free to collect that commit
-        before the tag existed. Callers tag a commit they are holding —
-        a head, or something a head descends from — and a commit a
-        branch reaches is never a sweep candidate.
+        Tagging a commit that is *already* an orphan older than
+        ``min_age`` can still lose to a concurrent sweep, which was free
+        to collect that commit before the tag existed — but it loses
+        cleanly. The call waits out a deep clean's lease before it looks
+        the commit up, so it either tags a commit that is really there
+        or raises; it never leaves a tag naming a commit the sweep took.
+        Callers tag a commit they are holding — a head, or something a
+        head descends from — and a commit a branch reaches is never a
+        sweep candidate.
         """
         _validate_tag_name(name)
         target = at or self._current_commit
+        # A tag is a GC root, so it must not be planted while a sweep is
+        # deciding what is reachable: a mark phase that ran before this
+        # head key landed treats the tagged commit as unreachable.
+        # Waiting first also makes the existence check below mean
+        # something — checked under a running sweep, it can pass for a
+        # commit that is collected before the tag lands.
+        _wait_for_gc(self.store)
         if self.store.get(COMMIT_ROOT % target) is None:
             raise ValueError(f"Commit '{target}' does not exist")
         # Encoded before anything is written, so info that cannot be
         # serialized raises without leaving a tag behind.
         record = dumps({"time": time.time(), "info": info})
-
-        # A tag is a GC root, so it must not be planted while a sweep is
-        # deciding what is reachable: a mark phase that ran before this
-        # head key landed treats the tagged commit as unreachable.
-        # Waiting out a live lease puts the whole tag write after the
-        # sweep that holds it.
-        _wait_for_gc(self.store)
 
         # CAS against absence: two writers racing the same name cannot
         # both win, and an existing tag is never silently overwritten.
@@ -1902,8 +1988,8 @@ class VersionedKV(VersionedBase):
         """Orphan sweep plus a full unreferenced-node/chunk scan.
 
         Thin instance wrapper over :func:`deep_clean`, which takes the
-        store's GC lease, pauses for ``grace`` so in-flight write
-        batches finish, sweeps, and releases. Use :meth:`clean_orphans`
+        store's GC lease, pauses for ``grace`` so writes already in
+        flight can land, sweeps, and releases. Use :meth:`clean_orphans`
         for routine cleanup and this one as a maintenance pass, since it
         is the only pass that reclaims chunks — both the ones no commit
         references and the ones deleted orphans owned.
@@ -1913,6 +1999,8 @@ class VersionedKV(VersionedBase):
 
         Raises:
             GcBusy: if another deep clean holds a live lease.
+            ValueError: if the store is stamped above the layout this
+                code reads. Nothing is written, the lease key included.
         """
         return deep_clean(self.store, min_age, grace=grace, lease_ttl=lease_ttl)
 
