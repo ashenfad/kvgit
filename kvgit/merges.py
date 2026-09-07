@@ -9,6 +9,9 @@ Anything that cannot be marked — undecodable bytes, NUL bytes, inputs
 over the size cap — raises :class:`CantMark`, which the merge machinery
 files as an ordinary conflict. Callers that need to tell "no encoding"
 from "too big" catch it themselves; callers that don't let it flow.
+
+Also here: :func:`ours` and :func:`theirs`, the pick-a-side merges, for
+keys where one branch simply owns the value.
 """
 
 from __future__ import annotations
@@ -16,7 +19,7 @@ from __future__ import annotations
 import difflib
 from collections.abc import Callable
 
-from .versioned.protocol import BytesMergeFn
+from .versioned.protocol import BytesMergeFn, MergeChoice
 
 #: Inputs whose combined size exceeds this are refused with
 #: :class:`CantMark` rather than merged. Line-diffing is quadratic-ish
@@ -245,3 +248,24 @@ def text(old: bytes | None, ours: bytes | None, theirs: bytes | None) -> bytes:
 
 TextMergeFn = Callable[[bytes | None, bytes | None, bytes | None], bytes]
 """Type of what :func:`make_text_merge` builds (== ``BytesMergeFn``)."""
+
+
+def ours(old: bytes | None, our: bytes | None, their: bytes | None) -> MergeChoice:
+    """Take our side: the merged value is our committed value.
+
+    Keeps our existing blob pointer rather than rewriting the value, so
+    the merge writes nothing for this key. If we removed the key, the
+    merge removes it. Usable as a per-key, per-prefix, or default merge.
+    """
+    return MergeChoice.OURS
+
+
+def theirs(old: bytes | None, our: bytes | None, their: bytes | None) -> MergeChoice:
+    """Take their side: the merged value is their committed value.
+
+    Keeps their existing blob pointer rather than rewriting the value,
+    so the merge writes nothing for this key. If they removed the key,
+    the merge removes it. Usable as a per-key, per-prefix, or default
+    merge.
+    """
+    return MergeChoice.THEIRS

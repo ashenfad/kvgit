@@ -1,10 +1,10 @@
 """Shared three-way merge resolution."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
 from ..errors import MergeConflict
-from .protocol import BytesMergeFn, DiffResult
+from .protocol import BytesMergeFn, DiffResult, MergeChoice
 
 BlobReader = Callable[[str], bytes | None]
 """Read a blob by its content identifier (versioned key or hex SHA)."""
@@ -24,6 +24,35 @@ class MergeResolution:
     auto_merged_keys: list[str]
 
 
+def pick_merge_fn(
+    key: str,
+    merge_fns: Mapping[str, BytesMergeFn],
+    merge_prefixes: Mapping[str, BytesMergeFn],
+    default_merge: BytesMergeFn | None,
+) -> BytesMergeFn | None:
+    """Choose the merge function for one contested key.
+
+    The most specific registration wins: an exact key match first, then
+    the longest registered prefix the key starts with, then the default.
+    ``None`` means nothing is registered for the key, which the caller
+    files as a conflict.
+    """
+    fn = merge_fns.get(key)
+    if fn is not None:
+        return fn
+
+    best_fn: BytesMergeFn | None = None
+    best_len = -1
+    for prefix, candidate in merge_prefixes.items():
+        if key.startswith(prefix) and len(prefix) > best_len:
+            best_fn = candidate
+            best_len = len(prefix)
+    if best_fn is not None:
+        return best_fn
+
+    return default_merge
+
+
 def resolve_merge(
     lca_keyset: dict[str, str],
     our_keyset: dict[str, str],
@@ -33,6 +62,7 @@ def resolve_merge(
     blob_reader: BlobReader,
     merge_fns: dict[str, BytesMergeFn],
     default_merge: BytesMergeFn | None,
+    merge_prefixes: dict[str, BytesMergeFn] | None = None,
 ) -> MergeResolution:
     """Resolve a three-way merge between two diverged keysets.
 
@@ -46,8 +76,11 @@ def resolve_merge(
         our_diff: DiffResult from LCA to our commit.
         their_diff: DiffResult from LCA to their commit.
         blob_reader: Callable to read blob bytes by content ID.
-        merge_fns: Per-key merge functions.
+        merge_fns: Per-key merge functions (exact key match).
         default_merge: Fallback merge function for unregistered keys.
+        merge_prefixes: Merge functions by key prefix, consulted when
+            no exact key match applies. The longest matching prefix
+            wins.
 
     Returns:
         MergeResolution with the merged keyset, values that need
@@ -60,6 +93,7 @@ def resolve_merge(
     their_changed = their_diff.added | their_diff.removed | their_diff.modified
     all_changed = our_changed | their_changed
 
+    prefixes = merge_prefixes or {}
     merged_keyset: dict[str, str] = {}
     merged_values: dict[str, bytes] = {}
     auto_merged: list[str] = []
@@ -103,23 +137,52 @@ def resolve_merge(
             merged_keyset[key] = their_keyset[key]
             continue
 
-        # Try merge function
-        fn = merge_fns.get(key, default_merge)
+        our_val = None if our_removed else blob_reader(our_keyset[key])
+        their_val = None if their_removed else blob_reader(their_keyset[key])
+
+        # Equal bytes under different pointers are still the same change.
+        # A blob identifier is commit-scoped, so two writers making the
+        # identical write from the same base end up with different
+        # pointers to identical content; take their pointer, with no
+        # merge function and no conflict. Both sides reading as None
+        # means both blobs are missing, which is damage rather than
+        # agreement, so it stays contested.
+        if (
+            not our_removed
+            and not their_removed
+            and our_val is not None
+            and our_val == their_val
+        ):
+            merged_keyset[key] = their_keyset[key]
+            continue
+
+        fn = pick_merge_fn(key, merge_fns, prefixes, default_merge)
         if fn is None:
             conflicts.add(key)
             continue
 
         old_val = blob_reader(lca_keyset[key]) if key in lca_keyset else None
-        our_val = None if our_removed else blob_reader(our_keyset[key])
-        their_val = None if their_removed else blob_reader(their_keyset[key])
         try:
             result_val = fn(old_val, our_val, their_val)
-            merged_values[key] = result_val
-            auto_merged.append(key)
         except Exception as e:  # noqa: BLE001 — `fn` is caller-supplied;
             # any failure it raises is reported as a merge conflict.
             conflicts.add(key)
             merge_errors[key] = e
+            continue
+
+        # A MergeChoice keeps the chosen side's committed value: carry
+        # that side's existing pointer, so the merge writes no new blob.
+        # A side that removed the key has no pointer to carry, and
+        # choosing it removes the key from the merge.
+        if result_val is MergeChoice.OURS:
+            if not our_removed:
+                merged_keyset[key] = our_keyset[key]
+        elif result_val is MergeChoice.THEIRS:
+            if not their_removed:
+                merged_keyset[key] = their_keyset[key]
+        else:
+            merged_values[key] = result_val
+        auto_merged.append(key)
 
     if conflicts:
         raise MergeConflict(conflicts, merge_errors)

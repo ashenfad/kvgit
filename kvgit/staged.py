@@ -10,6 +10,7 @@ from .content_types import MergeFn
 from .versioned.kv import CHUNK_PREFIX, VersionedKV
 from .versioned.protocol import (
     BytesMergeFn,
+    MergeChoice,
     MergeResult,
     PostCheck,
     TagInfo,
@@ -141,6 +142,7 @@ class Staged(MutableMapping[str, Any]):
         self._removals: set[str] = set()
         self._cache: dict[str, Any] = {}
         self._merge_fns: dict[str, MergeFn] = {}
+        self._merge_prefixes: dict[str, MergeFn] = {}
         self._default_merge: MergeFn | None = None
 
     def _decode(self, raw: bytes) -> Any:
@@ -230,6 +232,16 @@ class Staged(MutableMapping[str, Any]):
         """Register a merge function for a specific key."""
         self._merge_fns[key] = fn
 
+    def set_merge_prefix(self, prefix: str, fn: MergeFn) -> None:
+        """Register a merge function for every key under a prefix.
+
+        Prefixes cover keys whose names are not known when the policy is
+        set (``"runs/"`` for ``runs/<id>``). A contested key takes the
+        most specific registration: its exact key fn, else the longest
+        registered prefix it starts with, else the default merge fn.
+        """
+        self._merge_prefixes[prefix] = fn
+
     def set_default_merge(self, fn: MergeFn) -> None:
         """Register a default merge function."""
         self._default_merge = fn
@@ -245,16 +257,23 @@ class Staged(MutableMapping[str, Any]):
         outputs is not supported in v1; merge outputs are stored as
         opaque blobs. Subsequent commits that overwrite the merged key
         do go through the chunked path normally.
+
+        A ``MergeChoice`` comes back untouched. It names a side to keep
+        rather than a value, so encoding it would write a blob holding
+        the sentinel itself instead of keeping the side's own value.
         """
         decode = self._decode
 
         def wrapped(
             old: bytes | None, ours: bytes | None, theirs: bytes | None
-        ) -> bytes:
+        ) -> bytes | MergeChoice:
             old_val = decode(old) if old is not None else None
             ours_val = decode(ours) if ours is not None else None
             theirs_val = decode(theirs) if theirs is not None else None
-            return pickle.dumps(fn(old_val, ours_val, theirs_val))
+            result = fn(old_val, ours_val, theirs_val)
+            if isinstance(result, MergeChoice):
+                return result
+            return pickle.dumps(result)
 
         return wrapped
 
@@ -266,6 +285,7 @@ class Staged(MutableMapping[str, Any]):
         keys: set[str] | None = None,
         on_conflict: str = "raise",
         merge_fns: dict[str, MergeFn] | None = None,
+        merge_prefixes: dict[str, MergeFn] | None = None,
         default_merge: MergeFn | None = None,
         info: dict | None = None,
     ) -> MergeResult:
@@ -325,12 +345,22 @@ class Staged(MutableMapping[str, Any]):
         effective_fns = dict(self._merge_fns)
         if merge_fns:
             effective_fns.update(merge_fns)
+        effective_prefixes = dict(self._merge_prefixes)
+        if merge_prefixes:
+            effective_prefixes.update(merge_prefixes)
         effective_default = default_merge or self._default_merge
 
         bytes_merge_fns: dict[str, BytesMergeFn] | None = None
         if effective_fns:
             bytes_merge_fns = {
                 key: self._wrap_merge_fn(fn) for key, fn in effective_fns.items()
+            }
+
+        bytes_prefixes: dict[str, BytesMergeFn] | None = None
+        if effective_prefixes:
+            bytes_prefixes = {
+                prefix: self._wrap_merge_fn(fn)
+                for prefix, fn in effective_prefixes.items()
             }
 
         bytes_default: BytesMergeFn | None = None
@@ -342,6 +372,7 @@ class Staged(MutableMapping[str, Any]):
             removals,
             on_conflict=on_conflict,
             merge_fns=bytes_merge_fns,
+            merge_prefixes=bytes_prefixes,
             default_merge=bytes_default,
             info=info,
             chunks=chunks,
@@ -367,6 +398,7 @@ class Staged(MutableMapping[str, Any]):
         *,
         on_conflict: str = "raise",
         merge_fns: dict[str, MergeFn] | None = None,
+        merge_prefixes: dict[str, MergeFn] | None = None,
         default_merge: MergeFn | None = None,
         post_check: PostCheck | None = None,
         info: dict | None = None,
@@ -378,8 +410,9 @@ class Staged(MutableMapping[str, Any]):
         when the staging buffer holds uncommitted changes — commit or
         reset first, so the merge reads committed heads on both sides.
 
-        ``merge_fns`` / ``default_merge`` take decoded values (wrapped
-        like :meth:`commit`); ``post_check`` takes merged bytes.
+        ``merge_fns`` / ``merge_prefixes`` / ``default_merge`` take
+        decoded values (wrapped like :meth:`commit`); ``post_check``
+        takes merged bytes.
         """
         if self._updates or self._removals:
             raise ValueError("cannot merge with staged changes; commit or reset first")
@@ -388,10 +421,21 @@ class Staged(MutableMapping[str, Any]):
         effective_fns = dict(self._merge_fns)
         if merge_fns:
             effective_fns.update(merge_fns)
+        effective_prefixes = dict(self._merge_prefixes)
+        if merge_prefixes:
+            effective_prefixes.update(merge_prefixes)
         effective_default = default_merge or self._default_merge
         bytes_merge_fns = (
             {key: self._wrap_merge_fn(fn) for key, fn in effective_fns.items()}
             if effective_fns
+            else None
+        )
+        bytes_prefixes = (
+            {
+                prefix: self._wrap_merge_fn(fn)
+                for prefix, fn in effective_prefixes.items()
+            }
+            if effective_prefixes
             else None
         )
         bytes_default = (
@@ -401,6 +445,7 @@ class Staged(MutableMapping[str, Any]):
             their_head,
             on_conflict=on_conflict,
             merge_fns=bytes_merge_fns,
+            merge_prefixes=bytes_prefixes,
             default_merge=bytes_default,
             post_check=post_check,
             info=info,
