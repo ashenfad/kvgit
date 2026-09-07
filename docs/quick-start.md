@@ -240,11 +240,26 @@ s.set_merge_fn("tags", merge_lists)
 
 A merge function receives `(old_value, our_value, their_value)` and returns the merged value. Any argument can be `None` (key absent on that side).
 
+Cover a whole family of keys with one registration, for names you cannot
+know in advance:
+
+```python
+from kvgit.merges import ours
+
+s.set_merge_prefix("runs/", ours)   # every key under runs/
+```
+
+`ours` and `theirs` take a side outright, keeping that side's stored
+value rather than rewriting it.
+
 Set a default fallback for any key without a registered function:
 
 ```python
 s.set_default_merge(last_writer_wins())
 ```
+
+A contested key takes the most specific registration that applies: its
+exact key, else the longest matching prefix, else the default.
 
 ---
 

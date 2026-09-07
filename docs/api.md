@@ -134,7 +134,7 @@ The arity check is "second positional parameter has no default" -- so `pickle.du
 
 ### Committing
 
-#### `commit(*, keys=None, on_conflict="raise", merge_fns=None, default_merge=None, info=None) -> MergeResult`
+#### `commit(*, keys=None, on_conflict="raise", merge_fns=None, merge_prefixes=None, default_merge=None, info=None) -> MergeResult`
 
 Encode staged changes and flush as a single atomic commit. If HEAD has diverged, a three-way merge is performed.
 
@@ -143,8 +143,11 @@ Encode staged changes and flush as a single atomic commit. If HEAD has diverged,
 | `keys` | `set[str] \| None` | `None` | If provided, only commit these keys. Uncommitted keys remain staged. |
 | `on_conflict` | `str` | `"raise"` | `"raise"` or `"abandon"` |
 | `merge_fns` | `dict[str, MergeFn] \| None` | `None` | Per-key merge functions for this commit |
+| `merge_prefixes` | `dict[str, MergeFn] \| None` | `None` | Merge functions by key prefix for this commit |
 | `default_merge` | `MergeFn \| None` | `None` | Fallback merge function for this commit |
 | `info` | `dict \| None` | `None` | Metadata attached to the commit |
+
+Per-call `merge_fns` / `merge_prefixes` / `default_merge` layer over the registrations made with [`set_merge_fn`](#merge-functions) and friends.
 
 **Partial commits:** Pass `keys` to commit only a subset of staged changes. Keys not in `_updates` or `_removals` are silently ignored. Uncommitted keys remain staged for a future `commit()`.
 
@@ -154,6 +157,20 @@ s["b"] = b"beta"
 s.commit(keys={"a"}, info={"message": "just a"})
 # "a" is committed; "b" remains staged
 ```
+
+#### `merge(their_head, *, on_conflict="raise", merge_fns=None, merge_prefixes=None, default_merge=None, post_check=None, info=None) -> MergeResult`
+
+Merge another head — any commit in the store, usually another branch's HEAD — into this branch: lowest common ancestor, three-way resolve, two-parent merge commit guarded on your own head. Refuses with `ValueError` when the staging buffer holds uncommitted changes; commit or reset first.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `their_head` | `str` | — | Commit to merge in |
+| `on_conflict` | `str` | `"raise"` | `"raise"` or `"abandon"` (leaves the branch untouched) |
+| `merge_fns` | `dict[str, MergeFn] \| None` | `None` | Per-key merge functions for this merge |
+| `merge_prefixes` | `dict[str, MergeFn] \| None` | `None` | Merge functions by key prefix for this merge |
+| `default_merge` | `MergeFn \| None` | `None` | Fallback merge function for this merge |
+| `post_check` | `PostCheck \| None` | `None` | `(key, merged_bytes) -> bool` over each merge-produced value; `False` files that key as conflicted. A key resolved by a [`MergeChoice`](#mergechoice) produces no new value, so nothing is checked for it. |
+| `info` | `dict \| None` | `None` | Metadata attached to the merge commit |
 
 #### `reset() -> None`
 
@@ -169,9 +186,23 @@ Reload from HEAD and discard staged changes. Use this to see writes from other b
 
 Register a persistent merge function for a key. `fn` receives decoded values: `(old, ours, theirs) -> merged`.
 
+#### `set_merge_prefix(prefix, fn) -> None`
+
+Register a persistent merge function for every key starting with `prefix`. Use it for keys whose names are not known when the policy is set (`"runs/"` covering `runs/<id>`).
+
 #### `set_default_merge(fn) -> None`
 
-Register a fallback merge function for any key without a specific registration.
+Register a fallback merge function for any key no exact-key or prefix registration covers.
+
+**Resolution order.** A contested key takes the most specific registration that applies: its exact key, else the longest registered prefix it starts with, else the default. Nothing at all files the key as a conflict.
+
+```python
+s.set_merge_prefix("runs/", ours)              # every key under runs/
+s.set_merge_prefix("runs/counts/", counter())  # except these
+s.set_merge_fn("runs/counts/total", theirs)    # and this one exactly
+```
+
+A merge function may return a [`MergeChoice`](#mergechoice) instead of a value to keep one side's stored value untouched.
 
 ### Branching
 
@@ -318,6 +349,7 @@ Register merge functions on the underlying store with the full prefixed key:
 
 ```python
 s.set_merge_fn("myns/counter", fn)
+s.set_merge_prefix("myns/", fn)  # the whole namespace
 ```
 
 ---
@@ -372,12 +404,27 @@ MergeFn = Callable[[Any | None, Any, Any], Any]
 Bytes-level merge function type, used by `VersionedKV`:
 
 ```python
-BytesMergeFn = Callable[[bytes | None, bytes | None, bytes | None], bytes]
+BytesMergeFn = Callable[
+    [bytes | None, bytes | None, bytes | None], bytes | MergeChoice
+]
 ```
+
+### MergeChoice
+
+Enum a merge function returns in place of a value, at either level, to say the merged value is one side's committed value as it stands.
+
+| Member | Meaning |
+|--------|---------|
+| `MergeChoice.OURS` | Keep our side's value |
+| `MergeChoice.THEIRS` | Keep their side's value |
+
+The merge carries that side's existing blob pointer, so no new blob is written for the key — and if the chosen side removed the key, the merge removes it. Either way the key counts as auto-merged.
 
 ---
 
 ## Built-in merge functions
+
+Value-level factories from `kvgit.content_types`, for use with `Staged`:
 
 ### `counter() -> MergeFn`
 
@@ -385,7 +432,21 @@ Integer counter merge: `ours + theirs - old`. Both sides' increments are preserv
 
 ### `last_writer_wins() -> MergeFn`
 
-Always returns `theirs` (the HEAD value).
+Always returns `theirs` (the HEAD value), re-encoded as the merged value. `kvgit.merges.theirs` does the same thing without rewriting the value.
+
+Bytes-level functions from `kvgit.merges`, usable at either level (they ignore the values they are handed, so `Staged` can register them too):
+
+### `text(old, ours, theirs) -> bytes`
+
+Marker merge for line-oriented text: disjoint line changes merge cleanly, overlapping ones come back with git-style `<<<<<<<` markers. `make_text_merge(*, ours_label=, theirs_label=)` builds one with custom labels. Anything unmarkable — non-UTF-8 bytes, NUL bytes, inputs over the 1 MiB cap — raises `CantMark`, which the merge machinery files as an ordinary conflict.
+
+### `ours(old, our, their) -> MergeChoice`
+
+Take our side. Returns [`MergeChoice.OURS`](#mergechoice): our stored value is kept as it stands, so no new blob is written, and if we removed the key the merge removes it.
+
+### `theirs(old, our, their) -> MergeChoice`
+
+Take their side, on the same terms.
 
 ---
 
@@ -398,6 +459,8 @@ Raised when a CAS operation fails during `commit()`. Another writer updated HEAD
 ### MergeConflict
 
 Raised when a three-way merge encounters keys changed by both sides with no merge function to resolve them.
+
+Both sides writing the *same* bytes to a key is not a conflict, and needs no merge function: each side stores its own copy under its own commit, so the pointers differ, but the merge compares the bytes and carries the key through. A key one side removed and the other modified stays a conflict.
 
 | Attribute | Type | Description |
 |-----------|------|-------------|

@@ -71,6 +71,29 @@ from kvgit.merges import text
 result = main.merge(dev.current_commit, default_merge=text)
 ```
 
+`kvgit.merges.ours` and `kvgit.merges.theirs` pick a side outright, for
+keys one branch simply owns. They keep that side's stored value as it
+stands rather than rewriting it, so the merge writes no new blob -- and
+if the chosen side removed the key, the merge removes it.
+
+Merge functions register three ways, and a contested key takes the most
+specific one that applies: its exact key, else the longest registered
+prefix it starts with, else `default_merge`. Prefixes cover keys whose
+names are not known when the policy is set:
+
+```python
+from kvgit.merges import ours, text
+
+main.set_merge_prefix("runs/", ours)  # every key under runs/
+main.set_merge_fn("runs/index", text)  # except this one
+```
+
+`commit()` and `merge()` take `merge_fns=` / `merge_prefixes=` /
+`default_merge=` for one call, layered over what is registered.
+
+Keys both sides changed to the same bytes merge cleanly with no merge
+function, even though each side wrote its own copy.
+
 A `post_check(key, merged_bytes)` predicate runs over every
 merge-produced value; returning `False` files that key as conflicted.
 `on_conflict="abandon"` leaves the branch untouched instead of raising.

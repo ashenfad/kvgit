@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Merge policy by key prefix.** `set_merge_prefix(prefix, fn)` (on
+  `Staged` and `VersionedKV`) registers one merge function for every key
+  under a prefix, for keys whose names are not known when the policy is
+  set — `"runs/"` covering `runs/<id>`. A contested key takes the most
+  specific registration that applies: its exact key, else the longest
+  registered prefix it starts with, else `default_merge`, else it is a
+  conflict as before. `commit()`, `merge()` and `merge_heads()` take a
+  matching `merge_prefixes=` argument for one call, layered over the
+  instance-level registrations the same way `merge_fns=` already is.
+
+- **`ours` / `theirs`: pick-a-side merges that keep the stored value.**
+  `kvgit.merges.ours` and `kvgit.merges.theirs` resolve a contested key
+  to one side's committed value. They answer with a `MergeChoice` rather
+  than bytes, so the merge carries that side's existing blob pointer
+  instead of writing a new copy of a value the store already holds; if
+  the chosen side removed the key, the merge removes it. Either way the
+  key counts as auto-merged. Merge functions written by hand may return
+  `MergeChoice.OURS` / `MergeChoice.THEIRS` too, at the bytes level or
+  from a `Staged` merge function over decoded values. A key resolved
+  this way produces no new value, so `post_check` does not run for it.
+
+### Fixed
+
+- **Both sides writing the same bytes no longer conflicts.** A blob
+  identifier is scoped to the commit that wrote it, so two writers
+  making the identical change from the same base ended up with different
+  pointers to identical content, and the merge — which compared pointers
+  — filed a conflict on a key both sides agreed about. Contested keys
+  now fall back to comparing the bytes themselves and merge cleanly when
+  they match, as git does. The two extra blob reads happen only on the
+  contested path. A key one side removed and the other modified remains
+  a conflict.
+
 ## [0.3.7] - 2026-09-04
 
 ### Added
