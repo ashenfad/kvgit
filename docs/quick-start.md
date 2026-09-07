@@ -227,7 +227,17 @@ b2.commit()
 print(b2["hits"])    # 135 (115 + 120 - 100)
 ```
 
-`last_writer_wins()` always takes the HEAD value. Custom merge functions work too:
+`last_writer_wins()` always takes the HEAD value, and `text_merge()`
+resolves line-oriented text -- disjoint line edits merge cleanly,
+overlapping ones come back with git-style `<<<<<<<` markers:
+
+```python
+from kvgit import text_merge
+
+s.set_merge_fn("notes", text_merge())
+```
+
+Custom merge functions work too:
 
 ```python
 def merge_lists(old, ours, theirs):
@@ -245,7 +255,6 @@ know in advance:
 
 ```python
 from kvgit import MergeChoice
-from kvgit.merges import ours
 
 s.set_merge_prefix("counts/", counter())        # every key under counts/
 s.set_merge_prefix("notes/", MergeChoice.OURS)  # this branch owns notes/

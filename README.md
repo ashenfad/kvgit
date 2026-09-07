@@ -60,16 +60,32 @@ print(main["score"])  # 500 (fast-forward: main hadn't diverged)
 ```
 
 Overlapping changes need a merge function per key, or a `default_merge`
-fallback. `kvgit.merges.text` resolves line-oriented text with git-style
-`<<<<<<<` markers (see `make_text_merge` for custom labels); anything it
-cannot mark -- binary, non-UTF-8, oversized -- raises `CantMark`, filed
-as an ordinary conflict:
+fallback. `text_merge()` resolves line-oriented text with git-style
+`<<<<<<<` markers (its `ours_label` / `theirs_label` arguments name
+them); anything it cannot mark -- binary, non-UTF-8, oversized -- raises
+`CantMark`, filed as an ordinary conflict:
 
 ```python
-from kvgit.merges import text
+from kvgit import text_merge
 
-result = main.merge(dev.current_commit, default_merge=text)
+main["notes"] = "alpha\nbeta\n"
+main.commit()
+
+edits = main.create_branch("edits")
+edits["notes"] = "alpha\nBETA\n"
+edits.commit()
+
+main["notes"] = "ALPHA\nbeta\n"
+main.commit()
+
+main.merge(edits.current_commit, default_merge=text_merge())
+print(main["notes"])  # "ALPHA\nBETA\n" -- both edits kept
 ```
+
+`kvgit.merges.text` is the same merge one level down, over raw bytes,
+for `VersionedKV`. A `Staged` decodes each side before calling a merge
+function, so register `text_merge()` there unless the key's values are
+already `bytes`.
 
 Registrations resolve most-specific-first: a key takes its exact-key
 registration, else the longest registered prefix it starts with, else
@@ -77,11 +93,10 @@ registration, else the longest registered prefix it starts with, else
 policy is set:
 
 ```python
-from kvgit import MergeChoice
-from kvgit.merges import text
+from kvgit import MergeChoice, text_merge
 
-main.set_merge_prefix("runs/", MergeChoice.OURS)  # this branch owns runs/
-main.set_merge_fn("runs/index", text)             # except this one key
+main.set_merge_prefix("runs/", MergeChoice.OURS)   # this branch owns runs/
+main.set_merge_fn("runs/index", text_merge())      # except this one key
 ```
 
 A registration holds either a merge function or a `MergeChoice`, and the

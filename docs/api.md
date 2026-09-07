@@ -182,7 +182,9 @@ Reload from HEAD and discard staged changes. Use this to see writes from other b
 
 ### Merge functions
 
-Each registration holds either a merge function — `fn(old, ours, theirs) -> merged`, over decoded values — or a [`MergeChoice`](#mergechoice). See [MergePolicy](#mergepolicy) for how far each kind reaches.
+Each registration holds either a merge function — `fn(old, ours, theirs) -> merged` — or a [`MergeChoice`](#mergechoice). See [MergePolicy](#mergepolicy) for how far each kind reaches.
+
+A function registered here receives **decoded values**, not bytes, so pick one written for that level: `text_merge()` rather than `kvgit.merges.text` for a key holding `str`. See [Built-in merge functions](#built-in-merge-functions).
 
 #### `set_merge_fn(key, fn) -> None`
 
@@ -392,7 +394,7 @@ Frozen dataclass returned by `diff()`.
 
 ### MergeFn
 
-User-level merge function type (decoded values), used by `Staged`:
+User-level merge function type (decoded values, whatever you stored), used by `Staged`:
 
 ```python
 MergeFn = Callable[[Any | None, Any, Any], Any]
@@ -460,27 +462,39 @@ s.set_merge_prefix("__agno__/", MergeChoice.OURS)
 
 ## Built-in merge functions
 
-Value-level factories from `kvgit.content_types`, for use with `Staged`:
+They come at two levels, and the level decides where a function fits. `VersionedKV` stores raw `bytes` and hands a merge function bytes. `Staged` decodes both sides first, so a function registered there receives your values as you stored them — a `str` key arrives as `str`, not as UTF-8 bytes.
 
-### `counter() -> MergeFn`
+### Value-level, from `kvgit.content_types`
+
+Factories, for use with `Staged`.
+
+#### `counter() -> MergeFn`
 
 Integer counter merge: `ours + theirs - old`. Both sides' increments are preserved.
 
-### `last_writer_wins() -> MergeFn`
+#### `last_writer_wins() -> MergeFn`
 
 Always returns `theirs` (the HEAD value), re-encoded as the merged value. `kvgit.merges.theirs` does the same thing without rewriting the value.
 
-Bytes-level functions from `kvgit.merges`, usable at either level (they ignore the values they are handed, so `Staged` can register them too):
+#### `text_merge(*, ours_label="ours", theirs_label="theirs") -> MergeFn`
 
-### `text(old, ours, theirs) -> bytes`
+Marker merge for keys holding `str` or `bytes`: disjoint line changes merge cleanly, overlapping ones come back with git-style `<<<<<<<` markers under the given labels. `str` sides are encoded as UTF-8 for the merge and the result comes back as `str` when any side was `str`; a key whose values are `bytes` merges as bytes. A value that is neither, and anything unmarkable — non-UTF-8 bytes, NUL bytes, inputs over the 1 MiB cap — raises `CantMark`, which the merge machinery files as an ordinary conflict.
 
-Marker merge for line-oriented text: disjoint line changes merge cleanly, overlapping ones come back with git-style `<<<<<<<` markers. `make_text_merge(*, ours_label=, theirs_label=)` builds one with custom labels. Anything unmarkable — non-UTF-8 bytes, NUL bytes, inputs over the 1 MiB cap — raises `CantMark`, which the merge machinery files as an ordinary conflict.
+This is the one to register on a `Staged` for text. `kvgit.merges.text` below is the same merge over raw bytes.
 
-### `ours(old, our, their) -> MergeChoice`
+### Bytes-level, from `kvgit.merges`
+
+For `VersionedKV`. Two of them also work through `Staged`, and the difference is worth stating exactly: `ours` and `theirs` never look at the values they are handed, so nothing about them depends on the level; `text` and `make_text_merge` do read their arguments as bytes, so through a `Staged` they fit only keys whose stored values are already `bytes`. Registered on a key holding `str`, `text` receives a `str` and raises, and the key is filed as a `MergeConflict` — use `text_merge()` above instead.
+
+#### `text(old, ours, theirs) -> bytes`
+
+Marker merge for line-oriented text over bytes: disjoint line changes merge cleanly, overlapping ones come back with git-style `<<<<<<<` markers. `make_text_merge(*, ours_label=, theirs_label=)` builds one with custom labels. Anything unmarkable — non-UTF-8 bytes, NUL bytes, inputs over the 1 MiB cap — raises `CantMark`, which the merge machinery files as an ordinary conflict.
+
+#### `ours(old, our, their) -> MergeChoice`
 
 Take our side on a *contested* key. Returns [`MergeChoice.OURS`](#mergechoice): our stored value is kept as it stands, so no new blob is written, and if we removed the key the merge removes it. Being a merge function, it is consulted only where both sides changed the key — register `MergeChoice.OURS` itself for a policy that also governs one-sided changes.
 
-### `theirs(old, our, their) -> MergeChoice`
+#### `theirs(old, our, their) -> MergeChoice`
 
 Take their side, on the same terms.
 
