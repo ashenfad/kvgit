@@ -1,6 +1,6 @@
 """kvgit: Versioned key-value store."""
 
-from .content_types import MergeFn, counter, last_writer_wins
+from .content_types import MergeFn, counter, last_writer_wins, text_merge
 from .errors import ConcurrencyError, MergeConflict
 from .merges import CantMark, TextMergeFn, make_text_merge, ours, text, theirs
 from .namespaced import Namespaced
@@ -37,5 +37,6 @@ __all__ = [
     "ours",
     "store",
     "text",
+    "text_merge",
     "theirs",
 ]

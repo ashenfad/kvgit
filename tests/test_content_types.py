@@ -1,7 +1,17 @@
 """Tests for merge functions."""
 
-from kvgit import Staged, VersionedKV as Versioned, counter, last_writer_wins
+import pytest
+
+from kvgit import (
+    MergeConflict,
+    Staged,
+    VersionedKV as Versioned,
+    counter,
+    last_writer_wins,
+    text_merge,
+)
 from kvgit.kv.memory import Memory
+from kvgit.merges import CantMark
 
 
 class TestCounter:
@@ -85,3 +95,97 @@ class TestMergeFnIntegration:
         s2["tags"] = ["a", "b", "d"]
         assert s2.commit()
         assert s2.get("tags") == ["a", "b", "c", "d"]
+
+
+def _diverged(value_main, value_dev, base):
+    """Main + dev Staged pair, each with its own change to "doc"."""
+    from kvgit.store import store
+
+    main = store(kind="memory", branch="main")
+    main["doc"] = base
+    main.commit()
+    dev = main.create_branch("dev")
+    dev["doc"] = value_dev
+    dev.commit()
+    main["doc"] = value_main
+    main.commit()
+    return main, dev
+
+
+class TestTextMerge:
+    """The value-level text merge, as registered on a Staged."""
+
+    def test_str_values_merge_to_str_with_markers(self):
+        main, dev = _diverged("ours\n", "theirs\n", "base\n")
+
+        result = main.merge(dev.current_commit, default_merge=text_merge())
+        assert result.merged
+        merged = main["doc"]
+        assert isinstance(merged, str)
+        assert merged == "<<<<<<< ours\nours\n=======\ntheirs\n>>>>>>> theirs\n"
+
+    def test_str_values_merge_disjoint_lines_cleanly(self):
+        main, dev = _diverged("ALPHA\nbeta\n", "alpha\nBETA\n", "alpha\nbeta\n")
+
+        result = main.merge(dev.current_commit, default_merge=text_merge())
+        assert result.merged
+        assert main["doc"] == "ALPHA\nBETA\n"
+
+    def test_custom_labels(self):
+        main, dev = _diverged("ours\n", "theirs\n", "base\n")
+
+        main.merge(
+            dev.current_commit,
+            default_merge=text_merge(ours_label="main", theirs_label="dev"),
+        )
+        assert main["doc"].startswith("<<<<<<< main\n")
+        assert main["doc"].endswith(">>>>>>> dev\n")
+
+    def test_bytes_values_merge_to_bytes(self):
+        main, dev = _diverged(b"ALPHA\nbeta\n", b"alpha\nBETA\n", b"alpha\nbeta\n")
+
+        result = main.merge(dev.current_commit, default_merge=text_merge())
+        assert result.merged
+        assert main["doc"] == b"ALPHA\nBETA\n"
+
+    def test_removed_side_yields_the_other_sides_text(self):
+        main, dev = _diverged("ours\nkept\n", "base\n", "base\n")
+        del dev["doc"]
+        dev.commit()
+
+        result = main.merge(dev.current_commit, default_merge=text_merge())
+        assert result.merged
+        assert main["doc"] == ("<<<<<<< ours\nours\nkept\n=======\n>>>>>>> theirs\n")
+
+    def test_unchanged_side_removed_takes_the_removal(self):
+        main, dev = _diverged("base\n", "base\n", "base\n")
+        del dev["doc"]
+        dev.commit()
+
+        result = main.merge(dev.current_commit, default_merge=text_merge())
+        assert result.merged
+        assert "doc" not in main
+
+    def test_binary_values_conflict_through_cant_mark(self):
+        main, dev = _diverged(b"\x00ours", b"\x00theirs", b"\x00base")
+
+        with pytest.raises(MergeConflict) as exc_info:
+            main.merge(dev.current_commit, default_merge=text_merge())
+        assert exc_info.value.conflicting_keys == {"doc"}
+        assert isinstance(exc_info.value.merge_errors["doc"], CantMark)
+
+    def test_non_text_values_conflict_through_cant_mark(self):
+        main, dev = _diverged(1, 2, 0)
+
+        with pytest.raises(MergeConflict) as exc_info:
+            main.merge(dev.current_commit, default_merge=text_merge())
+        assert isinstance(exc_info.value.merge_errors["doc"], CantMark)
+
+    def test_mixed_str_and_bytes_sides_come_back_as_str(self):
+        fn = text_merge()
+        assert fn(None, "ours\n", b"ours\n") == "ours\n"
+
+    def test_cant_mark_propagates_from_the_fn_itself(self):
+        fn = text_merge()
+        with pytest.raises(CantMark):
+            fn(None, "text\n", b"\x00binary")
