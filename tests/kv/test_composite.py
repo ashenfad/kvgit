@@ -4,6 +4,7 @@ import logging
 
 import pytest
 
+from kvgit import Staged, VersionedKV
 from kvgit.kv.composite import Composite
 from kvgit.kv.memory import Memory
 
@@ -216,3 +217,88 @@ class TestCompositeFailureModes:
         with caplog.at_level(logging.WARNING, logger="kvgit.kv.composite"):
             assert "k" in c
         assert any("tier 0" in r.message for r in caplog.records)
+
+
+class TestMutableKeysReadThrough:
+    """``__``-prefixed keys are served by the authoritative tier alone.
+
+    Branch heads, their prev-HEAD backups, the storage version stamp and
+    the GC lease all change under a fixed key. Cached, they let a
+    process keep serving state another process has already replaced —
+    the failure being that a handle takes a ``ConcurrencyError`` on
+    commit, refreshes, and reads the same stale head back out of L1.
+    Content-derived keys are unaffected: the same key always holds the
+    same bytes, so any tier's copy is the right answer.
+    """
+
+    def test_get_ignores_a_stale_cached_branch_head(self):
+        l1, l2 = Memory(), Memory()
+        c = Composite([l1, l2])
+        l1.set("__branch_head__main", b'"stale"')
+        l2.set("__branch_head__main", b'"fresh"')
+        assert c.get("__branch_head__main") == b'"fresh"'
+
+    def test_a_mutable_key_missing_from_the_authoritative_tier_is_missing(self):
+        l1, l2 = Memory(), Memory()
+        c = Composite([l1, l2])
+        l1.set("__kvgit_version__", b"3")
+        assert c.get("__kvgit_version__") is None
+        assert "__kvgit_version__" not in c
+        assert c.get_many(["__kvgit_version__"]) == {}
+
+    def test_get_many_splits_mutable_from_content_keys(self):
+        l1, l2 = Memory(), Memory()
+        c = Composite([l1, l2])
+        l1.set("__kvgit_version__", b"2")
+        l2.set("__kvgit_version__", b"3")
+        l2.set("kvgit:chunk:x", b"chunk bytes")
+
+        got = c.get_many(["__kvgit_version__", "kvgit:chunk:x"])
+        assert got == {"__kvgit_version__": b"3", "kvgit:chunk:x": b"chunk bytes"}
+        assert l1.get("__kvgit_version__") == b"2", (
+            "a mutable key must not be written into a cache tier"
+        )
+        assert l1.get("kvgit:chunk:x") == b"chunk bytes"
+
+    def test_cas_on_a_mutable_key_does_not_populate_the_cache(self):
+        l1, l2 = Memory(), Memory()
+        c = Composite([l1, l2])
+        assert c.cas("__branch_head__main", b'"a"', expected=None)
+        assert l2.get("__branch_head__main") == b'"a"'
+        assert l1.get("__branch_head__main") is None
+
+    def test_content_addressed_keys_are_still_cached(self):
+        l1, l2 = Memory(), Memory()
+        c = Composite([l1, l2])
+        l2.set("kvgit:chunk:abc", b"payload")
+
+        assert c.get("kvgit:chunk:abc") == b"payload"
+        assert l1.get("kvgit:chunk:abc") == b"payload", "a miss must populate L1"
+
+        # Only L1 can answer now, which is the point of caching them.
+        l2.remove("kvgit:chunk:abc")
+        assert c.get("kvgit:chunk:abc") == b"payload"
+
+
+class TestCompositeBackedHandle:
+    """A cache tier must not hide another process's commits."""
+
+    def test_refresh_sees_a_commit_made_through_the_shared_tier(self):
+        shared = Memory()
+        cached = Composite([Memory(), shared])
+
+        mine = Staged(VersionedKV(cached))
+        mine["k"] = "first"
+        mine.commit()
+
+        # A second handle on the authoritative store, standing in for
+        # another process sharing the same backend.
+        theirs = Staged(VersionedKV(shared))
+        theirs["k"] = "second"
+        theirs.commit()
+
+        mine.refresh()
+        assert mine.current_commit == theirs.current_commit, (
+            "the L1 tier served a branch head another writer had moved"
+        )
+        assert mine["k"] == "second"

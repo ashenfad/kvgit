@@ -20,15 +20,45 @@ def _is_bug(exc: BaseException) -> bool:
     return isinstance(exc, _BUG_EXCEPTIONS)
 
 
+MUTABLE_PREFIX = "__"
+"""Key prefix marking a value that may change under a fixed key.
+
+Every mutable key kvgit writes starts with it — branch heads, their
+prev-HEAD backups, the storage version stamp, the GC lease — and so does
+commit metadata, which is immutable but small enough that reading it
+from the authoritative tier costs little. Everything else is derived
+from its own content (``kvgit:keyset:``, ``kvgit:chunk:``,
+``<commit>:<key>``): the same key always holds the same bytes, which is
+what makes it cacheable.
+"""
+
+
+def _is_mutable(key: str) -> bool:
+    return isinstance(key, str) and key.startswith(MUTABLE_PREFIX)
+
+
 class Composite(KVStore):
     """N-tier cache composing any number of KV stores.
 
-    On get: check L1, L2, ..., Ln in order. On hit at tier i,
-    populate L1..L(i-1) and return.
+    **Cache tiers serve only immutable, content-derived keys.** A key
+    starting with ``__`` names a value that changes under a fixed key —
+    a branch head, its recovery backup, the storage version stamp, the
+    GC lease — so ``get``, ``get_many`` and ``__contains__`` read those
+    from Ln alone and never populate a cache with them. Cached, they
+    would let a process keep serving a branch head that another process
+    has already moved: the handle would take a ``ConcurrencyError`` on
+    commit, call ``refresh()``, and read the same stale head back out of
+    L1. Everything else is keyed by its own content
+    (``kvgit:keyset:``, ``kvgit:chunk:``, ``<commit>:<key>``), so a hit
+    at any tier is the right answer forever.
+
+    On get: for a ``__`` key, read Ln. Otherwise check L1, L2, ..., Ln
+    in order; on hit at tier i, populate L1..L(i-1) and return.
 
     On set: write to all tiers (most durable first).
 
-    On cas: delegate to Ln (authoritative), update caches on success.
+    On cas: delegate to Ln (authoritative), update caches on success —
+    except for ``__`` keys, which no cache tier serves.
 
     Tier failures (``OSError``, network errors, etc.) are logged at
     WARNING and the next tier is tried; programming-error exceptions
@@ -54,8 +84,20 @@ class Composite(KVStore):
                     raise
                 logger.warning("Composite cache populate failed at tier %d: %s", j, e)
 
+    def _first_read_tier(self, key: str) -> int:
+        """Index of the highest tier allowed to answer for ``key``.
+
+        A ``__``-prefixed key names a value that can change under a
+        fixed key, so only the authoritative tier may answer it;
+        everything else is content-derived and may be served by any
+        tier.
+        """
+        return len(self._stores) - 1 if _is_mutable(key) else 0
+
     def get(self, key: str) -> bytes | None:
-        for i, store in enumerate(self._stores):
+        start = self._first_read_tier(key)
+        for i in range(start, len(self._stores)):
+            store = self._stores[i]
             try:
                 value = store.get(key)
             except Exception as e:
@@ -64,17 +106,21 @@ class Composite(KVStore):
                 logger.warning("Composite get failed at tier %d for %r: %s", i, key, e)
                 continue
             if value is not None:
-                if i > 0:
+                # Nothing to populate when the read started at the
+                # authoritative tier, which is where a mutable key's
+                # read starts and ends.
+                if i > start:
                     self._populate_caches(i, {key: value})
                 return value
         return None
 
-    def get_many(self, *args) -> Mapping[str, bytes]:
+    def _get_many_from(self, remaining: set[str], start: int) -> dict[str, bytes]:
+        """Bulk read ``remaining``, consulting tiers ``start``..Ln."""
         result: dict[str, bytes] = {}
-        remaining = set(self._normalize_keys(args))
-        for i, store in enumerate(self._stores):
+        for i in range(start, len(self._stores)):
             if not remaining:
                 break
+            store = self._stores[i]
             try:
                 # Delegate to the tier's bulk get — backends with high
                 # per-call latency (Disk, IndexedDB) collapse N round-trips
@@ -86,16 +132,28 @@ class Composite(KVStore):
                     raise
                 logger.warning("Composite get_many failed at tier %d: %s", i, e)
                 continue
-            if tier_values and i > 0:
+            if tier_values and i > start:
                 self._populate_caches(i, tier_values)
             result.update(tier_values)
-            remaining -= tier_values.keys()
+            remaining = remaining - tier_values.keys()
+        return result
+
+    def get_many(self, *args) -> Mapping[str, bytes]:
+        keys = set(self._normalize_keys(args))
+        mutable = {key for key in keys if _is_mutable(key)}
+        if not mutable:
+            return self._get_many_from(keys, 0)
+        # Two passes rather than one: mutable keys must come from the
+        # authoritative tier and must not be written into a cache, so
+        # they cannot share a batch with content-derived keys.
+        result = self._get_many_from(mutable, len(self._stores) - 1)
+        result.update(self._get_many_from(keys - mutable, 0))
         return result
 
     def __contains__(self, key: str) -> bool:
-        for i, store in enumerate(self._stores):
+        for i in range(self._first_read_tier(key), len(self._stores)):
             try:
-                if key in store:
+                if key in self._stores[i]:
                     return True
             except Exception as e:
                 if _is_bug(e):
@@ -175,7 +233,10 @@ class Composite(KVStore):
 
     def cas(self, key: str, value: bytes, expected: bytes | None) -> bool:
         success = self._stores[-1].cas(key, value, expected)
-        if success:
+        # A ``__``-prefixed key is read from the authoritative tier
+        # only, so writing it into a cache stores bytes nothing will
+        # ever read, and a CAS is almost always against such a key.
+        if success and not _is_mutable(key):
             for i, store in enumerate(self._stores[:-1]):
                 try:
                     store.set(key, value)
