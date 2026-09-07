@@ -55,6 +55,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from a `Staged` merge function over decoded values. A key resolved
   this way produces no new value, so `post_check` does not run for it.
 
+- **A GC lease, so `deep_clean` no longer needs a promise the caller cannot keep.** `deep_clean` used to ask for a quiescent store — no other process or thread writing, for the whole call — which is a condition a caller can intend but not verify. It now establishes that condition itself. The sweep takes a lease in the reserved key `__gc_lease__` (`{"owner": <opaque id>, "expires": <unix time>}`) by CAS, sleeps `grace` seconds so write batches already in flight can land, marks and sweeps, and releases the lease in a `finally`. Every write path — `commit`, a merge commit, `tag` — reads the lease immediately before its write batch and waits while a live one is held, at the cost of one `get` when no sweep is running, which is the common case.
+
+  New keyword arguments: `deep_clean(store, min_age=3600, *, grace=5.0, lease_ttl=600.0)`, and the same on `VersionedKV.deep_clean`. Both have defaults, so existing calls are unchanged apart from the five-second pause.
+
+  **The one assumption the guarantee rests on:** a writer's window between reading the lease and finishing its write batch is shorter than `grace`. A writer slower than that can still lose its nodes and chunks. Five seconds covers an in-memory or local-disk store with room to spare; raise it for a slow or remote backend. `lease_ttl` bounds what a crashed holder costs — writers wait out a lease's remaining term and no longer — and a sweep that outlives its own lease is not extended silently: it finishes and logs a warning at `kvgit.orphans` naming the overrun.
+
+  A writer that does not read the lease is still exposed, which is the same hazard in its original shape: an older kvgit, or a process editing the backend directly, commits mid-sweep and the namespace scan takes its nodes. Every process touching a store you deep-clean needs a version that honours the lease.
+- **`kvgit.GcBusy`**, raised by `deep_clean` when another deep clean holds a live lease. Nothing is swept and the holder's lease is left untouched; retry later.
+
+### Changed
+
+- **`clean_orphans` waits out a deep clean's lease before its own removals.** It takes no lease and needs none — everything it deletes is found by walking an orphan's own keyset, and every class it deletes is commit-scoped — but two sweeps deleting at once reclaim nothing extra and make a store under maintenance harder to reason about.
+- **Docs no longer describe `deep_clean` as requiring a quiescent store.** What it requires now is that `grace` exceeds a writer's check-then-write window, and that every writer on the store honours the lease.
+
 ### Fixed
 
 - **Docs: which built-in merge functions work at which level.** The API
@@ -83,6 +97,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   they match, as git does. The two extra blob reads happen only on the
   contested path. A key one side removed and the other modified remains
   a conflict.
+
+- **`Composite` served a stale branch HEAD from its cache tiers.** A process reading through a `Composite` over a shared authoritative store cached `__branch_head__<branch>` in L1. After another process committed, this one took a `ConcurrencyError`, called `refresh()`, and read the same stale head straight back out of the cache — permanently, since nothing invalidated it. `get`, `get_many` and `__contains__` now read every `__`-prefixed key from the authoritative tier alone and never populate a cache with one, and a successful `cas` on such a key no longer writes it into the cache tiers either.
+
+  The rule the class now states: **cache tiers serve only immutable, content-derived keys.** Every mutable key kvgit writes is `__`-prefixed — branch heads, their prev-HEAD backups, the storage version stamp, the GC lease — and so is commit metadata, which is immutable but small enough that reading it through costs little. `kvgit:keyset:`, `kvgit:chunk:` and `<commit>:<key>` are unaffected and remain the bulk of cached reads.
 
 ## [0.3.7] - 2026-09-04
 

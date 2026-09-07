@@ -378,17 +378,35 @@ Chunks -- the content-addressed bytes a [chunked codec](#storing-scientific-data
 The cost is real, because chunks are the large objects -- the numpy and pandas buffers. On a store using chunked codecs, deleted branches leave their unique buffers behind, and routine GC will not give that space back. Two things soften it:
 
 * Chunks only exist if you use a chunked codec. A store on plain pickle has none, and loses nothing here.
-* `deep_clean()` reclaims them, on a quiescent store.
+* `deep_clean()` reclaims them.
 
 ### `deep_clean()` -- the maintenance pass
 
-`deep_clean()` does everything `clean_orphans()` does, then scans the `kvgit:keyset:` and `kvgit:chunk:` namespaces directly. That scan is the only way to reclaim chunks, and also the only way to reach a keyset node or chunk that *no* commit references -- left behind by an interrupted write, or by a store swept by an earlier kvgit -- since those have no orphan to be found through. **It is not safe against concurrent writers** and must be run on a quiescent store:
+`deep_clean()` does everything `clean_orphans()` does, then scans the `kvgit:keyset:` and `kvgit:chunk:` namespaces directly. That scan is the only way to reclaim chunks, and also the only way to reach a keyset node or chunk that *no* commit references -- left behind by an interrupted write, or by a store swept by an earlier kvgit -- since those have no orphan to be found through.
+
+The scan deletes anything the mark phase did not see, so nothing else may be writing while it runs. You do not have to arrange that yourself: `deep_clean()` takes a lease on the store under the reserved key `__gc_lease__`, and every write path -- `commit()`, a merge commit, `tag()` -- reads that lease immediately before its write batch and waits while a live one is held.
 
 ```python
-s.versioned.deep_clean()   # no other writers, for the whole call
+s.versioned.deep_clean()                 # takes the lease, sweeps, releases
+s.versioned.deep_clean(grace=30)         # slow backend: allow longer write batches
 ```
 
-So: `clean_orphans()` (or plain `delete_branch()`) is your routine, always-safe cleanup, and `deep_clean()` is a scheduled maintenance pass during a quiet window. If you store large arrays, you want both.
+Concretely, the call takes the lease by CAS, sleeps `grace` seconds (default 5) so any batch that checked the lease just before it was taken has time to land, marks and sweeps, and releases the lease in a `finally`. `lease_ttl` (default 600 seconds) bounds the damage from a holder that crashes: writers wait out a lease's remaining term and no longer.
+
+**What this requires of you**, in place of quiescing the store: that a writer's window between checking the lease and finishing its write batch is shorter than `grace`. Five seconds is generous for an in-memory or local-disk store; raise it for a slow or remote backend. Raise `lease_ttl` above the longest sweep this store has taken, too -- an overrun is not extended silently, it just logs a warning and leaves writers free during the overrun.
+
+If another `deep_clean()` already holds the lease, the call raises `kvgit.GcBusy` rather than sweeping beside it. Retry later.
+
+```python
+try:
+    s.versioned.deep_clean()
+except kvgit.GcBusy:
+    pass   # someone else is already sweeping
+```
+
+A writer that does not read the lease is still exposed -- an older kvgit, or a process editing the backend directly. The lease is what the guarantee rests on, so every process touching the store needs a version that honours it.
+
+So: `clean_orphans()` (or plain `delete_branch()`) is your routine, always-safe cleanup, and `deep_clean()` is a scheduled maintenance pass. If you store large arrays, you want both.
 
 A commit that loses a CAS race leaves garbage too — it writes its blobs, nodes and metadata before attempting the swap, and nothing deletes them inline, because the winner may legitimately share the content-addressed ones. They are ordinary orphans and the ordinary sweep collects them.
 
@@ -536,7 +554,7 @@ See [the API reference](api.md#chunked-codecs) for the full protocol and the sto
 
 ### Reclaiming chunk space
 
-One thing to plan for: chunks are the only object kvgit stores under a bare content hash, and routine garbage collection deliberately does not delete them. Deleting a branch reclaims its commits, blobs and keyset nodes, but its unique buffers stay on disk until you run `deep_clean()` on a quiescent store. See [Cleaning up unreachable commits](#cleaning-up-unreachable-commits).
+One thing to plan for: chunks are the only object kvgit stores under a bare content hash, and routine garbage collection deliberately does not delete them. Deleting a branch reclaims its commits, blobs and keyset nodes, but its unique buffers stay on disk until you run `deep_clean()`. See [Cleaning up unreachable commits](#cleaning-up-unreachable-commits).
 
 ---
 
