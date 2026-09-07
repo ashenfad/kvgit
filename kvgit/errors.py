@@ -26,3 +26,13 @@ class MergeConflict(Exception):
         self.merge_errors = merge_errors or {}
         keys_str = ", ".join(sorted(conflicting_keys))
         super().__init__(f"Merge conflict on keys: {keys_str}")
+
+
+class GcBusy(Exception):
+    """Raised when a deep clean cannot take the store's GC lease.
+
+    Another process or thread holds an unexpired lease, so a namespace
+    scan started now would run beside a sweep that is already deleting.
+    Retry later; the lease carries an expiry, so a holder that dies
+    without releasing it blocks nothing past that point.
+    """
