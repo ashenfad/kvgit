@@ -2,7 +2,12 @@
 
 import pytest
 
-from kvgit import MergeConflict, MergeResult, VersionedKV as Versioned
+from kvgit import (
+    ConcurrencyError,
+    MergeConflict,
+    MergeResult,
+    VersionedKV as Versioned,
+)
 from kvgit.encoding import dumps
 from kvgit.kv.memory import Memory
 from kvgit.versioned.kv import BRANCH_HEAD
@@ -216,6 +221,86 @@ class TestVersionedCommit:
         v2.refresh()
         assert v2.get("c") == b"3"
         assert v2.get("a") == b"1"
+
+
+def _race_once(loser, advance):
+    """Make ``loser``'s next CAS lose: advance HEAD first, then run it."""
+    real_cas = loser._cas_head
+    raced = False
+
+    def cas(expected, new_head):
+        nonlocal raced
+        if not raced:
+            raced = True
+            advance()
+        return real_cas(expected, new_head)
+
+    loser._cas_head = cas
+
+
+class TestFastForwardRace:
+    """Issue #39: a HEAD move inside the fast-forward CAS window must
+    re-read HEAD and merge internally — not raise an error whose named
+    recovery (``refresh()``) discards the caller's staged work."""
+
+    def test_lost_race_merges_instead_of_raising(self):
+        store = Memory()
+        v1 = Versioned(store)
+        v1.commit({"base": b"0"})
+        v2 = Versioned(store)
+        _race_once(v2, lambda: v1.commit({"other": b"1"}))
+
+        result = v2.commit({"mine": b"2"})
+
+        assert result.merged
+        assert result.strategy == "three_way"
+        assert v2.get("mine") == b"2"
+        assert v2.get("other") == b"1"
+
+    def test_lost_race_with_abandon_merges_clean_change(self):
+        """A lost race is not a conflict: like the base-behind-head case,
+        ``abandon`` still attempts the merge and succeeds when clean."""
+        store = Memory()
+        v1 = Versioned(store)
+        v1.commit({"base": b"0"})
+        v2 = Versioned(store)
+        _race_once(v2, lambda: v1.commit({"other": b"1"}))
+
+        result = v2.commit({"mine": b"2"}, on_conflict="abandon")
+
+        assert result.merged
+        assert result.strategy == "three_way"
+
+    def test_lost_race_with_abandon_bails_on_true_conflict(self):
+        store = Memory()
+        v1 = Versioned(store)
+        v1.commit({"x": b"1"})
+        v2 = Versioned(store)
+        _race_once(v2, lambda: v1.commit({"x": b"v1"}))
+
+        result = v2.commit({"x": b"v2"}, on_conflict="abandon")
+
+        assert not result
+        assert result.strategy == "three_way"
+        assert v1.current_commit == v2.latest_head  # branch untouched
+        assert v2.get("x") == b"1"  # loser restored to its pre-commit base
+
+    def test_repeated_race_still_raises(self):
+        """The internal retry is bounded: a race on the merge CAS too
+        still surfaces ConcurrencyError instead of looping."""
+        store = Memory()
+        v1 = Versioned(store)
+        v1.commit({"base": b"0"})
+        v2 = Versioned(store)
+        real_cas = v2._cas_head
+
+        def always_race(expected, new_head):
+            v1.commit({"other": b"1"})
+            return real_cas(expected, new_head)
+
+        v2._cas_head = always_race
+        with pytest.raises(ConcurrencyError):
+            v2.commit({"mine": b"2"})
 
 
 class TestVersionedSharedStore:

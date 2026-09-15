@@ -504,6 +504,40 @@ class TestStagedRefresh:
         assert not s.has_changes
 
 
+class TestStagedCommitRace:
+    """Issue #39 at the Staged level: dirty before, committed after —
+    no refresh (which would discard the buffer) required."""
+
+    def test_commit_survives_fast_forward_race(self):
+        store = Memory()
+        s1 = Staged(Versioned(store))
+        s1["seed"] = "0"
+        s1.commit()
+        s2 = Staged(Versioned(store))
+
+        s1["mine"] = "2"
+        assert s1.has_changes
+        real_cas = s1.versioned._cas_head
+        raced = False
+
+        def cas(expected, new_head):
+            nonlocal raced
+            if not raced:
+                raced = True
+                s2["other"] = "1"
+                s2.commit()
+            return real_cas(expected, new_head)
+
+        s1.versioned._cas_head = cas
+        result = s1.commit()
+
+        assert result.merged
+        assert result.strategy == "three_way"
+        assert not s1.has_changes
+        assert s1.get("mine") == "2"
+        assert s1.get("other") == "1"
+
+
 class TestStagedEncoder:
     def test_custom_encoder_decoder(self):
         import json
