@@ -32,7 +32,7 @@ import time
 
 import pytest
 
-from kvgit import ConcurrencyError, VersionedKV
+from kvgit import ConcurrencyError, MergeConflict, VersionedKV
 from kvgit.encoding import dumps, loads
 from kvgit.kv.memory import Memory
 from kvgit.versioned.keyset import Keyset
@@ -237,8 +237,12 @@ class TestPrevHeadInvariant:
 
         store.arm_commit_batch(winner_lands_twice)
 
-        with pytest.raises(ConcurrencyError):
-            loser.commit({"a": b"2"})
+        # Issue #39: the lost fast-forward race merges internally instead
+        # of raising, so the loser lands a merge commit on top. The
+        # invariant under test is unchanged: whatever wins the final CAS
+        # writes the backup, so prev-HEAD is still the immediately-prior
+        # HEAD rather than the loser's stale value.
+        loser.commit({"a": b"2"})
 
         history = store.head_history["main"]
         prev = loads(store.get(BRANCH_HEAD_PREV % "main"))
@@ -390,14 +394,21 @@ class TestLostCasGarbage:
     """A lost CAS leaves its writes for GC, and must not delete them."""
 
     def test_lost_cas_leaves_collectable_garbage(self):
-        """The loser's commit is garbage the ordinary sweep reclaims.
+        """The loser's commits are garbage the ordinary sweep reclaims.
 
         Nothing is deleted inline. The loser's HAMT nodes are keyed by
         content, so the winner may legitimately share them, and blowing
         them away is the resurrection hazard the scoped sweep exists to
-        avoid. The orphan is collected on the normal path once it ages
+        avoid. The orphans are collected on the normal path once they age
         past ``min_age``; chunks wait for ``deep_clean`` (see
         ``clean_orphans``).
+
+        Issue #39 retries a lost fast-forward race through the merge
+        path, so a conflicting loser now surfaces ``MergeConflict``
+        instead of ``ConcurrencyError``. The retry's merge attempt writes
+        the identical commit objects (same parent, same changes, same
+        ``created_at``), so there is still exactly one orphan for the
+        sweep.
         """
         store = HookStore()
         v = VersionedKV(store)
@@ -408,17 +419,21 @@ class TestLostCasGarbage:
         winner = VersionedKV(store, commit_hash=first)
         store.arm_commit_batch(lambda: winner.commit({"a": b"winner"}))
 
-        with pytest.raises(ConcurrencyError):
+        with pytest.raises(MergeConflict):
             loser.commit({"a": b"loser"})
 
         # The loser's writes are still there, untouched.
         live_history = set(winner.history())
-        orphan = next(
+        orphans = [
             key[len(ROOT_PREFIX) :]
             for key in store.keys()
             if key.startswith(ROOT_PREFIX)
             and key[len(ROOT_PREFIX) :] not in live_history
+        ]
+        assert len(orphans) == 1, (
+            "the retry rewrites the same commit objects, leaving one orphan"
         )
+        orphan = orphans[0]
         orphan_nodes = node_hashes(store, orphan)
         assert store.get(f"{orphan}:a") == b"loser"
         assert store.get(PARENT_COMMIT % orphan) is not None

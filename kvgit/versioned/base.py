@@ -141,6 +141,10 @@ class VersionedBase(ABC):
 
         Creates a new commit with the given changes and advances the
         branch HEAD.  If HEAD has diverged, performs a three-way merge.
+        A HEAD move that lands inside the fast-forward CAS window is
+        retried once against the new HEAD through that same merge path,
+        so a single well-behaved writer never sees ``ConcurrencyError``
+        for a race it can merge past.
 
         Args:
             updates: Key-value pairs to add or update (bytes values).
@@ -210,19 +214,13 @@ class VersionedBase(ABC):
                 self.last_merge_result = result
                 return result
             self._restore_state(saved)
-            if on_conflict == "abandon":
-                result = MergeResult(
-                    merged=False,
-                    commit=None,
-                    strategy="fast_forward",
-                    auto_merged_keys=(),
-                    carried_keys=(),
-                )
-                self.last_merge_result = result
-                return result
-            raise ConcurrencyError(
-                f"HEAD changed from {self._base_commit}. Refresh and retry."
-            )
+            # Lost the fast-forward race: another writer advanced HEAD
+            # between our read and our CAS. Re-read HEAD and merge, the
+            # way the base-behind-head case already does — in either
+            # mode, so a lost race is never mistaken for a conflict and
+            # the caller never has to refresh (and drop staged work)
+            # just to replay a mergeable commit.
+            current_head = self.latest_head
 
         # Three-way merge path
         if current_head is None:
