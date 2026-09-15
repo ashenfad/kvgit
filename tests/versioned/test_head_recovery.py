@@ -454,6 +454,46 @@ class TestLostCasGarbage:
         assert live.get("a") == b"winner"
 
 
+class TestRetryNodeAccounting:
+    def test_raced_new_key_merge_strands_no_nodes(self):
+        """The #39 retry must keep its first attempt as our side.
+
+        Rebuilding the commit after a lost CAS hashes identically
+        (``created_at`` is not in the commit hash) but writes different
+        HAMT nodes, detaching the first attempt's nodes where the
+        incremental sweep cannot find them. Merging from the already
+        built commit leaves every written node reachable from live
+        history.
+        """
+        store = Memory()
+        v1 = VersionedKV(store)
+        v1.commit({"base": b"0"})
+        v2 = VersionedKV(store)
+        real_cas = v2._cas_head
+        raced = False
+
+        def cas(expected, new_head):
+            nonlocal raced
+            if not raced:
+                raced = True
+                v1.commit({"other": b"1"})
+            return real_cas(expected, new_head)
+
+        v2._cas_head = cas
+        result = v2.commit({"mine": b"2"})
+        assert result.merged
+
+        reachable: set[str] = set()
+        for h in v2.history(all_parents=True):
+            reachable |= node_hashes(store, h)
+        present = {
+            key[len(Keyset.DEFAULT_PREFIX) :]
+            for key in store.keys()
+            if key.startswith(Keyset.DEFAULT_PREFIX)
+        }
+        assert present - reachable == set()
+
+
 class TestAbsentHeadCannotRecover:
     """A branch with no HEAD is deleted, not damaged.
 

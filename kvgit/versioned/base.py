@@ -190,6 +190,7 @@ class VersionedBase(ABC):
             )
 
         current_head = self.latest_head
+        ours_built = False
 
         if current_head == self._base_commit:
             # Fast-forward path
@@ -213,7 +214,6 @@ class VersionedBase(ABC):
                 )
                 self.last_merge_result = result
                 return result
-            self._restore_state(saved)
             # Lost the fast-forward race: another writer advanced HEAD
             # between our read and our CAS. Re-read HEAD and merge, the
             # way the base-behind-head case already does — in either
@@ -221,17 +221,24 @@ class VersionedBase(ABC):
             # the caller never has to refresh (and drop staged work)
             # just to replay a mergeable commit.
             current_head = self.latest_head
+            # Keep the commit just built as our side of the merge rather
+            # than restoring and rebuilding it: a rebuild hashes
+            # identically (created_at is not in the commit hash) but
+            # writes different HAMT nodes, orphaning the first attempt's
+            # nodes where clean_orphans cannot find them.
+            ours_built = True
 
         # Three-way merge path
         if current_head is None:
             raise ValueError(f"Branch '{self._branch}' has no HEAD")
-        saved = self._snapshot_state()
-        self._create_commit(
-            updates,
-            removals,
-            chunks=chunks,
-            chunk_refs=chunk_refs,
-        )
+        if not ours_built:
+            saved = self._snapshot_state()
+            self._create_commit(
+                updates,
+                removals,
+                chunks=chunks,
+                chunk_refs=chunk_refs,
+            )
         return self._three_way_merge(
             current_head,
             on_conflict=on_conflict,
