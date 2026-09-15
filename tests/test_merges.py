@@ -10,7 +10,7 @@ import pytest
 
 from kvgit import MergeConflict, VersionedKV as Versioned
 from kvgit.kv.memory import Memory
-from kvgit.merges import CantMark, make_text_merge, text
+from kvgit.merges import CantMark, make_text_merge, text, text_merge_result
 
 GIT = shutil.which("git")
 needs_git = pytest.mark.skipif(GIT is None, reason="git binary not available")
@@ -298,3 +298,87 @@ class TestVersionedIntegration:
             v2.commit({"doc": b"a\nb\nc\nD\n"}, default_merge=text_merge)
         assert "doc" in exc_info.value.conflicting_keys
         assert isinstance(exc_info.value.merge_errors["doc"], CantMark)
+
+
+class TestStrictAndFlag:
+    """Issue #38: strict mode aborts instead of marking; the flag reports
+    whether hunks were introduced (marker-like content merging cleanly
+    must not count)."""
+
+    def test_strict_raises_on_conflict(self):
+        fn = make_text_merge(strict=True)
+        with pytest.raises(CantMark):
+            fn(BASE, b"a\nX\nc\nd\n", b"a\nY\nc\nd\n")
+
+    def test_strict_passes_clean_merge_through(self):
+        fn = make_text_merge(strict=True)
+        assert fn(BASE, b"a\nB\nc\nd\n", b"a\nb\nc\nD\n") == b"a\nB\nc\nD\n"
+
+    def test_strict_ignores_carried_marker_like_content(self):
+        markerish = b"<<<<<<< not a real hunk\nsame\n"
+        fn = make_text_merge(strict=True)
+        assert fn(BASE, markerish, BASE) == markerish
+
+    def test_non_strict_default_still_marks(self):
+        out = make_text_merge()(BASE, b"a\nX\nc\nd\n", b"a\nY\nc\nd\n")
+        assert b"<<<<<<< ours\n" in out
+
+    def test_flag_false_on_clean_merge(self):
+        merged, conflicted = text_merge_result(BASE, b"a\nB\nc\nd\n", b"a\nb\nc\nD\n")
+        assert (merged, conflicted) == (b"a\nB\nc\nD\n", False)
+
+    def test_flag_false_for_carried_marker_like_content(self):
+        markerish = b"<<<<<<< not a real hunk\nsame\n"
+        merged, conflicted = text_merge_result(BASE, markerish, BASE)
+        assert (merged, conflicted) == (markerish, False)
+
+    def test_flag_true_on_conflict_and_bytes_match_marking_fn(self):
+        args = (BASE, b"a\nX\nc\nd\n", b"a\nY\nc\nd\n")
+        merged, conflicted = text_merge_result(*args)
+        assert conflicted is True
+        assert merged == make_text_merge()(*args) == text(*args)
+
+    def test_flag_custom_labels(self):
+        merged, conflicted = text_merge_result(
+            BASE,
+            b"a\nX\nc\nd\n",
+            b"a\nY\nc\nd\n",
+            ours_label="main",
+            theirs_label="dev",
+        )
+        assert conflicted is True
+        assert b"<<<<<<< main\n" in merged
+        assert b">>>>>>> dev\n" in merged
+
+    def test_unmarkable_still_raises(self):
+        with pytest.raises(CantMark):
+            text_merge_result(BASE, b"\xff binary", BASE)
+        with pytest.raises(CantMark):
+            make_text_merge(strict=True)(BASE, b"\xff binary", BASE)
+
+    def test_strict_conflict_aborts_versioned_merge(self):
+        store = Memory()
+        v1 = Versioned(store)
+        v1.commit({"doc": BASE})
+        v2 = Versioned(store)
+        v1.commit({"doc": b"a\nX\nc\nd\n"})
+        with pytest.raises(MergeConflict) as exc_info:
+            v2.commit(
+                {"doc": b"a\nY\nc\nd\n"},
+                default_merge=make_text_merge(strict=True),
+            )
+        assert "doc" in exc_info.value.conflicting_keys
+        assert isinstance(exc_info.value.merge_errors["doc"], CantMark)
+
+    def test_strict_clean_change_still_merges(self):
+        store = Memory()
+        v1 = Versioned(store)
+        v1.commit({"doc": BASE})
+        v2 = Versioned(store)
+        v1.commit({"doc": b"a\nB\nc\nd\n"})
+        result = v2.commit(
+            {"doc": b"a\nb\nc\nD\n"},
+            default_merge=make_text_merge(strict=True),
+        )
+        assert result
+        assert v2.get("doc") == b"a\nB\nc\nD\n"

@@ -476,9 +476,9 @@ Integer counter merge: `ours + theirs - old`. Both sides' increments are preserv
 
 Always returns `theirs` (the HEAD value), re-encoded as the merged value. `kvgit.merges.theirs` does the same thing without rewriting the value.
 
-#### `text_merge(*, ours_label="ours", theirs_label="theirs") -> MergeFn`
+#### `text_merge(*, ours_label="ours", theirs_label="theirs", strict=False) -> MergeFn`
 
-Marker merge for keys holding `str` or `bytes`: disjoint line changes merge cleanly, overlapping ones come back with git-style `<<<<<<<` markers under the given labels. `str` sides are encoded as UTF-8 for the merge and the result comes back as `str` when any side was `str`; a key whose values are `bytes` merges as bytes. A value that is neither, and anything unmarkable — non-UTF-8 bytes, NUL bytes, inputs over the 1 MiB cap — raises `CantMark`, which the merge machinery files as an ordinary conflict.
+Marker merge for keys holding `str` or `bytes`: disjoint line changes merge cleanly, overlapping ones come back with git-style `<<<<<<<` markers under the given labels. `str` sides are encoded as UTF-8 for the merge and the result comes back as `str` when any side was `str`; a key whose values are `bytes` merges as bytes. With `strict=True` a conflict raises `CantMark` instead of marking, so the merge aborts rather than landing hunks. A value that is neither, and anything unmarkable — non-UTF-8 bytes, NUL bytes, inputs over the 1 MiB cap — raises `CantMark`, which the merge machinery files as an ordinary conflict.
 
 This is the one to register on a `Staged` for text. `kvgit.merges.text` below is the same merge over raw bytes.
 
@@ -488,7 +488,7 @@ For `VersionedKV`. Two of them also work through `Staged`, and the difference is
 
 #### `text(old, ours, theirs) -> bytes`
 
-Marker merge for line-oriented text over bytes: disjoint line changes merge cleanly, overlapping ones come back with git-style `<<<<<<<` markers. `make_text_merge(*, ours_label=, theirs_label=)` builds one with custom labels. Anything unmarkable — non-UTF-8 bytes, NUL bytes, inputs over the 1 MiB cap — raises `CantMark`, which the merge machinery files as an ordinary conflict.
+Marker merge for line-oriented text over bytes: disjoint line changes merge cleanly, overlapping ones come back with git-style `<<<<<<<` markers. `make_text_merge(*, ours_label=, theirs_label=, strict=)` builds one with custom labels; `strict=True` raises `CantMark` instead of marking, so a true conflict aborts the commit rather than landing hunks. `text_merge_result(old, ours, theirs, *, ours_label=, theirs_label=)` runs the same merge and returns `(merged_bytes, conflicted)`, reporting reliably whether hunks were introduced even when the inputs contain marker-like lines. Anything unmarkable — non-UTF-8 bytes, NUL bytes, inputs over the 1 MiB cap — raises `CantMark`, which the merge machinery files as an ordinary conflict.
 
 #### `ours(old, our, their) -> MergeChoice`
 

@@ -189,3 +189,25 @@ class TestTextMerge:
         fn = text_merge()
         with pytest.raises(CantMark):
             fn(None, "text\n", b"\x00binary")
+
+    def test_strict_raises_on_conflict(self):
+        fn = text_merge(strict=True)
+        with pytest.raises(CantMark):
+            fn("a\nb\n", "a\nX\n", "a\nY\n")
+
+    def test_strict_passes_clean_merge_through(self):
+        fn = text_merge(strict=True)
+        assert fn("a\nb\n", "a\nB\n", "a\nb\n") == "a\nB\n"
+
+    def test_strict_conflict_aborts_staged_merge(self):
+        main = Staged(Versioned(Memory()))
+        main["doc"] = "a\nb\nc\nd\n"
+        main.commit()
+        dev = main.create_branch("dev")
+        dev["doc"] = "a\nY\nc\nd\n"
+        dev.commit()
+        main["doc"] = "a\nX\nc\nd\n"
+        main.commit()
+        with pytest.raises(MergeConflict) as exc_info:
+            main.merge(dev.current_commit, default_merge=text_merge(strict=True))
+        assert "doc" in exc_info.value.conflicting_keys

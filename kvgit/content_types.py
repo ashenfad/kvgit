@@ -31,7 +31,12 @@ def last_writer_wins() -> MergeFn:
     return lambda old, ours, theirs: theirs
 
 
-def text_merge(*, ours_label: str = "ours", theirs_label: str = "theirs") -> MergeFn:
+def text_merge(
+    *,
+    ours_label: str = "ours",
+    theirs_label: str = "theirs",
+    strict: bool = False,
+) -> MergeFn:
     """Marker merge for ``str`` (or ``bytes``) values, for use with ``Staged``.
 
     The value-level counterpart to :func:`kvgit.merges.text`. ``Staged``
@@ -43,13 +48,17 @@ def text_merge(*, ours_label: str = "ours", theirs_label: str = "theirs") -> Mer
 
     Disjoint line changes merge cleanly and overlapping ones come back
     with git-style ``<<<<<<<`` markers (labelled by ``ours_label`` /
-    ``theirs_label``) rather than raising. A value that is neither
-    ``str`` nor ``bytes``, and anything the marker merge cannot handle —
-    undecodable bytes, NUL bytes, inputs over the size cap — raises
+    ``theirs_label``) rather than raising. With ``strict=True`` a
+    conflict raises instead of marking, so the merge aborts rather than
+    landing hunks. A value that is neither ``str`` nor ``bytes``, and
+    anything the marker merge cannot handle — undecodable bytes, NUL
+    bytes, inputs over the size cap — raises
     :class:`~kvgit.merges.CantMark`, which the merge machinery files as
     an ordinary conflict.
     """
-    merge_bytes = make_text_merge(ours_label=ours_label, theirs_label=theirs_label)
+    merge_bytes = make_text_merge(
+        ours_label=ours_label, theirs_label=theirs_label, strict=strict
+    )
 
     def encode(value: Any) -> bytes | None:
         if value is None or isinstance(value, bytes):
