@@ -29,11 +29,14 @@ MAX_MARK_BYTES = 1024 * 1024
 
 
 class CantMark(Exception):
-    """A value cannot be marker-merged: not text, or too big.
+    """A value cannot be marker-merged: not text, too big, or a conflict
+    under ``strict=True``.
 
     Raised instead of returning bytes when the inputs are undecodable as
-    UTF-8, contain NUL bytes, or exceed ``MAX_MARK_BYTES`` combined.
-    The merge machinery reports it as a conflict for that key.
+    UTF-8, contain NUL bytes, or exceed ``MAX_MARK_BYTES`` combined — or,
+    when built with ``strict=True``, when the merge would have written
+    conflict markers. The merge machinery reports it as a conflict for
+    that key.
     """
 
 
@@ -210,33 +213,71 @@ def _merge_lines(
     return _terminate(out), conflicted
 
 
+def _check_labels(ours_label: str, theirs_label: str) -> None:
+    for name, label in (("ours_label", ours_label), ("theirs_label", theirs_label)):
+        if "\n" in label:
+            raise ValueError(f"{name} may not contain a newline: {label!r}")
+
+
+def text_merge_result(
+    old: bytes | None,
+    ours: bytes | None,
+    theirs: bytes | None,
+    *,
+    ours_label: str = "ours",
+    theirs_label: str = "theirs",
+) -> tuple[bytes, bool]:
+    """Marker-merge returning ``(merged_bytes, conflicted)``.
+
+    Same merge as :func:`make_text_merge`, but the flag tells whether the
+    merge introduced conflict hunks — reliably, where counting
+    ``<<<<<<<`` lines cannot, because the inputs may legitimately contain
+    marker-like lines that merge through untouched. Anything unmarkable
+    still raises :class:`CantMark`.
+    """
+    _check_labels(ours_label, theirs_label)
+    total = sum(len(d) for d in (old, ours, theirs) if d is not None)
+    if total > MAX_MARK_BYTES:
+        raise CantMark(f"inputs total {total} bytes over cap {MAX_MARK_BYTES}")
+    merged, conflicted = _merge_lines(
+        _decode(old),
+        _decode(ours),
+        _decode(theirs),
+        ours_label,
+        theirs_label,
+        ours_deleted=ours is None and old is not None,
+        theirs_deleted=theirs is None and old is not None,
+    )
+    return "".join(merged).encode("utf-8"), conflicted
+
+
 def make_text_merge(
-    *, ours_label: str = "ours", theirs_label: str = "theirs"
+    *,
+    ours_label: str = "ours",
+    theirs_label: str = "theirs",
+    strict: bool = False,
 ) -> BytesMergeFn:
     """Build a marker-merge fn with custom conflict labels.
 
     Labels ride git's positions (``<<<<<<< <ours>`` /
     ``>>>>>>> <theirs>``); pass branch names so conflicts read
     attributably. Labels may not contain newlines.
+
+    With ``strict=True`` the fn raises :class:`CantMark` instead of
+    writing markers when sides conflict — for branches where a true
+    conflict must abort the commit rather than land hunks. The merge
+    machinery files it as an ordinary conflict, same as unmarkable
+    input.
     """
-    for name, label in (("ours_label", ours_label), ("theirs_label", theirs_label)):
-        if "\n" in label:
-            raise ValueError(f"{name} may not contain a newline: {label!r}")
+    _check_labels(ours_label, theirs_label)
 
     def merge(old: bytes | None, ours: bytes | None, theirs: bytes | None) -> bytes:
-        total = sum(len(d) for d in (old, ours, theirs) if d is not None)
-        if total > MAX_MARK_BYTES:
-            raise CantMark(f"inputs total {total} bytes over cap {MAX_MARK_BYTES}")
-        merged, _ = _merge_lines(
-            _decode(old),
-            _decode(ours),
-            _decode(theirs),
-            ours_label,
-            theirs_label,
-            ours_deleted=ours is None and old is not None,
-            theirs_deleted=theirs is None and old is not None,
+        merged, conflicted = text_merge_result(
+            old, ours, theirs, ours_label=ours_label, theirs_label=theirs_label
         )
-        return "".join(merged).encode("utf-8")
+        if conflicted and strict:
+            raise CantMark("strict text merge: conflicting changes cannot be marked")
+        return merged
 
     return merge
 
