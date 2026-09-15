@@ -625,6 +625,10 @@ class Staged(MutableMapping[str, Any]):
         """Yield the commit chain from newest to oldest."""
         return self._versioned.history(commit_hash, all_parents=all_parents)
 
+    def merge_base(self, commit_a: str, commit_b: str) -> str | None:
+        """Lowest common ancestor of two commits, or None if unrelated."""
+        return self._versioned.merge_base(commit_a, commit_b)
+
     def refresh(self) -> None:
         """Reload from HEAD and discard staged changes."""
         self._versioned.refresh()

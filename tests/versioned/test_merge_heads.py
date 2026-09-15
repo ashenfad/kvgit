@@ -225,3 +225,37 @@ class TestVersionedMergeParity:
         result = v1.merge_heads(v2.current_commit, default_merge=text)
         assert result.merged
         assert v1.get("k") == b"dev"
+
+
+class TestMergeBase:
+    def test_same_commit_is_its_own_base(self):
+        main, _ = _branched_versioned()
+        assert main.merge_base(main.current_commit, main.current_commit) == (
+            main.current_commit
+        )
+
+    def test_diverged_branches_resolve_to_fork_point(self):
+        main, worker = _branched_versioned()
+        fork = main.current_commit
+        main.commit({"a": b"1"})
+        worker.commit({"b": b"2"})
+
+        assert main.merge_base(main.current_commit, worker.current_commit) == fork
+        assert worker.merge_base(worker.current_commit, main.current_commit) == fork
+
+    def test_linear_history_returns_ancestor(self):
+        main, _ = _branched_versioned()
+        base = main.current_commit
+        main.commit({"a": b"1"})
+
+        assert main.merge_base(base, main.current_commit) == base
+
+    def test_staged_delegates_to_versioned(self):
+        main, worker = _branched()
+        fork = main.current_commit
+        main["a"] = "1"
+        main.commit()
+        worker["b"] = "2"
+        worker.commit()
+
+        assert main.merge_base(main.current_commit, worker.current_commit) == fork
