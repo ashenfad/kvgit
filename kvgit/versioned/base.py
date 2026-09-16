@@ -220,7 +220,13 @@ class VersionedBase(ABC):
             # mode, so a lost race is never mistaken for a conflict and
             # the caller never has to refresh (and drop staged work)
             # just to replay a mergeable commit.
-            current_head = self.latest_head
+            try:
+                current_head = self.latest_head
+            except Exception:
+                # A failing re-read must not leave phantom state behind
+                # either.
+                self._restore_state(saved)
+                raise
             # Keep the commit just built as our side of the merge rather
             # than restoring and rebuilding it: a rebuild hashes
             # identically (created_at is not in the commit hash) but
@@ -230,6 +236,12 @@ class VersionedBase(ABC):
 
         # Three-way merge path
         if current_head is None:
+            # A retry that finds its branch gone restores the pre-commit
+            # snapshot, so the failed commit leaves the handle exactly as
+            # it found it. A null first read builds nothing, so only a
+            # retry can have anything to restore.
+            if ours_built:
+                self._restore_state(saved)
             raise ValueError(f"Branch '{self._branch}' has no HEAD")
         if not ours_built:
             saved = self._snapshot_state()
