@@ -103,6 +103,8 @@ s = Staged(VersionedKV(), encoder=pickle.dumps, decoder=pickle.loads)
 | `encoder` | `Callable[..., bytes]` | `pickle.dumps` | Serializes values to bytes on commit |
 | `decoder` | `Callable[..., Any]` | `pickle.loads` | Deserializes bytes to values on read |
 
+`VersionedKV(store, branch=name)` opens (or creates) a branch; pass `create=False` to raise [`UnknownBranchError`](#unknownbrancherror) instead of minting a missing one.
+
 #### Chunked encoder/decoder
 
 `Staged` autodetects the encoder/decoder shape by signature:
@@ -162,7 +164,7 @@ s.commit(keys={"a"}, info={"message": "just a"})
 
 #### `merge(their_head, *, on_conflict="raise", merge_fns=None, merge_prefixes=None, default_merge=None, post_check=None, info=None) -> MergeResult`
 
-Merge another head — any commit in the store, usually another branch's HEAD — into this branch: lowest common ancestor, three-way resolve, two-parent merge commit guarded on your own head. Refuses with `ValueError` when the staging buffer holds uncommitted changes; commit or reset first.
+Merge another head — any commit in the store, usually another branch's HEAD — into this branch: lowest common ancestor (criss-cross ties go to the smallest hash), three-way resolve, two-parent merge commit guarded on your own head. Refuses with `ValueError` when the staging buffer holds uncommitted changes; commit or reset first.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -245,6 +247,8 @@ s.versioned.commit_info()              # info dict for current commit
 s.versioned.commit_info(some_hash)     # info dict for specific commit
 s.versioned.diff(hash_a, hash_b)       # DiffResult between two commits
 s.versioned.parents()                  # parent hashes of current commit
+s.versioned.merge_base(hash_a, hash_b) # lowest common ancestor, or None;
+                                       # criss-cross ties go to the smallest hash
 ```
 
 ### Properties
@@ -481,7 +485,7 @@ Always returns `theirs` (the HEAD value), re-encoded as the merged value. `kvgit
 
 #### `text_merge(*, ours_label="ours", theirs_label="theirs", strict=False) -> MergeFn`
 
-Marker merge for keys holding `str` or `bytes`: disjoint line changes merge cleanly, overlapping ones come back with git-style `<<<<<<<` markers under the given labels. `str` sides are encoded as UTF-8 for the merge and the result comes back as `str` when any side was `str`; a key whose values are `bytes` merges as bytes. With `strict=True` a conflict raises `CantMark` instead of marking, so the merge aborts rather than landing hunks. A value that is neither, and anything unmarkable — non-UTF-8 bytes, NUL bytes, inputs over the 1 MiB cap — raises `CantMark`, which the merge machinery files as an ordinary conflict.
+Marker merge for keys holding `str` or `bytes`: disjoint line changes merge cleanly, overlapping ones come back with git-style `<<<<<<<` markers under the given labels, which may not contain line breaks. `str` sides are encoded as UTF-8 for the merge and the result comes back as `str` when any side was `str`; a key whose values are `bytes` merges as bytes. With `strict=True` a conflict raises `CantMark` instead of marking, so the merge aborts rather than landing hunks. A value that is neither, and anything unmarkable — non-UTF-8 bytes, NUL bytes, inputs over the 1 MiB cap — raises `CantMark`, which the merge machinery files as an ordinary conflict.
 
 This is the one to register on a `Staged` for text. `kvgit.merges.text` below is the same merge over raw bytes.
 
@@ -491,7 +495,7 @@ For `VersionedKV`. Two of them also work through `Staged`, and the difference is
 
 #### `text(old, ours, theirs) -> bytes`
 
-Marker merge for line-oriented text over bytes: disjoint line changes merge cleanly, overlapping ones come back with git-style `<<<<<<<` markers. `make_text_merge(*, ours_label=, theirs_label=, strict=)` builds one with custom labels; `strict=True` raises `CantMark` instead of marking, so a true conflict aborts the commit rather than landing hunks. `text_merge_result(old, ours, theirs, *, ours_label=, theirs_label=)` runs the same merge and returns `(merged_bytes, conflicted)`, reporting reliably whether hunks were introduced even when the inputs contain marker-like lines. Anything unmarkable — non-UTF-8 bytes, NUL bytes, inputs over the 1 MiB cap — raises `CantMark`, which the merge machinery files as an ordinary conflict.
+Marker merge for line-oriented text over bytes: disjoint line changes merge cleanly, overlapping ones come back with git-style `<<<<<<<` markers. `make_text_merge(*, ours_label=, theirs_label=, strict=)` builds one with custom labels (no line breaks allowed in labels); `strict=True` raises `CantMark` instead of marking, so a true conflict aborts the commit rather than landing hunks. `text_merge_result(old, ours, theirs, *, ours_label=, theirs_label=)` runs the same merge and returns `(merged_bytes, conflicted)`, reporting reliably whether hunks were introduced even when the inputs contain marker-like lines. Anything unmarkable — non-UTF-8 bytes, NUL bytes, inputs over the 1 MiB cap — raises `CantMark`, which the merge machinery files as an ordinary conflict.
 
 #### `ours(old, our, their) -> MergeChoice`
 
@@ -507,7 +511,7 @@ Take their side, on the same terms.
 
 ### ConcurrencyError
 
-Raised when a CAS operation fails during `commit()`. Another writer updated HEAD between when this instance last read it and when the commit was attempted.
+Raised when a CAS operation fails during `commit()` and the failure is not mergeable. A single lost fast-forward race is retried once through the three-way merge path instead of raising, so this surfaces only when the merge itself can't resolve — no common ancestor, a second lost race — while a true conflict raises `MergeConflict` in `raise` mode (or abandons the branch untouched in `abandon` mode). Another writer updated HEAD between when this instance last read it and when the commit was attempted.
 
 ### UnknownBranchError
 

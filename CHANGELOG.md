@@ -5,6 +5,59 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Public `merge_base(a, b)`.** Lowest common ancestor of two commits,
+  or `None` if unrelated — exactly the base a merge of the two would
+  use, so callers can preview a merge's base without merging. (#44)
+
+- **Strict text merges and a conflict flag.** `make_text_merge(...,
+  strict=True)` raises `CantMark` instead of writing conflict markers,
+  for branches where a true conflict must abort the commit rather than
+  land hunks; `text_merge_result()` returns `(merged_bytes, conflicted)`
+  for callers that want the flag without catching. (#38)
+
+- **Commits retry a lost fast-forward race through the merge path.** A
+  HEAD move inside the fast-forward CAS window re-reads HEAD and merges
+  instead of raising `ConcurrencyError`, in both `raise` and `abandon`
+  modes — a lost race is never mistaken for a conflict, and the caller
+  never has to refresh (and drop staged work) to replay a mergeable
+  commit. A true conflict still raises/abandons, and a second lost race
+  still raises. (#39)
+
+- **Open branches without minting.** `VersionedKV(store, branch=name,
+  create=False)` raises `UnknownBranchError` (a `ValueError`) instead of
+  creating the branch, and lists nothing — reads after a delete no
+  longer resurrect the branch and block a later create. (#43)
+
+### Fixed
+
+- **True lowest common ancestor.** `_find_lca` was an alternating
+  bidirectional BFS returning the first frontier intersection, which is
+  not lowest in merge-heavy DAGs (merging the root into each branch
+  demoted the base from X back to R) and was argument-order dependent on
+  criss-crosses. Ancestor-set intersection with non-minimal candidates
+  dropped, computed in one bottom-up pass; ties resolve to the smallest
+  hash, documented on `merge_base`. (#47)
+
+- **Retry keeps its first attempt as our side.** Rebuilding the commit
+  after a lost CAS hashed identically but wrote different HAMT nodes,
+  stranding the first attempt's nodes where the sweep cannot find them;
+  the retry now merges from the already-built commit.
+
+- **Non-LF line endings survive clean merges; labels reject all line
+  breaks.** `_terminate` treats every `str.splitlines` boundary as
+  terminated instead of rewriting lone-CR endings to CRLF, and conflict
+  labels may not contain any of them — one consistent notion of line
+  break across split, terminate, and label validation.
+
+- **Retry restores pre-commit state when HEAD can't be re-read.** A
+  retry whose HEAD re-read returns `None` (branch deleted mid-race) or
+  rejects now restores the snapshot, so the failed commit leaves the
+  handle exactly as it found it.
+
 ## [0.3.8] - 2026-09-07
 
 ### Added
