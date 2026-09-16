@@ -27,6 +27,14 @@ from .versioned.protocol import BytesMergeFn, MergeChoice
 #: is a whole-file conflict by inspection anyway.
 MAX_MARK_BYTES = 1024 * 1024
 
+#: Line boundaries recognized by ``str.splitlines`` beyond ``"\n"``. A
+#: line ending in any of these is already terminated — gluing the next
+#: line after it re-splits to the same lines — so :func:`_terminate`
+#: leaves it alone, and labels may not contain any of them.
+_LINE_BOUNDARIES = frozenset(
+    ["\n", "\r", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"]
+)
+
 
 class CantMark(Exception):
     """A value cannot be marker-merged: not text, too big, or a conflict
@@ -72,15 +80,17 @@ def _changes(base: list[str], side: list[str]) -> list[tuple[int, int, list[str]
 
 
 def _terminate(lines: list[str]) -> list[str]:
-    """Ensure every non-final line ends with a newline.
+    """Ensure every non-final line ends with a line break.
 
-    A line without a trailing newline glued onto following output would
+    A line without a trailing break glued onto following output would
     corrupt both; clean regions stay byte-exact (a final line keeps its
-    missing newline), markers pay the newline tax.
+    missing break, and lines ending in a non-LF ``splitlines`` boundary
+    such as lone ``\\r`` are already terminated, so no ``\\n`` is added),
+    markers pay the newline tax.
     """
     fixed: list[str] = []
     for i, ln in enumerate(lines):
-        if not ln.endswith("\n") and i + 1 < len(lines):
+        if i + 1 < len(lines) and ln[-1:] not in _LINE_BOUNDARIES:
             ln += "\n"
         fixed.append(ln)
     return fixed
@@ -215,7 +225,7 @@ def _merge_lines(
 
 def _check_labels(ours_label: str, theirs_label: str) -> None:
     for name, label in (("ours_label", ours_label), ("theirs_label", theirs_label)):
-        if "\n" in label:
+        if any(boundary in label for boundary in _LINE_BOUNDARIES):
             raise ValueError(f"{name} may not contain a newline: {label!r}")
 
 
@@ -261,7 +271,8 @@ def make_text_merge(
 
     Labels ride git's positions (``<<<<<<< <ours>`` /
     ``>>>>>>> <theirs>``); pass branch names so conflicts read
-    attributably. Labels may not contain newlines.
+    attributably. Labels may not contain newlines (any ``str.splitlines``
+    boundary: LF, lone CR, VT/FF, FS/GS/RS, NEL, U+2028/2029).
 
     With ``strict=True`` the fn raises :class:`CantMark` instead of
     writing markers when sides conflict — for branches where a true
