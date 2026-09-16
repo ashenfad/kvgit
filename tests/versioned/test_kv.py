@@ -303,6 +303,60 @@ class TestFastForwardRace:
         with pytest.raises(ConcurrencyError):
             v2.commit({"mine": b"2"})
 
+    def test_retry_finding_branch_gone_restores_state(self):
+        """A retry whose HEAD re-read finds the branch deleted must
+        restore the pre-commit snapshot, not leave the handle pointed
+        at the uncommitted side commit."""
+        store = Memory()
+        v1 = Versioned(store)
+        v1.commit({"base": b"0"})
+        base_head = v1.current_commit
+        v2 = Versioned(store)
+        _race_once(v2, lambda: store.remove(BRANCH_HEAD % "main"))
+
+        with pytest.raises(ValueError, match="has no HEAD"):
+            v2.commit({"mine": b"2"})
+
+        assert v2.current_commit == base_head
+        assert v2.get("mine") is None
+        assert v2.get("base") == b"0"
+
+    def test_failing_head_reread_restores_state(self, monkeypatch):
+        """A retry whose HEAD re-read rejects restores the pre-commit
+        snapshot too, and the handle stays usable afterwards."""
+        store = Memory()
+        v1 = Versioned(store)
+        v1.commit({"base": b"0"})
+        base_head = v1.current_commit
+        v2 = Versioned(store)
+
+        # Fail the third HEAD read: the loser's initial read and the
+        # winner's read inside the race succeed, so the fault lands
+        # exactly on the retry's re-read. (A store-level fault would
+        # fire earlier, inside the CAS's own heal check.)
+        real_fget = Versioned.latest_head.fget
+        reads = {"n": 0}
+
+        @property
+        def flaky_head(self):
+            reads["n"] += 1
+            if reads["n"] > 2:
+                raise RuntimeError("transient storage boom")
+            return real_fget(self)
+
+        monkeypatch.setattr(Versioned, "latest_head", flaky_head)
+        _race_once(v2, lambda: v1.commit({"other": b"1"}))
+        with pytest.raises(RuntimeError, match="transient storage boom"):
+            v2.commit({"mine": b"2"})
+
+        assert v2.current_commit == base_head
+        assert v2.get("mine") is None
+        # The handle stays usable: reset the counter and commit cleanly.
+        reads["n"] = 0
+        result = v2.commit({"mine": b"2"})
+        assert result.merged
+        assert v2.get("mine") == b"2"
+
 
 class TestBranchOpen:
     """Issue #43: opening a branch by name must not mint it.
