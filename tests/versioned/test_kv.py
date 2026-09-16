@@ -6,6 +6,7 @@ from kvgit import (
     ConcurrencyError,
     MergeConflict,
     MergeResult,
+    UnknownBranchError,
     VersionedKV as Versioned,
 )
 from kvgit.encoding import dumps
@@ -301,6 +302,74 @@ class TestFastForwardRace:
         v2._cas_head = always_race
         with pytest.raises(ConcurrencyError):
             v2.commit({"mine": b"2"})
+
+
+class TestBranchOpen:
+    """Issue #43: opening a branch by name must not mint it.
+
+    Reads (including opens) after a delete must not resurrect the
+    branch and block a later create.
+    """
+
+    def test_open_missing_default_mints(self):
+        store = Memory()
+        v = Versioned(store, branch="dev")
+        assert "dev" in Versioned.branches(store)
+        assert v.current_branch == "dev"
+
+    def test_open_missing_create_false_raises_named_error(self):
+        store = Memory()
+        with pytest.raises(UnknownBranchError):
+            Versioned(store, branch="dev", create=False)
+
+    def test_named_error_is_a_value_error(self):
+        assert issubclass(UnknownBranchError, ValueError)
+
+    def test_create_false_mints_no_branch(self):
+        store = Memory()
+        with pytest.raises(UnknownBranchError):
+            Versioned(store, branch="dev", create=False)
+        # No branch head installed: nothing listed, nothing to block a
+        # later create. (Opening stamps the store version key; that
+        # predates create=False and names no branch.)
+        assert Versioned.branches(store) == []
+        assert store.get(BRANCH_HEAD % "dev") is None
+
+    def test_create_false_opens_existing(self):
+        store = Memory()
+        v = Versioned(store)
+        v.commit({"a": b"1"})
+        v2 = Versioned(store, branch="main", create=False)
+        assert v2.get("a") == b"1"
+
+    def test_exists(self):
+        store = Memory()
+        assert not Versioned.exists(store, "dev")
+        Versioned(store, branch="dev")
+        assert Versioned.exists(store, "dev")
+        assert not Versioned.exists(store, "nope")
+
+    def test_branch_exists_instance(self):
+        v = Versioned(Memory())
+        assert v.branch_exists("main")
+        assert not v.branch_exists("dev")
+
+    def test_delete_then_open_does_not_resurrect(self):
+        store = Memory()
+        v = Versioned(store)
+        v.create_branch("dev")
+        v.delete_branch("dev")
+        assert not Versioned.exists(store, "dev")
+        with pytest.raises(UnknownBranchError):
+            Versioned(store, branch="dev", create=False)
+        assert not Versioned.exists(store, "dev")
+        v.create_branch("dev")  # recreate unblocked
+        assert Versioned.exists(store, "dev")
+
+    def test_switch_branch_raises_named_error(self):
+        v = Versioned(Memory())
+        with pytest.raises(UnknownBranchError):
+            v.switch_branch("nope")
 
 
 class TestVersionedSharedStore:

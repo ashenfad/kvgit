@@ -52,6 +52,7 @@ def store(
     path: str | None = None,
     db_name: str = "kvgit",
     branch: str = "main",
+    create: bool = True,
     encoder: Callable[..., bytes] = pickle.dumps,
     decoder: Callable[..., Any] = pickle.loads,
     codecs: str | None = None,
@@ -66,6 +67,11 @@ def store(
         db_name: IndexedDB database name (default ``"kvgit"``).
             Only used when ``kind="indexeddb"``.
         branch: Branch name (default ``"main"``).
+        create: Mint the branch with an initial commit when it does not
+            exist (default ``True``). Pass ``False`` to raise
+            :class:`~kvgit.errors.UnknownBranchError` instead, so a
+            read after a delete cannot resurrect the branch and block
+            a later create.
         encoder: Value encoder (default ``pickle.dumps``).
         decoder: Value decoder (default ``pickle.loads``).
         codecs: Optional named codec preset. Currently supported:
@@ -106,6 +112,7 @@ def store(
         VersionedKV(
             backend,
             branch=branch,
+            create=create,
             recover_from_corrupt_head=recover_from_corrupt_head,
         ),
         encoder=encoder,

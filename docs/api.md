@@ -11,6 +11,7 @@ kvgit.store(
     path=None,           # required for "disk"
     db_name="kvgit",     # IndexedDB database name (only for "indexeddb")
     branch="main",
+    create=True,         # False raises UnknownBranchError instead of minting
     encoder=pickle.dumps,
     decoder=pickle.loads,
     codecs=None,         # named codec preset (mutually exclusive with encoder/decoder)
@@ -23,6 +24,7 @@ kvgit.store(
 | `path` | `str \| None` | `None` | Required for `"disk"` |
 | `db_name` | `str` | `"kvgit"` | IndexedDB database name. Only used with `"indexeddb"`. |
 | `branch` | `str` | `"main"` | Branch name |
+| `create` | `bool` | `True` | Mint the branch with an initial commit when missing. `False` raises `UnknownBranchError` instead, so a read after a delete cannot resurrect the branch. |
 | `encoder` | `Callable[..., bytes]` | `pickle.dumps` | Value encoder. Pass a `compose()` pair to enable [chunked codecs](#chunked-codecs). |
 | `decoder` | `Callable[..., Any]` | `pickle.loads` | Value decoder. |
 | `codecs` | `str \| None` | `None` | Named codec preset shortcut. Currently `"scientific"` (numpy + pandas chunked codecs). Mutually exclusive with explicit `encoder` / `decoder`. |
@@ -215,6 +217,7 @@ s.set_merge_fn("runs/counts/total", theirs)    # and this one exactly
 | `switch_branch` | `(name) -> None` | Switch to an existing branch (clears staged buffer). |
 | `delete_branch` | `(name) -> None` | Delete a branch and clean up orphaned commits. Cannot delete the current branch. |
 | `list_branches` | `() -> list[str]` | All branch names in the store. |
+| `branch_exists` | `(name) -> bool` | Whether a branch has a HEAD entry. Never writes, so it cannot resurrect a deleted branch. |
 | `peek` | `(key, *, branch=None, tag=None) -> Any \| None` | Read a decoded value from another branch's HEAD, or from a [tag](#tags). Exactly one of `branch` / `tag`. |
 | `reset_to` | `(commit_hash) -> bool` | Force HEAD to a specific commit. Returns `False` if not found. |
 
@@ -506,6 +509,10 @@ Take their side, on the same terms.
 
 Raised when a CAS operation fails during `commit()`. Another writer updated HEAD between when this instance last read it and when the commit was attempted.
 
+### UnknownBranchError
+
+Raised when opening with `create=False` (or switching to) a branch that does not exist. A subclass of `ValueError`.
+
 ### MergeConflict
 
 Raised when a three-way merge encounters keys changed by both sides with no merge function to resolve them.
@@ -652,6 +659,7 @@ v = VersionedKV(store, commit_hash="a1b2c3...")         # resume
 | `store` | `KVStore \| None` | `None` | Backend. Creates `Memory()` if None. |
 | `commit_hash` | `str \| None` | `None` | Resume from this commit. Reads HEAD if None. |
 | `branch` | `str` | `"main"` | Branch name. |
+| `create` | `bool` | `True` | Mint the branch with an initial commit when missing. `False` raises `UnknownBranchError` instead. |
 | `recover_from_corrupt_head` | `CorruptHeadRecoverer \| None` | `None` | Last-resort HEAD recovery, applied to every resolve this handle makes. `None` means a HEAD that is corrupt with no usable backup is unrecoverable. See [HEAD Recovery](#head-recovery). |
 
 All methods from the `Versioned` protocol are implemented. Additional:
@@ -660,6 +668,8 @@ All methods from the `Versioned` protocol are implemented. Additional:
 |--------------------|-------------|
 | `store` | Direct access to the underlying `KVStore` |
 | `branches(store)` | Static method: list branch names for a store. Excludes the reserved `refs/tags/` names that hold [tags](#tags). |
+| `exists(store, name)` | Static method: whether a branch has a HEAD entry. Never writes. |
+| `branch_exists(name)` | Whether a branch exists in this handle's store. |
 | `tag(name, *, at=None, info=None)` | Name a commit permanently — see [Tags](#tags). Also `tags()`, `tag_info(name)`, `delete_tag(name)`. Module-level `kvgit.versioned.kv.tags(store)` and `tag_info(store, name)` do the same without a handle. |
 | `clean_orphans(min_age=3600)` | Remove orphaned commits unreachable from any branch HEAD, along with the blobs and HAMT nodes they uniquely owned. **Does not reclaim chunks** — see below. Returns count of cleaned orphans. Only deletes commits older than `min_age` seconds. Safe under concurrent writers. |
 | `deep_clean(min_age=3600, *, grace=5.0, lease_ttl=600.0)` | `clean_orphans` plus a full scan of the `kvgit:keyset:` and `kvgit:chunk:` namespaces. The only pass that reclaims chunks, orphan-owned ones included. Runs under the store's GC lease, which every write path honours; raises [`GcBusy`](#gcbusy) if another deep clean holds one, and `ValueError` (writing nothing at all) for a store stamped too high. See below. |
