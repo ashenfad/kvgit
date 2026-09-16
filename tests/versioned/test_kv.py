@@ -4,6 +4,7 @@ import pytest
 
 from kvgit import (
     ConcurrencyError,
+    MergeChoice,
     MergeConflict,
     MergeResult,
     UnknownBranchError,
@@ -942,6 +943,66 @@ class TestThreeWayMerge:
 
         lca = v1._find_lca(h1, h2)
         assert lca == r_base.commit
+
+    def test_merge_root_into_branches_keeps_base(self):
+        """Issue #47: merging the root into each branch must not demote
+        the merge base from X back to R."""
+        store = Memory()
+        v = Versioned(store)
+        v.commit({})
+        root = v.current_commit
+        v.commit({"x": b"1"})
+        fork = v.current_commit
+        a = v.create_branch("a")
+        b = v.create_branch("b")
+        a.commit({"a": b"1"})
+        b.commit({"b": b"2"})
+        a.merge_heads(root)
+        b.merge_heads(root)
+
+        assert v.merge_base(a.current_commit, b.current_commit) == fork
+        assert v.merge_base(b.current_commit, a.current_commit) == fork
+
+    def test_criss_cross_base_is_deterministic(self):
+        """Two best ancestors: the smallest hash wins, whichever order
+        the commits are given in."""
+        store = Memory()
+        v = Versioned(store)
+        v.commit({})
+        fork_a = v.create_branch("pa")
+        fork_b = v.create_branch("pb")
+        fork_a.commit({"k": b"v1"})
+        fork_b.commit({"k": b"v2"})
+        p1, p2 = fork_a.current_commit, fork_b.current_commit
+        m = v.create_branch("m", at=p1)
+        m.merge_heads(p2, merge_fns={"k": MergeChoice.OURS})
+        q = v.create_branch("q", at=p2)
+        q.merge_heads(p1, merge_fns={"k": MergeChoice.OURS})
+
+        assert v.merge_base(m.current_commit, q.current_commit) == min(p1, p2)
+        assert v.merge_base(q.current_commit, m.current_commit) == min(p1, p2)
+
+    def test_criss_cross_merge_is_direction_independent(self):
+        """Both merge directions use the same base now, so they resolve
+        to the same value instead of each side winning its own merge."""
+        store = Memory()
+        v = Versioned(store)
+        v.commit({})
+        fork_a = v.create_branch("pa")
+        fork_b = v.create_branch("pb")
+        fork_a.commit({"k": b"v1"})
+        fork_b.commit({"k": b"v2"})
+        p1, p2 = fork_a.current_commit, fork_b.current_commit
+        m = v.create_branch("m", at=p1)
+        m.merge_heads(p2, merge_fns={"k": MergeChoice.OURS})
+        q = v.create_branch("q", at=p2)
+        q.merge_heads(p1, merge_fns={"k": MergeChoice.OURS})
+
+        fwd = v.create_branch("fwd", at=m.current_commit)
+        fwd.merge_heads(q.current_commit)
+        back = v.create_branch("back", at=q.current_commit)
+        back.merge_heads(m.current_commit)
+        assert fwd.get("k") == back.get("k")
 
     def test_commit_with_info(self):
         """Commit carries info."""

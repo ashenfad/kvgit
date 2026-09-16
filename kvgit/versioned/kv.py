@@ -65,6 +65,7 @@ import logging
 import os
 import time
 import uuid
+from collections import deque
 from collections.abc import Callable
 
 from ..encoding import dumps, loads, safe_loads
@@ -1584,41 +1585,71 @@ class VersionedKV(VersionedBase):
         return tuple(raw)
 
     def _find_lca(self, commit_a: str, commit_b: str) -> str | None:
-        """Find the lowest common ancestor of two commits."""
+        """Find the lowest common ancestor of two commits.
+
+        Ancestor-set intersection with non-minimal candidates dropped
+        (a candidate that is itself an ancestor of another candidate is
+        not lowest). When several commits tie for lowest — criss-cross
+        histories — the smallest hash wins: deterministic, but
+        arbitrary, so criss-cross merges resolve cleanly rather than
+        raising.
+        """
         if commit_a == commit_b:
             return commit_a
 
-        from collections import deque
+        parents: dict[str, tuple[str, ...]] = {}
+        ancestors_a = self._walk_ancestors(commit_a, parents)
+        # Fast path: b inside a's history (or vice versa) names the
+        # lowest directly — every other common ancestor sits above it.
+        if commit_b in ancestors_a:
+            return commit_b
+        ancestors_b = self._walk_ancestors(commit_b, parents)
+        if commit_a in ancestors_b:
+            return commit_a
 
-        seen_a: set[str] = {commit_a}
-        seen_b: set[str] = {commit_b}
-        queue_a: deque[str] = deque([commit_a])
-        queue_b: deque[str] = deque([commit_b])
+        common = ancestors_a & ancestors_b
+        if not common:
+            return None
+        # Minimality in one bottom-up pass: a candidate is lowest when
+        # no other candidate sits below it. Propagate "a candidate is
+        # at-or-below here" from tips to roots over the in-memory
+        # parent map — no further store reads, linear in the history.
+        children: dict[str, list[str]] = {node: [] for node in parents}
+        for node, node_parents in parents.items():
+            for parent in node_parents:
+                children[parent].append(node)
+        below: dict[str, bool] = dict.fromkeys(parents, False)
+        remaining = {node: len(kids) for node, kids in children.items()}
+        queue = deque(node for node, kids in children.items() if not kids)
+        while queue:
+            node = queue.popleft()
+            for parent in parents[node]:
+                if node in common or below[node]:
+                    below[parent] = True
+                remaining[parent] -= 1
+                if remaining[parent] == 0:
+                    queue.append(parent)
+        best = {c for c in common if not below[c]}
+        return min(best) if best else None
 
-        while queue_a or queue_b:
-            if queue_a:
-                current = queue_a.popleft()
-                if current in seen_b:
-                    return current
-                for p in self._load_parents(current):
-                    if p not in seen_a:
-                        seen_a.add(p)
-                        queue_a.append(p)
-                        if p in seen_b:
-                            return p
-
-            if queue_b:
-                current = queue_b.popleft()
-                if current in seen_a:
-                    return current
-                for p in self._load_parents(current):
-                    if p not in seen_b:
-                        seen_b.add(p)
-                        queue_b.append(p)
-                        if p in seen_a:
-                            return p
-
-        return None
+    def _walk_ancestors(
+        self, start: str, parents: dict[str, tuple[str, ...]]
+    ) -> set[str]:
+        """All ancestors of ``start`` (itself included), recording each
+        visited commit's parents in ``parents`` for later passes."""
+        ancestors = {start}
+        stack = [start]
+        while stack:
+            current = stack.pop()
+            if current in parents:
+                continue
+            node_parents = self._load_parents(current)
+            parents[current] = node_parents
+            for parent in node_parents:
+                if parent not in ancestors:
+                    ancestors.add(parent)
+                    stack.append(parent)
+        return ancestors
 
     def _read_blob(self, content_id: str) -> bytes | None:
         """Read a blob by its versioned key."""
