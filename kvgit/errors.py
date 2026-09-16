@@ -28,6 +28,15 @@ class MergeConflict(Exception):
         super().__init__(f"Merge conflict on keys: {keys_str}")
 
 
+class UnknownBranchError(ValueError):
+    """Raised when opening or switching to a branch that does not exist.
+
+    A subclass of ``ValueError``, so existing ``except ValueError``
+    handlers keep working. Open with ``create=True`` (the default) to
+    mint the branch instead.
+    """
+
+
 class GcBusy(Exception):
     """Raised when a deep clean cannot take the store's GC lease.
 

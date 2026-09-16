@@ -26,6 +26,24 @@ class TestStoreFactory:
         assert isinstance(s, Staged)
         assert s.versioned._branch == "dev"
 
+    def test_branch_create_false_raises_on_fresh_store(self):
+        from kvgit import UnknownBranchError
+
+        with pytest.raises(UnknownBranchError):
+            store(branch="dev", create=False)
+
+    def test_branch_create_false_opens_shared_disk_branch(self):
+        from kvgit import UnknownBranchError
+
+        with tempfile.TemporaryDirectory() as path:
+            s = store(kind="disk", path=path)
+            s["k"] = "v"
+            s.commit()
+            s_main = store(kind="disk", path=path, branch="main", create=False)
+            assert s_main.get("k") == "v"
+            with pytest.raises(UnknownBranchError):
+                store(kind="disk", path=path, branch="dev", create=False)
+
 
 class TestStoreFactoryRoundTrip:
     def test_set_commit_get(self):

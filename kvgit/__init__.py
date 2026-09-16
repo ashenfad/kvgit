@@ -1,7 +1,7 @@
 """kvgit: Versioned key-value store."""
 
 from .content_types import MergeFn, counter, last_writer_wins, text_merge
-from .errors import ConcurrencyError, GcBusy, MergeConflict
+from .errors import ConcurrencyError, GcBusy, MergeConflict, UnknownBranchError
 from .merges import (
     CantMark,
     TextMergeFn,
@@ -36,6 +36,7 @@ __all__ = [
     "Staged",
     "TagInfo",
     "TextMergeFn",
+    "UnknownBranchError",
     "Versioned",
     "VersionedKV",
     "counter",

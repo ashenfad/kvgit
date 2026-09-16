@@ -68,7 +68,7 @@ import uuid
 from collections.abc import Callable
 
 from ..encoding import dumps, loads, safe_loads
-from ..errors import GcBusy
+from ..errors import GcBusy, UnknownBranchError
 from ..hamt import EMPTY_HASH
 from ..kv.base import KVStore
 from ..kv.memory import Memory
@@ -1184,6 +1184,7 @@ class VersionedKV(VersionedBase):
         *,
         commit_hash: str | None = None,
         branch: str = "main",
+        create: bool = True,
         recover_from_corrupt_head: CorruptHeadRecoverer | None = None,
     ) -> None:
         if store is None:
@@ -1205,6 +1206,11 @@ class VersionedKV(VersionedBase):
             if commit_hash is None and store.get(BRANCH_HEAD % branch) is not None:
                 raise ValueError(f"Branch '{branch}' HEAD is corrupt and unrecoverable")
             if commit_hash is None:
+                if not create:
+                    raise UnknownBranchError(
+                        f"Branch '{branch}' does not exist "
+                        "(open with create=True to create it)"
+                    )
                 # Create initial empty commit
                 commit_hash = content_hash((), {}, {})
                 initial = {
@@ -1731,7 +1737,7 @@ class VersionedKV(VersionedBase):
         if commit_hash is None:
             if self.store.get(BRANCH_HEAD % name) is not None:
                 raise ValueError(f"Branch '{name}' HEAD is corrupt and unrecoverable")
-            raise ValueError(f"Branch '{name}' does not exist")
+            raise UnknownBranchError(f"Branch '{name}' does not exist")
         self._branch = name
         self._load_commit(commit_hash, update_base=True)
 
@@ -1815,6 +1821,25 @@ class VersionedKV(VersionedBase):
     def list_branches(self) -> list[str]:
         """List all branch names in the store."""
         return VersionedKV.branches(self.store)
+
+    @staticmethod
+    def exists(store: KVStore, name: str) -> bool:
+        """Whether a branch exists — openable without creating.
+
+        The same predicate :meth:`branches` lists by: the branch has a
+        HEAD entry. Reserved ``refs/tags/`` names are never branches,
+        so they read as missing here as they are excluded there. A
+        damaged HEAD still counts as existing; opening it raises either
+        way. Never writes, so checking cannot resurrect a deleted
+        branch.
+        """
+        if not isinstance(name, str) or name.startswith(TAG_BRANCH_PREFIX):
+            return False
+        return store.get(BRANCH_HEAD % name) is not None
+
+    def branch_exists(self, name: str) -> bool:
+        """Whether a branch exists in this handle's store."""
+        return VersionedKV.exists(self.store, name)
 
     # -- Tags --
 
