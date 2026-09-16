@@ -45,6 +45,14 @@ class TestCleanMerges:
     def test_no_trailing_newline_preserved(self):
         assert text(b"a\nb", b"a\nB", b"a\nb") == b"a\nB"
 
+    def test_non_lf_endings_preserved_on_clean_merge(self):
+        """Lines ending in a non-LF splitlines boundary (lone CR here)
+        are already terminated: gluing the next line after one re-splits
+        to the same lines, so a clean merge must not rewrite them to
+        CRLF."""
+        base = b"a\rb\rc\r"
+        assert text(base, b"a\rB\rc\r", b"a\rb\rC\r") == b"a\rB\rC\r"
+
     def test_empty_inputs(self):
         assert text(b"", b"", b"") == b""
 
@@ -78,6 +86,34 @@ class TestConflicts:
     def test_label_newline_rejected(self):
         with pytest.raises(ValueError):
             make_text_merge(ours_label="a\nb")
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            "a\rb",
+            "a\vb",
+            "a\fb",
+            "a\x1cb",
+            "a\x1db",
+            "a\x1eb",
+            "a\x85b",
+            "a\u2028b",
+            "a\u2029b",
+        ],
+    )
+    def test_label_other_line_breaks_rejected(self, bad):
+        """Every str.splitlines boundary can split a marker line for some
+        consumer, so labels may not contain any of them — not just LF."""
+        with pytest.raises(ValueError):
+            make_text_merge(ours_label=bad)
+        with pytest.raises(ValueError):
+            make_text_merge(theirs_label=bad)
+
+    def test_conflict_markers_over_cr_content(self):
+        """Conflict markers still arrive newline-terminated while CR
+        content lines pass through byte-exact."""
+        out = text(b"a\rb\rc\r", b"a\rB\rc\r", b"a\rX\rc\r")
+        assert out == b"a\r<<<<<<< ours\nB\r=======\nX\r>>>>>>> theirs\nc\r"
 
     def test_deterministic(self):
         args = (BASE, b"a\nX\nc\nd\n", b"a\nY\nc\nd\n")
