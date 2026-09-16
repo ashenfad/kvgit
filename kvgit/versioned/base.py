@@ -119,7 +119,12 @@ class VersionedBase(ABC):
         return self._load_parents(target)
 
     def merge_base(self, commit_a: str, commit_b: str) -> str | None:
-        """Lowest common ancestor of two commits, or None if unrelated."""
+        """Lowest common ancestor of two commits, or None if unrelated.
+
+        When several commits tie for lowest (criss-cross histories),
+        the smallest hash wins — deterministic, but arbitrary. This is
+        exactly the base a merge of the two commits would use.
+        """
         return self._find_lca(commit_a, commit_b)
 
     # -- Commit orchestration --
