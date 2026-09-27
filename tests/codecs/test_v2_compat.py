@@ -1,13 +1,13 @@
-"""Tests for v2 ↔ v3 store compatibility.
+"""Tests for opening v2 stores and for chunked entries.
 
 The contract:
 
-* v3 code can open a v2 store transparently.
-* No write happens until a chunked write is performed; a v2 store
-  with only pickle writes stays v2.
+* Current code opens a v2 store transparently, and opening writes
+  nothing: the stamp moves only when a commit lands (see
+  ``tests/test_storage_v4.py`` for stores written by a released kvgit).
 * Chunked entries and plain entries coexist in the same store.
-* Importing values from a v2 source into a v3 target naturally
-  dedups equal buffers — the migration win.
+* Importing values from a store without chunks into one with a chunked
+  codec naturally dedups equal buffers — the migration win.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ from kvgit.codecs.numpy import NumpyCodec
 from kvgit.encoding import dumps, safe_loads
 from kvgit.kv.memory import Memory
 from kvgit.versioned.kv import (
+    BLOB_STORAGE_VERSION,
     CHUNK_PREFIX,
     CHUNK_STORAGE_VERSION,
     STORAGE_VERSION_KEY,
@@ -35,33 +36,27 @@ def chunked_pair():
 class TestV2StoreOpenedByV3Code:
     def test_open_existing_v2_store_no_stamp_change(self):
         store = Memory()
-        # Pre-existing v2 store with some plain pickle data.
         store.set(STORAGE_VERSION_KEY, dumps(2))
-        s_old = Staged(VersionedKV(store))
-        s_old["greeting"] = "hello"
-        s_old.commit()
-        assert safe_loads(store.get(STORAGE_VERSION_KEY)) == 2
 
-        # New code (v3) opens the same store.
-        s_new = Staged(VersionedKV(store))
-        # Stamp is preserved.
+        s = Staged(VersionedKV(store))
         assert safe_loads(store.get(STORAGE_VERSION_KEY)) == 2
-        assert s_new["greeting"] == "hello"
+        assert list(s.keys()) == []
 
-    def test_chunked_codec_first_write_upgrades(self):
+    def test_first_commit_stamps_v4_and_chunks_keep_it(self):
         store = Memory()
         store.set(STORAGE_VERSION_KEY, dumps(2))
 
         s = Staged(VersionedKV(store))
         s["x"] = "plain"
         s.commit()
-        assert safe_loads(store.get(STORAGE_VERSION_KEY)) == 2
+        assert safe_loads(store.get(STORAGE_VERSION_KEY)) == BLOB_STORAGE_VERSION
 
         encoder, decoder = chunked_pair()
         s2 = Staged(VersionedKV(store), encoder=encoder, decoder=decoder)
         s2["arr"] = np.arange(2048, dtype="float64")
         s2.commit()
-        assert safe_loads(store.get(STORAGE_VERSION_KEY)) == CHUNK_STORAGE_VERSION
+        assert safe_loads(store.get(STORAGE_VERSION_KEY)) == BLOB_STORAGE_VERSION
+        assert BLOB_STORAGE_VERSION >= CHUNK_STORAGE_VERSION
 
     def test_mixed_pickle_and_chunked_entries_coexist(self):
         encoder, decoder = chunked_pair()

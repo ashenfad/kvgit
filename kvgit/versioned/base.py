@@ -233,10 +233,9 @@ class VersionedBase(ABC):
                 self._restore_state(saved)
                 raise
             # Keep the commit just built as our side of the merge rather
-            # than restoring and rebuilding it: a rebuild hashes
-            # identically (created_at is not in the commit hash) but
-            # writes different HAMT nodes, orphaning the first attempt's
-            # nodes where clean_orphans cannot find them.
+            # than restoring and rebuilding it: a rebuild would mint a
+            # second commit for the same change (the hash covers the
+            # commit time) and leave the first one behind as an orphan.
             ours_built = True
 
         # Three-way merge path

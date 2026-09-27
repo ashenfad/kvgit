@@ -12,7 +12,7 @@ from kvgit import (
 )
 from kvgit.encoding import dumps
 from kvgit.kv.memory import Memory
-from kvgit.versioned.kv import BRANCH_HEAD
+from kvgit.versioned.kv import BRANCH_HEAD, _load_root, blob_key
 
 
 class TestVersionedBasic:
@@ -65,14 +65,14 @@ class TestVersionedBasic:
         assert v.current_commit == initial
 
     def test_content_addressable(self):
-        """Same changes on same parent produce same hash."""
-        store = Memory()
-        v1 = Versioned(store)
-        r1 = v1.commit({"k": b"v"})
-
-        v2 = Versioned(Memory())
-        r2 = v2.commit({"k": b"v"})
-        assert r1.commit == r2.commit
+        """Same changes on the same parent produce the same keyset root
+        and the same blob; the commit hash covers the time as well."""
+        store1, store2 = Memory(), Memory()
+        r1 = Versioned(store1).commit({"k": b"v"})
+        r2 = Versioned(store2).commit({"k": b"v"})
+        assert r1.commit != r2.commit
+        assert _load_root(store1, r1.commit) == _load_root(store2, r2.commit)
+        assert blob_key(b"v") in store1.keys() and blob_key(b"v") in store2.keys()
 
 
 class TestVersionedUpdatesAndRemovals:

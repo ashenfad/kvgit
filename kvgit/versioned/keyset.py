@@ -28,10 +28,17 @@ class MetaEntry:
     "this blob is opaque (e.g. plain pickle) — no chunks to track".
     Stored only when non-empty so v2-format entries stay
     byte-identical and remain readable by older code.
+
+    ``created_at`` is only ever set on entries written before storage
+    v4. Everything an entry holds must follow from the blob's bytes,
+    so that identical content gives identical HAMT nodes; a timestamp
+    made every node unique to the moment it was written. Old entries
+    keep theirs, so a subtree nobody touched re-encodes to the bytes
+    it was stored as.
     """
 
     size: int | None
-    created_at: float
+    created_at: float | None = None
     chunks: list[str] | None = None
 
 
@@ -54,7 +61,9 @@ def encode_entry(entry: KeysetEntry) -> bytes:
     inherently a new format and require new code to read.
     """
     meta = entry.meta
-    meta_dict: dict = {"size": meta.size, "created_at": meta.created_at}
+    meta_dict: dict = {"size": meta.size}
+    if meta.created_at is not None:
+        meta_dict["created_at"] = meta.created_at
     if meta.chunks:
         meta_dict["chunks"] = list(meta.chunks)
     return json.dumps([entry.blob, meta_dict], separators=(",", ":")).encode()
@@ -67,7 +76,7 @@ def decode_entry(raw: bytes) -> KeysetEntry:
         blob=blob,
         meta=MetaEntry(
             size=meta_dict.get("size"),
-            created_at=meta_dict["created_at"],
+            created_at=meta_dict.get("created_at"),
             chunks=meta_dict.get("chunks"),
         ),
     )

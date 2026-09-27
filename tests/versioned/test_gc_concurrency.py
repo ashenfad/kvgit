@@ -267,10 +267,15 @@ class TestSharedStructure:
         reader = Staged(VersionedKV(store))
         assert [reader[f"key{i:03d}"] for i in range(60)] == list(range(60))
 
-        # The orphan's own, unshared nodes are gone.
+        # The orphan's own, unshared nodes are content: the incremental
+        # sweep leaves them, and a deep clean takes them.
         unshared = dev_nodes - main_nodes
         assert unshared
+        assert not missing_nodes(store, dev_commit, unshared)
+        deep_clean(store, min_age=3600, grace=0)
         assert missing_nodes(store, dev_commit, unshared) == sorted(unshared)
+        assert not missing_nodes(store, main_commit, main_nodes)
+        assert [reader[f"key{i:03d}"] for i in range(60)] == list(range(60))
 
     def test_two_orphans_sharing_a_subtree_collect_cleanly(self):
         """Overlapping orphans may name the same hash twice; that's fine."""
@@ -343,13 +348,13 @@ class TestDamagedOrphans:
 
 class TestOrdinaryGarbage:
     def test_orphan_payload_is_still_collected(self):
-        """The fix must not turn GC into a no-op.
+        """Each sweep reclaims what it may, and together they reclaim all.
 
-        Every commit-scoped class an orphan owns — commit metadata,
-        blob, HAMT nodes — is still reclaimed by the incremental
-        sweep. Only the content-addressed chunk is left for
-        ``deep_clean``; both directions of that contract are asserted
-        here so a regression in either shows up.
+        The incremental sweep takes the orphan's commit metadata and
+        leaves its content — blob, HAMT nodes, chunks — because another
+        commit's identical bytes are the same keys. ``deep_clean`` takes
+        the content. Both directions are asserted so a regression in
+        either shows up.
         """
         store = Memory()
         s = Staged(VersionedKV(store), encoder=chunky_encoder, decoder=chunky_decoder)
@@ -363,7 +368,7 @@ class TestOrdinaryGarbage:
         dev_root = _load_root(store, dev_commit)
         dev_nodes = node_hashes(store, dev_commit)
         dev_chunks = set(chunk_keys(store)) - live_chunks
-        dev_blob = f"{dev_commit}:dev_only"
+        dev_blob = dev.versioned._commit_keys["dev_only"]
         assert dev_chunks
         assert store.get(dev_blob) is not None
 
@@ -373,13 +378,10 @@ class TestOrdinaryGarbage:
 
         assert store.get(COMMIT_ROOT % dev_commit) is None
         assert store.get(COMMIT_TIME % dev_commit) is None
-        assert store.get(dev_blob) is None, "orphan blob not collected"
-        assert store.get(NODE_PREFIX + str(dev_root)) is None, (
-            "orphan HAMT root not collected"
-        )
-        assert missing_nodes(store, dev_commit, dev_nodes) == sorted(dev_nodes)
+        assert store.get(dev_blob) is not None
+        assert not missing_nodes(store, dev_commit, dev_nodes)
         assert [k for k in dev_chunks if store.get(k) is None] == [], (
-            "the incremental sweep must not delete chunks — another "
+            "the incremental sweep must not delete content — another "
             "commit's identical bytes hash to the same key"
         )
 
@@ -390,6 +392,11 @@ class TestOrdinaryGarbage:
 
         # The other direction: a maintenance pass does reclaim them.
         deep_clean(store, min_age=0, grace=0)
+        assert store.get(dev_blob) is None, "orphan blob not collected"
+        assert store.get(NODE_PREFIX + str(dev_root)) is None, (
+            "orphan HAMT root not collected"
+        )
+        assert missing_nodes(store, dev_commit, dev_nodes) == sorted(dev_nodes)
         assert [k for k in dev_chunks if store.get(k) is not None] == [], (
             "deep_clean must reclaim what the incremental sweep left"
         )
