@@ -157,3 +157,11 @@ class TestKeysByPrefix:
         store.set_many({"é/a": b"", "é/b": b"", "ê": b"", "e": b"", "🔑/x": b""})
         assert sorted(store.keys("é/")) == ["é/a", "é/b"]
         assert list(store.keys("🔑")) == ["🔑/x"]
+
+    def test_prefixes_ending_at_the_last_code_point(self, store):
+        top = chr(0x10FFFF)
+        store.set_many(
+            {f"a{top}": b"", f"a{top}x": b"", "b": b"", top: b"", f"{top}y": b""}
+        )
+        assert sorted(store.keys(f"a{top}")) == [f"a{top}", f"a{top}x"]
+        assert sorted(store.keys(top)) == [top, f"{top}y"]

@@ -890,7 +890,7 @@ s = Staged(VersionedKV(backend))
 
 Keys are a `text COLLATE "C"` primary key, so `keys(prefix)` is an index range scan; values are `bytea`. Every method but `cas_many` is one statement on an autocommit connection — one round trip, atomic on its own — and batch writes go in key order, so concurrent batches upserting overlapping keys cannot deadlock.
 
-`cas_many` is one transaction: a transaction-scoped advisory lock per expected key, all taken by one statement in a fixed order, then the check, then the writes. The locks serialize every batch expecting the same key — including one expecting it absent, which no row lock could cover — and the check, a statement of its own after the locks, reads the latest committed values under READ COMMITTED. The statements are pipelined, so a batch costs two round trips; a statement that fails rolls the batch back.
+`cas_many` is one transaction that locks every expected key with Postgres's own row locking, so no write to it — by any method, `set` and `remove` included — can land between the check and the batch. A key expected to hold a value is read `FOR UPDATE`; a key expected absent gets a placeholder row inserted, which a concurrent insert of the same key must wait on (and if the row already exists, the check fails). Then come the writes, and the removal of placeholders the batch does not write. The statements are pipelined, so a batch costs two round trips. A write Postgres aborts to break a deadlock is retried; one that fails otherwise is rolled back.
 
 `close()` closes the pool if the store opened it; `drop()` drops the table.
 
