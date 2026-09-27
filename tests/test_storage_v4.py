@@ -337,7 +337,7 @@ class TestSweepingAMixedStore:
         assert store.get(f"{orphan}:gone_only") is None
         check_every_branch(store, manifest)
 
-    def test_a_content_orphan_waits_for_deep_clean(self):
+    def test_a_content_orphan_goes_with_its_commit(self):
         store, manifest = load_v3()
         main = Staged(VersionedKV(store))
         scratch = main.create_branch("scratch")
@@ -347,8 +347,6 @@ class TestSweepingAMixedStore:
         main.delete_branch("scratch")
 
         clean_orphans(store, min_age=0)
-        assert store.get(pointer) is not None
-        deep_clean(store, min_age=0, grace=0)
         assert store.get(pointer) is None
         check_every_branch(store, manifest)
 
@@ -369,7 +367,7 @@ class TestSweepingAMixedStore:
         shared.commit()
         main.delete_branch("shared")
 
-        deep_clean(store, min_age=0, grace=0)
+        deep_clean(store, min_age=0)
         assert store.get(blob_key(pickled(3))) is not None
         assert values(Staged(VersionedKV(store))) == live
         dev_only = {"dev": manifest["branches"]["dev"]}

@@ -52,9 +52,9 @@ class Memory(KVStore):
         with self._lock:
             return list(self.memory.items())
 
-    def keys(self) -> Iterable[str]:
+    def keys(self, prefix: str = "") -> Iterable[str]:
         with self._lock:
-            return list(self.memory.keys())
+            return [k for k in self.memory if k.startswith(prefix)]
 
     def __contains__(self, key: str) -> bool:
         with self._lock:
@@ -70,15 +70,20 @@ class Memory(KVStore):
             for key in keys:
                 self.memory.pop(key, None)
 
-    def cas(self, key: str, value: bytes, expected: bytes | None) -> bool:
-        if not isinstance(value, bytes):
-            raise TypeError(f"Expected bytes, got {type(value).__name__}")
+    def cas_many(
+        self,
+        expected: Mapping[str, bytes | None],
+        writes: Mapping[str, bytes],
+        removes: Iterable[str] = (),
+    ) -> bool:
+        removes = self._check_batch(writes, removes)
         with self._lock:
-            current = self.memory.get(key)
-            if current == expected:
-                self.memory[key] = value
-                return True
-            return False
+            if any(self.memory.get(k) != v for k, v in expected.items()):
+                return False
+            self.memory.update(writes)
+            for key in removes:
+                self.memory.pop(key, None)
+            return True
 
     def clear(self) -> None:
         with self._lock:

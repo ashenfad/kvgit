@@ -15,7 +15,6 @@ from kvgit.versioned.kv import (
     _resolve_head,
     blob_key,
     clean_orphans,
-    deep_clean,
 )
 
 
@@ -131,10 +130,9 @@ class TestDeleteBranches:
             assert not os.path.exists(p)
 
     def test_min_age_zero_reclaims_immediately(self):
-        """min_age=0 lets an admin who knows the store is quiet reclaim
-        a just-committed branch's commits in the same call, instead of
-        waiting out the one-hour concurrent-writer guard. Its blob is
-        content, which only a deep clean takes back."""
+        """min_age=0 reclaims a just-committed branch in the same call,
+        commits and content both, instead of waiting out the one-hour
+        default."""
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "store")
             s = store(kind="disk", path=p)
@@ -154,8 +152,6 @@ class TestDeleteBranches:
             s2 = store(kind="disk", path=p)
             backend = s2.versioned.store
             assert backend.get(COMMIT_ROOT % dev_commit) is None
-            assert backend.get(pointer) is not None
-            deep_clean(backend, min_age=0, grace=0)
             assert backend.get(pointer) is None
 
     def test_reopen_after_delete_not_locked(self):
@@ -171,9 +167,9 @@ class TestDeleteBranches:
 
 class TestSharedOrphanSweep:
     def test_orphan_gc_reclaims_deleted_branch_blobs(self):
-        """The shared sweep takes the deleted branch's commits; a deep
-        clean takes its unique blobs. Uses min_age=0 to bypass the age
-        guard on fresh commits."""
+        """The shared sweep takes the deleted branch's commits and its
+        unique blobs. Uses min_age=0 to bypass the age guard on fresh
+        commits."""
         backend = Memory()
         v = VersionedKV(backend)  # main
         dev = v.create_branch("dev")
@@ -188,8 +184,6 @@ class TestSharedOrphanSweep:
 
         assert removed >= 1
         assert backend.get(COMMIT_ROOT % dev.current_commit) is None
-        assert backend.get(pointer) is not None  # content: deep clean's job
-        deep_clean(backend, min_age=0, grace=0)
         assert backend.get(pointer) is None
 
     def test_module_clean_orphans_matches_instance(self):

@@ -28,6 +28,7 @@ exactly and repeats identically.
 
 from __future__ import annotations
 
+import threading
 import time
 
 import pytest
@@ -46,7 +47,6 @@ from kvgit.versioned.kv import (
     _resolve_head,
     blob_key,
     clean_orphans,
-    deep_clean,
     recover_by_commit_scan,
     repair_head,
 )
@@ -70,8 +70,9 @@ class HookStore(Memory):
       — after its writer has read HEAD, before it reaches its CAS.
     * ``arm_get`` fires after a chosen key's value has been read but
       before the caller sees it, on the *nth* read of that key.
-    * ``arm_set`` fires before a chosen key is written, so a writer can
-      be paused mid-sequence while another completes.
+    * ``arm_set`` fires before a chosen key is written — alone, or as
+      part of an atomic batch — so a writer can be paused while another
+      completes.
 
     Both are points every version of the code passes through, so a test
     written against them means the same thing before and after a fix.
@@ -136,11 +137,20 @@ class HookStore(Memory):
         for key, value in items.items():
             self._record(key, value)
 
-    def cas(self, key: str, value: bytes, expected: bytes | None) -> bool:
-        won = super().cas(key, value, expected)
-        if won:
-            self._record(key, value)
-        return won
+    def cas_many(self, expected, writes, removes=()) -> bool:
+        fn = self._on_commit_batch
+        if fn is not None and any(k.startswith(ROOT_PREFIX) for k in writes):
+            self._on_commit_batch = None
+            fn()
+        for key in writes:
+            armed = self._on_set.pop(key, None)
+            if armed is not None:
+                armed()
+        applied = super().cas_many(expected, writes, removes)
+        if applied:
+            for key, value in writes.items():
+                self._record(key, value)
+        return applied
 
 
 def age_commits(store, seconds: float) -> None:
@@ -254,15 +264,13 @@ class TestPrevHeadInvariant:
             f"(history: {history})"
         )
 
-    def test_crash_between_cas_and_backup_degrades_to_an_older_head(self):
-        """The crash window costs a commit, never an invented lineage.
+    def test_a_crash_cannot_separate_head_from_its_backup(self):
+        """HEAD and its backup move in one write, or neither moves.
 
-        Writing the backup after the CAS opens a window where HEAD has
-        advanced but the backup has not. Recovery from that state lands
-        on the *previous* previous HEAD — one commit further back than
-        ideal, but a commit that really was HEAD, with real ancestry.
-        That is the trade this ordering buys, and the store offers no
-        multi-key atomicity that would avoid the trade.
+        A process that dies at the publishing write leaves the branch
+        exactly as it was: HEAD on the previous commit, the backup on
+        the one before that. There is no state with HEAD advanced and
+        the backup stale.
         """
         store = HookStore()
         v = VersionedKV(store)
@@ -274,30 +282,15 @@ class TestPrevHeadInvariant:
         class Died(Exception):
             """Stands in for the process dying mid-commit."""
 
-        prev_key = BRANCH_HEAD_PREV % "main"
-        real_set = store.set
+        def die():
+            raise Died
 
-        def dying_set(key, value):
-            if key == prev_key:
-                raise Died
-            real_set(key, value)
-
-        store.set = dying_set  # type: ignore[method-assign]
+        store.arm_set(BRANCH_HEAD_PREV % "main", die)
         with pytest.raises(Died):
             v.commit({"a": b"3"})
-        store.set = real_set  # type: ignore[method-assign]
 
-        third = loads(store.get(BRANCH_HEAD % "main"))
-        assert third not in (first, second), "the CAS should have landed"
-        assert loads(store.get(prev_key)) == first, (
-            "the backup should still hold its pre-crash value"
-        )
-
-        # HEAD is then damaged; recovery lands on a real, older HEAD.
-        store.set(BRANCH_HEAD % "main", b"")
-        recovered = _resolve_head(store, "main")
-        assert recovered == first
-        assert recovered in store.head_history["main"]
+        assert loads(store.get(BRANCH_HEAD % "main")) == second
+        assert loads(store.get(BRANCH_HEAD_PREV % "main")) == first
 
 
 class TestReadsDoNotWrite:
@@ -400,8 +393,8 @@ class TestLostCasGarbage:
 
         Nothing is deleted inline. The loser's blobs and HAMT nodes are
         keyed by content, so the winner may legitimately share them.
-        The incremental sweep collects the orphan commit once it ages
-        past ``min_age``; its content waits for ``deep_clean``.
+        The sweep collects the orphan commit, and whatever content only
+        it held, once it ages past ``min_age``.
 
         A lost fast-forward race is retried through the merge path, so
         a conflicting loser surfaces ``MergeConflict`` rather than
@@ -441,8 +434,6 @@ class TestLostCasGarbage:
         age_commits(store, 10_000)
         assert clean_orphans(store, min_age=3600) == 1
         assert store.get(COMMIT_ROOT % orphan) is None
-        assert store.get(blob_key(b"loser")) is not None  # content
-        deep_clean(store, min_age=3600, grace=0)
         assert store.get(blob_key(b"loser")) is None
 
         live = VersionedKV(store)
@@ -498,15 +489,21 @@ class TestAbsentHeadCannotRecover:
     Recovery tiers exist for a HEAD that is *present and unusable*.
     ``delete_branch`` removes the key, so an absent HEAD means the
     branch is gone — and a backup that outlives it must not bring it
-    back. Writing the backup after the CAS opened a route to exactly
-    that: a writer descheduled between the two, resuming after a
-    concurrent delete, recreates only the backup.
+    back. Writing the backup after the CAS once opened a route to
+    exactly that: a writer descheduled between the two, resuming after a
+    concurrent delete, recreated only the backup.
 
     Reviving a branch from a lone backup is the v0.3.1 failure class,
     reached from a new direction.
     """
 
-    def test_a_delayed_backup_does_not_resurrect_a_deleted_branch(self):
+    def test_a_writer_racing_a_delete_cannot_bring_the_branch_back(self):
+        """A publish that loses to a delete writes nothing at all.
+
+        HEAD and its backup land in one conditional write, so a writer
+        whose branch is deleted just before it publishes cannot leave a
+        backup behind to resurrect it.
+        """
         store = HookStore()
         VersionedKV(store).commit({"anchor": b"1"})
         doomed = VersionedKV(store, branch="doomed")
@@ -515,19 +512,14 @@ class TestAbsentHeadCannotRecover:
         def delete_it_mid_write():
             VersionedKV(store).delete_branch("doomed")
 
-        # Pause the winner between its CAS and its backup write.
+        # Delete the branch just before the writer's publishing write.
         store.arm_set(BRANCH_HEAD_PREV % "doomed", delete_it_mid_write)
-        doomed.commit({"secret": b"classified-v2"})
+        with pytest.raises(ValueError, match="no HEAD"):
+            doomed.commit({"secret": b"classified-v2"})
 
         assert store.get(BRANCH_HEAD % "doomed") is None, "the delete should have won"
-        assert store.get(BRANCH_HEAD_PREV % "doomed") is not None, (
-            "this test is only meaningful while the delayed write recreates "
-            "the backup; if that stops happening, the seam has drifted"
-        )
-        assert _resolve_head(store, "doomed") is None, (
-            "a backup outliving its branch resurrected it — the deleted "
-            "branch's state is readable again"
-        )
+        assert store.get(BRANCH_HEAD_PREV % "doomed") is None
+        assert _resolve_head(store, "doomed") is None
 
     def test_a_corrupt_but_present_head_still_recovers(self):
         """The gate must not cost the tier its actual purpose."""
@@ -572,21 +564,18 @@ class TestAbsentHeadCannotRecover:
         assert store.get(BRANCH_HEAD_PREV % "revived") is None
 
 
-class TestConcurrencyLimitsOfTheBackup:
-    """What writing the backup after the CAS does *not* buy.
+class TestTheBackupIsExact:
+    """The backup names the commit HEAD held immediately before.
 
-    The swap and the backup write are two steps. Anything that separates
-    them — a crash, or simply losing the CPU while another writer
-    completes both of its own — lets the older writer's backup land
-    last. The invariant that survives is the narrower one: the backup
-    names a commit HEAD really held. "Exactly one commit back" is not a
-    guarantee, and these pin that so the docs are not quietly re-widened.
+    HEAD and ``__branch_head_prev__`` are written in one atomic write
+    conditioned on HEAD, so however writers interleave, the backup is
+    always HEAD's immediate predecessor on this branch.
     """
 
-    def test_a_paused_winner_can_clobber_a_newer_backup(self):
+    def test_a_paused_writer_publishes_with_the_right_backup(self):
         store = HookStore()
         writer = VersionedKV(store)
-        first = writer.commit({"k": b"1"}).commit
+        writer.commit({"k": b"1"})
 
         landed = {}
 
@@ -594,28 +583,18 @@ class TestConcurrencyLimitsOfTheBackup:
             other = VersionedKV(store)
             landed["third"] = other.commit({"k2": b"3"}).commit
 
-        # Pause the winner between its successful CAS and its backup write.
+        # Pause the writer just before its publishing write; another
+        # writer publishes first, so this one merges and publishes after.
         store.arm_set(BRANCH_HEAD_PREV % "main", other_writer_advances)
-        second = writer.commit({"k": b"2"}).commit
+        result = writer.commit({"k": b"2"})
 
         head = loads(store.get(BRANCH_HEAD % "main"))
         prev = loads(store.get(BRANCH_HEAD_PREV % "main"))
         history = store.head_history["main"]
 
-        assert head == landed["third"], "the later writer should hold HEAD"
-        assert prev != second, (
-            "this pins the limitation, not the ideal: the paused winner's "
-            "backup landed last"
-        )
-        assert prev == first
-        # The guarantee that does survive.
-        assert prev in history, (
-            f"prev-HEAD {prev} was never HEAD (history: {history}) — the "
-            f"invariant this ordering exists to protect is broken"
-        )
-        assert history.index(prev) < history.index(head), (
-            "the backup must name a commit older than HEAD, not a sibling"
-        )
+        assert result.strategy == "three_way"
+        assert head == result.commit
+        assert prev == landed["third"] == history[-2]
 
 
 class TestRepairHeadReturnValue:
@@ -687,6 +666,7 @@ class TestRedoMintsANewCommit:
         assert _load_root(store, v.current_commit) == _load_root(store, second)
 
     def test_a_redo_under_a_sweep_loses_nothing(self):
+        """A writer that starts mid-sweep waits for it, then lands whole."""
         store = HookStore()
         v = VersionedKV(store)
         v.commit({"a": b"1"})
@@ -696,14 +676,15 @@ class TestRedoMintsANewCommit:
         v.reset_to(first)
         age_commits(store, 10_000)
 
-        # Fire once the sweep has read the orphan's age and believes it
-        # old: the writer then redoes the same change onto the branch.
+        # Once the sweep has read the orphan's age and believes it old,
+        # another thread redoes the same change onto the branch.
         redone: list[str] = []
-        store.arm_get(
-            COMMIT_TIME % second,
-            lambda: redone.append(v.commit({"a": b"2"}).commit),
+        writer = threading.Thread(
+            target=lambda: redone.append(v.commit({"a": b"2"}).commit)
         )
+        store.arm_get(COMMIT_TIME % second, writer.start)
         assert clean_orphans(store, min_age=3600) == 1
+        writer.join(timeout=10)
 
         assert store.get(COMMIT_ROOT % second) is None
         assert redone and redone[0] != second

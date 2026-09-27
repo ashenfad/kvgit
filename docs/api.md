@@ -62,7 +62,7 @@ kvgit.delete_branches(
 | `db_name` | `str` | `"kvgit"` | IndexedDB database name. Only used with `"indexeddb"`. |
 | `min_age` | `float` | `3600` | Passed to the orphan sweep — commits younger than this many seconds survive. `0` reclaims immediately (only when no concurrent writers). |
 
-Each name's `__branch_head__` and its `__branch_head_prev__` recovery backup are removed (the backup too, so a later same-named branch can't resurrect the deleted state), then a single [`clean_orphans`](#orphan-cleanup) sweep — at `min_age` (default: the one-hour concurrent-writer guard) — reclaims commits only the deleted branches referenced. That sweep does not reclaim content — blobs, HAMT nodes, chunks (see [Orphan Cleanup](#orphan-cleanup)); follow with `deep_clean` to give that space back. Deleting every branch is legal; the store mints a fresh empty `main` on next open. [Tags](#tags) are branch heads under a reserved name, so a tagged commit survives the deletion of every ordinary branch that reached it — the sweep marks from it like any other head.
+Each name's `__branch_head__` and its `__branch_head_prev__` recovery backup are removed (the backup too, so a later same-named branch can't resurrect the deleted state), then a single [`clean_orphans`](#orphan-cleanup) sweep — at `min_age` (default: the one-hour concurrent-writer guard) — reclaims commits only the deleted branches referenced, with the content only they held. Deleting every branch is legal; the store mints a fresh empty `main` on next open. [Tags](#tags) are branch heads under a reserved name, so a tagged commit survives the deletion of every ordinary branch that reached it — the sweep marks from it like any other head.
 
 ---
 
@@ -530,7 +530,7 @@ Both sides writing the *same* bytes to a key is not a conflict, and needs no mer
 
 ### GcBusy
 
-Raised by `deep_clean()` when another deep clean holds an unexpired lease on the store. Nothing is swept and the holder's lease is left alone. Retry later; the lease carries an expiry, so a holder that dies without releasing it blocks nothing past that point. See [Orphan Cleanup](#orphan-cleanup).
+Raised by `deep_clean()` when another sweep holds an unexpired lease on the store. Nothing is swept and the holder's lease is left alone. Retry later; the lease carries an expiry, so a holder that dies without releasing it blocks nothing past that point. See [Orphan Cleanup](#orphan-cleanup).
 
 ---
 
@@ -617,7 +617,7 @@ The first chunked write lazily upgrades a store from v2 to v3:
 | `kvgit:chunk:<hash>` | Content-addressed chunk bytes |
 | `MetaEntry.chunks` (per key) | List of chunk hashes referenced by that key's blob |
 
-Chunk reclamation belongs to [`deep_clean`](#orphan-cleanup) alone. Because a chunk key is a bare content hash, an orphan's chunk may be the very key a concurrent writer's new commit just deduped onto, so `clean_orphans` leaves chunks in place — see [Content is not reclaimed by `clean_orphans()`](#content-is-not-reclaimed-by-clean_orphans). `deep_clean` marks `MetaEntry.chunks` from every reachable commit plus any commit younger than `min_age` (in-flight writer protection), then sweeps the rest.
+Chunks are reclaimed like all content: a sweep marks `MetaEntry.chunks` from every live commit — reachable, in flight, or younger than `min_age` — and takes an orphan's chunks that nothing live references. See [Orphan Cleanup](#orphan-cleanup).
 
 * **Mixed entries**: a single store can hold both plain-pickle and chunked entries; dispatch is per-entry based on whether `MetaEntry.chunks` is populated.
 * **Migration**: import values from a store without chunks into a fresh chunked target (`new[k] = old[k]; new.commit()`). Equal buffers across the source's keys collapse into one chunk in the target -- you get retroactive dedup as a side effect of the copy.
@@ -688,8 +688,8 @@ All methods from the `Versioned` protocol are implemented. Additional:
 | `exists(store, name)` | Static method: whether a branch has a HEAD entry. Never writes. |
 | `branch_exists(name)` | Whether a branch exists in this handle's store. |
 | `tag(name, *, at=None, info=None)` | Name a commit permanently — see [Tags](#tags). Also `tags()`, `tag_info(name)`, `delete_tag(name)`. Module-level `kvgit.versioned.kv.tags(store)` and `tag_info(store, name)` do the same without a handle. |
-| `clean_orphans(min_age=3600)` | Remove orphaned commits unreachable from any branch HEAD, along with blobs from before v4 that only they referenced. **Does not reclaim content** — v4 blobs, HAMT nodes, chunks — see below. Returns count of cleaned orphans. Only deletes commits older than `min_age` seconds. |
-| `deep_clean(min_age=3600, *, grace=5.0, lease_ttl=600.0)` | `clean_orphans` plus a full scan of the `kvgit:blob:`, `kvgit:keyset:` and `kvgit:chunk:` namespaces. The only pass that reclaims content, orphan-owned content included. Runs under the store's GC lease, which every write path honours; raises [`GcBusy`](#gcbusy) if another deep clean holds one, and `ValueError` (writing nothing at all) for a store stamped too high. See below. |
+| `clean_orphans(min_age=3600)` | Remove orphaned commits unreachable from any branch HEAD, with the blobs, nodes and chunks only they held. Returns count of cleaned orphans. Only deletes commits older than `min_age` seconds; safe beside concurrent writers at any `min_age`. Runs under the store's GC lease, waiting for another sweep's. See below. |
+| `deep_clean(min_age=3600, *, lease_ttl=600.0)` | `clean_orphans` plus a full scan of the `kvgit:blob:`, `kvgit:keyset:` and `kvgit:chunk:` namespaces, for content no commit references. Raises [`GcBusy`](#gcbusy) if another sweep holds the lease, and `ValueError` (writing nothing at all) for a store stamped too high. See below. |
 | `repair_head()` | Persist a recovered HEAD for this branch. Reads recover a damaged HEAD in memory without writing it back; this is the explicit call that makes the recovery durable. Returns the commit HEAD now names, or `None` if nothing was recoverable. See [HEAD Recovery](#head-recovery). |
 
 ### HEAD Recovery
@@ -730,23 +730,17 @@ v.repair_head()                                  # or:
 kvgit.versioned.kv.repair_head(store, "main")    # no handle needed
 ```
 
-**The backup only ever names a commit HEAD really held.** `__branch_head_prev__` is written after a HEAD swap succeeds, never before. Written first it would land whether or not the swap did, so a writer losing a race would leave its own stale value as the branch's recovery target — and where that value came from a recoverer, a commit that was never HEAD at all, which recovery would then graft onto the branch as a lineage it never had. It does **not** guarantee a backup exactly one commit back. The swap and the backup write are two steps, and anything that separates them — a crash, or simply losing the CPU while another writer completes both of its own — lets the older writer's backup land last, leaving HEAD two or more commits ahead of it. Recovery then skips whatever came between. That is the deliberate trade: recovering to an older real HEAD loses commits, recovering to a commit that was never HEAD loses the branch. No backend offers a CAS spanning two keys, so the two writes cannot be made one.
+**The backup is exactly the previous HEAD.** `__branch_head_prev__` is written in the same atomic `cas_many` that moves HEAD, conditioned on HEAD holding the value being backed up. So the backup always names the commit HEAD held immediately before its current one — never a losing writer's stale value, never a commit that was never HEAD — and a crash cannot leave one moved without the other. Deleting a branch removes both keys in one call, so a backup cannot outlive its branch either. (Stores written by older kvgit, which wrote the two separately, can still hold a backup older than one commit back, or one with no HEAD; resolution never serves a backup whose HEAD is absent.)
 
 ### Orphan Cleanup
 
-When branches are deleted, the commits they referenced may become unreachable ("orphaned"). `delete_branch()` automatically calls `clean_orphans()` after removing the branch HEAD. The default `min_age=3600` (1 hour) decides which unreachable commits are old enough to delete; orphans from deleted branches are cleaned up by subsequent `clean_orphans()` calls once they age past the guard.
+When branches are deleted, the commits they referenced may become unreachable ("orphaned"). `delete_branch()` automatically calls `clean_orphans()` after removing the branch HEAD. The default `min_age=3600` (1 hour) decides which unreachable commits are old enough to delete; orphans from deleted branches are cleaned up by subsequent `clean_orphans()` calls once they age past it.
 
 Reachability is decided by walking live branch heads. [Tags](#tags) need no special case: a tag is a branch head under a reserved name, so it keeps its commit's whole ancestry alive by being walked with everything else.
 
-`clean_orphans()` finds everything it deletes by walking the keyset of each orphan commit it is removing, and deletes only what an orphan alone can own: its commit metadata, and blobs from before v4, whose `<commit_hash>:<key>` keys no later commit can write. Anything shared with a reachable commit — or with a young orphan inside the `min_age` window, which protects in-flight writers — is left alone. Because candidates come only from orphan keysets and never from a namespace scan, a commit made by another writer *while the sweep is running* can never contribute a deletion candidate. A commit younger than `min_age` is never deleted, which is what protects one whose writer has written it but not yet published it; at `min_age=0` nothing does, so reserve that for a store with no concurrent writers.
+`clean_orphans()` finds everything it deletes by walking the keyset of each orphan commit it is removing, and deletes the orphan's commit metadata and whatever in its keyset — blobs, HAMT nodes, chunks — nothing live shares. "Live" is every commit the mark phase saw: reachable from a branch head or tag, in flight (below), or an orphan younger than `min_age`. Content is keyed by what it holds, so an orphan's blob may be the very key a live commit uses; what makes deleting it safe is that the sweep runs under the [GC lease](#the-gc-lease), which no commit batch can land beside, so the mark phase has seen every commit that could point at it.
 
-#### A lost CAS leaves garbage, and that is the safe outcome
-
-A commit writes its blobs, HAMT nodes, chunks and metadata *before* it attempts the CAS that advances HEAD. A writer that loses that race leaves all of it behind, and nothing deletes it inline. That is deliberate, not an oversight: the loser's blobs, nodes and chunks are content-addressed, so the winning commit may legitimately share them, and deleting what a loser wrote is the same hazard that keeps `clean_orphans()` off content entirely.
-
-The leftovers are ordinary orphans and are collected on the ordinary path. Commit metadata goes once the commit ages past `min_age`; its content waits for `deep_clean()`, like all content. There is no retry loop and no inline cleanup, so a store under heavy CAS contention accumulates orphan commits between sweeps.
-
-You can call it manually:
+`min_age` is policy alone — how long abandoned work lingers before it is taken — and any value is safe beside concurrent writers, `0` included.
 
 ```python
 v = VersionedKV(store)
@@ -754,65 +748,59 @@ cleaned = v.clean_orphans()            # default: only orphans older than 1 hour
 cleaned = v.clean_orphans(min_age=0)   # delete unreachable commits immediately
 ```
 
-The cleanup is safe for shared commit histories (e.g., forked branches). Blobs referenced by any reachable commit are never deleted.
+#### A lost CAS leaves garbage, and that is the safe outcome
 
-#### Content is not reclaimed by `clean_orphans()`
-
-Blobs (`kvgit:blob:<sha256>`), HAMT nodes (`kvgit:keyset:<hash>`) and chunks (`kvgit:chunk:<hash>`) are keyed on what they hold and nothing else, so two unrelated commits share them whenever their bytes match. An orphan's blob and a blob written by a commit made one microsecond ago are the *same key*, and the sweep never scanned that commit — scoping the walk to orphan keysets cannot help, because the key genuinely is in the orphan's tree.
-
-So `clean_orphans()` deletes no content at all. This is correctness by construction rather than by narrowing a window: re-validating just before the delete would shrink the race to microseconds without closing it, and locking content deletion would close it at the cost of stalling writers. Blobs written before v4 are the exception: their `<commit_hash>:<key>` keys belong to one commit, which no later commit can write, so the incremental sweep takes those.
-
-The cost is that routine GC gives back only commit metadata: a deleted branch's content stays on disk until a maintenance pass. `deep_clean()` reclaims it; schedule one.
+A commit writes its blobs, HAMT nodes, chunks and metadata *before* it publishes the HEAD that makes it reachable. A writer that loses the race to publish leaves its commit behind — kept as one side of the merge it retries through, or, if it gives up, withdrawn from flight and left as an ordinary orphan. Nothing deletes it inline: its content is shared by key with whatever else holds the same bytes, so only a sweep, which sees every live commit, can tell what is safe to take.
 
 #### `deep_clean()` — reclaiming commit-less artifacts
 
-`deep_clean()` does everything `clean_orphans()` does and then scans the whole `kvgit:blob:`, `kvgit:keyset:` and `kvgit:chunk:` namespaces, deleting anything not reachable from a live branch head or a young orphan. That scan reaches two things the incremental sweep cannot: **all content**, per the section above, and any blob, node or chunk that *no* commit references — leftovers from interrupted writes, from crashes between a write and its CAS, and from stores swept by an earlier kvgit, which have no keyset to be found through.
+`deep_clean()` does everything `clean_orphans()` does and then scans the whole `kvgit:blob:`, `kvgit:keyset:` and `kvgit:chunk:` namespaces, deleting anything not reachable from a live commit. That scan reaches what no orphan keyset points at — leftovers from crashes and interrupted writes, and from stores swept by an earlier kvgit. Run it as an occasional maintenance pass; `clean_orphans()` is the routine one.
 
 ```python
 v = VersionedKV(store)
 v.deep_clean()   # or kvgit.versioned.kv.deep_clean(store)
 ```
 
+`deep_clean()` raises [`GcBusy`](#gcbusy) if another sweep holds the lease; `clean_orphans()`, which runs inside `delete_branch()`, waits for it instead.
+
 ##### The GC lease
 
-The namespace scan deletes anything the mark phase did not see, so no write batch may be in flight while it runs. `deep_clean()` establishes that itself rather than asking the caller to promise it.
+A sweep deletes whatever its mark phase did not see, so it is only correct if no commit it should have seen can appear while it runs. Every sweep establishes that itself rather than asking the caller to promise it.
 
 The lease lives in one reserved key, `__gc_lease__`, holding `{"owner": <opaque id>, "expires": <unix time>}`. Absent, expired, or bytes that do not decode all mean "no live lease"; any of those may be taken over by a CAS against exactly those bytes, so two sweeps racing the same dead lease cannot both win.
 
 | Step | What happens |
 |------|--------------|
 | Version check | Refuse a store stamped above the layout this code reads, *before* touching the lease key, so such a store comes out of the call with nothing written to it. |
-| Acquire | CAS the lease key. A live lease held by someone else raises [`GcBusy`](#gcbusy) and sweeps nothing. |
-| Grace | Sleep `grace` seconds (default 5). Writes that read the lease just before it was taken land during this pause. |
-| Sweep | Mark and sweep, namespace scans included, protecting commits stamped within `grace` of acquisition (below). |
-| Release | In a `finally`: CAS our own bytes to an expired record. A failed release means the lease was already reclaimed by someone else, and theirs is left alone. |
+| Acquire | CAS the lease key. `deep_clean()` raises [`GcBusy`](#gcbusy) on a live lease held by someone else; `clean_orphans()` waits it out. |
+| Sweep | Mark from in-flight markers, then branch heads, then young orphans; delete the rest. |
+| Release | In a `finally`: CAS our own bytes to an expired record carrying our owner id. A failed release means the lease was already reclaimed by someone else, and theirs is left alone. |
 
-Writers hold up their end with one `get`. Every path that writes something the scan can delete — or that makes a commit reachable — reads the lease immediately before its write and, if a live one is held, polls until it is released or its term runs out:
+Writers hold up their end inside the store's own atomicity. Every path that writes something a sweep could delete — or that makes a commit reachable — reads the lease, waits while a live one is held, and then writes with a [`cas_many`](#compare-and-swap) that expects the lease key to still hold the bytes it read:
 
 | Path | What it writes |
 |------|----------------|
-| `commit()` fast-forward and merge batches | Nodes, blobs, chunks, commit metadata |
-| `commit()` / `merge()` HEAD advance | `__branch_head__<branch>` |
+| `commit()` fast-forward and merge batches | Nodes, blobs, chunks, commit metadata, in-flight marker |
 | `create_branch(name, at=...)` | `__branch_head__<name>` |
-| `reset_to(commit)` | `__branch_head__<branch>` |
-| `tag(name, at=...)` | `__branch_head__refs/tags/<name>` |
-| corrupt-HEAD repair (`repair_head()`, and the retry inside a losing CAS) | `__branch_head__<branch>` |
+| `reset_to(commit)` | `__branch_head__<branch>` and its backup |
+| `tag(name, at=...)` | `__branch_head__refs/tags/<name>` and `__tag_info__<name>` |
+| corrupt-HEAD repair (`repair_head()`, and the retry inside a losing publish) | `__branch_head__<branch>` |
 
-The head writes wait *before* checking their target commit exists, so the check and the write see the same store. `create_branch(at=...)`, `reset_to` and `tag` aimed at a commit a concurrent sweep collects therefore report it gone rather than installing a head that names nothing.
+Every acquisition writes a fresh owner id and release writes an expired record rather than deleting the key, so bytes a writer read before a sweep can never match again: a sweep that starts after the read makes the write fail, and the writer waits and tries again. The head writes check their target commit exists and write the head against the same lease record, so `create_branch(at=...)`, `reset_to` and `tag` aimed at a commit a concurrent sweep collects report it gone rather than installing a head that names nothing.
 
-`clean_orphans()` takes no lease — it is safe beside a writer by construction — but it does wait one out before its own removals, since two sweeps deleting at once reclaim nothing extra.
+`lease_ttl` (default 600 seconds) bounds what a crashed holder costs: writers wait out a lease's remaining term and no longer. A sweep that outlives its own lease is **not** extended silently — it finishes, logs a warning at `kvgit.orphans` naming the overrun, and during that window writers are free to write. Set `lease_ttl` above the longest sweep this store has taken.
+
+The price is that writers wait while a sweep runs, including the mark phase, which walks every live commit's keyset once; on a large store, schedule sweeps for quiet moments.
 
 ##### Commits between their write batch and their HEAD advance
 
-A commit lands in two steps: the `set_many` that writes its nodes, blobs, chunks and metadata, and — later — the CAS that makes it a branch HEAD, or the three-way merge that folds it into one. In between it is fully written and completely unreachable, which is indistinguishable from garbage; at `min_age=0` a mark phase landing in that gap would delete a commit whose writer is about to publish it.
+A commit lands in two steps: the batch that writes its nodes, blobs, chunks and metadata, and — later — the write that publishes it as a branch HEAD, or the three-way merge that folds it into one. In between it is fully written and unreachable from every head.
 
-So the sweep keeps every unreachable commit stamped at or after `lease acquisition - grace`: its nodes, blobs and chunks are marked and its metadata left in place, regardless of `min_age`. The two guards answer different questions — `min_age` is the caller's policy on how long abandoned work lingers, this bound is the lease's own correctness rule — so the bound applies even at `min_age=0`.
+So the batch also writes an in-flight marker, `__inflight__<commit>`, holding the time its protection lapses (`IN_FLIGHT_TTL`, 600 seconds), and the publishing write removes it in the same atomic step that moves HEAD. A sweep reads the markers *before* the branch heads: a commit published after its marker was read is under a head read later, and one published before has no marker to miss. So a commit in flight is marked live whatever `min_age` says, and a sweep never deletes a commit whose writer is about to publish it — or whose writer is still reading it back, as the merge path does.
 
-**The one assumption:** a writer's whole window, from reading the lease to the CAS that advances HEAD, is shorter than `grace`. A writer slower than that — descheduled, or on a backend where one `set_many` can stall for seconds — can still lose its nodes and chunks. Five seconds is generous for an in-memory or local-disk store; raise it for a slow or remote backend.
+A writer that abandons its attempt withdraws its markers; one that dies leaves them, and they lapse, after which the next sweep takes the commit like any other orphan. The publishing write also expects each marker to hold the bytes its writer wrote, so a writer that took longer than `IN_FLIGHT_TTL` to publish — whose marker lapsed and may have been reaped along with its commit — gets an error instead of a head over a commit that is gone.
 
-`lease_ttl` (default 600 seconds) bounds what a crashed holder costs: writers wait out a lease's remaining term and no longer, so a process that dies mid-sweep stalls the store until its expiry and then no further. A sweep that outlives its own lease is **not** extended silently — it finishes, logs a warning at `kvgit.orphans` naming the overrun, and during that window writers are free to write. Set `lease_ttl` above the longest sweep this store has taken.
-
-**A writer that does not read the lease is still exposed**, which is the shape the hazard always had: an older kvgit, or a process editing the backend directly, commits mid-sweep and the scan takes its nodes. Every process touching a store you deep-clean needs a version that honours the lease.
+**A writer that bypasses kvgit is still exposed**: a process editing the backend directly, or an older kvgit (which the storage version stamp locks out), can land writes a sweep never saw.
 
 ---
 
@@ -830,17 +818,22 @@ from kvgit.kv.base import KVStore
 | `set` | `(key, value) -> None` | Set a value |
 | `get_many` | `(*keys) -> Mapping[str, bytes]` | Batch get; only existing keys |
 | `set_many` | `(**kwargs) -> None` | Batch set |
-| `keys` | `() -> Iterable[str]` | All keys |
+| `keys` | `(prefix="") -> Iterable[str]` | All keys, or those starting with `prefix` |
 | `items` | `() -> Iterable[tuple[str, bytes]]` | All key-value pairs |
 | `__contains__` | `(key) -> bool` | Check existence |
 | `remove` | `(key) -> None` | Remove (no-op if missing) |
 | `remove_many` | `(*keys) -> None` | Batch remove |
-| `cas` | `(key, value, expected) -> bool` | Atomic compare-and-swap |
+| `cas_many` | `(expected, writes, removes=()) -> bool` | Atomic conditional batch |
+| `cas` | `(key, value, expected) -> bool` | One-key compare-and-swap (provided) |
 | `clear` | `() -> None` | Remove all entries |
 
 ### Compare-and-swap
 
-`cas(key, value, expected)` sets `key` to `value` only if the current value equals `expected`. Pass `expected=None` to require the key not exist. Returns `True` on success. This is the foundation of kvgit's optimistic concurrency.
+`cas_many(expected, writes, removes=())` applies `writes` and `removes` atomically if and only if every key in `expected` currently holds its value — `None` meaning "must not exist" — and returns `True`; otherwise it changes nothing and returns `False`. No other writer's change may land between the check and the write. This is the foundation of kvgit's concurrency: every commit batch expects the GC lease record, and every publish expects the branch HEAD while moving it, writing its backup and removing the commit's in-flight marker in one step.
+
+`cas(key, value, expected)` is the one-key case, provided by the base class on top of `cas_many`.
+
+A backend implements `cas_many` with whatever multi-key atomicity it has: a lock (`Memory`), a SQLite transaction (`Disk`), one `readwrite` transaction (`IndexedDB`), or — outside kvgit — a Postgres transaction, a Redis `MULTI`/`WATCH`, a DynamoDB transactional write. `keys(prefix)` lets a backend with an ordered index answer the sweep's and the branch listing's prefix scans without reading every key; `Memory` and `Disk` filter, `IndexedDB` asks for a key range.
 
 ---
 

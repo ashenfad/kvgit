@@ -7,24 +7,18 @@ but visible to the sweep phase, so its HAMT nodes and chunks were
 deleted while its ``__commit_root__`` (fixed at the earlier scan)
 survived — a live branch HEAD pointing at missing nodes.
 
-The seam here is deterministic: ``ScanHookStore`` counts ``keys()``
-calls and runs a callback after the Nth one. ``clean_orphans`` makes
-its scans in a fixed order, so "commit between the commit-root scan
-and the node scan" is expressible as "run the writer after keys()
-call #2" with no sleeps and no real threads.
-
-Scoping the sweep to orphan keysets closed that for nodes and blobs,
-which are commit-scoped, but not for chunks: a chunk key is a bare
-content hash, so an orphan's chunk and a new commit's chunk are the
-same key. ``TestChunkDedupRace`` pins that, and the fix — the
-incremental sweep does not delete chunks at all.
+Every sweep now runs under the GC lease, and every commit batch lands
+only while no lease is held, so a writer that starts mid-sweep waits for
+the sweep to finish. The seam here is deterministic: ``ScanHookStore``
+counts ``keys()`` calls and runs a callback after the Nth one, and the
+tests start a writer thread from inside the sweep at the worst moment
+the old code had, then check that its commit comes through whole.
 """
 
 from __future__ import annotations
 
+import threading
 import time
-
-import pytest
 
 from kvgit import Staged, VersionedKV
 from kvgit.encoding import dumps
@@ -44,10 +38,11 @@ from kvgit.versioned.kv import (
 
 NODE_PREFIX = Keyset.DEFAULT_PREFIX
 
-# Scan order inside clean_orphans: (1) branch heads, (2) __commit_root__,
-# (3) kvgit:keyset:, (4) kvgit:chunk:. A writer that lands after #2 is
-# invisible to the mark phase but visible to #3 and #4.
-AFTER_COMMIT_ROOT_SCAN = 2
+# Scan order inside a sweep: (1) in-flight markers, (2) branch heads,
+# (3) __commit_root__, then on the deep path (4) kvgit:keyset:,
+# (5) kvgit:chunk:, (6) kvgit:blob:. A writer that landed after #3 would
+# be invisible to the mark phase and visible to everything after it.
+AFTER_COMMIT_ROOT_SCAN = 3
 
 
 class ScanHookStore(Memory):
@@ -72,8 +67,8 @@ class ScanHookStore(Memory):
         self.keys_calls = 0
         self.hooks[nth] = fn
 
-    def keys(self):
-        snapshot = super().keys()
+    def keys(self, prefix: str = ""):
+        snapshot = super().keys(prefix)
         self.keys_calls += 1
         hook = self.hooks.pop(self.keys_calls, None)
         if hook is not None:
@@ -81,20 +76,16 @@ class ScanHookStore(Memory):
         return snapshot
 
 
-class LeaseBlindStore(ScanHookStore):
-    """Scan-hook store whose ``get`` never reports the GC lease.
+def in_a_thread(fn):
+    """A seam callback that starts ``fn`` on its own thread.
 
-    Stands in for a writer that does not honour the lease — an older
-    kvgit, or anything editing the backend directly. ``cas`` still sees
-    the real value, so a deep clean takes and releases the lease
-    normally; only the pre-write check that would make a writer wait
-    comes back empty.
+    A writer run on the sweep's own thread would wait on the lease the
+    sweep holds, forever. Started from the seam instead, it begins at
+    exactly the moment the seam marks and runs as a real concurrent
+    writer; ``started.join()`` collects it once the sweep has returned.
     """
-
-    def get(self, key: str) -> bytes | None:
-        if key == GC_LEASE_KEY:
-            return None
-        return super().get(key)
+    started = threading.Thread(target=fn)
+    return started.start, started
 
 
 def node_hashes(store, commit_hash: str) -> set[str]:
@@ -137,13 +128,13 @@ def chunky_decoder(raw: bytes, reader):
 
 class TestNodeRace:
     def test_commit_landing_mid_sweep_keeps_its_nodes(self):
-        """A commit made between the root scan and the node scan survives.
+        """A commit started between the root scan and the delete survives.
 
-        Without the fix the node scan sees the new commit's HAMT nodes,
-        finds them absent from the mark phase's reachable set, and
-        deletes them — while the commit's ``__commit_root__``, chosen
-        from the earlier snapshot, is left in place. The branch HEAD
-        then names a commit whose keyset cannot be loaded.
+        Unguarded, the writer's HAMT nodes would land after the mark
+        phase, count as unreachable and be deleted, while its
+        ``__commit_root__`` stayed — a branch HEAD naming a keyset that
+        cannot be loaded. Under the lease the writer waits for the sweep
+        and lands after it.
         """
         store = ScanHookStore()
         s = Staged(VersionedKV(store))
@@ -160,8 +151,10 @@ class TestNodeRace:
             landed["commit"] = other.commit().commit
             landed["nodes"] = node_hashes(store, landed["commit"])
 
-        store.arm(AFTER_COMMIT_ROOT_SCAN, concurrent_writer)
+        start, writer = in_a_thread(concurrent_writer)
+        store.arm(AFTER_COMMIT_ROOT_SCAN, start)
         clean_orphans(store, min_age=3600)
+        writer.join(timeout=10)
 
         head = _resolve_head(store, "main")
         assert head == landed["commit"], "the concurrent commit should be HEAD"
@@ -196,8 +189,10 @@ class TestNodeRace:
             landed["commit"] = other.commit().commit
             landed["chunks"] = set(chunk_keys(store)) - before
 
-        store.arm(AFTER_COMMIT_ROOT_SCAN, concurrent_writer)
+        start, writer = in_a_thread(concurrent_writer)
+        store.arm(AFTER_COMMIT_ROOT_SCAN, start)
         clean_orphans(store, min_age=3600)
+        writer.join(timeout=10)
 
         head = _resolve_head(store, "main")
         assert head == landed["commit"]
@@ -267,15 +262,10 @@ class TestSharedStructure:
         reader = Staged(VersionedKV(store))
         assert [reader[f"key{i:03d}"] for i in range(60)] == list(range(60))
 
-        # The orphan's own, unshared nodes are content: the incremental
-        # sweep leaves them, and a deep clean takes them.
+        # The orphan's own, unshared nodes are gone.
         unshared = dev_nodes - main_nodes
         assert unshared
-        assert not missing_nodes(store, dev_commit, unshared)
-        deep_clean(store, min_age=3600, grace=0)
         assert missing_nodes(store, dev_commit, unshared) == sorted(unshared)
-        assert not missing_nodes(store, main_commit, main_nodes)
-        assert [reader[f"key{i:03d}"] for i in range(60)] == list(range(60))
 
     def test_two_orphans_sharing_a_subtree_collect_cleanly(self):
         """Overlapping orphans may name the same hash twice; that's fine."""
@@ -348,13 +338,11 @@ class TestDamagedOrphans:
 
 class TestOrdinaryGarbage:
     def test_orphan_payload_is_still_collected(self):
-        """Each sweep reclaims what it may, and together they reclaim all.
+        """The fix must not turn GC into a no-op.
 
-        The incremental sweep takes the orphan's commit metadata and
-        leaves its content — blob, HAMT nodes, chunks — because another
-        commit's identical bytes are the same keys. ``deep_clean`` takes
-        the content. Both directions are asserted so a regression in
-        either shows up.
+        Everything an orphan alone holds — commit metadata, blob, HAMT
+        nodes, chunks — is reclaimed by the routine sweep, and nothing
+        the live branch shares with it is.
         """
         store = Memory()
         s = Staged(VersionedKV(store), encoder=chunky_encoder, decoder=chunky_decoder)
@@ -366,7 +354,9 @@ class TestOrdinaryGarbage:
         dev["dev_only"] = "throw me away"
         dev_commit = dev.commit().commit
         dev_root = _load_root(store, dev_commit)
-        dev_nodes = node_hashes(store, dev_commit)
+        dev_nodes = node_hashes(store, dev_commit) - node_hashes(
+            store, s.current_commit
+        )
         dev_chunks = set(chunk_keys(store)) - live_chunks
         dev_blob = dev.versioned._commit_keys["dev_only"]
         assert dev_chunks
@@ -378,30 +368,18 @@ class TestOrdinaryGarbage:
 
         assert store.get(COMMIT_ROOT % dev_commit) is None
         assert store.get(COMMIT_TIME % dev_commit) is None
-        assert store.get(dev_blob) is not None
-        assert not missing_nodes(store, dev_commit, dev_nodes)
-        assert [k for k in dev_chunks if store.get(k) is None] == [], (
-            "the incremental sweep must not delete content — another "
-            "commit's identical bytes hash to the same key"
-        )
-
-        reader = Staged(
-            VersionedKV(store), encoder=chunky_encoder, decoder=chunky_decoder
-        )
-        assert reader["live"] == "keep me"
-
-        # The other direction: a maintenance pass does reclaim them.
-        deep_clean(store, min_age=0, grace=0)
         assert store.get(dev_blob) is None, "orphan blob not collected"
         assert store.get(NODE_PREFIX + str(dev_root)) is None, (
             "orphan HAMT root not collected"
         )
         assert missing_nodes(store, dev_commit, dev_nodes) == sorted(dev_nodes)
-        assert [k for k in dev_chunks if store.get(k) is not None] == [], (
-            "deep_clean must reclaim what the incremental sweep left"
-        )
+        assert [k for k in dev_chunks if store.get(k) is not None] == []
         assert [k for k in live_chunks if store.get(k) is None] == [], (
-            "deep_clean took a chunk the live branch still references"
+            "the sweep took a chunk the live branch still references"
+        )
+
+        reader = Staged(
+            VersionedKV(store), encoder=chunky_encoder, decoder=chunky_decoder
         )
         assert reader["live"] == "keep me"
 
@@ -428,7 +406,7 @@ class TestDeepClean:
         )
         assert store.get(stray_chunk) is not None
 
-        assert deep_clean(store, min_age=0, grace=0) == 0
+        assert deep_clean(store, min_age=0) == 0
         assert store.get(stray_node) is None
         assert store.get(stray_chunk) is None
         assert not missing_nodes(store, live_commit, live_nodes)
@@ -458,60 +436,41 @@ class TestDeepClean:
         )
         assert stranded, "test needs the orphan to have children below its root"
 
-        assert deep_clean(store, min_age=0, grace=0) == 0
+        assert deep_clean(store, min_age=0) == 0
         assert [n for n in stranded if store.get(NODE_PREFIX + n)] == []
         assert Staged(VersionedKV(store))["live"] == "keep me"
 
-    def test_deep_clean_still_eats_a_writer_that_ignores_the_lease(self):
-        """The namespace scan has no defence of its own; the lease is it.
+    def test_no_batch_can_land_under_a_sweep(self):
+        """The lease is load-bearing: a batch expecting the record read
+        before the sweep began cannot land while the sweep runs, nor
+        after it, and one expecting the current record lands once it is
+        over."""
+        store = ScanHookStore()
+        Staged(VersionedKV(store)).commit()
+        before = store.get(GC_LEASE_KEY)
+        attempts: list[bool] = []
 
-        A writer that reads the GC lease before its write batch waits
-        one out, so the mid-sweep commit this pins cannot happen through
-        the ordinary API. Blind that one read and the hazard is exactly
-        what it always was: the scan deletes every node the mark phase
-        did not see, including a live HEAD's. That is what makes the
-        lease load-bearing rather than advisory decoration, and what an
-        older kvgit — or anything editing the backend directly — is
-        still exposed to.
-        """
-        store = LeaseBlindStore()
-        s = Staged(VersionedKV(store))
-        for i in range(20):
-            s[f"key{i}"] = i
-        s.commit()
-        age_commits(store, 10_000)
+        def a_batch_mid_sweep():
+            attempts.append(store.cas_many({GC_LEASE_KEY: before}, {"stray": b"x"}))
 
-        landed: dict[str, object] = {}
+        store.arm(AFTER_COMMIT_ROOT_SCAN, a_batch_mid_sweep)
+        deep_clean(store, min_age=3600)
 
-        def concurrent_writer():
-            other = Staged(VersionedKV(store))
-            other["late"] = "written mid-sweep"
-            landed["commit"] = other.commit().commit
-            landed["nodes"] = node_hashes(store, landed["commit"])
-
-        store.arm(AFTER_COMMIT_ROOT_SCAN, concurrent_writer)
-        deep_clean(store, min_age=3600, grace=0)
-
-        head = _resolve_head(store, "main")
-        assert head == landed["commit"]
-        assert missing_nodes(store, head, landed["nodes"]), (  # type: ignore[arg-type]
-            "the namespace scan deletes whatever the mark phase missed"
-        )
-        with pytest.raises(KeyError):
-            Staged(VersionedKV(store))["late"]
+        assert attempts == [False]
+        assert store.get("stray") is None
+        assert not store.cas_many({GC_LEASE_KEY: before}, {"stray": b"x"})
+        after = store.get(GC_LEASE_KEY)
+        assert store.cas_many({GC_LEASE_KEY: after}, {"stray": b"x"})
 
 
 class TestChunkDedupRace:
-    """Chunks are content-addressed, so "the orphan owns it" is not enough.
+    """Content is shared by key, so "the orphan owns it" is not enough.
 
-    Blobs are keyed ``<commit_hash>:<key>`` and HAMT leaf nodes embed
-    that blob pointer, so both are commit-scoped: two unrelated commits
-    holding identical data still get distinct keys. Chunks are keyed
-    ``kvgit:chunk:<content_hash>`` with nothing commit-derived in them,
-    so an orphan's chunk and a brand-new commit's chunk are literally
-    the same key. Scoping the sweep to orphan keysets does not help —
-    the key really is in the orphan's tree, and the new commit that
-    also points at it was never marked.
+    Chunks — like blobs and HAMT nodes — are keyed by their bytes, so an
+    orphan's chunk and a brand-new commit's chunk are literally the same
+    key. What keeps the sweep off a chunk a new commit uses is that the
+    commit's batch cannot land while the sweep runs, so the mark phase
+    has always seen every commit that could point at it.
     """
 
     def test_chunk_deduped_by_a_mid_sweep_commit_survives(self):
@@ -543,8 +502,10 @@ class TestChunkDedupRace:
             other["late"] = shared_value
             landed["commit"] = other.commit().commit
 
-        store.arm(AFTER_COMMIT_ROOT_SCAN, concurrent_writer)
+        start, writer = in_a_thread(concurrent_writer)
+        store.arm(AFTER_COMMIT_ROOT_SCAN, start)
         clean_orphans(store, min_age=3600)
+        writer.join(timeout=10)
 
         head = _resolve_head(store, "main")
         assert head == landed["commit"], "the concurrent commit should be HEAD"
@@ -559,13 +520,11 @@ class TestChunkDedupRace:
         )
         assert reader["late"] == shared_value
 
-    def test_deep_clean_reclaims_the_orphan_chunk_left_behind(self):
-        """The other half of the contract: the space is not lost forever.
+    def test_the_orphan_chunk_is_reclaimed(self):
+        """The other half of the contract: the space comes back.
 
-        ``clean_orphans`` deletes the orphan's commit metadata, blob
-        and nodes but leaves its chunk, because the chunk key is not
-        the orphan's to give away. ``deep_clean``, which sweeps under a
-        lease writers honour, is where that space comes back.
+        With nothing live sharing it, an orphan's chunk goes with the
+        orphan on the routine sweep.
         """
         store = Memory()
         s = Staged(VersionedKV(store), encoder=chunky_encoder, decoder=chunky_decoder)
@@ -583,12 +542,7 @@ class TestChunkDedupRace:
         age_commits(store, 10_000)
         assert clean_orphans(store, min_age=3600) == 1
 
-        assert store.get(COMMIT_ROOT % dev_commit) is None, "commit metadata kept"
-        assert [k for k in orphan_chunks if store.get(k) is None] == [], (
-            "the incremental sweep deleted a chunk"
-        )
-
-        assert deep_clean(store, min_age=0, grace=0) == 0
+        assert store.get(COMMIT_ROOT % dev_commit) is None
         assert [k for k in orphan_chunks if store.get(k) is not None] == []
         assert [k for k in live_chunks if store.get(k) is None] == []
 

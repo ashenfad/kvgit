@@ -54,7 +54,7 @@ def probe(path: str) -> None:
         "open main": lambda: kvgit.store(kind="disk", path=path),
         "open dev": lambda: kvgit.store(kind="disk", path=path, branch="dev"),
         "clean_orphans": lambda: clean_orphans(Disk(path), min_age=0),
-        "deep_clean": lambda: deep_clean(Disk(path), min_age=0, grace=0),
+        "deep_clean": lambda: deep_clean(Disk(path), min_age=0),
         "delete_branches": lambda: kvgit.delete_branches(
             "dev", kind="disk", path=path, min_age=0
         ),

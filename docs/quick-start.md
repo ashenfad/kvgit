@@ -367,34 +367,28 @@ s.versioned.clean_orphans()           # default: skip commits younger than 1 hou
 s.versioned.clean_orphans(min_age=0)  # sweep unreachable commits immediately
 ```
 
-`clean_orphans()` is safe to run while other writers are committing. Everything it deletes is found by walking the keysets of the orphan commits it is removing, and everything it deletes -- commit metadata, and blobs written before v4 -- is keyed by commit hash, so a commit that lands mid-sweep is never a candidate. The `min_age=3600` default decides how long an unreachable commit gets to settle before it counts as an orphan at all -- and it is also what protects a commit another writer has written but not yet published, so keep `min_age=0` for stores nobody else is writing to.
+`clean_orphans()` is safe to run while other writers are committing, at any `min_age` -- `0` included. It takes the orphans' commit metadata and the blobs, keyset nodes and chunks that nothing live shares. `min_age` is purely your policy on how long abandoned work lingers before it is taken.
 
 Cleanup is safe for shared commit histories -- blobs, keyset nodes, and chunks referenced by any reachable commit are never deleted.
 
-### `clean_orphans()` does not reclaim content
+### How a sweep runs beside writers
 
-Blobs, keyset nodes and chunks are keyed by what they hold (`kvgit:blob:<sha256>`, `kvgit:keyset:<hash>`, `kvgit:chunk:<hash>`), with nothing commit-derived in the key. That is what stores equal bytes once -- and it means an orphan's blob and a blob a *brand-new* commit just wrote are literally the same key whenever the bytes match. "The orphan owned it" does not imply "safe to delete", and no amount of narrowing the window changes that: the new commit was never scanned. Rather than race it, `clean_orphans()` deletes no content at all.
+Blobs, keyset nodes and chunks are keyed by what they hold, so an orphan's blob and a blob a *brand-new* commit just wrote are literally the same key whenever the bytes match. A sweep may take an orphan's content only if it has seen every commit that could point at it, and kvgit makes that true rather than asking you to quiesce the store:
 
-So routine GC gives back commit metadata, and a deleted branch's content stays on disk until the maintenance pass below.
+* Every sweep takes a lease under the reserved key `__gc_lease__`, and every commit batch is written with a `cas_many` that expects the lease record its writer read. No batch lands while a sweep runs; a writer that tries waits, and lands after.
+* Every batch carries an `__inflight__` marker for its commit, removed by the write that publishes it. A sweep marks from those markers as well as from branch heads, so a commit written but not yet published is live, not garbage.
+
+Writers do wait while a sweep runs, so on a large store, sweep at quiet moments. `clean_orphans()` waits for another sweep's lease rather than failing.
 
 ### `deep_clean()` -- the maintenance pass
 
-`deep_clean()` does everything `clean_orphans()` does, then scans the `kvgit:blob:`, `kvgit:keyset:` and `kvgit:chunk:` namespaces directly. That scan is the only way to reclaim content, and also the only way to reach a blob, node or chunk that *no* commit references -- left behind by an interrupted write, or by a store swept by an earlier kvgit -- since those have no orphan to be found through.
-
-The scan deletes anything the mark phase did not see, so nothing else may be writing while it runs. You do not have to arrange that yourself: `deep_clean()` takes a lease on the store under the reserved key `__gc_lease__`, and every write path reads that lease immediately before its write and waits while a live one is held. That covers the commit and merge-commit write batches and every write that makes a commit reachable -- the HEAD advance behind `commit()`, plus `create_branch()`, `reset_to()`, `tag()` and the corrupt-HEAD repair.
+`deep_clean()` does everything `clean_orphans()` does, then scans the `kvgit:blob:`, `kvgit:keyset:` and `kvgit:chunk:` namespaces directly for content *no* commit references -- left behind by a crash or an interrupted write, or by a store swept by an earlier kvgit -- since those have no orphan to be found through. Run it occasionally.
 
 ```python
 s.versioned.deep_clean()                 # takes the lease, sweeps, releases
-s.versioned.deep_clean(grace=30)         # slow backend: allow longer write batches
 ```
 
-Concretely, the call refuses a store stamped above the layout it reads (writing nothing, the lease key included), takes the lease by CAS, sleeps `grace` seconds (default 5) so any write that checked the lease just before it was taken has time to land, marks and sweeps, and releases the lease in a `finally`. `lease_ttl` (default 600 seconds) bounds the damage from a holder that crashes: writers wait out a lease's remaining term and no longer.
-
-A commit's write batch and the CAS that publishes it as a branch HEAD are two steps, and in between the commit is written but unreachable -- which looks exactly like garbage. The sweep therefore keeps every unreachable commit stamped within `grace` of the moment it took the lease, whatever `min_age` says. `min_age` is your policy on how long abandoned work lingers; that bound is the lease's own correctness rule.
-
-**What this requires of you**, in place of quiescing the store: that a writer's whole window -- checking the lease, writing its batch, advancing HEAD -- is shorter than `grace`. Five seconds is generous for an in-memory or local-disk store; raise it for a slow or remote backend. Raise `lease_ttl` above the longest sweep this store has taken, too -- an overrun is not extended silently, it just logs a warning and leaves writers free during the overrun.
-
-If another `deep_clean()` already holds the lease, the call raises `kvgit.GcBusy` rather than sweeping beside it. Retry later.
+If another sweep already holds the lease, the call raises `kvgit.GcBusy` rather than sweeping beside it. Retry later.
 
 ```python
 try:
@@ -403,11 +397,11 @@ except kvgit.GcBusy:
     pass   # someone else is already sweeping
 ```
 
-A writer that does not read the lease is still exposed -- an older kvgit, or a process editing the backend directly. The lease is what the guarantee rests on, so every process touching the store needs a version that honours it.
+`lease_ttl` (default 600 seconds) bounds the damage from a sweep that crashes holding the lease: writers wait out its remaining term and no longer. Raise it above the longest sweep this store has taken -- an overrun is not extended silently, it logs a warning and leaves writers free during the overrun.
 
-So: `clean_orphans()` (or plain `delete_branch()`) is your routine cleanup, and `deep_clean()` is the scheduled maintenance pass that gives the space back. You want both.
+A writer that bypasses kvgit is still exposed -- a process editing the backend directly. Older kvgit is locked out of a v4 store by its version stamp.
 
-A commit that loses a CAS race leaves garbage too — it writes its blobs, nodes and metadata before attempting the swap, and nothing deletes them inline, because the winner may legitimately share the content-addressed ones. They are ordinary orphans and the ordinary sweep collects them.
+A commit that loses a race to publish leaves its commit behind too -- nothing deletes it inline, because the winner may share its content. It is an ordinary orphan and the ordinary sweep collects it.
 
 See [Orphan Cleanup in the API reference](api.md#orphan-cleanup) for details.
 

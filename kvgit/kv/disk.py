@@ -56,9 +56,10 @@ class Disk(KVStore):
         for key in self.store.iterkeys():
             yield str(key), cast(bytes, self.store[key])
 
-    def keys(self) -> Iterable[str]:
+    def keys(self, prefix: str = "") -> Iterable[str]:
         for key in self.store.iterkeys():
-            yield str(key)
+            if str(key).startswith(prefix):
+                yield str(key)
 
     def __contains__(self, key: str) -> bool:
         return key in self.store
@@ -75,15 +76,25 @@ class Disk(KVStore):
             for key in keys:
                 self.store.delete(key, retry=False)
 
-    def cas(self, key: str, value: bytes, expected: bytes | None) -> bool:
-        if not isinstance(value, bytes):
-            raise TypeError(f"Expected bytes, got {type(value).__name__}")
+    def cas_many(
+        self,
+        expected: Mapping[str, bytes | None],
+        writes: Mapping[str, bytes],
+        removes: Iterable[str] = (),
+    ) -> bool:
+        removes = self._check_batch(writes, removes)
+        # One SQLite transaction, which diskcache opens with BEGIN
+        # IMMEDIATE: it holds the write lock from the first read, so no
+        # other process's write can land between the check and the batch.
         with self.store.transact():
-            current = cast(bytes | None, self.store.get(key))
-            if current == expected:
+            for key, value in expected.items():
+                if cast(bytes | None, self.store.get(key)) != value:
+                    return False
+            for key, value in writes.items():
                 self.store[key] = value
-                return True
-            return False
+            for key in removes:
+                self.store.delete(key, retry=False)
+            return True
 
     def clear(self) -> None:
         self.store.clear()

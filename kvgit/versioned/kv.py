@@ -13,7 +13,8 @@ Storage layout (v4):
 - ``__tag_info__<tag>``                — tag creation time + info
 - ``kvgit:keyset:<node_hash>``         — HAMT node bytes
 - ``kvgit:chunk:<chunk_hash>``         — content-addressed chunk bytes (v3)
-- ``__gc_lease__``                     — lease a deep clean sweeps under
+- ``__gc_lease__``                     — lease every sweep runs under
+- ``__inflight__<commit>``             — a written commit not yet published
 - ``kvgit:blob:<sha256>``              — blob value bytes, keyed by content
 - ``<commit_hash>:<user_key>``         — blob value bytes written before v4
 
@@ -46,14 +47,17 @@ time and the info, so one commit hash names one root. Equal bytes are
 stored once across keys, commits and branches, and the two sides of a
 merge agree about a key exactly when they point at the same blob.
 
-That decides who may delete what. Content two commits can share is
-never deleted merely because an orphan holds it: a commit made a moment
-ago may have written the same key, and the sweep never saw that commit.
-So ``clean_orphans`` deletes only what an orphan alone can own — its
-commit metadata, and blobs from before v4, whose keys carry the commit
-hash — and ``deep_clean`` reclaims blobs, HAMT nodes and chunks under
-the ``__gc_lease__`` key: it holds the lease for the sweep, and every
-write path waits while a live lease is held.
+Content two commits share is one key, so a sweep may delete an orphan's
+content only if no live commit uses it — including a commit a writer is
+in the middle of making. Every sweep therefore runs under the
+``__gc_lease__`` key, and every commit batch is a ``cas_many`` expecting
+the lease record its writer read after waiting any live lease out: no
+batch lands while a sweep runs. A batch that landed earlier carries an
+``__inflight__`` marker for its commit, removed by the write that
+publishes it, and a sweep marks from those markers as well as from the
+branch heads. So every live commit — published, in flight, or younger
+than ``min_age`` — is marked, and everything an orphan alone held goes
+with it.
 
 Every layout reads the ones before it, and a store is stamped up only
 when something newer is actually written:
@@ -116,7 +120,7 @@ shipped.
 CHUNK_PREFIX = "kvgit:chunk:"
 
 GC_LEASE_KEY = "__gc_lease__"
-"""Reserved key holding the store-wide lease a deep clean runs under.
+"""Reserved key holding the store-wide lease every sweep runs under.
 
 The value is ``{"owner": <opaque id>, "expires": <unix time>}`` encoded
 with :func:`kvgit.encoding.dumps`. A record whose ``expires`` is in the
@@ -125,6 +129,26 @@ over by CAS against those exact bytes. Absent, unreadable and expired
 all mean "no live lease", so a holder that dies mid-sweep blocks the
 store only until its expiry passes.
 """
+
+GC_LEASE_TTL = 600.0
+"""Default seconds a sweep's GC lease stays live.
+
+A sweep that crashes holding it blocks writers for at most this long.
+"""
+
+IN_FLIGHT_KEY = "__inflight__%s"
+"""Marker for a commit whose batch has landed but whose head has not.
+
+Written in the commit's own batch and removed by the write that
+publishes it, so a sweep that starts in between marks the commit live:
+it is unreachable from every head, and without the marker it would be
+indistinguishable from abandoned work. The value is the unix time the
+protection lapses, :data:`IN_FLIGHT_TTL` after the batch, which is what
+eventually releases the commit of a writer that died before publishing.
+"""
+
+IN_FLIGHT_TTL = 600.0
+"""Seconds an in-flight marker protects an unpublished commit."""
 
 GC_WAIT_POLL = 0.05
 """Seconds a writer sleeps between checks while a GC lease is live.
@@ -272,9 +296,7 @@ def _check_storage_version(store: KVStore) -> None:
 
     # No version sentinel. Either fresh, or pre-v2.
     branch_prefix = BRANCH_HEAD.replace("%s", "")
-    has_existing = any(
-        isinstance(k, str) and k.startswith(branch_prefix) for k in store.keys()
-    )
+    has_existing = any(True for _ in store.keys(branch_prefix))
     if has_existing:
         raise ValueError(
             "Store appears to use an older kvgit storage format. "
@@ -354,13 +376,10 @@ def _resolve_head(
     # Only reached when HEAD exists. An absent HEAD does not mean
     # damage, it means the branch is gone — ``delete_branch`` removes
     # the key — and a backup that outlives its branch must not bring
-    # the branch back. One can outlive it: a writer descheduled between
-    # its CAS and its backup write, resuming after a concurrent delete,
-    # recreates only the backup.
-    #
-    # Nothing legitimate needs the ungated form: ``_cas_head`` writes
-    # the backup only after a successful CAS, so HEAD exists whenever
-    # the backup means anything.
+    # the branch back. This code writes a backup only in the same atomic
+    # write as its HEAD and removes the two together, but a store an
+    # older kvgit wrote, which did each separately, can hold a backup
+    # with no HEAD.
     prev_bytes = (
         store.get(BRANCH_HEAD_PREV % branch) if head_bytes is not None else None
     )
@@ -447,7 +466,7 @@ def recover_by_commit_scan(store: KVStore, branch: str) -> str | None:
     """
     root_prefix = COMMIT_ROOT.replace("%s", "")
     all_commits: dict[str, float] = {}
-    for key in store.keys():
+    for key in store.keys(root_prefix):
         if not isinstance(key, str) or not key.startswith(root_prefix):
             continue
         h = key[len(root_prefix) :]
@@ -472,7 +491,7 @@ def recover_by_commit_scan(store: KVStore, branch: str) -> str | None:
     # Exclude commits reachable from healthy branches
     claimed: set[str] = set()
     head_prefix = BRANCH_HEAD.replace("%s", "")
-    for key in store.keys():
+    for key in store.keys(head_prefix):
         if not isinstance(key, str) or not key.startswith(head_prefix):
             continue
         other = key[len(head_prefix) :]
@@ -540,24 +559,31 @@ def _heal_head(store: KVStore, branch: str, recovered: bytes) -> bool:
     clobbered.
     """
     branch_key = BRANCH_HEAD % branch
-    raw = store.get(branch_key)
-    if raw is None or raw == recovered:
-        return False
-    commit_hash = safe_loads(raw)
-    if (
-        isinstance(commit_hash, str)
-        and store.get(COMMIT_ROOT % commit_hash) is not None
-    ):
-        return False
     # Installing a recovered HEAD makes a commit reachable that the
-    # store did not claim a moment ago, which is a root appearing under
-    # a sweep that has already decided what is reachable. Wait a live
-    # lease out first.
-    _wait_for_gc(store)
-    if not store.cas(branch_key, recovered, expected=raw):
-        return False
-    logger.warning("Branch '%s': corrupt HEAD replaced with recovered commit", branch)
-    return True
+    # store did not claim a moment ago — a root appearing under a sweep
+    # that has already decided what is reachable. So the checks and the
+    # write happen against one lease record, and a sweep in between
+    # sends the whole decision round again.
+    while True:
+        lease = _wait_for_gc(store)
+        raw = store.get(branch_key)
+        if raw is None or raw == recovered:
+            return False
+        commit_hash = safe_loads(raw)
+        if (
+            isinstance(commit_hash, str)
+            and store.get(COMMIT_ROOT % commit_hash) is not None
+        ):
+            return False
+        landed = _try_land(store, lease, {branch_key: raw}, {branch_key: recovered})
+        if landed is None:
+            continue
+        if not landed:
+            return False
+        logger.warning(
+            "Branch '%s': corrupt HEAD replaced with recovered commit", branch
+        )
+        return True
 
 
 def repair_head(
@@ -673,7 +699,7 @@ def tags(store: KVStore) -> dict[str, str]:
     """
     prefix = BRANCH_HEAD % TAG_BRANCH_PREFIX
     found: dict[str, str] = {}
-    for key in store.keys():
+    for key in store.keys(prefix):
         if not (isinstance(key, str) and key.startswith(prefix)):
             continue
         name = key[len(prefix) :]
@@ -736,15 +762,17 @@ def _lease_expiry(raw: bytes | None) -> float:
     return 0.0
 
 
-def _wait_for_gc(store: KVStore) -> None:
-    """Block until no live GC lease is held, then return.
+def _wait_for_gc(store: KVStore) -> bytes | None:
+    """Block until no live GC lease is held; return the lease record then.
 
-    Every path that writes an artifact a deep clean's namespace scan can
-    delete — keyset nodes, chunks, and the commit metadata that keeps
-    them reachable — calls this immediately before its write batch, so
-    that no batch is in flight while a sweep deletes.
+    The bytes returned are what a write that must not land under a
+    sweep expects the lease key to still hold: absent, or the expired
+    record the last sweep left. A sweep that starts afterwards replaces
+    them with a record of its own — every acquisition writes a fresh
+    owner id — so a ``cas_many`` expecting them fails for as long as that
+    sweep runs, and afterwards too; the writer comes back here and waits.
 
-    Costs one ``get`` when no lease exists, which is the common case.
+    Costs one ``get`` when no lease is live, which is the common case.
     While a lease is live this polls, sleeping at most until that
     lease's own expiry, so a holder that died without releasing delays a
     writer by the remainder of its term and no longer. A fresh lease
@@ -754,9 +782,31 @@ def _wait_for_gc(store: KVStore) -> None:
     while raw is not None:
         remaining = _lease_expiry(raw) - time.time()
         if remaining <= 0:
-            return
+            return raw
         time.sleep(min(GC_WAIT_POLL, remaining))
         raw = store.get(GC_LEASE_KEY)
+    return None
+
+
+def _try_land(
+    store: KVStore,
+    lease: bytes | None,
+    expected: dict[str, bytes | None],
+    writes: dict[str, bytes],
+    removes: tuple[str, ...] = (),
+) -> bool | None:
+    """Apply a batch unless a sweep has started since ``lease`` was read.
+
+    Returns True when the batch landed, False when one of the caller's
+    own expectations failed, and None when the lease moved — a sweep
+    began (or ran) since, so whatever the caller checked before writing
+    may no longer hold; it waits again, re-checks, and retries.
+    """
+    if store.cas_many({GC_LEASE_KEY: lease, **expected}, writes, removes):
+        return True
+    if store.get(GC_LEASE_KEY) != lease:
+        return None
+    return False
 
 
 def _acquire_gc_lease(store: KVStore, lease_ttl: float) -> tuple[bytes, float, float]:
@@ -778,26 +828,38 @@ def _acquire_gc_lease(store: KVStore, lease_ttl: float) -> tuple[bytes, float, f
         holder = safe_loads(raw)
         owner = holder.get("owner") if isinstance(holder, dict) else None
         raise GcBusy(
-            f"A deep clean holds the GC lease (owner {owner!r}, "
+            f"A sweep holds the GC lease (owner {owner!r}, "
             f"expires in {expiry - now:.1f}s)"
         )
     expires = now + lease_ttl
     owner = f"{os.getpid()}-{uuid.uuid4().hex[:12]}"
     ours = dumps({"owner": owner, "expires": expires})
     if not store.cas(GC_LEASE_KEY, ours, expected=raw):
-        raise GcBusy("Another deep clean took the GC lease first")
+        raise GcBusy("Another sweep took the GC lease first")
     return ours, now, expires
 
 
-def _release_gc_lease(store: KVStore, ours: bytes) -> None:
+def _release_gc_lease(
+    store: KVStore, ours: bytes, expires: float, lease_ttl: float
+) -> None:
     """Give up a lease this call took, if the store still holds it.
 
-    ``KVStore`` has no delete-if-equal, so release is a CAS overwriting
-    our own bytes with the same record expired (``expires: 0``). A
-    failed CAS means the lease under the key is no longer ours — it ran
-    out and another sweep claimed it — and that sweep's lease must not
-    be cleared, so the failure is ignored.
+    Release is a CAS overwriting our own bytes with the same record
+    expired (``expires: 0``), never a delete: writers that read the lease
+    before this sweep began expect the bytes they read, and a record
+    carrying this sweep's owner id can never match them again. A failed
+    CAS means the lease under the key is no longer ours — it ran out and
+    another sweep claimed it — and that sweep's lease must not be
+    cleared, so the failure is ignored.
     """
+    overrun = time.time() - expires
+    if overrun > 0:
+        logging.getLogger("kvgit.orphans").warning(
+            "a sweep ran %.1fs past its %.1fs GC lease; writers were free to "
+            "write during that window. Raise lease_ttl.",
+            overrun,
+            lease_ttl,
+        )
     record = safe_loads(ours)
     owner = record.get("owner") if isinstance(record, dict) else None
     store.cas(GC_LEASE_KEY, dumps({"owner": owner, "expires": 0}), expected=ours)
@@ -807,9 +869,8 @@ def clean_orphans(store: KVStore, min_age: float = 3600) -> int:
     """Remove orphaned commits unreachable from any branch HEAD.
 
     Traces all reachable commits from live branch HEADs, then deletes
-    what only the orphaned commits can own: their commit metadata, and
-    blobs stored before v4 (keyed ``<commit_hash>:<key>``) that nothing
-    reachable shares. Tags need no
+    the orphaned commits' metadata and everything in their keysets —
+    blobs, HAMT nodes, chunks — that nothing live shares. Tags need no
     special handling: a tag is a branch head under a reserved name, so
     it keeps its commit's whole ancestry alive by being walked with
     everything else.
@@ -817,101 +878,65 @@ def clean_orphans(store: KVStore, min_age: float = 3600) -> int:
     Handle-independent by design: it marks from ALL live branch HEADs
     and touches nothing but ``store``, so it works with or without a
     ``VersionedKV`` anchored on it. :meth:`VersionedKV.clean_orphans`
-    and the anchor-free admin path (:func:`kvgit.delete_branches`)
-    share this one implementation.
+    and the anchor-free admin paths (:func:`kvgit.delete_branches`,
+    :func:`kvgit.delete_tags`) share this one implementation.
 
-    Safe beside concurrent writers whose window from write batch to
-    HEAD swap is shorter than ``min_age``: every deletion candidate is
-    discovered by walking an orphan commit's own keyset, and every key
-    it deletes is commit-scoped, so a commit that lands mid-sweep can
-    never contribute one. A commit younger than ``min_age`` is never
-    deleted, which is what protects one whose writer has not yet
-    published it; at ``min_age=0`` nothing does.
-
-    **Does not reclaim content.** Blobs written by v4, HAMT nodes and
-    chunks are keyed by what they hold, so an orphan's copy and a
-    brand-new commit's copy are the same key whenever the bytes match
-    — "the orphan owned it" does not imply "safe to delete", at any
-    window size. They accumulate between maintenance passes; run
-    :func:`deep_clean` to reclaim them.
-
-    This sweep takes no GC lease, because it needs none. It does wait
-    out a lease another sweep holds before deleting anything: two
-    sweeps deleting at once reclaim nothing extra and make the store's
-    behaviour under maintenance harder to reason about.
-
-    The ``min_age`` guard (default 1 hour) still applies: it decides
-    which unreachable commits are old enough to delete at all.
+    Runs under the store's GC lease, waiting out another sweep's lease
+    first rather than failing. While it holds the lease no commit batch
+    can land, and every commit written but not yet published carries an
+    in-flight marker the sweep marks from, so it is safe beside
+    concurrent writers at any ``min_age`` — including 0. ``min_age`` is
+    policy alone: how long abandoned work lingers before it is taken.
 
     Returns:
         Number of orphaned commits removed.
+
+    Raises:
+        ValueError: if the store is stamped above the layout this code
+            reads. Nothing is written, the lease key included.
     """
-    return _sweep(store, min_age, deep=False)
+    _assert_supported_version(store)
+    while True:
+        _wait_for_gc(store)
+        try:
+            ours, _acquired, expires = _acquire_gc_lease(store, GC_LEASE_TTL)
+        except GcBusy:
+            continue
+        break
+    try:
+        return _sweep(store, min_age, deep=False)
+    finally:
+        _release_gc_lease(store, ours, expires, GC_LEASE_TTL)
 
 
 def deep_clean(
     store: KVStore,
     min_age: float = 3600,
     *,
-    grace: float = 5.0,
-    lease_ttl: float = 600.0,
+    lease_ttl: float = GC_LEASE_TTL,
 ) -> int:
-    """Sweep orphans *and* every unreferenced blob, node and chunk, under a lease.
+    """:func:`clean_orphans`, plus a scan for content nothing references.
 
-    Does everything :func:`clean_orphans` does, then additionally scans
-    the whole ``kvgit:blob:``, ``kvgit:keyset:`` and ``kvgit:chunk:``
-    namespaces and deletes anything not reachable from a live branch
-    head or a young orphan commit. That namespace scan is the only way
-    to reclaim content no commit references any more — leftovers from a
-    crash, from an interrupted write, or from a store swept by an
-    earlier kvgit — because no orphan keyset points at them.
-
-    It is also the only way to reclaim content-addressed blobs, HAMT
-    nodes and chunks at all, including ones a deleted orphan uniquely
-    owned: the incremental sweep leaves every one of them in place, so
-    this is the maintenance pass that gives that space back.
-
-    The namespace scan deletes anything not seen by the mark phase, so
-    it is only correct while nothing else is writing. This call makes
-    that condition hold rather than asking the caller for it:
+    Sweeps orphans the way :func:`clean_orphans` does, then scans the
+    whole ``kvgit:blob:``, ``kvgit:keyset:`` and ``kvgit:chunk:``
+    namespaces and deletes anything no live branch head, young orphan or
+    in-flight commit reaches. That scan is the only way to reclaim
+    content no commit references any more — leftovers from a crash,
+    from an interrupted write, or from a store swept by an earlier
+    kvgit — because no orphan keyset points at them. Run it as an
+    occasional maintenance pass; :func:`clean_orphans` is the routine
+    one.
 
     1. It refuses a store stamped above the layout this code reads,
        before touching the lease key, so such a store comes out of the
        call with nothing written to it at all.
     2. It takes the ``__gc_lease__`` key by CAS, raising :class:`GcBusy`
        if another sweep holds an unexpired one.
-    3. It sleeps ``grace`` seconds. Every writer reads the lease
-       immediately before the write it is about to make and waits while
-       a live one is held, so after this pause the only writes that can
-       still be in flight are ones that read the lease before step 2 and
-       found it free.
-    4. It marks and sweeps, protecting every unreachable commit stamped
-       within ``grace`` of the moment the lease was taken (see below).
-    5. It releases the lease, in a ``finally``.
-
-    Every path that writes something the scan can delete waits on the
-    lease: the commit and merge-commit write batches, ``tag``, and every
-    branch-head write — the HEAD advance behind ``commit``,
-    ``create_branch``, ``reset_to``, and the corrupt-HEAD repair.
-
-    A commit's write batch and the CAS that makes it a branch HEAD are
-    two separate steps. Between them the commit is written but
-    unreachable, so a mark phase landing in that gap sees garbage, and
-    with a low ``min_age`` it would delete a commit whose writer is
-    about to publish it. The sweep therefore keeps every unreachable
-    commit stamped at or after ``lease acquisition - grace``: its
-    payload is marked and its metadata left in place, regardless of
-    ``min_age``. The two guards answer different questions —
-    ``min_age`` is the caller's policy on how long abandoned work
-    lingers, this bound is the lease's own correctness rule — so the
-    bound applies even at ``min_age=0``.
-
-    **The one assumption:** a writer's whole window, from reading the
-    lease to the CAS that advances HEAD, is shorter than ``grace``. A
-    writer slower than that — descheduled, or on a backend where one
-    ``set_many`` can stall for seconds — can still have its nodes and
-    chunks deleted. Five seconds covers an in-memory or local-disk
-    store with room to spare; raise it for a slow or remote backend.
+    3. It marks and sweeps. Every commit batch is written conditionally
+       on the lease record, so none can land while the lease is held;
+       batches that landed before carry in-flight markers the mark
+       phase reads, so their commits survive until published.
+    4. It releases the lease, in a ``finally``.
 
     A ``lease_ttl`` shorter than the sweep takes is not extended
     silently: the sweep finishes and logs a warning naming the overrun,
@@ -921,9 +946,6 @@ def deep_clean(
     Args:
         min_age: Unreachable commits younger than this many seconds are
             kept, along with everything they reference.
-        grace: Seconds to wait after taking the lease, before marking.
-            Also the width of the window before acquisition whose
-            commits are protected from deletion.
         lease_ttl: Seconds the lease stays live. A holder that crashes
             blocks writers for at most this long.
 
@@ -931,58 +953,31 @@ def deep_clean(
         Number of orphaned commits removed.
 
     Raises:
-        GcBusy: if another deep clean holds a live lease.
+        GcBusy: if another sweep holds a live lease.
         ValueError: if the store is stamped above the layout this code
             reads. Nothing is written, the lease key included.
     """
-    gc_logger = logging.getLogger("kvgit.orphans")
     # Before the lease, not after: a store this code must not touch has
     # to come out of the call untouched, and an acquire-then-fail would
     # leave an expired lease record behind in a store kvgit had no
     # business writing to.
     _assert_supported_version(store)
-    ours, acquired_at, expires = _acquire_gc_lease(store, lease_ttl)
+    ours, _acquired, expires = _acquire_gc_lease(store, lease_ttl)
     try:
-        time.sleep(grace)
-        return _sweep(store, min_age, deep=True, protect_after=acquired_at - grace)
+        return _sweep(store, min_age, deep=True)
     finally:
-        overrun = time.time() - expires
-        if overrun > 0:
-            gc_logger.warning(
-                "deep_clean ran %.1fs past its %.1fs GC lease; writers were "
-                "free to write during that window. Raise lease_ttl.",
-                overrun,
-                lease_ttl,
-            )
-        _release_gc_lease(store, ours)
+        _release_gc_lease(store, ours, expires, lease_ttl)
 
 
-def _sweep(
-    store: KVStore,
-    min_age: float,
-    *,
-    deep: bool,
-    protect_after: float | None = None,
-) -> int:
+def _sweep(store: KVStore, min_age: float, *, deep: bool) -> int:
     """Shared mark-and-sweep behind ``clean_orphans`` / ``deep_clean``.
 
-    ``protect_after`` is a unix time below which the ``min_age`` guard
-    is the only thing deciding an orphan's fate. An unreachable commit
-    stamped at or after it is kept and its payload marked, whatever
-    ``min_age`` says, because a commit that new may be one whose writer
-    has not yet run the CAS that publishes it. ``deep_clean`` passes
-    the moment it took the lease, backed off by its grace window;
-    ``clean_orphans`` passes None, having no window to reason from.
+    The caller holds the GC lease, so no commit batch lands while this
+    runs and nothing this deletes can be rewritten underneath it.
     """
     gc_logger = logging.getLogger("kvgit.orphans")
-    # Reachability is decided from the roots this code knows about, so
-    # a store stamped above what this code reads must not be swept: its
-    # roots may be a kind that did not exist here, and everything hanging
-    # off them would look like garbage. The check belongs on this side of
-    # the call rather than only in the handle constructors, because the
-    # admin entry points sweep a raw store with no handle at all.
-    _assert_supported_version(store)
-    cutoff_time = time.time() - min_age
+    now = time.time()
+    cutoff_time = now - min_age
 
     def _parent_loader(commit_hash: str) -> tuple[str, ...]:
         parent_bytes = store.get(PARENT_COMMIT % commit_hash)
@@ -995,16 +990,11 @@ def _sweep(
             return (raw,)
         return tuple(raw)
 
-    # Mark phase: walk every branch's history, collecting reachable
-    # commits, blob keys, HAMT node hashes, and chunk references.
+    # Mark phase: collect reachable commits, blob keys, HAMT node hashes
+    # and chunk references.
     reachable_commits: set[str] = set()
     reachable_blobs: set[str] = set()
     reachable_nodes: set[str] = set()
-    # Only the deep path deletes chunks, and it is the only consumer of
-    # this set. The incremental path leaves it empty on purpose rather
-    # than paying to accumulate every chunk hash in the store — if you
-    # ever add a chunk deletion outside the ``if deep:`` block below,
-    # you must populate this unconditionally first.
     reachable_chunks: set[str] = set()
 
     def _walk_commit_for_marks(commit_hash: str) -> None:
@@ -1020,9 +1010,34 @@ def _sweep(
         entries, new_nodes = Keyset(store, root=root).walk(skip_nodes=reachable_nodes)
         for entry in entries.values():
             reachable_blobs.add(entry.blob)
-            if deep and entry.meta.chunks:
+            if entry.meta.chunks:
                 reachable_chunks.update(entry.meta.chunks)
         reachable_nodes.update(new_nodes)
+
+    def _mark_from(tip: str) -> None:
+        for commit in walk_history(tip, _parent_loader, all_parents=True):
+            if commit in reachable_commits:
+                continue
+            reachable_commits.add(commit)
+            _walk_commit_for_marks(commit)
+
+    # In-flight markers first, branch heads second. Publishing a commit
+    # installs its head and drops its marker in one atomic write, so a
+    # commit published after its marker was read is under a head read
+    # later, and one published before has no marker to miss — read the
+    # other way round, a publish landing between the two reads would
+    # leave the commit under neither.
+    stale_markers: list[str] = []
+    in_flight_prefix = IN_FLIGHT_KEY.replace("%s", "")
+    for key in list(store.keys(in_flight_prefix)):
+        commit_hash = key[len(in_flight_prefix) :]
+        expires = safe_loads(store.get(key) or b"null")
+        if isinstance(expires, (int, float)) and expires > now:
+            _mark_from(commit_hash)
+        else:
+            # The writer never published or withdrew it; its commit is
+            # an ordinary orphan now, governed by ``min_age``.
+            stale_markers.append(key)
 
     # Every root is a branch head, tags included: a tag is a head under
     # the reserved ``refs/tags/`` name, so it is marked here without the
@@ -1030,9 +1045,7 @@ def _sweep(
     # property — a kvgit that predates tags runs this same loop and
     # keeps tagged commits alive for the same reason.
     branch_prefix = BRANCH_HEAD.replace("%s", "")
-    for key in store.keys():
-        if not (isinstance(key, str) and key.startswith(branch_prefix)):
-            continue
+    for key in list(store.keys(branch_prefix)):
         branch_name = key[len(branch_prefix) :]
         # No ``recover_from_corrupt_head`` here, deliberately, even when
         # the caller has one wired into their handles. GC must not
@@ -1048,27 +1061,18 @@ def _sweep(
         # settle what it points at. The inconsistency with the read
         # paths is the point, not an oversight.
         branch_head = _resolve_head(store, branch_name)
-        if branch_head is None:
-            continue
-        for commit in walk_history(branch_head, _parent_loader, all_parents=True):
-            if commit in reachable_commits:
-                continue
-            reachable_commits.add(commit)
-            _walk_commit_for_marks(commit)
+        if branch_head is not None:
+            _mark_from(branch_head)
 
-    # Sweep phase: find orphaned commits via __commit_root__ scan.
-    # Also identify "young orphans" — commits inside the min_age
-    # window that aren't branch-reachable. Their chunks must be
-    # protected from sweeping (they may be in-flight from another
-    # writer), even though we won't delete the commits themselves
-    # until they age past the cutoff.
+    # Sweep phase: find orphaned commits via the __commit_root__ scan,
+    # and set aside the young ones — unreachable, but inside the
+    # ``min_age`` window the caller gave abandoned work to linger. They
+    # are kept whole, so everything they reference is marked too.
     orphans: list[str] = []
     young_orphan_commits: list[str] = []
     root_prefix = COMMIT_ROOT.replace("%s", "")
 
-    for key in store.keys():
-        if not (isinstance(key, str) and key.startswith(root_prefix)):
-            continue
+    for key in list(store.keys(root_prefix)):
         commit_hash = key[len(root_prefix) :]
         if not commit_hash or commit_hash in reachable_commits:
             continue
@@ -1076,60 +1080,33 @@ def _sweep(
         if time_bytes is None:
             # No timestamp recorded — be conservative, leave it alone.
             continue
-        try:
-            ts_val = safe_loads(time_bytes)
-            if not isinstance(ts_val, (int, float)):
-                continue
-            created = float(ts_val)
-            # A commit's write batch and the CAS that makes it a branch
-            # HEAD are two steps. In between it is written and
-            # unreachable, so it looks exactly like garbage — and a
-            # sweep running with a low min_age would delete a commit
-            # whose writer is about to publish it. Anything stamped
-            # inside the caller's protection window is therefore treated
-            # as in flight no matter how low min_age is: min_age says
-            # how long abandoned work lingers, this says which commits
-            # might still have an owner.
-            in_flight = protect_after is not None and created >= protect_after
-            if not in_flight and created < cutoff_time:
-                orphans.append(commit_hash)
-            else:
-                young_orphan_commits.append(commit_hash)
-        except (TypeError, ValueError):
+        ts_val = safe_loads(time_bytes)
+        if not isinstance(ts_val, (int, float)) or isinstance(ts_val, bool):
             continue
+        if float(ts_val) < cutoff_time:
+            orphans.append(commit_hash)
+        else:
+            young_orphan_commits.append(commit_hash)
 
-    # Protect what young orphan commits reference — they may belong to
-    # in-flight writers whose CAS has not landed yet. Their nodes and
-    # blobs matter to both paths (an aged orphan sharing a subtree with
-    # a young one must not take it down); their chunks matter to
-    # ``deep_clean``, whose namespace scan would otherwise eat them.
     for young in young_orphan_commits:
         _walk_commit_for_marks(young)
 
     # Collect everything to delete in one batch so the sweep is atomic
     # at the store level (defends against partial sweeps under crash).
-    all_removals: list[str] = []
+    all_removals: list[str] = list(stale_markers)
     keyset_prefix = Keyset.DEFAULT_PREFIX
 
-    # Every deletion candidate on the incremental path comes from
-    # walking an orphan's own keyset, and only what the orphan alone can
-    # own qualifies: its commit metadata, and blobs from before v4,
-    # whose ``<commit_hash>:<key>`` keys no later commit can write. A
-    # commit that lands after the mark phase is in nobody's orphan tree,
-    # so nothing it wrote can end up on this list.
-    #
-    # Everything else is content-addressed — v4 blobs, every HAMT node,
-    # chunks — and an orphan's copy is the *same key* as the one a
-    # brand-new commit writes whenever the bytes match. That commit was
-    # never marked, so "in the orphan's tree" does not imply "safe to
-    # delete", and no amount of scoping fixes it. Those are reclaimed
-    # only on the deep path, under the GC lease.
+    # Every deletion candidate on this path comes from walking an
+    # orphan's own keyset. Content is keyed by what it holds, so an
+    # orphan's blob or node may be the very key a live commit uses; the
+    # mark phase saw every live commit — published, in flight, or young
+    # — so "unmarked" is what makes a key safe to take, and no batch can
+    # land to change that while the lease is held.
     #
     # ``skip_nodes=reachable_nodes`` prunes subtrees shared with a live
-    # commit or a young orphan: nothing under them is deletable, and
-    # shared structure is walked once, not per orphan. Two orphans
-    # sharing a subtree may each name the same key; ``remove_many``
-    # tolerates duplicates.
+    # commit: nothing under them is deletable, and shared structure is
+    # walked once, not per orphan. Two orphans sharing a subtree may each
+    # name the same key; ``remove_many`` tolerates duplicates.
     for orphan_hash in orphans:
         orphan_root = _load_root(store, orphan_hash)
         if orphan_root is not None and orphan_root != EMPTY_HASH:
@@ -1143,12 +1120,12 @@ def _sweep(
                 # let one corrupt keyset block GC for the whole store.
                 orphan_entries, orphan_nodes = {}, set()
             for entry in orphan_entries.values():
-                if entry.blob in reachable_blobs:
-                    continue
-                if deep or not entry.blob.startswith(BLOB_PREFIX):
+                if entry.blob not in reachable_blobs:
                     all_removals.append(entry.blob)
-            if deep:
-                all_removals.extend(keyset_prefix + node for node in orphan_nodes)
+                for chunk in entry.meta.chunks or ():
+                    if chunk not in reachable_chunks:
+                        all_removals.append(CHUNK_PREFIX + chunk)
+            all_removals.extend(keyset_prefix + node for node in orphan_nodes)
         all_removals.extend(
             [
                 COMMIT_ROOT % orphan_hash,
@@ -1159,36 +1136,22 @@ def _sweep(
         )
 
     if deep:
-        # Namespace scans: the only place content-addressed blobs and
-        # chunks are ever deleted, and the way nodes and blobs no orphan
-        # keyset points at (a crash's leftovers) come back. Anything
-        # committed since the mark phase would look unreferenced here,
-        # which is why this path runs only under the GC lease.
-        for key in store.keys():
-            if not isinstance(key, str):
-                continue
-            if key.startswith(keyset_prefix):
-                node_hash = key[len(keyset_prefix) :]
-                if node_hash and node_hash not in reachable_nodes:
-                    all_removals.append(key)
-            elif key.startswith(CHUNK_PREFIX):
-                chunk_hash = key[len(CHUNK_PREFIX) :]
-                if chunk_hash and chunk_hash not in reachable_chunks:
-                    all_removals.append(key)
-            elif key.startswith(BLOB_PREFIX):
-                if key not in reachable_blobs:
-                    all_removals.append(key)
-
-    if not deep:
-        # The incremental sweep is safe beside a writer, but not worth
-        # running beside another sweep: both would compute delete lists
-        # from the same store and race each other's removals for no
-        # extra space back. Wait the lease holder out, then delete.
-        # The deep path skips this — it holds the lease itself.
-        _wait_for_gc(store)
+        # Namespace scans: the way content no orphan keyset points at (a
+        # crash's leftovers, an interrupted write) comes back.
+        for key in store.keys(keyset_prefix):
+            node_hash = key[len(keyset_prefix) :]
+            if node_hash and node_hash not in reachable_nodes:
+                all_removals.append(key)
+        for key in store.keys(CHUNK_PREFIX):
+            chunk_hash = key[len(CHUNK_PREFIX) :]
+            if chunk_hash and chunk_hash not in reachable_chunks:
+                all_removals.append(key)
+        for key in store.keys(BLOB_PREFIX):
+            if key not in reachable_blobs:
+                all_removals.append(key)
 
     if all_removals:
-        store.remove_many(*all_removals)
+        store.remove_many(all_removals)
 
     if orphans:
         gc_logger.debug("Cleaned %d orphaned commit(s)", len(orphans))
@@ -1270,6 +1233,11 @@ class VersionedKV(VersionedBase):
         # Stamps only ever rise, so once this handle has seen the store
         # at v4 it never needs to read the stamp again.
         self._blob_version_stamped = False
+        # Commits this handle has written and not yet published, with the
+        # bytes of each one's in-flight marker: the marker stays in the
+        # store until the publishing write removes it, or a failed
+        # attempt withdraws it.
+        self._in_flight: dict[str, bytes] = {}
 
         # Materialize keyset + meta from the HAMT
         self._meta: dict[str, MetaEntry] = {}
@@ -1338,8 +1306,32 @@ class VersionedKV(VersionedBase):
         )
 
     def _restore_state(self, saved: tuple) -> None:
-        """Restore in-memory state after a failed commit attempt."""
+        """Restore in-memory state after a failed commit attempt.
+
+        The attempt's commits are abandoned, so their in-flight markers
+        are withdrawn and they become ordinary orphans. Best effort: a
+        marker left behind lapses after :data:`IN_FLIGHT_TTL`.
+        """
         self._current_commit, self._commit_keys, self._meta = saved
+        if self._in_flight:
+            markers = [IN_FLIGHT_KEY % commit for commit in self._in_flight]
+            self._in_flight = {}
+            self.store.remove_many(markers)
+
+    def _land_batch(self, commit: str, diffs: dict[str, bytes]) -> None:
+        """Write a commit's batch, marked in flight, while no sweep runs.
+
+        The batch is conditional on the lease record read after waiting
+        any live sweep out, so it lands before a sweep starts or after
+        one ends, never during. Landing before is safe because the batch
+        carries the commit's in-flight marker, which every later sweep
+        marks from until the commit is published.
+        """
+        marker = dumps(time.time() + IN_FLIGHT_TTL)
+        diffs[IN_FLIGHT_KEY % commit] = marker
+        while not self.store.cas_many({GC_LEASE_KEY: _wait_for_gc(self.store)}, diffs):
+            pass
+        self._in_flight[commit] = marker
 
     def _create_commit(
         self,
@@ -1373,9 +1365,9 @@ class VersionedKV(VersionedBase):
             if key in self._meta:
                 new_meta[key] = self._meta[key]
 
-        # Every blob is written, even one whose key is already stored:
-        # skipping it would leave this commit depending on a copy a
-        # concurrent deep clean may be about to delete.
+        # Every blob is written, even one whose key is already stored,
+        # so the batch holds everything its commit needs whatever a sweep
+        # took before it landed.
         diffs: dict[str, bytes] = {}
         for key, value in updates.items():
             pointer = blob_key(value)
@@ -1389,7 +1381,7 @@ class VersionedKV(VersionedBase):
         # Stage chunk writes under their content-addressed namespace.
         # Like blobs, every chunk is written even when its key is
         # already stored; the key is the hash, so the rewrite is a no-op
-        # for the data and a guarantee against a concurrent deep clean.
+        # for the data and a guarantee against an earlier sweep.
         if chunks:
             _stamp_version_at_least(self.store, CHUNK_STORAGE_VERSION)
             for chunk_hash, chunk_bytes in chunks.items():
@@ -1417,17 +1409,11 @@ class VersionedKV(VersionedBase):
 
         self._stamp_blob_version()
 
-        # Everything this commit writes that a deep clean's namespace
-        # scan could delete — chunks, HAMT nodes, blobs, commit
-        # metadata — is in this one batch, so one lease check covers it
-        # all. It goes immediately before the write so the window
-        # between "no sweep is running" and "the batch has landed" is as
-        # short as the backend allows. (The version stamp above is not
-        # covered and needs no cover: no sweep deletes it.)
-        _wait_for_gc(self.store)
-
-        # Write everything atomically
-        self.store.set_many(diffs)
+        # Everything this commit writes that a sweep could delete —
+        # chunks, HAMT nodes, blobs, commit metadata — lands in this one
+        # batch. (The version stamp above is not in it and needs no
+        # cover: no sweep deletes it.)
+        self._land_batch(new_hash, diffs)
 
         # Update in-memory state
         self._commit_keys = new_commit_keys
@@ -1527,15 +1513,7 @@ class VersionedKV(VersionedBase):
             diffs[INFO_KEY % merge_hash] = dumps(info)
 
         self._stamp_blob_version()
-
-        # A deep clean deletes any blob, node or chunk its mark phase
-        # did not see, so no write batch may be in flight while one
-        # sweeps.
-        # Checked immediately before the batch, which is the whole of
-        # what this commit writes.
-        _wait_for_gc(self.store)
-
-        self.store.set_many(diffs)
+        self._land_batch(merge_hash, diffs)
 
         # Update in-memory state
         self._commit_keys = merged_keyset
@@ -1545,53 +1523,38 @@ class VersionedKV(VersionedBase):
         return merge_hash
 
     def _cas_head(self, expected: str, new_head: str) -> bool:
-        """Atomically advance branch HEAD via KVStore CAS.
+        """Publish ``new_head`` as this branch's HEAD if HEAD is ``expected``.
 
-        The prev-HEAD backup is written **after** the swap succeeds,
-        never before. Written first, it lands whether or not the CAS
-        does, so a writer that loses the race still leaves its own stale
-        ``expected`` as the branch's recovery target — clobbering the
-        winner's backup, and, when ``expected`` came from an injected
-        recoverer, naming a commit that was never HEAD at all. Writing it
-        afterwards makes it always a value ``__branch_head__`` really
-        held.
+        One atomic write moves HEAD, records ``expected`` as the
+        prev-HEAD backup, and removes the in-flight markers of the
+        commits being published. The backup therefore always names the
+        commit HEAD held immediately before, and a published commit
+        never keeps a marker, nor loses it before its head lands.
 
-        What this does **not** buy is a backup that is always exactly
-        one commit back. The swap and the backup write are two steps,
-        and anything that separates them — a crash, or simply losing
-        the CPU while another writer completes both of its own — lets
-        the older writer's backup land last. HEAD then sits two or more
-        commits ahead of a backup that is still a real former HEAD, and
-        recovery skips whatever came between.
+        The write also expects each marker to hold the bytes this handle
+        wrote. A marker only disappears early if it lapsed — the writer
+        took longer than :data:`IN_FLIGHT_TTL` to publish — and a sweep
+        reaped it, possibly with the commit; then the publish fails, and
+        the commit surfaces an error rather than a head over a commit
+        that may be gone.
 
-        So the guarantee is the narrower one: the backup always names a
-        commit ``__branch_head__`` really held, never a commit invented
-        by a losing writer. Recovery may lose more than one commit; it
-        cannot graft on a lineage the branch never had. There is no way
-        to do better with what the store offers — ``KVStore.cas`` takes
-        a single key and no backend exposes a transaction spanning two,
-        so HEAD and its backup cannot move in one step.
-
-        A CAS that fails against a *damaged* HEAD is retried once
-        through :func:`_heal_head`, which repairs it atomically. That is
-        the only place a corrupt HEAD is written back, now that reads
-        do not.
+        A CAS that fails against a *damaged* HEAD is retried through
+        :func:`_heal_head`, which repairs it atomically. That is the only
+        place a corrupt HEAD is written back, now that reads do not.
         """
         branch_key = BRANCH_HEAD % self._branch
         expected_bytes = dumps(expected)
-        new_bytes = dumps(new_head)
-
-        # A branch head is what makes a commit reachable, so moving one
-        # under a running sweep changes the answer the mark phase
-        # already computed. Wait the lease out and publish afterwards.
-        _wait_for_gc(self.store)
-
-        won = self.store.cas(branch_key, new_bytes, expected=expected_bytes)
-        if not won and _heal_head(self.store, self._branch, expected_bytes):
-            won = self.store.cas(branch_key, new_bytes, expected=expected_bytes)
-        if won:
-            self.store.set(BRANCH_HEAD_PREV % self._branch, expected_bytes)
-        return won
+        writes = {
+            branch_key: dumps(new_head),
+            BRANCH_HEAD_PREV % self._branch: expected_bytes,
+        }
+        markers = {IN_FLIGHT_KEY % c: marker for c, marker in self._in_flight.items()}
+        expect = {branch_key: expected_bytes, **markers}
+        while not self.store.cas_many(expect, writes, tuple(markers)):
+            if not _heal_head(self.store, self._branch, expected_bytes):
+                return False
+        self._in_flight = {}
+        return True
 
     def _load_keyset(self, commit_hash: str) -> dict[str, str]:
         """Load just the keyset for a commit (key -> versioned_key mapping).
@@ -1743,29 +1706,32 @@ class VersionedKV(VersionedBase):
         _reject_reserved_branch(name)
         branch_key = BRANCH_HEAD % name
         target = at or self._current_commit
-        # Waited out before the existence check, not just before the
-        # CAS: a sweep in progress is about to change which commits
-        # exist, so a check answered from underneath it can pass for a
-        # commit that is gone by the time the head lands. After the
-        # wait, "the commit is here" and "the head names it" are
-        # decided against the same store, so the outcomes are a branch
-        # on a commit that loads, or a refusal — never a head pointing
-        # at nothing.
-        _wait_for_gc(self.store)
-        if at is not None and self.store.get(COMMIT_ROOT % at) is None:
-            raise ValueError(f"Commit '{at}' does not exist")
-        if not self.store.cas(branch_key, dumps(target), expected=None):
-            raise ValueError(f"Branch '{name}' already exists")
-        # A branch that has just been created has no previous HEAD, so any
-        # backup under this name is stale by definition. One can outlive a
-        # ``delete_branch`` — a writer descheduled between its CAS and its
-        # backup write, resuming after the delete — and while the name is
-        # unclaimed head resolution ignores it, but re-installing an anchor
-        # would make it reachable again: corrupt this branch's fresh HEAD
-        # before its first successful CAS and the prev-HEAD tier would serve
-        # the *deleted* branch's tip. Dropped after the CAS, so a losing
-        # attempt cannot take out the existing branch's real backup.
-        self.store.remove(BRANCH_HEAD_PREV % name)
+        # "The commit is here" and "the head names it" are decided
+        # against one lease record: a sweep that starts between the
+        # check and the write makes the write fail, and the check runs
+        # again. So the outcomes are a branch on a commit that loads, or
+        # a refusal — never a head pointing at nothing.
+        #
+        # The write also drops any backup under this name. A branch that
+        # has just been created has no previous HEAD, and a stale backup
+        # left by an earlier branch of the same name would otherwise be
+        # what head recovery serves if this HEAD were ever damaged.
+        while True:
+            lease = _wait_for_gc(self.store)
+            if at is not None and self.store.get(COMMIT_ROOT % at) is None:
+                raise ValueError(f"Commit '{at}' does not exist")
+            landed = _try_land(
+                self.store,
+                lease,
+                {branch_key: None},
+                {branch_key: dumps(target)},
+                (BRANCH_HEAD_PREV % name,),
+            )
+            if landed is None:
+                continue
+            if not landed:
+                raise ValueError(f"Branch '{name}' already exists")
+            break
         return VersionedKV(
             self.store,
             commit_hash=target,
@@ -1781,12 +1747,11 @@ class VersionedKV(VersionedBase):
         branch_key = BRANCH_HEAD % name
         if self.store.get(branch_key) is None:
             raise ValueError(f"Branch '{name}' does not exist")
-        self.store.remove(branch_key)
-        # The prev-HEAD recovery backup goes too: left behind, a
-        # same-named branch created later would "recover" the deleted
-        # state through _resolve_head's fallback. Removed before
-        # clean_orphans so commits only it referenced are collectable.
-        self.store.remove(BRANCH_HEAD_PREV % name)
+        # The prev-HEAD recovery backup goes in the same removal: left
+        # behind, it would be a lone backup naming the deleted state.
+        # Both go before clean_orphans, so commits only they referenced
+        # are collectable.
+        self.store.remove_many([branch_key, BRANCH_HEAD_PREV % name])
         self.clean_orphans()
 
     def switch_branch(self, name: str) -> None:
@@ -1842,23 +1807,27 @@ class VersionedKV(VersionedBase):
         return self.store.get(entry.blob)
 
     def reset_to(self, commit_hash: str) -> bool:
-        """Reset HEAD to a specific commit."""
-        # Ahead of the existence check for the same reason
-        # ``create_branch`` does it: a sweep is about to change which
-        # commits exist, and a head must never be pointed at one the
-        # sweep has since taken. After the wait the check and the write
-        # see the same store, so this either resets onto a commit that
-        # loads or reports the commit gone.
-        _wait_for_gc(self.store)
-        if self.store.get(COMMIT_ROOT % commit_hash) is None:
-            return False
+        """Reset HEAD to a specific commit.
+
+        Whatever HEAD held becomes the prev-HEAD backup in the same
+        write. A concurrent writer moving HEAD in between does not stop
+        the reset; it is retried against the new HEAD.
+        """
         branch_key = BRANCH_HEAD % self._branch
         prev_key = BRANCH_HEAD_PREV % self._branch
-        # Save current HEAD as prev before overwriting
-        current = self.store.get(branch_key)
-        if current is not None:
-            self.store.set(prev_key, current)
-        self.store.set(branch_key, dumps(commit_hash))
+        # The existence check and the write are decided against one
+        # lease record, as in ``create_branch``: this either resets onto
+        # a commit that loads or reports the commit gone.
+        while True:
+            lease = _wait_for_gc(self.store)
+            if self.store.get(COMMIT_ROOT % commit_hash) is None:
+                return False
+            current = self.store.get(branch_key)
+            writes = {branch_key: dumps(commit_hash)}
+            if current is not None:
+                writes[prev_key] = current
+            if _try_land(self.store, lease, {branch_key: current}, writes):
+                break
         self._load_commit(commit_hash, update_base=True)
         return True
 
@@ -1874,7 +1843,7 @@ class VersionedKV(VersionedBase):
         """
         prefix = BRANCH_HEAD.replace("%s", "")
         result = []
-        for key in store.keys():
+        for key in store.keys(prefix):
             if isinstance(key, str) and key.startswith(prefix):
                 branch_name = key[len(prefix) :]
                 if branch_name and not branch_name.startswith(TAG_BRANCH_PREFIX):
@@ -1949,44 +1918,43 @@ class VersionedKV(VersionedBase):
         Tagging a commit that is *already* an orphan older than
         ``min_age`` can still lose to a concurrent sweep, which was free
         to collect that commit before the tag existed — but it loses
-        cleanly. The call waits out a deep clean's lease before it looks
-        the commit up, so it either tags a commit that is really there
-        or raises; it never leaves a tag naming a commit the sweep took.
+        cleanly. The lookup and the tag are decided against one lease
+        record, so it either tags a commit that is really there or
+        raises; it never leaves a tag naming a commit the sweep took.
         Callers tag a commit they are holding — a head, or something a
         head descends from — and a commit a branch reaches is never a
         sweep candidate.
         """
         _validate_tag_name(name)
         target = at or self._current_commit
-        # A tag is a GC root, so it must not be planted while a sweep is
-        # deciding what is reachable: a mark phase that ran before this
-        # head key landed treats the tagged commit as unreachable.
-        # Waiting first also makes the existence check below mean
-        # something — checked under a running sweep, it can pass for a
-        # commit that is collected before the tag lands.
-        _wait_for_gc(self.store)
-        if self.store.get(COMMIT_ROOT % target) is None:
-            raise ValueError(f"Commit '{target}' does not exist")
         # Encoded before anything is written, so info that cannot be
         # serialized raises without leaving a tag behind.
         record = dumps({"time": time.time(), "info": info})
-
-        # CAS against absence: two writers racing the same name cannot
-        # both win, and an existing tag is never silently overwritten.
         head_key = BRANCH_HEAD % _tag_branch(name)
-        if not self.store.cas(head_key, dumps(target), expected=None):
-            raise ValueError(f"Tag '{name}' already exists")
-        # A name that has just been claimed has no previous HEAD, so any
-        # backup under it is stale by definition — left by an earlier tag
-        # of the same name, or by something that moved this name as an
-        # ordinary branch. Dropped after the CAS, so a losing attempt
-        # cannot take out the winner's state.
-        self.store.remove(BRANCH_HEAD_PREV % _tag_branch(name))
-        # The record is a second write, so a crash in between leaves a
-        # tag with no time and no info. That is why the head key alone is
-        # what GC and resolution read.
-        self.store.set(TAG_INFO_KEY % name, record)
-        return target
+        # A tag is a GC root, so it must not be planted under a sweep
+        # that has already decided what is reachable, and the existence
+        # check must still hold when it lands: both are decided against
+        # one lease record, and a sweep in between sends them round
+        # again. The head is claimed against absence, so two writers
+        # racing the same name cannot both win and an existing tag is
+        # never overwritten; the record lands with it, and any backup
+        # left under the name by an earlier tag goes in the same write.
+        while True:
+            lease = _wait_for_gc(self.store)
+            if self.store.get(COMMIT_ROOT % target) is None:
+                raise ValueError(f"Commit '{target}' does not exist")
+            landed = _try_land(
+                self.store,
+                lease,
+                {head_key: None},
+                {head_key: dumps(target), TAG_INFO_KEY % name: record},
+                (BRANCH_HEAD_PREV % _tag_branch(name),),
+            )
+            if landed is None:
+                continue
+            if not landed:
+                raise ValueError(f"Tag '{name}' already exists")
+            return target
 
     def tags(self) -> dict[str, str]:
         """Map every tag in the store to the commit it names."""
@@ -2016,9 +1984,9 @@ class VersionedKV(VersionedBase):
         head_key = BRANCH_HEAD % _tag_branch(name)
         if self.store.get(head_key) is None:
             raise ValueError(f"Tag '{name}' does not exist")
-        self.store.remove(head_key)
-        self.store.remove(BRANCH_HEAD_PREV % _tag_branch(name))
-        self.store.remove(TAG_INFO_KEY % name)
+        self.store.remove_many(
+            [head_key, BRANCH_HEAD_PREV % _tag_branch(name), TAG_INFO_KEY % name]
+        )
         self.clean_orphans()
 
     def commit_info(self, commit_hash: str | None = None) -> dict | None:
@@ -2054,12 +2022,9 @@ class VersionedKV(VersionedBase):
         """Remove orphaned commits unreachable from any branch HEAD.
 
         Thin instance wrapper over :func:`clean_orphans`, which does the
-        mark-and-sweep against ``self.store``. Kept as a method so
-        existing callers (and ``delete_branch``) read naturally.
-
-        Reclaims commit metadata, blobs and HAMT nodes, but **not
-        chunks** — see :func:`clean_orphans` for why, and
-        :meth:`deep_clean` for the pass that reclaims them.
+        mark-and-sweep against ``self.store`` under the GC lease. Kept as
+        a method so existing callers (and ``delete_branch``) read
+        naturally.
 
         Returns:
             Number of orphaned commits removed.
@@ -2067,30 +2032,24 @@ class VersionedKV(VersionedBase):
         return clean_orphans(self.store, min_age)
 
     def deep_clean(
-        self,
-        min_age: float = 3600,
-        *,
-        grace: float = 5.0,
-        lease_ttl: float = 600.0,
+        self, min_age: float = 3600, *, lease_ttl: float = GC_LEASE_TTL
     ) -> int:
-        """Orphan sweep plus a full unreferenced-node/chunk scan.
+        """Orphan sweep plus a scan for content nothing references.
 
-        Thin instance wrapper over :func:`deep_clean`, which takes the
-        store's GC lease, pauses for ``grace`` so writes already in
-        flight can land, sweeps, and releases. Use :meth:`clean_orphans`
-        for routine cleanup and this one as a maintenance pass, since it
-        is the only pass that reclaims chunks — both the ones no commit
-        references and the ones deleted orphans owned.
+        Thin instance wrapper over :func:`deep_clean`. Use
+        :meth:`clean_orphans` for routine cleanup and this one as an
+        occasional maintenance pass, for leftovers no orphan keyset
+        points at.
 
         Returns:
             Number of orphaned commits removed.
 
         Raises:
-            GcBusy: if another deep clean holds a live lease.
+            GcBusy: if another sweep holds a live lease.
             ValueError: if the store is stamped above the layout this
                 code reads. Nothing is written, the lease key included.
         """
-        return deep_clean(self.store, min_age, grace=grace, lease_ttl=lease_ttl)
+        return deep_clean(self.store, min_age, lease_ttl=lease_ttl)
 
     # -- Internal --
 

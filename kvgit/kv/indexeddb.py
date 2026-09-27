@@ -29,11 +29,11 @@ you are already in an environment where both conditions hold.
 Concurrency
 -----------
 IndexedDB is shared across Web Workers within the same origin.
-Write operations (``set``, ``set_many``, ``remove``, ``cas``, ``clear``)
-use ``readwrite`` transactions, which IndexedDB serializes against other
-``readwrite`` transactions on the same object store.  ``cas`` performs
-its read and write within a single ``readwrite`` transaction, making it
-safe across workers.
+Write operations (``set``, ``set_many``, ``remove``, ``cas_many``,
+``clear``) use ``readwrite`` transactions, which IndexedDB serializes
+against other ``readwrite`` transactions on the same object store.
+``cas_many`` performs its reads and its conditional batch within a
+single ``readwrite`` transaction, making it safe across workers.
 
 Implementation note
 -------------------
@@ -47,7 +47,12 @@ the handler is set, causing a deadlock.
 
 from collections.abc import Iterable, Mapping
 
-from js import Promise, indexedDB, undefined  # type: ignore[import-not-found]
+from js import (  # type: ignore[import-not-found]
+    IDBKeyRange,
+    Promise,
+    indexedDB,
+    undefined,
+)
 from pyodide.ffi import create_proxy, run_sync, to_js  # type: ignore[import-not-found]
 
 from .base import KVStore
@@ -131,6 +136,23 @@ async def _idb_tx_complete(tx):
         tx.onabort = lambda e: reject(e.target.error)
 
     await _promise(_executor)
+
+
+def _prefix_range(prefix: str):
+    """The IDBKeyRange holding every key that starts with ``prefix``.
+
+    IndexedDB orders strings by UTF-16 code unit, so the keys starting
+    with ``p`` are those in ``[p, p')`` where ``p'`` bumps the last code
+    unit — exact whenever that character is outside the surrogate range
+    and below U+FFFF, which covers every prefix kvgit asks for. Otherwise
+    the range is left open above and the caller filters.
+    """
+    if not prefix:
+        return undefined
+    last = ord(prefix[-1])
+    if last < 0xD7FF or 0xE000 <= last < 0xFFFF:
+        return IDBKeyRange.bound(prefix, prefix[:-1] + chr(last + 1), False, True)
+    return IDBKeyRange.lowerBound(prefix)
 
 
 def _to_uint8array(data: bytes):
@@ -268,13 +290,13 @@ class IndexedDB(KVStore):
         run_sync(_op())
         return results
 
-    def keys(self) -> Iterable[str]:
+    def keys(self, prefix: str = "") -> Iterable[str]:
         async def _op():
             store, _tx = self._object_store("readonly")
-            return await _idb_request(store.getAllKeys())
+            return await _idb_request(store.getAllKeys(_prefix_range(prefix)))
 
         result = run_sync(_op())
-        return [str(k) for k in result]
+        return [str(k) for k in result if str(k).startswith(prefix)]
 
     def __contains__(self, key: str) -> bool:
         async def _op():
@@ -303,35 +325,59 @@ class IndexedDB(KVStore):
 
         run_sync(_op())
 
-    def cas(self, key: str, value: bytes, expected: bytes | None) -> bool:
-        """Atomic compare-and-swap.
+    def cas_many(
+        self,
+        expected: Mapping[str, bytes | None],
+        writes: Mapping[str, bytes],
+        removes: Iterable[str] = (),
+    ) -> bool:
+        """Atomic conditional batch.
 
-        Read and write happen in a single ``readwrite`` transaction.
-        IndexedDB serializes ``readwrite`` transactions on the same
-        object store, so this is safe across Web Workers sharing the
-        same database.
+        Every read and the batch happen in a single ``readwrite``
+        transaction. IndexedDB serializes ``readwrite`` transactions on
+        the same object store, so this is safe across Web Workers sharing
+        the same database.
         """
-        if not isinstance(value, bytes):
-            raise TypeError(f"Expected bytes, got {type(value).__name__}")
-
-        cas_result = [False]
+        removes = self._check_batch(writes, removes)
+        expected = dict(expected)
+        applied = [False]
 
         async def _op():
             store, tx = self._object_store("readwrite")
-            read_req = store.get(key)
 
-            # Do the read and conditional write entirely within callbacks
-            # to keep the transaction alive (no await between read and write).
+            # The reads and the conditional writes all run inside
+            # callbacks, with no await in between, to keep the one
+            # transaction alive from the first read to the last write.
             def _executor(resolve, reject):
-                def on_read_success(event):
-                    current = _to_bytes(event.target.result)
-                    if current != expected:
-                        return  # tx will auto-commit empty
-                    store.put(_to_uint8array(value), key)
-                    cas_result[0] = True
+                waiting = [len(expected)]
+                failed = [False]
 
-                read_req.onsuccess = on_read_success
-                read_req.onerror = lambda e: reject(e.target.error)
+                def apply():
+                    for key, value in writes.items():
+                        store.put(_to_uint8array(value), key)
+                    for key in removes:
+                        store.delete(key)
+                    applied[0] = True
+
+                def on_read_for(want):
+                    def on_read(event):
+                        if failed[0]:
+                            return
+                        if _to_bytes(event.target.result) != want:
+                            failed[0] = True  # tx commits with nothing written
+                            return
+                        waiting[0] -= 1
+                        if waiting[0] == 0:
+                            apply()
+
+                    return on_read
+
+                for key, want in expected.items():
+                    request = store.get(key)
+                    request.onsuccess = on_read_for(want)
+                    request.onerror = lambda e: reject(e.target.error)
+                if not expected:
+                    apply()
                 tx.oncomplete = lambda e: resolve(None)
                 tx.onerror = lambda e: reject(e.target.error)
                 tx.onabort = lambda e: reject(e.target.error)
@@ -339,7 +385,7 @@ class IndexedDB(KVStore):
             await _promise(_executor)
 
         run_sync(_op())
-        return cas_result[0]
+        return applied[0]
 
     def clear(self) -> None:
         async def _op():

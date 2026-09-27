@@ -176,7 +176,7 @@ class TestTagsAsGCRoots:
     def test_deep_clean_keeps_a_tagged_commit(self):
         backend, v, tagged = self._store_with_tagged_orphan()
 
-        assert v.deep_clean(min_age=0, grace=0) == 0
+        assert v.deep_clean(min_age=0) == 0
         assert backend.get(COMMIT_ROOT % tagged) is not None
         assert v.checkout(tag="v1").get("secret") == b"tagged value"
 
@@ -189,7 +189,7 @@ class TestTagsAsGCRoots:
         assert backend.get(TAG_INFO_KEY % "v1") is None
         assert v.clean_orphans(min_age=0) >= 1
         assert backend.get(COMMIT_ROOT % tagged) is None
-        v.deep_clean(min_age=0, grace=0)
+        v.deep_clean(min_age=0)
         assert backend.get(SECRET) is None
 
     def test_dangling_tag_keeps_nothing_alive(self):
@@ -258,7 +258,7 @@ class TestAnchorFreeTagPaths:
             backend = s2.versioned.store
             assert backend.get(TAG_INFO_KEY % "v1") is None
             assert backend.get(COMMIT_ROOT % tagged) is None
-            s2.versioned.deep_clean(min_age=0, grace=0)
+            s2.versioned.deep_clean(min_age=0)
             assert backend.get(pointer) is None
 
     def test_delete_tags_unknown_name_is_a_noop(self):
@@ -408,7 +408,7 @@ class TestTagKeyLayout:
         backend = Memory()
         v = Versioned(backend)
         v.tag("v1", info={"by": "ann"})
-        v.deep_clean(min_age=0, grace=0)
+        v.deep_clean(min_age=0)
         assert backend.get(TAG_INFO_KEY % "v1") is not None
         assert v.tag_info("v1").info == {"by": "ann"}
 
@@ -644,5 +644,5 @@ class TestStagedTagOps:
 
         s.delete_tag("v1")
         assert s.versioned.clean_orphans(min_age=0) >= 1
-        s.versioned.deep_clean(min_age=0, grace=0)
+        s.versioned.deep_clean(min_age=0)
         assert backend.get(pointer) is None
