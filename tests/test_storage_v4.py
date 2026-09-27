@@ -191,23 +191,29 @@ class TestWriting:
 
 class TestMergingAcrossFormats:
     def test_legacy_and_content_pointers_to_equal_bytes_merge_clean(self):
-        """Both sides changed ``notes`` to the same text: dev under a
+        """Both sides changed ``notes`` to the same bytes: dev under a
         legacy pointer, main under a content pointer. The pointers differ,
-        the bytes do not, so the merge is clean with no merge function."""
-        store, manifest = load_v3()
-        main = Staged(VersionedKV(store))
-        main["notes"] = manifest["branches"]["dev"]["values"]["notes"]
-        main.commit()
+        the bytes do not, so the merge is clean with no merge function.
 
+        Main writes dev's stored bytes as they are rather than encoding
+        the same string again: pickle's output depends on the Python
+        version (its default protocol moved in 3.14), so re-encoding
+        would not reliably reproduce what the older kvgit stored.
+        """
+        store, manifest = load_v3()
         dev_head = manifest["branches"]["dev"]["head"]
-        ours = main.versioned._load_keyset(main.current_commit)["notes"]
-        theirs = main.versioned._load_keyset(dev_head)["notes"]
+        main = VersionedKV(store)
+        theirs = main._load_keyset(dev_head)["notes"]
+        main.commit({"notes": store.get(theirs)})
+        ours = main._load_keyset(main.current_commit)["notes"]
         assert ours.startswith(BLOB_PREFIX) and not theirs.startswith(BLOB_PREFIX)
-        result = main.merge(dev_head)
+
+        result = main.merge_heads(dev_head)
         assert result.merged
         assert "notes" not in result.auto_merged_keys
-        assert main["notes"] == "alpha\nBETA\ngamma\n"
-        assert main["dev_only"] == "only on dev"
+        merged = Staged(VersionedKV(store))
+        assert merged["notes"] == "alpha\nBETA\ngamma\n"
+        assert merged["dev_only"] == "only on dev"
 
     def test_text_merge_across_formats(self):
         store, manifest = load_v3()
