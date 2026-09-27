@@ -44,7 +44,9 @@ from kvgit.versioned.kv import (
     PARENT_COMMIT,
     _load_root,
     _resolve_head,
+    blob_key,
     clean_orphans,
+    deep_clean,
     recover_by_commit_scan,
     repair_head,
 )
@@ -394,21 +396,17 @@ class TestLostCasGarbage:
     """A lost CAS leaves its writes for GC, and must not delete them."""
 
     def test_lost_cas_leaves_collectable_garbage(self):
-        """The loser's commits are garbage the ordinary sweep reclaims.
+        """The loser's commits are garbage the sweeps reclaim.
 
-        Nothing is deleted inline. The loser's HAMT nodes are keyed by
-        content, so the winner may legitimately share them, and blowing
-        them away is the resurrection hazard the scoped sweep exists to
-        avoid. The orphans are collected on the normal path once they age
-        past ``min_age``; chunks wait for ``deep_clean`` (see
-        ``clean_orphans``).
+        Nothing is deleted inline. The loser's blobs and HAMT nodes are
+        keyed by content, so the winner may legitimately share them.
+        The incremental sweep collects the orphan commit once it ages
+        past ``min_age``; its content waits for ``deep_clean``.
 
-        Issue #39 retries a lost fast-forward race through the merge
-        path, so a conflicting loser now surfaces ``MergeConflict``
-        instead of ``ConcurrencyError``. The retry's merge attempt writes
-        the identical commit objects (same parent, same changes, same
-        ``created_at``), so there is still exactly one orphan for the
-        sweep.
+        A lost fast-forward race is retried through the merge path, so
+        a conflicting loser surfaces ``MergeConflict`` rather than
+        ``ConcurrencyError``. The retry merges from the commit it has
+        already built, so there is exactly one orphan for the sweep.
         """
         store = HookStore()
         v = VersionedKV(store)
@@ -435,7 +433,7 @@ class TestLostCasGarbage:
         )
         orphan = orphans[0]
         orphan_nodes = node_hashes(store, orphan)
-        assert store.get(f"{orphan}:a") == b"loser"
+        assert store.get(blob_key(b"loser")) == b"loser"
         assert store.get(PARENT_COMMIT % orphan) is not None
 
         # The winner is unaffected, and ordinary GC reclaims the orphan.
@@ -443,7 +441,9 @@ class TestLostCasGarbage:
         age_commits(store, 10_000)
         assert clean_orphans(store, min_age=3600) == 1
         assert store.get(COMMIT_ROOT % orphan) is None
-        assert store.get(f"{orphan}:a") is None
+        assert store.get(blob_key(b"loser")) is not None  # content
+        deep_clean(store, min_age=3600, grace=0)
+        assert store.get(blob_key(b"loser")) is None
 
         live = VersionedKV(store)
         unshared = orphan_nodes - node_hashes(store, live.current_commit)
@@ -458,12 +458,10 @@ class TestRetryNodeAccounting:
     def test_raced_new_key_merge_strands_no_nodes(self):
         """The #39 retry must keep its first attempt as our side.
 
-        Rebuilding the commit after a lost CAS hashes identically
-        (``created_at`` is not in the commit hash) but writes different
-        HAMT nodes, detaching the first attempt's nodes where the
-        incremental sweep cannot find them. Merging from the already
-        built commit leaves every written node reachable from live
-        history.
+        Rebuilding the commit after a lost CAS would mint a second
+        commit for the same change (the hash covers the commit time)
+        and leave the first behind. Merging from the already built
+        commit leaves every written node reachable from live history.
         """
         store = Memory()
         v1 = VersionedKV(store)
@@ -664,46 +662,18 @@ class TestRepairHeadReturnValue:
         assert repair_head(store, "nonexistent") is None
 
 
-class TestAgedOutOrphanResurrection:
-    """A recreated orphan can be swept out from under a live HEAD.
+class TestRedoMintsANewCommit:
+    """Rolling a branch back and redoing a change mints a new commit.
 
-    ``content_hash`` has no nonce, so rolling a branch back and redoing
-    the same change byte-for-byte mints the *same* commit hash. If that
-    happens while a sweep is in flight — after the sweep has read the
-    orphan's ``__commit_time__`` and decided it is old, before it
-    deletes — the sweep deletes commit metadata that is now live.
-
-    Closing that properly needs a lock, which is out of scope here.
-    What is pinned is the fallout: HEAD names a commit whose metadata is
-    gone, and head resolution lands on the immediately-previous HEAD.
-    Both fixes in this module make that outcome *better*. The backup is
-    a commit that really was HEAD rather than a losing writer's stale
-    guess, and a read no longer makes the loss durable behind the
-    operator's back. It lands one commit back here because this scenario
-    has a single writer; under concurrent writers the backup can sit
-    further behind (see ``test_a_paused_winner_can_clobber_a_newer_backup``).
+    The commit hash covers the commit time, so a redo is never the
+    commit it repeats. A sweep deleting the old one — even a sweep that
+    has already judged it old garbage when the redo lands — deletes
+    nothing the redo needs: the redo's metadata lives under its own
+    hash, and its blob and nodes are content, which the incremental
+    sweep leaves alone.
     """
 
-    def _resurrect_under_a_sweep(self):
-        store = HookStore()
-        v = VersionedKV(store)
-        v.commit({"a": b"1"})
-        first = v.current_commit
-        v.commit({"a": b"2"})
-        second = v.current_commit
-
-        v.reset_to(first)
-        age_commits(store, 10_000)
-
-        # Fire once the sweep has read the orphan's age and believes it
-        # old: the writer then recreates it byte-identically and CASes
-        # HEAD onto it.
-        store.arm_get(COMMIT_TIME % second, lambda: v.commit({"a": b"2"}))
-        cleaned = clean_orphans(store, min_age=3600)
-        return store, first, second, cleaned
-
-    def test_the_hash_collision_is_real(self):
-        """Rollback-then-redo mints the same commit hash."""
+    def test_a_redo_is_a_new_commit_with_the_same_root(self):
         store = Memory()
         v = VersionedKV(store)
         v.commit({"a": b"1"})
@@ -713,22 +683,10 @@ class TestAgedOutOrphanResurrection:
 
         v.reset_to(first)
         v.commit({"a": b"2"})
-        assert v.current_commit == second
-
-        # Differing info breaks it, which is why commits carrying
-        # distinct metadata never collide this way.
-        v.reset_to(first)
-        v.commit({"a": b"2"}, info={"who": "someone else"})
         assert v.current_commit != second
+        assert _load_root(store, v.current_commit) == _load_root(store, second)
 
-    def test_ordinary_interleavings_do_not_corrupt(self):
-        """A resurrection that lands before the age check is safe.
-
-        Recreating the commit rewrites ``__commit_time__`` under the
-        same key, so the orphan reads as young and ``min_age`` protects
-        it. Only a writer landing between the age read and the delete
-        gets through.
-        """
+    def test_a_redo_under_a_sweep_loses_nothing(self):
         store = HookStore()
         v = VersionedKV(store)
         v.commit({"a": b"1"})
@@ -737,44 +695,21 @@ class TestAgedOutOrphanResurrection:
         second = v.current_commit
         v.reset_to(first)
         age_commits(store, 10_000)
-        v.commit({"a": b"2"})  # resurrects before the sweep starts
 
-        assert clean_orphans(store, min_age=3600) == 0
-        assert store.get(COMMIT_ROOT % second) is not None
+        # Fire once the sweep has read the orphan's age and believes it
+        # old: the writer then redoes the same change onto the branch.
+        redone: list[str] = []
+        store.arm_get(
+            COMMIT_TIME % second,
+            lambda: redone.append(v.commit({"a": b"2"}).commit),
+        )
+        assert clean_orphans(store, min_age=3600) == 1
+
+        assert store.get(COMMIT_ROOT % second) is None
+        assert redone and redone[0] != second
+        assert loads(store.get(BRANCH_HEAD % "main")) == redone[0]
+        assert _resolve_head(store, "main") == redone[0]
         assert VersionedKV(store).get("a") == b"2"
-
-    def test_resurrection_under_a_sweep_degrades_to_a_lost_commit(self):
-        """The narrow window costs the newest commit, not readability."""
-        store, first, second, cleaned = self._resurrect_under_a_sweep()
-
-        assert cleaned == 1
-        assert loads(store.get(BRANCH_HEAD % "main")) == second
-        assert store.get(COMMIT_ROOT % second) is None, (
-            "the sweep should have deleted the resurrected commit"
-        )
-
-        # Head resolution falls back — one commit back, this being a
-        # single-writer scenario.
-        recovered = _resolve_head(store, "main")
-        assert recovered == first
-        assert recovered == store.head_history["main"][-2]
-        assert VersionedKV(store).get("a") == b"1"
-
-    def test_the_fallback_does_not_make_the_loss_durable(self):
-        """Reading the damaged branch leaves the evidence in place."""
-        store, first, second, _ = self._resurrect_under_a_sweep()
-
-        before = dict(store.items())
-        assert VersionedKV(store).get("a") == b"1"
-        assert dict(store.items()) == before
-        assert loads(store.get(BRANCH_HEAD % "main")) == second, (
-            "a read overwrote the damaged HEAD, discarding the only "
-            "record of which commit went missing"
-        )
-
-        # The operator decides when to make it durable.
-        assert repair_head(store, "main") == first
-        assert loads(store.get(BRANCH_HEAD % "main")) == first
 
 
 class TestScanRecoveryIsOptIn:

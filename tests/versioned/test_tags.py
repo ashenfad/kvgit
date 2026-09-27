@@ -7,6 +7,7 @@ a store whose tags it cannot see.
 """
 
 import os
+import pickle
 import tempfile
 
 import pytest
@@ -24,20 +25,11 @@ from kvgit.versioned.kv import (
     TAG_BRANCH_PREFIX,
     TAG_INFO_KEY,
     _stamp_version_at_least,
+    blob_key,
     clean_orphans,
 )
 
-
-def _blob_keys(backend) -> set[str]:
-    """Versioned blob keys (``<commit>:<user_key>``) currently in the store."""
-    return {
-        k
-        for k in backend.keys()
-        if isinstance(k, str)
-        and ":" in k
-        and not k.startswith("__")
-        and "kvgit:" not in k
-    }
+SECRET = blob_key(b"tagged value")
 
 
 def _tag_head(name: str) -> str:
@@ -179,7 +171,7 @@ class TestTagsAsGCRoots:
 
         assert v.clean_orphans(min_age=0) == 0
         assert backend.get(COMMIT_ROOT % tagged) is not None
-        assert {k for k in _blob_keys(backend) if k.endswith(":secret")}
+        assert backend.get(SECRET) == b"tagged value"
 
     def test_deep_clean_keeps_a_tagged_commit(self):
         backend, v, tagged = self._store_with_tagged_orphan()
@@ -197,7 +189,8 @@ class TestTagsAsGCRoots:
         assert backend.get(TAG_INFO_KEY % "v1") is None
         assert v.clean_orphans(min_age=0) >= 1
         assert backend.get(COMMIT_ROOT % tagged) is None
-        assert not {k for k in _blob_keys(backend) if k.endswith(":secret")}
+        v.deep_clean(min_age=0, grace=0)
+        assert backend.get(SECRET) is None
 
     def test_dangling_tag_keeps_nothing_alive(self):
         """A tag naming a commit the store does not have marks nothing.
@@ -252,6 +245,8 @@ class TestAnchorFreeTagPaths:
             s["keep"] = "tagged value"
             s.commit()
             s.tag("v1")
+            tagged = s.current_commit
+            pointer = s.versioned._commit_keys["keep"]
             backend = s.versioned.store
             backend.close()
 
@@ -260,10 +255,11 @@ class TestAnchorFreeTagPaths:
 
             s2 = store(kind="disk", path=p)
             assert s2.tags() == {}
-            assert s2.versioned.store.get(TAG_INFO_KEY % "v1") is None
-            assert not {
-                k for k in _blob_keys(s2.versioned.store) if k.endswith(":keep")
-            }
+            backend = s2.versioned.store
+            assert backend.get(TAG_INFO_KEY % "v1") is None
+            assert backend.get(COMMIT_ROOT % tagged) is None
+            s2.versioned.deep_clean(min_age=0, grace=0)
+            assert backend.get(pointer) is None
 
     def test_delete_tags_unknown_name_is_a_noop(self):
         """Teardown is idempotent, like delete_branches."""
@@ -401,10 +397,10 @@ class TestTagKeyLayout:
         backend = Memory()
         v = Versioned(backend)
         v.commit({"x": b"1"})
-        assert _version(backend) == 3
+        before = _version(backend)
 
         v.tag("v1")
-        assert _version(backend) == 3
+        assert _version(backend) == before
 
     def test_info_record_survives_a_deep_clean(self):
         """The record lives under its own key kind that no sweep — this
@@ -643,6 +639,10 @@ class TestStagedTagOps:
         backend = s.versioned.store
         assert s.versioned.clean_orphans(min_age=0) == 0
 
+        pointer = blob_key(pickle.dumps("tagged value"))
+        assert backend.get(pointer) is not None
+
         s.delete_tag("v1")
         assert s.versioned.clean_orphans(min_age=0) >= 1
-        assert not {k for k in _blob_keys(backend) if k.endswith(":secret")}
+        s.versioned.deep_clean(min_age=0, grace=0)
+        assert backend.get(pointer) is None

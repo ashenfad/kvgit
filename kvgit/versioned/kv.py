@@ -1,6 +1,6 @@
 """KVStore-backed versioned state.
 
-Storage layout (v3):
+Storage layout (v4):
 
 - ``__kvgit_version__``                — storage version sentinel
 - ``__branch_head__<branch>``          — current HEAD commit hash
@@ -14,7 +14,8 @@ Storage layout (v3):
 - ``kvgit:keyset:<node_hash>``         — HAMT node bytes
 - ``kvgit:chunk:<chunk_hash>``         — content-addressed chunk bytes (v3)
 - ``__gc_lease__``                     — lease a deep clean sweeps under
-- ``<commit_hash>:<user_key>``         — blob value bytes
+- ``kvgit:blob:<sha256>``              — blob value bytes, keyed by content
+- ``<commit_hash>:<user_key>``         — blob value bytes written before v4
 
 A tag is deliberately not a key kind of its own. It is a branch head
 under a reserved name, hidden from the branch API, so that reachability
@@ -36,24 +37,36 @@ Chunks (v3) are content-addressed bytes referenced by per-key
 ``MetaEntry.chunks``. They let chunked codecs (numpy, pandas, ...) share
 large buffers across keys, commits, and branches.
 
-Chunks are the *only* class above keyed purely by content. Blobs carry
-the commit hash in the key; HAMT nodes embed that blob pointer, so a
-node hash is commit-scoped too. That difference decides who may delete
-what: ``clean_orphans`` never deletes chunks, because a chunk an orphan
-owns may be the same key a commit made a moment ago just deduped onto,
-and the sweep has no way to know. Only ``deep_clean`` reclaims chunks,
-and it does so under the ``__gc_lease__`` key: it holds the lease for
-the sweep, and every write path waits while a live lease is held.
+Everything below a commit is keyed by content. A blob's key is the
+SHA-256 of its bytes; a keyset entry holds only what follows from those
+bytes (the pointer, the size, the chunk references), so a HAMT node is
+named by the entries it holds; a chunk is named by its bytes. The
+commit hash is computed last, over the parents, the keyset root, the
+time and the info, so one commit hash names one root. Equal bytes are
+stored once across keys, commits and branches, and the two sides of a
+merge agree about a key exactly when they point at the same blob.
 
-v3 is a strict superset of v2:
+That decides who may delete what. Content two commits can share is
+never deleted merely because an orphan holds it: a commit made a moment
+ago may have written the same key, and the sweep never saw that commit.
+So ``clean_orphans`` deletes only what an orphan alone can own — its
+commit metadata, and blobs from before v4, whose keys carry the commit
+hash — and ``deep_clean`` reclaims blobs, HAMT nodes and chunks under
+the ``__gc_lease__`` key: it holds the lease for the sweep, and every
+write path waits while a live lease is held.
 
-* Opening a v2 store with v3 code is allowed; the version stamp is left
-  unchanged until a chunked write actually occurs.
-* The first commit that includes ``chunks`` lazily stamps the store as
-  v3. From then on, older code refuses to open it (intentional: it
-  cannot decode chunked blobs).
-* A v3 store with no chunks ever written is byte-identical to a v2
-  store except for the version sentinel.
+Every layout reads the ones before it, and a store is stamped up only
+when something newer is actually written:
+
+* v3 added chunks. The first chunked write stamps v3.
+* v4 changed how new blobs, entries and commits are keyed. The first
+  commit written by this code stamps v4. Nothing already stored is
+  rewritten: existing commit hashes, branch heads and tags stay valid,
+  and one keyset may hold blobs of both kinds.
+* A stamp locks out older code, deliberately. An older sweep deletes
+  by rules that are wrong for content it did not write, so it must not
+  run; every sweep and every handle refuses a store stamped above what
+  it reads.
 
 The pre-v2 layout is **not** supported. Stores written by an earlier
 version raise on open and need to be rebuilt fresh.
@@ -122,7 +135,7 @@ ten-minute sweep is not hammering the backend.
 """
 
 STORAGE_VERSION_KEY = "__kvgit_version__"
-STORAGE_VERSION = 3
+STORAGE_VERSION = 4
 """Highest layout this code knows how to write.
 
 Tags did not raise it. They are branch heads under a reserved name, so
@@ -139,34 +152,53 @@ Named separately from :data:`STORAGE_VERSION` because it is a rule about
 chunks, not about whatever the newest layout happens to be.
 """
 
-# Lower versions accepted as input. v3 code reads v2 stores transparently
-# and only stamps the store as v3 once a chunked write actually happens.
-SUPPORTED_READ_VERSIONS = frozenset({2, 3})
+BLOB_STORAGE_VERSION = 4
+"""Lowest layout that can read a store holding content-addressed blobs.
+
+Stamped before a handle's first commit batch lands, so no v4 object is
+ever visible to code that would sweep it by the older rules.
+"""
+
+# Lower versions accepted as input, read as they are; the stamp moves
+# only when a write needs a newer layout.
+SUPPORTED_READ_VERSIONS = frozenset({2, 3, 4})
+
+BLOB_PREFIX = "kvgit:blob:"
+
+ROOT_COMMIT = "821bf06b4dcb406ea508a4a992eadc22f29850cd"
+"""Hash of every branch's initial empty commit, in every layout.
+
+Fixed rather than derived from the commit hash scheme, so any two
+branches share it as an ancestor whichever kvgit minted them.
+"""
 
 
-def content_hash(
+def blob_key(value: bytes) -> str:
+    """Storage key of a blob: the SHA-256 of its bytes."""
+    return BLOB_PREFIX + hashlib.sha256(value).hexdigest()
+
+
+def commit_hash(
     parents: tuple[str, ...],
-    keyset: dict[str, str],
-    updates: dict[str, bytes],
+    root: str,
+    created: float,
     info: dict | None = None,
 ) -> str:
-    """Compute a content-addressable commit hash.
+    """The 40-hex hash naming a commit.
 
-    Hashes the parent pointers, keyset preview, update blob digests,
-    and optional info to produce a deterministic 40-hex-char commit
-    hash. The keyset passed here is the in-memory placeholder dict
-    (with ``<pending:key>`` markers for not-yet-written blobs), the
-    same shape v1 used.
+    Covers the parents, the keyset root, the commit time and the info,
+    and is computed after the keyset is built, so a hash names exactly
+    one root. The time makes every ``__commit_*__<hash>`` key written
+    once and never rewritten: two writers making the same change mint
+    two commits rather than one hash with two roots, and merging them
+    is clean because both point at the same blobs.
     """
-    h = hashlib.sha256()
-    h.update(json.dumps(list(parents), separators=(",", ":")).encode())
-    h.update(json.dumps(sorted(keyset.items()), separators=(",", ":")).encode())
-    for key in sorted(updates):
-        h.update(key.encode())
-        h.update(updates[key])
-    if info is not None:
-        h.update(json.dumps(info, sort_keys=True, separators=(",", ":")).encode())
-    return h.hexdigest()[:40]
+    payload = json.dumps(
+        ["kvgit/4", list(parents), root, created, info],
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()[:40]
 
 
 logger = logging.getLogger("kvgit")
@@ -774,8 +806,9 @@ def clean_orphans(store: KVStore, min_age: float = 3600) -> int:
     """Remove orphaned commits unreachable from any branch HEAD.
 
     Traces all reachable commits from live branch HEADs, then deletes
-    the commit metadata, blobs and HAMT nodes owned by the orphaned
-    commits and not shared with anything still reachable. Tags need no
+    what only the orphaned commits can own: their commit metadata, and
+    blobs stored before v4 (keyed ``<commit_hash>:<key>``) that nothing
+    reachable shares. Tags need no
     special handling: a tag is a branch head under a reserved name, so
     it keeps its commit's whole ancestry alive by being walked with
     everything else.
@@ -786,21 +819,20 @@ def clean_orphans(store: KVStore, min_age: float = 3600) -> int:
     and the anchor-free admin path (:func:`kvgit.delete_branches`)
     share this one implementation.
 
-    Safe under concurrent writers: every deletion candidate is
-    discovered by walking an orphan commit's own keyset, and every
-    class it deletes is commit-scoped (blob keys carry the commit
-    hash; HAMT nodes embed that pointer), so a commit that lands
-    mid-sweep can never contribute one.
+    Safe beside concurrent writers whose window from write batch to
+    HEAD swap is shorter than ``min_age``: every deletion candidate is
+    discovered by walking an orphan commit's own keyset, and every key
+    it deletes is commit-scoped, so a commit that lands mid-sweep can
+    never contribute one. A commit younger than ``min_age`` is never
+    deleted, which is what protects one whose writer has not yet
+    published it; at ``min_age=0`` nothing does.
 
-    **Does not reclaim chunks.** Chunk keys are pure content hashes,
-    so an orphan's chunk and a brand-new commit's chunk are the same
-    key whenever the bytes match — "the orphan owned it" does not
-    imply "safe to delete", at any window size. Chunks are the large
-    objects (numpy and pandas buffers), so on a store using chunked
-    codecs they accumulate between maintenance passes; a store that
-    never uses a chunked codec has none and loses nothing here. Run
-    :func:`deep_clean` to reclaim them, along with nodes and chunks no
-    commit points at.
+    **Does not reclaim content.** Blobs written by v4, HAMT nodes and
+    chunks are keyed by what they hold, so an orphan's copy and a
+    brand-new commit's copy are the same key whenever the bytes match
+    — "the orphan owned it" does not imply "safe to delete", at any
+    window size. They accumulate between maintenance passes; run
+    :func:`deep_clean` to reclaim them.
 
     This sweep takes no GC lease, because it needs none. It does wait
     out a lease another sweep holds before deleting anything: two
@@ -823,20 +855,20 @@ def deep_clean(
     grace: float = 5.0,
     lease_ttl: float = 600.0,
 ) -> int:
-    """Sweep orphans *and* every unreferenced node and chunk, under a lease.
+    """Sweep orphans *and* every unreferenced blob, node and chunk, under a lease.
 
     Does everything :func:`clean_orphans` does, then additionally scans
-    the whole ``kvgit:keyset:`` and ``kvgit:chunk:`` namespaces and
-    deletes anything not reachable from a live branch head or a young
-    orphan commit. That namespace scan is the only way to reclaim
-    nodes and chunks that no commit references any more — leftovers
-    from a crash, from an interrupted write, or from a store swept by
-    an earlier kvgit — because no orphan keyset points at them.
+    the whole ``kvgit:blob:``, ``kvgit:keyset:`` and ``kvgit:chunk:``
+    namespaces and deletes anything not reachable from a live branch
+    head or a young orphan commit. That namespace scan is the only way
+    to reclaim content no commit references any more — leftovers from a
+    crash, from an interrupted write, or from a store swept by an
+    earlier kvgit — because no orphan keyset points at them.
 
-    It is also the only way to reclaim **any** chunk at all, including
-    ones a deleted orphan uniquely owned: the incremental sweep leaves
-    every chunk in place, so on a store using chunked codecs this is
-    the maintenance pass that gives the space back.
+    It is also the only way to reclaim content-addressed blobs, HAMT
+    nodes and chunks at all, including ones a deleted orphan uniquely
+    owned: the incremental sweep leaves every one of them in place, so
+    this is the maintenance pass that gives that space back.
 
     The namespace scan deletes anything not seen by the mark phase, so
     it is only correct while nothing else is writing. This call makes
@@ -1078,27 +1110,25 @@ def _sweep(
     all_removals: list[str] = []
     keyset_prefix = Keyset.DEFAULT_PREFIX
 
-    # Every deletion candidate comes from walking an orphan's own
-    # keyset — never from a namespace scan. That is what makes this
-    # safe under concurrent writers: a commit that lands after the
-    # mark phase is in nobody's orphan tree, so nothing it wrote can
-    # end up on this list. ``skip_nodes=reachable_nodes`` prunes
-    # subtrees shared with a live commit or a young orphan, which is
-    # both the correct thing (nothing under them is deletable) and
-    # the cheap thing (shared structure is walked once, not per
-    # orphan). Two orphans sharing a subtree may each name the same
-    # hash; ``remove_many`` tolerates duplicates.
+    # Every deletion candidate on the incremental path comes from
+    # walking an orphan's own keyset, and only what the orphan alone can
+    # own qualifies: its commit metadata, and blobs from before v4,
+    # whose ``<commit_hash>:<key>`` keys no later commit can write. A
+    # commit that lands after the mark phase is in nobody's orphan tree,
+    # so nothing it wrote can end up on this list.
     #
-    # Chunks are deliberately absent here. Blob keys are
-    # ``<commit_hash>:<key>`` and HAMT nodes embed that pointer, so
-    # both are commit-scoped: an orphan's node hash can only collide
-    # with a commit in its own ancestry, which the mark phase already
-    # covered. A chunk key is ``kvgit:chunk:<content_hash>`` and
-    # carries nothing commit-derived, so an orphan's chunk and a
-    # brand-new commit's chunk are the *same key* whenever the bytes
-    # match. "In the orphan's tree" therefore does not imply "safe to
-    # delete", and no amount of scoping fixes that — the new commit
-    # was never marked. Chunk reclamation lives in ``deep_clean``.
+    # Everything else is content-addressed — v4 blobs, every HAMT node,
+    # chunks — and an orphan's copy is the *same key* as the one a
+    # brand-new commit writes whenever the bytes match. That commit was
+    # never marked, so "in the orphan's tree" does not imply "safe to
+    # delete", and no amount of scoping fixes it. Those are reclaimed
+    # only on the deep path, under the GC lease.
+    #
+    # ``skip_nodes=reachable_nodes`` prunes subtrees shared with a live
+    # commit or a young orphan: nothing under them is deletable, and
+    # shared structure is walked once, not per orphan. Two orphans
+    # sharing a subtree may each name the same key; ``remove_many``
+    # tolerates duplicates.
     for orphan_hash in orphans:
         orphan_root = _load_root(store, orphan_hash)
         if orphan_root is not None and orphan_root != EMPTY_HASH:
@@ -1112,9 +1142,12 @@ def _sweep(
                 # let one corrupt keyset block GC for the whole store.
                 orphan_entries, orphan_nodes = {}, set()
             for entry in orphan_entries.values():
-                if entry.blob not in reachable_blobs:
+                if entry.blob in reachable_blobs:
+                    continue
+                if deep or not entry.blob.startswith(BLOB_PREFIX):
                     all_removals.append(entry.blob)
-            all_removals.extend(keyset_prefix + node for node in orphan_nodes)
+            if deep:
+                all_removals.extend(keyset_prefix + node for node in orphan_nodes)
         all_removals.extend(
             [
                 COMMIT_ROOT % orphan_hash,
@@ -1125,25 +1158,25 @@ def _sweep(
         )
 
     if deep:
-        # Namespace scans. The node scan reclaims nodes no orphan
-        # keyset points at; the chunk scan is the *only* place chunks
-        # are ever deleted, orphan-owned ones included. Both are
-        # unsafe against a concurrent writer, because anything
-        # committed since the mark phase looks unreferenced here.
-        # Quiescent stores only.
+        # Namespace scans: the only place content-addressed blobs and
+        # chunks are ever deleted, and the way nodes and blobs no orphan
+        # keyset points at (a crash's leftovers) come back. Anything
+        # committed since the mark phase would look unreferenced here,
+        # which is why this path runs only under the GC lease.
         for key in store.keys():
-            if not (isinstance(key, str) and key.startswith(keyset_prefix)):
+            if not isinstance(key, str):
                 continue
-            node_hash = key[len(keyset_prefix) :]
-            if node_hash and node_hash not in reachable_nodes:
-                all_removals.append(key)
-
-        for key in store.keys():
-            if not (isinstance(key, str) and key.startswith(CHUNK_PREFIX)):
-                continue
-            chunk_hash = key[len(CHUNK_PREFIX) :]
-            if chunk_hash and chunk_hash not in reachable_chunks:
-                all_removals.append(key)
+            if key.startswith(keyset_prefix):
+                node_hash = key[len(keyset_prefix) :]
+                if node_hash and node_hash not in reachable_nodes:
+                    all_removals.append(key)
+            elif key.startswith(CHUNK_PREFIX):
+                chunk_hash = key[len(CHUNK_PREFIX) :]
+                if chunk_hash and chunk_hash not in reachable_chunks:
+                    all_removals.append(key)
+            elif key.startswith(BLOB_PREFIX):
+                if key not in reachable_blobs:
+                    all_removals.append(key)
 
     if not deep:
         # The incremental sweep is safe beside a writer, but not worth
@@ -1213,7 +1246,7 @@ class VersionedKV(VersionedBase):
                         "(open with create=True to create it)"
                     )
                 # Create initial empty commit
-                commit_hash = content_hash((), {}, {})
+                commit_hash = ROOT_COMMIT
                 initial = {
                     COMMIT_ROOT % commit_hash: dumps(EMPTY_HASH),
                     PARENT_COMMIT % commit_hash: dumps([]),
@@ -1233,6 +1266,9 @@ class VersionedKV(VersionedBase):
             )
 
         super().__init__(branch=branch, commit_hash=commit_hash)
+        # Stamps only ever rise, so once this handle has seen the store
+        # at v4 it never needs to read the stamp again.
+        self._blob_version_stamped = False
 
         # Materialize keyset + meta from the HAMT
         self._meta: dict[str, MetaEntry] = {}
@@ -1335,29 +1371,17 @@ class VersionedKV(VersionedBase):
             if key in self._meta:
                 new_meta[key] = self._meta[key]
 
-        # Compute content-addressable hash from a placeholder keyset
-        # (real versioned blob keys depend on the commit hash itself).
-        preview_keys = dict(new_commit_keys)
-        for key in updates:
-            preview_keys[key] = f"<pending:{key}>"
-        new_hash = content_hash(
-            (self._current_commit,), preview_keys, updates, info=info
-        )
-
-        # Resolve real versioned blob keys for new updates
+        # Every blob is written, even one whose key is already stored:
+        # skipping it would leave this commit depending on a copy a
+        # concurrent deep clean may be about to delete.
         diffs: dict[str, bytes] = {}
         for key, value in updates.items():
-            versioned_key = f"{new_hash}:{key}"
-            diffs[versioned_key] = value
-            new_commit_keys[key] = versioned_key
-            size = len(value)
+            pointer = blob_key(value)
+            diffs[pointer] = value
+            new_commit_keys[key] = pointer
             refs = chunk_refs.get(key)
-            refs_list = list(refs) if refs else None
-            created_at = new_meta[key].created_at if key in new_meta else time.time()
             new_meta[key] = MetaEntry(
-                size=size,
-                created_at=created_at,
-                chunks=refs_list,
+                size=len(value), chunks=list(refs) if refs else None
             )
 
         # Stage chunk writes under their content-addressed namespace.
@@ -1381,12 +1405,15 @@ class VersionedKV(VersionedBase):
         new_ks, pending = parent_ks.updated(updates=keyset_updates, removals=removals)
         diffs.update(pending)
 
-        # Commit metadata
+        created = time.time()
+        new_hash = commit_hash((self._current_commit,), new_ks.root, created, info)
         diffs[COMMIT_ROOT % new_hash] = dumps(new_ks.root)
         diffs[PARENT_COMMIT % new_hash] = dumps([self._current_commit])
-        diffs[COMMIT_TIME % new_hash] = dumps(time.time())
+        diffs[COMMIT_TIME % new_hash] = dumps(created)
         if info is not None:
             diffs[INFO_KEY % new_hash] = dumps(info)
+
+        self._stamp_blob_version()
 
         # Everything this commit writes that a deep clean's namespace
         # scan could delete — chunks, HAMT nodes, blobs, commit
@@ -1407,6 +1434,12 @@ class VersionedKV(VersionedBase):
 
         return new_hash
 
+    def _stamp_blob_version(self) -> None:
+        """Stamp the store v4 before this handle's first commit batch."""
+        if not self._blob_version_stamped:
+            _stamp_version_at_least(self.store, BLOB_STORAGE_VERSION)
+            self._blob_version_stamped = True
+
     def _create_merge_commit(
         self,
         resolution: MergeResolution,
@@ -1417,18 +1450,12 @@ class VersionedKV(VersionedBase):
         merged_keyset = resolution.merged_keyset
         merged_values = resolution.merged_values
 
-        preview_keys = dict(merged_keyset)
-        for key in merged_values:
-            preview_keys[key] = f"<pending:{key}>"
-
-        merge_hash = content_hash(parents, preview_keys, merged_values, info)
-
         # Build write batch
         diffs: dict[str, bytes] = {}
         for key, value in merged_values.items():
-            vk = f"{merge_hash}:{key}"
-            merged_keyset[key] = vk
-            diffs[vk] = value
+            pointer = blob_key(value)
+            merged_keyset[key] = pointer
+            diffs[pointer] = value
 
         # Build merged meta from the parents' meta, indexed by blob
         # pointer. Metadata describes the blob, not the key: size is that
@@ -1438,8 +1465,9 @@ class VersionedKV(VersionedBase):
         # describes a blob it no longer points at — and a stale chunk
         # list makes garbage collection trace the wrong chunks. Indexing
         # by key instead cannot express that, since the two sides
-        # disagree about the key. A pointer names the commit that wrote
-        # it, so one pointer has one meta and first-seen wins.
+        # disagree about the key. A pointer names either the bytes it
+        # holds or the commit that wrote it, so one pointer has one meta
+        # and first-seen wins.
         meta_by_blob: dict[str, MetaEntry] = {}
         meta_by_key: dict[str, MetaEntry] = {}
         for parent in parents:
@@ -1455,10 +1483,7 @@ class VersionedKV(VersionedBase):
             if key in merged_values:
                 # A value the merge itself produced: new blob, new meta.
                 # Merge output is never chunked, so it lists no chunks.
-                merged_meta[key] = MetaEntry(
-                    size=len(merged_values[key]),
-                    created_at=time.time(),
-                )
+                merged_meta[key] = MetaEntry(size=len(merged_values[key]))
                 continue
             meta = meta_by_blob.get(blob)
             if meta is None and blob == self._commit_keys.get(key):
@@ -1491,14 +1516,19 @@ class VersionedKV(VersionedBase):
         )
         diffs.update(pending)
 
+        created = time.time()
+        merge_hash = commit_hash(parents, new_ks.root, created, info)
         diffs[COMMIT_ROOT % merge_hash] = dumps(new_ks.root)
         diffs[PARENT_COMMIT % merge_hash] = dumps(list(parents))
-        diffs[COMMIT_TIME % merge_hash] = dumps(time.time())
+        diffs[COMMIT_TIME % merge_hash] = dumps(created)
         if info is not None:
             diffs[INFO_KEY % merge_hash] = dumps(info)
 
-        # A deep clean deletes any node or chunk its mark phase did not
-        # see, so no write batch may be in flight while one sweeps.
+        self._stamp_blob_version()
+
+        # A deep clean deletes any blob, node or chunk its mark phase
+        # did not see, so no write batch may be in flight while one
+        # sweeps.
         # Checked immediately before the batch, which is the whole of
         # what this commit writes.
         _wait_for_gc(self.store)

@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Storage v4: everything below a commit is keyed by content.** A
+  blob's key is the SHA-256 of its bytes (`kvgit:blob:<sha256>`), a
+  keyset entry holds only what follows from those bytes (no
+  `created_at`), and the commit hash is computed last, over the
+  parents, keyset root, time and info. Equal bytes are stored once
+  across keys, commits and branches; merge sides agree about a key
+  exactly when they point at the same blob; and one commit hash names
+  one root, so every `__commit_*__<hash>` key is written once and never
+  rewritten. (#40)
+  - **Existing stores read in place.** Nothing already stored is
+    rewritten: every commit hash, branch head and tag stays valid, and
+    one keyset may hold blobs of both kinds. Opening a store never
+    changes its stamp; the first commit this code writes stamps v4.
+  - **Older kvgit is locked out of a v4 store**, deliberately — its
+    sweep deletes by rules that are wrong for content it did not write.
+    kvgit 0.3.9 refuses every open and sweep of a v4 store and leaves it
+    byte-identical.
+  - **`clean_orphans` reclaims commit metadata, not content.** v4
+    blobs, HAMT nodes and chunks can be shared with a commit the sweep
+    never saw, so only `deep_clean` (under the GC lease) deletes them.
+    Blobs written before v4 are commit-scoped and still go
+    incrementally. Stores that relied on `clean_orphans` /
+    `delete_branch` alone to give space back need a scheduled
+    `deep_clean`.
+  - The initial empty commit keeps its old fixed hash (`ROOT_COMMIT`),
+    so branches minted before and after v4 still share an ancestor.
+  - `MetaEntry.created_at` is `None` on entries written by v4.
+  - `content_hash` is replaced by `commit_hash(parents, root, time,
+    info)` and `blob_key(value)`.
+
 ## [0.3.9] - 2026-09-16
 
 ### Added

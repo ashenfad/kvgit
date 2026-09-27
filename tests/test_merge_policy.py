@@ -8,6 +8,7 @@ from kvgit import MergeChoice, MergeConflict, Staged, VersionedKV as Versioned
 from kvgit.kv.memory import Memory
 from kvgit.merges import ours, theirs
 from kvgit.store import store
+from kvgit.versioned.kv import blob_key
 
 
 def _mark(tag: bytes):
@@ -178,8 +179,6 @@ class TestOursTheirs:
         assert result.merged
         assert main.get("k") == b"their-value"
         assert main._load_keyset(result.commit)["k"] == their_pointer
-        # A new blob for the key would live under the merge commit's hash.
-        assert f"{result.commit}:k" not in main.store.keys()
 
     def test_ours_keeps_our_pointer_and_writes_no_blob(self):
         main, worker = _branched_versioned()
@@ -191,7 +190,6 @@ class TestOursTheirs:
         assert result.merged
         assert main.get("k") == b"our-value"
         assert main._load_keyset(result.commit)["k"] == our_pointer
-        assert f"{result.commit}:k" not in main.store.keys()
 
     def test_side_pick_counts_as_auto_merged(self):
         main, worker = _branched_versioned()
@@ -239,23 +237,20 @@ class TestOursTheirs:
         result = second.commit({"keep/1": b"ours"})
         assert result.merged
         assert second.get("keep/1") == b"ours"
-        # The kept pointer belongs to our own commit, not the merge one.
-        assert not second._load_keyset(result.commit)["keep/1"].startswith(
-            f"{result.commit}:"
-        )
-        assert f"{result.commit}:keep/1" not in second.store.keys()
+        assert second._load_keyset(result.commit)["keep/1"] == blob_key(b"ours")
 
 
 class TestByteEqualContested:
     def test_identical_bytes_merge_clean_across_branches(self):
         main, worker = _branched_versioned()
-        # Both sides write the same bytes to "k"; the extra keys make the
-        # two commit hashes differ, so the blob pointers differ too.
+        # Both sides write the same bytes to "k" in commits that differ
+        # otherwise; equal bytes are one blob, so the pointers agree.
         main.commit({"k": b"same", "a": b"1"})
         worker.commit({"k": b"same", "b": b"2"})
         assert (
             main._load_keyset(main.current_commit)["k"]
-            != worker._load_keyset(worker.current_commit)["k"]
+            == worker._load_keyset(worker.current_commit)["k"]
+            == blob_key(b"same")
         )
 
         result = main.merge_heads(worker.current_commit)
@@ -401,7 +396,6 @@ class TestStagedMergePolicy:
         assert main["k"] == "their-value"
         keyset = main.versioned._load_keyset(result.commit)
         assert keyset["k"] == their_pointer
-        assert f"{result.commit}:k" not in main.versioned.store.keys()
 
     def test_ours_keeps_our_pointer_through_staged_commit(self):
         first, second = _concurrent_staged()
@@ -413,7 +407,8 @@ class TestStagedMergePolicy:
         result = second.commit()
         assert result.merged
         assert second["keep/1"] == "ours"
-        assert f"{result.commit}:keep/1" not in second.versioned.store.keys()
+        keyset = second.versioned._load_keyset(result.commit)
+        assert keyset["keep/1"] == blob_key(pickle.dumps("ours"))
 
     def test_decoded_merge_fn_may_return_a_merge_choice(self):
         main, worker = _branched_staged()
@@ -435,7 +430,6 @@ class TestStagedMergePolicy:
         assert main["doc/a"] == "a longer value"
         assert main["doc/b"] == "a longer value"
         assert main.versioned._load_keyset(result.commit)["doc/b"] == their_pointer
-        assert f"{result.commit}:doc/b" not in main.versioned.store.keys()
 
     def test_identical_values_merge_clean_on_commit_path(self):
         first, second = _concurrent_staged()
@@ -578,7 +572,6 @@ class TestMergeChoicePolicy:
 
         result = main.merge_heads(worker.current_commit)
         assert main._load_keyset(result.commit)["runs/1"] == our_pointer
-        assert f"{result.commit}:runs/1" not in main.store.keys()
 
     def test_untouched_keys_outside_the_prefix_are_unaffected(self):
         main, worker = _branched_versioned({"kept": b"base"})

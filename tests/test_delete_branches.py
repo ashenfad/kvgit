@@ -11,21 +11,12 @@ from kvgit.kv.memory import Memory
 from kvgit.versioned.kv import (
     BRANCH_HEAD,
     BRANCH_HEAD_PREV,
+    COMMIT_ROOT,
     _resolve_head,
+    blob_key,
     clean_orphans,
+    deep_clean,
 )
-
-
-def _blob_keys(backend) -> set[str]:
-    """Versioned blob keys (``<commit>:<user_key>``) currently in the store."""
-    return {
-        k
-        for k in backend.keys()
-        if isinstance(k, str)
-        and ":" in k
-        and not k.startswith("__")
-        and "kvgit:" not in k
-    }
 
 
 class TestDeleteBranches:
@@ -141,8 +132,9 @@ class TestDeleteBranches:
 
     def test_min_age_zero_reclaims_immediately(self):
         """min_age=0 lets an admin who knows the store is quiet reclaim
-        a just-committed branch's blobs in the same call, instead of
-        waiting out the one-hour concurrent-writer guard."""
+        a just-committed branch's commits in the same call, instead of
+        waiting out the one-hour concurrent-writer guard. Its blob is
+        content, which only a deep clean takes back."""
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "store")
             s = store(kind="disk", path=p)
@@ -151,15 +143,20 @@ class TestDeleteBranches:
             dev = s.create_branch("dev")
             dev["secret"] = "unique-blob-value"
             dev.commit()
+            dev_commit = dev.current_commit
+            pointer = dev.versioned._commit_keys["secret"]
             backend = s.versioned.store
-            assert {k for k in _blob_keys(backend) if k.endswith(":secret")}
+            assert backend.get(pointer) is not None
             backend.close()
 
             kvgit.delete_branches("dev", kind="disk", path=p, min_age=0)
 
             s2 = store(kind="disk", path=p)
-            after = {k for k in _blob_keys(s2.versioned.store) if k.endswith(":secret")}
-            assert not after  # reclaimed without waiting out the guard
+            backend = s2.versioned.store
+            assert backend.get(COMMIT_ROOT % dev_commit) is None
+            assert backend.get(pointer) is not None
+            deep_clean(backend, min_age=0, grace=0)
+            assert backend.get(pointer) is None
 
     def test_reopen_after_delete_not_locked(self):
         """The disk handle is released (finally-close), so the next
@@ -174,16 +171,15 @@ class TestDeleteBranches:
 
 class TestSharedOrphanSweep:
     def test_orphan_gc_reclaims_deleted_branch_blobs(self):
-        """The deleted branch's unique blobs are gone after the shared
-        sweep. Uses min_age=0 to bypass the age guard on fresh commits."""
+        """The shared sweep takes the deleted branch's commits; a deep
+        clean takes its unique blobs. Uses min_age=0 to bypass the age
+        guard on fresh commits."""
         backend = Memory()
         v = VersionedKV(backend)  # main
         dev = v.create_branch("dev")
         dev.commit({"secret": b"unique-blob-value"})
-
-        # A blob key referencing the dev-only value exists.
-        before = {k for k in _blob_keys(backend) if k.endswith(":secret")}
-        assert before
+        pointer = blob_key(b"unique-blob-value")
+        assert backend.get(pointer) == b"unique-blob-value"
 
         # Mimic delete_branches' removals, then the shared sweep at min_age=0.
         backend.remove(BRANCH_HEAD % "dev")
@@ -191,8 +187,10 @@ class TestSharedOrphanSweep:
         removed = clean_orphans(backend, min_age=0)
 
         assert removed >= 1
-        after = {k for k in _blob_keys(backend) if k.endswith(":secret")}
-        assert not after  # reclaimed
+        assert backend.get(COMMIT_ROOT % dev.current_commit) is None
+        assert backend.get(pointer) is not None  # content: deep clean's job
+        deep_clean(backend, min_age=0, grace=0)
+        assert backend.get(pointer) is None
 
     def test_module_clean_orphans_matches_instance(self):
         """The instance method delegates to the module function; both

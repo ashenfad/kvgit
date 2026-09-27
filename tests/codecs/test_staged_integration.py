@@ -12,6 +12,7 @@ from kvgit.codecs.numpy import NumpyCodec
 from kvgit.encoding import safe_loads
 from kvgit.kv.memory import Memory
 from kvgit.versioned.kv import (
+    BLOB_STORAGE_VERSION,
     CHUNK_PREFIX,
     CHUNK_STORAGE_VERSION,
     STORAGE_VERSION_KEY,
@@ -185,29 +186,28 @@ class TestRoundTripThroughStore:
 
 
 class TestStorageVersioning:
-    def test_chunked_write_stamps_v3(self, chunked):
+    def test_chunked_write_stamps_at_least_v3(self, chunked):
         s, store = chunked
         arr = np.arange(2048, dtype="float64")
         s["x"] = arr
         s.commit()
         version_raw = store.get(STORAGE_VERSION_KEY)
-        assert safe_loads(version_raw) == CHUNK_STORAGE_VERSION
+        assert safe_loads(version_raw) >= CHUNK_STORAGE_VERSION
 
-    def test_pickle_only_writes_dont_force_v3_on_v2_store(self):
-        """Opening a v2 store with v3 code keeps it v2 until a chunk lands."""
+    def test_opening_a_v2_store_leaves_its_stamp_until_a_commit(self):
+        """Reading is not a reason to lock older code out; writing is."""
         from kvgit.encoding import dumps
 
         store = Memory()
-        # Simulate an existing v2 store.
         store.set(STORAGE_VERSION_KEY, dumps(2))
 
         s = Staged(VersionedKV(store))  # default pickle, not chunked
+        assert safe_loads(store.get(STORAGE_VERSION_KEY)) == 2
         s["x"] = "hello"
         s.commit()
-        # Still v2 — no chunked write occurred.
-        assert safe_loads(store.get(STORAGE_VERSION_KEY)) == 2
+        assert safe_loads(store.get(STORAGE_VERSION_KEY)) == BLOB_STORAGE_VERSION
 
-    def test_v2_store_then_chunked_write_upgrades(self):
+    def test_v2_store_then_chunked_write(self):
         from kvgit.encoding import dumps
 
         store = Memory()
@@ -217,14 +217,15 @@ class TestStorageVersioning:
         s_plain = Staged(VersionedKV(store))
         s_plain["plain"] = {"a": 1}
         s_plain.commit()
-        assert safe_loads(store.get(STORAGE_VERSION_KEY)) == 2
+        assert safe_loads(store.get(STORAGE_VERSION_KEY)) == BLOB_STORAGE_VERSION
 
-        # Now open with chunked codec and write an array.
+        # Now open with chunked codec and write an array: the stamp,
+        # already above what chunks need, stays where it is.
         encoder, decoder = compose(NumpyCodec(min_bytes=64))
         s_chunked = Staged(VersionedKV(store), encoder=encoder, decoder=decoder)
         s_chunked["arr"] = np.arange(2048, dtype="float64")
         s_chunked.commit()
-        assert safe_loads(store.get(STORAGE_VERSION_KEY)) == CHUNK_STORAGE_VERSION
+        assert safe_loads(store.get(STORAGE_VERSION_KEY)) == BLOB_STORAGE_VERSION
 
         # Both keys still readable.
         assert s_chunked["plain"] == {"a": 1}

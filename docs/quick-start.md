@@ -367,22 +367,19 @@ s.versioned.clean_orphans()           # default: skip commits younger than 1 hou
 s.versioned.clean_orphans(min_age=0)  # sweep unreachable commits immediately
 ```
 
-`clean_orphans()` is safe to run while other writers are committing. Everything it deletes is found by walking the keysets of the orphan commits it is removing, and every class it deletes -- commit metadata, blobs, keyset nodes -- is keyed by commit hash, so a commit that lands mid-sweep is never a candidate. The `min_age=3600` default is a separate, softer guard: it decides how long an unreachable commit gets to settle before it counts as an orphan at all.
+`clean_orphans()` is safe to run while other writers are committing. Everything it deletes is found by walking the keysets of the orphan commits it is removing, and everything it deletes -- commit metadata, and blobs written before v4 -- is keyed by commit hash, so a commit that lands mid-sweep is never a candidate. The `min_age=3600` default decides how long an unreachable commit gets to settle before it counts as an orphan at all -- and it is also what protects a commit another writer has written but not yet published, so keep `min_age=0` for stores nobody else is writing to.
 
 Cleanup is safe for shared commit histories -- blobs, keyset nodes, and chunks referenced by any reachable commit are never deleted.
 
-### `clean_orphans()` does not reclaim chunks
+### `clean_orphans()` does not reclaim content
 
-Chunks -- the content-addressed bytes a [chunked codec](#storing-scientific-data-efficiently-chunked-codecs) writes -- are keyed `kvgit:chunk:<content_hash>`, with nothing commit-derived in the key. So an orphan's chunk and a chunk a *brand-new* commit just wrote are literally the same key whenever the bytes match. "The orphan owned it" does not imply "safe to delete", and no amount of narrowing the window changes that: the new commit was never scanned. Rather than race it, `clean_orphans()` deletes no chunks at all.
+Blobs, keyset nodes and chunks are keyed by what they hold (`kvgit:blob:<sha256>`, `kvgit:keyset:<hash>`, `kvgit:chunk:<hash>`), with nothing commit-derived in the key. That is what stores equal bytes once -- and it means an orphan's blob and a blob a *brand-new* commit just wrote are literally the same key whenever the bytes match. "The orphan owned it" does not imply "safe to delete", and no amount of narrowing the window changes that: the new commit was never scanned. Rather than race it, `clean_orphans()` deletes no content at all.
 
-The cost is real, because chunks are the large objects -- the numpy and pandas buffers. On a store using chunked codecs, deleted branches leave their unique buffers behind, and routine GC will not give that space back. Two things soften it:
-
-* Chunks only exist if you use a chunked codec. A store on plain pickle has none, and loses nothing here.
-* `deep_clean()` reclaims them.
+So routine GC gives back commit metadata, and a deleted branch's content stays on disk until the maintenance pass below.
 
 ### `deep_clean()` -- the maintenance pass
 
-`deep_clean()` does everything `clean_orphans()` does, then scans the `kvgit:keyset:` and `kvgit:chunk:` namespaces directly. That scan is the only way to reclaim chunks, and also the only way to reach a keyset node or chunk that *no* commit references -- left behind by an interrupted write, or by a store swept by an earlier kvgit -- since those have no orphan to be found through.
+`deep_clean()` does everything `clean_orphans()` does, then scans the `kvgit:blob:`, `kvgit:keyset:` and `kvgit:chunk:` namespaces directly. That scan is the only way to reclaim content, and also the only way to reach a blob, node or chunk that *no* commit references -- left behind by an interrupted write, or by a store swept by an earlier kvgit -- since those have no orphan to be found through.
 
 The scan deletes anything the mark phase did not see, so nothing else may be writing while it runs. You do not have to arrange that yourself: `deep_clean()` takes a lease on the store under the reserved key `__gc_lease__`, and every write path reads that lease immediately before its write and waits while a live one is held. That covers the commit and merge-commit write batches and every write that makes a commit reachable -- the HEAD advance behind `commit()`, plus `create_branch()`, `reset_to()`, `tag()` and the corrupt-HEAD repair.
 
@@ -408,7 +405,7 @@ except kvgit.GcBusy:
 
 A writer that does not read the lease is still exposed -- an older kvgit, or a process editing the backend directly. The lease is what the guarantee rests on, so every process touching the store needs a version that honours it.
 
-So: `clean_orphans()` (or plain `delete_branch()`) is your routine, always-safe cleanup, and `deep_clean()` is a scheduled maintenance pass. If you store large arrays, you want both.
+So: `clean_orphans()` (or plain `delete_branch()`) is your routine cleanup, and `deep_clean()` is the scheduled maintenance pass that gives the space back. You want both.
 
 A commit that loses a CAS race leaves garbage too — it writes its blobs, nodes and metadata before attempting the swap, and nothing deletes them inline, because the winner may legitimately share the content-addressed ones. They are ordinary orphans and the ordinary sweep collects them.
 
@@ -502,7 +499,7 @@ s.commit()
 
 ### Migrating an existing store
 
-A v3 store (one that has ever held a chunked write) is a strict superset of a v2 store. Opening a v2 store with chunked-codec code is allowed; the upgrade only happens on the first chunked write. To migrate an existing v2 store and reclaim disk from accidental duplicates, just import its values into a fresh chunked store -- the dedup happens during the copy:
+Current kvgit reads every older store in place; see [Storage versions](api.md#storage-versions). Chunked codecs need no migration either -- a store takes chunked writes as it is. To reclaim disk from arrays an older store pickled once per key, import its values into a fresh chunked store -- the dedup happens during the copy:
 
 ```python
 old = kvgit.store(kind="disk", path="/old/v2/store")        # plain pickle, v2
