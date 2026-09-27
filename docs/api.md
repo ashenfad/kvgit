@@ -781,6 +781,7 @@ Writers hold up their end inside the store's own atomicity. Every path that writ
 | Path | What it writes |
 |------|----------------|
 | `commit()` fast-forward and merge batches | Nodes, blobs, chunks, commit metadata, in-flight marker |
+| `commit()` / `merge()` HEAD advance | `__branch_head__<branch>`, its backup, and the in-flight markers' removal |
 | `create_branch(name, at=...)` | `__branch_head__<name>` |
 | `reset_to(commit)` | `__branch_head__<branch>` and its backup |
 | `tag(name, at=...)` | `__branch_head__refs/tags/<name>` and `__tag_info__<name>` |
@@ -798,7 +799,7 @@ A commit lands in two steps: the batch that writes its nodes, blobs, chunks and 
 
 So the batch also writes an in-flight marker, `__inflight__<commit>`, holding the time its protection lapses (`IN_FLIGHT_TTL`, 600 seconds), and the publishing write removes it in the same atomic step that moves HEAD. A sweep reads the markers *before* the branch heads: a commit published after its marker was read is under a head read later, and one published before has no marker to miss. So a commit in flight is marked live whatever `min_age` says, and a sweep never deletes a commit whose writer is about to publish it — or whose writer is still reading it back, as the merge path does.
 
-A writer that abandons its attempt withdraws its markers; one that dies leaves them, and they lapse, after which the next sweep takes the commit like any other orphan. The publishing write also expects each marker to hold the bytes its writer wrote, so a writer that took longer than `IN_FLIGHT_TTL` to publish — whose marker lapsed and may have been reaped along with its commit — gets an error instead of a head over a commit that is gone.
+A writer that abandons its attempt withdraws its markers; one that dies leaves them, and they lapse, after which the next sweep takes the commit like any other orphan. The publishing write also expects the lease record — the one its latest batch landed against, so the common case costs no extra read — which keeps a publish from landing between a sweep's scans and its removals. And it expects each marker to hold the bytes its writer wrote, so a writer that took longer than `IN_FLIGHT_TTL` to publish — whose marker lapsed and may have been reaped along with its commit — gets an error instead of a head over a commit that is gone.
 
 **A writer that bypasses kvgit is still exposed**: a process editing the backend directly, or an older kvgit (which the storage version stamp locks out), can land writes a sweep never saw.
 

@@ -26,7 +26,7 @@ import time
 import pytest
 
 from kvgit import ConcurrencyError, GcBusy, MergeConflict, Staged, VersionedKV
-from kvgit.encoding import dumps
+from kvgit.encoding import dumps, loads
 from kvgit.kv.memory import Memory
 from kvgit.versioned import kv as kv_module
 from kvgit.versioned.keyset import Keyset
@@ -54,6 +54,7 @@ from .test_gc_concurrency import (
     chunk_keys,
     chunky_decoder,
     chunky_encoder,
+    in_a_thread,
     missing_nodes,
     node_hashes,
 )
@@ -517,6 +518,82 @@ class TestALapsedMarker:
         head = _resolve_head(store, "main")
         assert head == head_before, "a head was published over a reaped commit"
         assert store.get(COMMIT_ROOT % head) is not None
+
+
+class SlowSweepStore(ScanHookStore):
+    """Scan-hook store that dawdles before it deletes, so a writer
+    started from a scan seam reliably acts before the sweep's removals."""
+
+    def remove_many(self, *args) -> None:
+        time.sleep(0.2)
+        super().remove_many(*args)
+
+
+class TestPublishingUnderASweep:
+    def test_a_publish_waits_for_a_running_sweep(self):
+        store = Memory()
+        v = VersionedKV(store)
+        v.commit({"base": b"1"})
+        base = v.current_commit
+        v._create_commit({"late": b"written before the sweep"})
+        commit = v.current_commit
+
+        ours, _, expires = _acquire_gc_lease(store, 60.0)
+        done = threading.Event()
+        publisher = threading.Thread(
+            target=lambda: (v._cas_head(base, commit), done.set())
+        )
+        publisher.start()
+        try:
+            assert not done.wait(0.3), "published while a sweep held the lease"
+            _release_gc_lease(store, ours, expires, 60.0)
+            assert done.wait(10), "never published after the release"
+        finally:
+            publisher.join(timeout=10)
+        assert _resolve_head(store, "main") == commit
+
+    def test_a_lapsed_marker_cannot_publish_between_a_sweeps_scans_and_its_removals(
+        self,
+    ):
+        """A sweep reads a lapsed marker as stale and the old HEAD as the
+        branch's root; a publish landing after those reads and before the
+        sweep deletes would install a head over a commit about to go."""
+        store = SlowSweepStore()
+        v = VersionedKV(store)
+        v.commit({"base": b"1"})
+        base = v.current_commit
+        v._create_commit({"late": b"a very slow writer"})
+        commit = v.current_commit
+        marker = dumps(time.time() - 1)
+        store.set(IN_FLIGHT_KEY % commit, marker)
+        v._in_flight[commit] = marker
+
+        published: dict[str, bool] = {}
+        start, publisher = in_a_thread(
+            lambda: published.update(ok=v._cas_head(base, commit))
+        )
+        store.arm(AFTER_COMMIT_ROOT_SCAN, start)
+        clean_orphans(store, min_age=0)
+        publisher.join(timeout=10)
+
+        assert published == {"ok": False}
+        assert loads(store.get(BRANCH_HEAD % "main")) == base
+        assert _resolve_head(store, "main") == base
+
+
+class TestTagTimes:
+    def test_a_tag_records_when_it_landed_not_when_it_began_waiting(self):
+        store = Memory()
+        v = VersionedKV(store)
+        v.commit({"k": b"v"})
+        ours, _, expires = _acquire_gc_lease(store, 60.0)
+        tagger = threading.Thread(target=lambda: v.tag("v1"))
+        tagger.start()
+        time.sleep(0.3)
+        released_at = time.time()
+        _release_gc_lease(store, ours, expires, 60.0)
+        tagger.join(timeout=10)
+        assert v.tag_info("v1").time >= released_at
 
 
 class TestSweepsBesideWriters:

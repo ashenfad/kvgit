@@ -40,7 +40,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **HEAD and its backup move in one write.** `__branch_head_prev__` is
   written in the same `cas_many` that moves HEAD, so it is always HEAD's
   immediate predecessor, and a crash can no longer leave one moved
-  without the other. Tag creation writes its head and `__tag_info__`
+  without the other. The publish also expects the lease record and the
+  commits' in-flight markers, so it cannot land mid-sweep, and a writer
+  whose marker lapsed errors instead of publishing a dangling head. Tag creation writes its head and `__tag_info__`
   record together; deleting a branch or tag removes its keys in one
   call.
 
