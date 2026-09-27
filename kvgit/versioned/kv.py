@@ -1313,18 +1313,19 @@ class VersionedKV(VersionedBase):
 
     def get_many(self, *keys: str) -> dict[str, bytes]:
         """Get multiple values from the current commit."""
-        # Map user keys -> versioned keys, skipping missing
-        vk_to_key: dict[str, str] = {}
+        # Keys holding equal bytes share one blob, so a blob answers for
+        # every key that points at it. Missing keys are skipped.
+        keys_by_blob: dict[str, list[str]] = {}
         for key in keys:
-            vk = self._commit_keys.get(key)
-            if vk is not None:
-                vk_to_key[vk] = key
+            blob = self._commit_keys.get(key)
+            if blob is not None:
+                keys_by_blob.setdefault(blob, []).append(key)
 
-        if not vk_to_key:
+        if not keys_by_blob:
             return {}
 
-        raw = self.store.get_many(*vk_to_key.keys())
-        return {vk_to_key[vk]: value for vk, value in raw.items()}
+        raw = self.store.get_many(keys_by_blob.keys())
+        return {key: value for blob, value in raw.items() for key in keys_by_blob[blob]}
 
     # -- Abstract method implementations --
 

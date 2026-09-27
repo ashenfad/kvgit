@@ -189,6 +189,43 @@ class TestWriting:
         assert values(fork) == dict(manifest["branches"]["dev"]["values"], extra="v4")
 
 
+class TestKeysSharingABlob:
+    """Keys holding equal bytes point at one blob; every read path must
+    still answer for each key."""
+
+    def test_versioned_get_many_answers_every_key(self):
+        v = VersionedKV(Memory())
+        v.commit({"a": b"x", "b": b"x", "c": b"y"})
+        assert v.get_many("a", "b", "c", "missing") == {
+            "a": b"x",
+            "b": b"x",
+            "c": b"y",
+        }
+        assert v.get_many("a", "a") == {"a": b"x"}
+
+    def test_staged_get_many_decodes_each_key_on_its_own(self):
+        s = Staged(VersionedKV(Memory()))
+        s["a"] = [1, 2]
+        s["b"] = [1, 2]
+        s.commit()
+        reader = Staged(VersionedKV(s.versioned.store))
+
+        got = reader.get_many("a", "b")
+        assert got == {"a": [1, 2], "b": [1, 2]}
+        got["a"].append(3)
+        assert reader["b"] == [1, 2]
+
+    def test_a_legacy_store_extended_with_a_shared_blob(self):
+        store, _ = load_v3()
+        main = Staged(VersionedKV(store))
+        main["twin_one"] = "twin"
+        main["twin_two"] = "twin"
+        main.commit()
+        reader = Staged(VersionedKV(store))
+        got = reader.get_many("greeting", "twin_one", "twin_two")
+        assert got == {"greeting": "hello", "twin_one": "twin", "twin_two": "twin"}
+
+
 class TestMergingAcrossFormats:
     def test_legacy_and_content_pointers_to_equal_bytes_merge_clean(self):
         """Both sides changed ``notes`` to the same bytes: dev under a
