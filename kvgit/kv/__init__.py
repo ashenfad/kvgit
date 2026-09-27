@@ -13,3 +13,10 @@ try:
     __all__ += ["IndexedDB"]
 except ImportError:
     pass
+
+try:
+    from .postgres import Postgres
+
+    __all__ += ["Postgres"]
+except ImportError:
+    pass

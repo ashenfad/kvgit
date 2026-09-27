@@ -867,6 +867,35 @@ By default the store has no practical size cap. Pass `size_limit` (in bytes) to 
 
 ---
 
+## Postgres
+
+`KVStore` in one PostgreSQL table, for a store shared by processes on several machines. Requires `pip install kvgit[postgres]` (psycopg 3 and psycopg-pool) and PostgreSQL 11 or later.
+
+```python
+from kvgit import Staged, VersionedKV
+from kvgit.kv.postgres import Postgres
+
+backend = Postgres("postgresql://app@db.internal/kvgit")        # table "kvgit"
+backend = Postgres("dbname=kvgit", table="sessions", max_size=16)
+s = Staged(VersionedKV(backend))
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `conninfo` | `""` | libpq connection string or URL (libpq environment variables apply). Ignored when `pool` is given. |
+| `table` | `"kvgit"` | Table holding this store — lowercase letters, digits, underscores. Several stores may share a database. |
+| `pool` | `None` | An existing `psycopg_pool.ConnectionPool` to draw from; its connections should be in autocommit mode. |
+| `create` | `True` | Create the table if it does not exist. |
+| `max_size` | `8` | Size of the pool the store opens when `pool` is not given. |
+
+Keys are a `text COLLATE "C"` primary key, so `keys(prefix)` is an index range scan; values are `bytea`. Every method but `cas_many` is one statement on an autocommit connection — one round trip, atomic on its own — and batch writes go in key order, so concurrent batches upserting overlapping keys cannot deadlock.
+
+`cas_many` is one transaction: a transaction-scoped advisory lock per expected key, all taken by one statement in a fixed order, then the check, then the writes. The locks serialize every batch expecting the same key — including one expecting it absent, which no row lock could cover — and the check, a statement of its own after the locks, reads the latest committed values under READ COMMITTED. The statements are pipelined, so a batch costs two round trips; a statement that fails rolls the batch back.
+
+`close()` closes the pool if the store opened it; `drop()` drops the table.
+
+---
+
 ## IndexedDB
 
 Browser-persistent `KVStore` via IndexedDB. Available automatically in [Pyodide](https://pyodide.org/) environments (no extra install needed).

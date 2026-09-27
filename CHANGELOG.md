@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **PostgreSQL backend** (`kvgit.kv.postgres.Postgres`, `pip install
+  kvgit[postgres]`). One table with a `text COLLATE "C"` key, so
+  `keys(prefix)` is an index range scan. `cas_many` is one transaction
+  taking an advisory lock per expected key, pipelined into two round
+  trips; every other method is one statement on an autocommit
+  connection, and batch writes go in key order so concurrent batches
+  cannot deadlock. CI runs the backend tests and the whole suite against
+  a Postgres service.
+
 ### Changed
 
 - **`KVStore` requires `cas_many` and `keys(prefix)`.** `cas_many(expected,

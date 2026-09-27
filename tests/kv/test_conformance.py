@@ -1,11 +1,14 @@
 """What every ``KVStore`` owes kvgit beyond reads and writes.
 
 ``cas_many`` and ``keys(prefix)`` are run against each backend that can
-run here; the IndexedDB backend has the same cases in
-``test_indexeddb.py``, run in a browser.
+run here — Postgres when a server answers at ``KVGIT_POSTGRES_DSN``
+(default ``dbname=kvgit_test``); the IndexedDB backend has the same
+cases in ``test_indexeddb.py``, run in a browser.
 """
 
+import os
 import threading
+import uuid
 
 import pytest
 
@@ -13,11 +16,47 @@ from kvgit.kv.composite import Composite
 from kvgit.kv.disk import Disk
 from kvgit.kv.memory import Memory
 
+POSTGRES_DSN = os.environ.get("KVGIT_POSTGRES_DSN", "dbname=kvgit_test")
 
-@pytest.fixture(params=["memory", "disk", "composite-memory", "composite-disk"])
+
+def _postgres_unavailable() -> str | None:
+    """Why the Postgres cases cannot run here, or None if they can."""
+    try:
+        import psycopg
+    except ImportError:
+        return "psycopg is not installed (kvgit[postgres])"
+    try:
+        psycopg.connect(POSTGRES_DSN, connect_timeout=2).close()
+    except psycopg.OperationalError:
+        return f"no Postgres at {POSTGRES_DSN!r}"
+    return None
+
+
+_WHY_NOT_POSTGRES = _postgres_unavailable()
+needs_postgres = pytest.mark.skipif(
+    _WHY_NOT_POSTGRES is not None, reason=_WHY_NOT_POSTGRES or ""
+)
+
+
+@pytest.fixture(
+    params=[
+        "memory",
+        "disk",
+        "composite-memory",
+        "composite-disk",
+        pytest.param("postgres", marks=needs_postgres),
+    ]
+)
 def store(request, tmp_path):
     kind = request.param
-    if kind == "memory":
+    if kind == "postgres":
+        from kvgit.kv.postgres import Postgres
+
+        pg = Postgres(POSTGRES_DSN, table="t_" + uuid.uuid4().hex[:12])
+        yield pg
+        pg.drop()
+        pg.close()
+    elif kind == "memory":
         yield Memory()
     elif kind == "disk":
         disk = Disk(str(tmp_path / "store"))
