@@ -1238,6 +1238,9 @@ class VersionedKV(VersionedBase):
         # store until the publishing write removes it, or a failed
         # attempt withdraws it.
         self._in_flight: dict[str, bytes] = {}
+        # The lease record this handle's latest batch landed against: a
+        # publish expecting it cannot land while a sweep runs.
+        self._lease_seen: bytes | None = None
 
         # Materialize keyset + meta from the HAMT
         self._meta: dict[str, MetaEntry] = {}
@@ -1329,9 +1332,12 @@ class VersionedKV(VersionedBase):
         """
         marker = dumps(time.time() + IN_FLIGHT_TTL)
         diffs[IN_FLIGHT_KEY % commit] = marker
-        while not self.store.cas_many({GC_LEASE_KEY: _wait_for_gc(self.store)}, diffs):
-            pass
+        while True:
+            lease = _wait_for_gc(self.store)
+            if self.store.cas_many({GC_LEASE_KEY: lease}, diffs):
+                break
         self._in_flight[commit] = marker
+        self._lease_seen = lease
 
     def _create_commit(
         self,
@@ -1531,12 +1537,20 @@ class VersionedKV(VersionedBase):
         commit HEAD held immediately before, and a published commit
         never keeps a marker, nor loses it before its head lands.
 
-        The write also expects each marker to hold the bytes this handle
-        wrote. A marker only disappears early if it lapsed — the writer
-        took longer than :data:`IN_FLIGHT_TTL` to publish — and a sweep
-        reaped it, possibly with the commit; then the publish fails, and
-        the commit surfaces an error rather than a head over a commit
-        that may be gone.
+        The write also expects the GC lease record, so it cannot land
+        while a sweep runs: a sweep decides what to delete from the
+        heads and markers it read at its start, and a head installed
+        before it deletes would name a commit it may still take. The
+        record the latest batch landed against is expected first — no
+        extra read in the common case — and after a sweep the publish
+        waits it out and tries again.
+
+        And it expects each marker to hold the bytes this handle wrote.
+        A marker only disappears early if it lapsed — the writer took
+        longer than :data:`IN_FLIGHT_TTL` to publish — and a sweep reaped
+        it, possibly with the commit; then the publish fails, and the
+        commit surfaces an error rather than a head over a commit that
+        may be gone.
 
         A CAS that fails against a *damaged* HEAD is retried through
         :func:`_heal_head`, which repairs it atomically. That is the only
@@ -1549,8 +1563,19 @@ class VersionedKV(VersionedBase):
             BRANCH_HEAD_PREV % self._branch: expected_bytes,
         }
         markers = {IN_FLIGHT_KEY % c: marker for c, marker in self._in_flight.items()}
-        expect = {branch_key: expected_bytes, **markers}
-        while not self.store.cas_many(expect, writes, tuple(markers)):
+        lease = self._lease_seen if self._in_flight else _wait_for_gc(self.store)
+        while True:
+            expect = {GC_LEASE_KEY: lease, branch_key: expected_bytes, **markers}
+            if self.store.cas_many(expect, writes, tuple(markers)):
+                break
+            if self.store.get(GC_LEASE_KEY) != lease:
+                # A sweep ran, or is running: wait it out and try again.
+                # A marker it reaped fails the next attempt on its own.
+                lease = _wait_for_gc(self.store)
+                continue
+            present = self.store.get_many(markers.keys())
+            if any(present.get(key) != marker for key, marker in markers.items()):
+                return False
             if not _heal_head(self.store, self._branch, expected_bytes):
                 return False
         self._in_flight = {}
@@ -1928,8 +1953,10 @@ class VersionedKV(VersionedBase):
         _validate_tag_name(name)
         target = at or self._current_commit
         # Encoded before anything is written, so info that cannot be
-        # serialized raises without leaving a tag behind.
-        record = dumps({"time": time.time(), "info": info})
+        # serialized raises without leaving a tag behind. The record
+        # itself is built after the wait below, so its time is when the
+        # tag lands, not when the call began waiting on a sweep.
+        dumps(info)
         head_key = BRANCH_HEAD % _tag_branch(name)
         # A tag is a GC root, so it must not be planted under a sweep
         # that has already decided what is reachable, and the existence
@@ -1943,6 +1970,7 @@ class VersionedKV(VersionedBase):
             lease = _wait_for_gc(self.store)
             if self.store.get(COMMIT_ROOT % target) is None:
                 raise ValueError(f"Commit '{target}' does not exist")
+            record = dumps({"time": time.time(), "info": info})
             landed = _try_land(
                 self.store,
                 lease,
