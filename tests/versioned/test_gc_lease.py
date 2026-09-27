@@ -564,6 +564,9 @@ class TestSweepsBesideWriters:
         while time.monotonic() < deadline:
             clean_orphans(store, min_age=0)
             sweeps += 1
+            # Writers wait while a sweep holds the lease and poll for its
+            # release; sweeping back to back with no gap starves them.
+            time.sleep(0.01)
         stop.set()
         for t in threads:
             t.join(timeout=10)
