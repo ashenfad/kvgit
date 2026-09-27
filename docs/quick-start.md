@@ -17,6 +17,17 @@ s = kvgit.store(kind="indexeddb", db_name="myapp")    # browser-persistent via I
 
 `kind="disk"` requires `pip install kvgit[disk]`. `kind="indexeddb"` is available in Pyodide (browser) environments but has portability and durability tradeoffs — see [Browser persistence in Pyodide](pyodide.md) for the full picture and the recommended cross-browser alternative.
 
+For a store shared by processes on several machines, construct the PostgreSQL backend (`pip install kvgit[postgres]`) and wrap it yourself:
+
+```python
+from kvgit import Staged, VersionedKV
+from kvgit.kv.postgres import Postgres
+
+s = Staged(VersionedKV(Postgres("postgresql://app@db.internal/kvgit")))
+```
+
+Any number of processes may commit to the same store, and garbage collection runs beside them — see [Postgres](api.md#postgres) in the API reference.
+
 ---
 
 ## Basic reads and writes

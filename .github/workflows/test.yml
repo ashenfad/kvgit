@@ -59,6 +59,52 @@ jobs:
       run: |
         pytest tests/ -v
 
+  # The Postgres backend against a real server: its own tests and the
+  # backend conformance suite, then the whole suite with every in-memory
+  # store swapped for a Postgres table. Elsewhere psycopg is not
+  # installed and those tests skip.
+  test-postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      KVGIT_POSTGRES_DSN: host=localhost user=postgres password=postgres dbname=kvgit_test
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e ".[dev,postgres]"
+
+    - name: Create the test database
+      run: |
+        python -c "import psycopg; psycopg.connect('host=localhost user=postgres password=postgres dbname=postgres', autocommit=True).execute('CREATE DATABASE kvgit_test')"
+
+    - name: Run backend tests
+      run: |
+        pytest tests/kv -v
+
+    - name: Run the whole suite on Postgres
+      run: |
+        KVGIT_TEST_BACKEND=postgres pytest tests/ -q
+
   test-pyodide:
     runs-on: ubuntu-latest
     strategy:
