@@ -40,8 +40,9 @@ class UnknownBranchError(ValueError):
 class GcBusy(Exception):
     """Raised when a deep clean cannot take the store's GC lease.
 
-    Another process or thread holds an unexpired lease, so a namespace
-    scan started now would run beside a sweep that is already deleting.
-    Retry later; the lease carries an expiry, so a holder that dies
-    without releasing it blocks nothing past that point.
+    Another process or thread holds an unexpired lease, so a sweep
+    started now would run beside one that is already deleting. Retry
+    later; the lease carries an expiry, so a holder that dies without
+    releasing it blocks nothing past that point. (``clean_orphans`` waits
+    for the lease instead of raising.)
     """

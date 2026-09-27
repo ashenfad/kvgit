@@ -57,8 +57,9 @@ class Composite(KVStore):
 
     On set: write to all tiers (most durable first).
 
-    On cas: delegate to Ln (authoritative), update caches on success —
-    except for ``__`` keys, which no cache tier serves.
+    On cas_many: decided by Ln (authoritative) alone; on success the
+    caches take the writes and removals — except ``__`` keys, which no
+    cache tier serves.
 
     Tier failures (``OSError``, network errors, etc.) are logged at
     WARNING and the next tier is tried; programming-error exceptions
@@ -164,8 +165,8 @@ class Composite(KVStore):
                 continue
         return False
 
-    def keys(self) -> Iterable[str]:
-        return self._stores[-1].keys()
+    def keys(self, prefix: str = "") -> Iterable[str]:
+        return self._stores[-1].keys(prefix)
 
     def items(self) -> Iterable[tuple[str, bytes]]:
         return self._stores[-1].items()
@@ -231,22 +232,32 @@ class Composite(KVStore):
                     raise
                 logger.warning("Composite clear failed at tier %d: %s", i, e)
 
-    def cas(self, key: str, value: bytes, expected: bytes | None) -> bool:
-        success = self._stores[-1].cas(key, value, expected)
-        # A ``__``-prefixed key is read from the authoritative tier
-        # only, so writing it into a cache stores bytes nothing will
-        # ever read, and a CAS is almost always against such a key.
-        if success and not _is_mutable(key):
-            for i, store in enumerate(self._stores[:-1]):
-                try:
-                    store.set(key, value)
-                except Exception as e:
-                    if _is_bug(e):
-                        raise
-                    logger.warning(
-                        "Composite cas cache-update failed at tier %d for %r: %s",
-                        i,
-                        key,
-                        e,
-                    )
-        return success
+    def cas_many(
+        self,
+        expected: Mapping[str, bytes | None],
+        writes: Mapping[str, bytes],
+        removes: Iterable[str] = (),
+    ) -> bool:
+        removes = list(removes)
+        # Decided by the authoritative tier alone: a cache may be missing
+        # a key or hold one the authoritative tier has dropped, so it can
+        # neither answer an expectation nor take part in the atomicity.
+        if not self._stores[-1].cas_many(expected, writes, removes):
+            return False
+        # Then the caches follow, best effort. A ``__``-prefixed key is
+        # read from the authoritative tier only, so writing one into a
+        # cache stores bytes nothing will ever read.
+        cached = {k: v for k, v in writes.items() if not _is_mutable(k)}
+        for i, store in enumerate(self._stores[:-1]):
+            try:
+                if cached:
+                    store.set_many(cached)
+                if removes:
+                    store.remove_many(removes)
+            except Exception as e:
+                if _is_bug(e):
+                    raise
+                logger.warning(
+                    "Composite cas_many cache-update failed at tier %d: %s", i, e
+                )
+        return True

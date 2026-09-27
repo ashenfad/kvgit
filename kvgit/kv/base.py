@@ -10,6 +10,17 @@ class KVStore(ABC):
     All values are stored and retrieved as bytes. Serialization is
     handled at higher layers (e.g., Versioned).
 
+    Beyond reads and writes, a backend owes kvgit two things:
+
+    * ``cas_many`` — a write of several keys that applies only if
+      several other keys hold what the caller expects, atomically. kvgit
+      publishes every commit through it, with the GC lease among the
+      expected keys, which is what lets a sweep run beside writers. Any
+      store with a multi-key transaction or conditional batch can
+      provide it (SQLite, Postgres, IndexedDB, Redis, DynamoDB).
+    * ``keys(prefix)`` — the keys under a prefix, which a backend with an
+      ordered index answers without scanning everything.
+
     Bulk methods (``set_many`` / ``get_many`` / ``remove_many``)
     accept two equivalent call forms — pass a Mapping/Iterable
     directly, or use the variadic ``**kwargs`` / ``*args`` form:
@@ -62,8 +73,8 @@ class KVStore(ABC):
         """Iterate over all key-value pairs."""
 
     @abstractmethod
-    def keys(self) -> Iterable[str]:
-        """Iterate over all keys."""
+    def keys(self, prefix: str = "") -> Iterable[str]:
+        """Iterate over all keys, or only those starting with ``prefix``."""
 
     @abstractmethod
     def __contains__(self, key: str) -> bool:
@@ -82,20 +93,54 @@ class KVStore(ABC):
         """
 
     @abstractmethod
+    def cas_many(
+        self,
+        expected: Mapping[str, bytes | None],
+        writes: Mapping[str, bytes],
+        removes: Iterable[str] = (),
+    ) -> bool:
+        """Apply ``writes`` and ``removes`` atomically, if and only if
+        every key in ``expected`` currently holds its value.
+
+        ``None`` as an expected value means "this key must not exist".
+        Either every write and removal lands or none does, and no other
+        writer's change can land between the check and the write. A key
+        may appear in both ``expected`` and ``writes``; a key in both
+        ``writes`` and ``removes`` is a caller error.
+
+        Returns True if the batch was applied, False if any expectation
+        failed (in which case nothing changed).
+        """
+
     def cas(self, key: str, value: bytes, expected: bytes | None) -> bool:
-        """Atomic compare-and-swap.
+        """Atomic compare-and-swap of one key.
 
         Set value only if current value equals expected.
         None means "key must not exist".
 
         Returns True if swap succeeded, False otherwise.
         """
+        if not isinstance(value, bytes):
+            raise TypeError(f"Expected bytes, got {type(value).__name__}")
+        return self.cas_many({key: expected}, {key: value})
 
     @abstractmethod
     def clear(self) -> None:
         """Remove all items from the store."""
 
     # ---- protected helpers for subclass implementations ----
+
+    @staticmethod
+    def _check_batch(writes: Mapping[str, bytes], removes: Iterable[str]) -> list[str]:
+        """Validate a ``cas_many`` batch; return ``removes`` as a list."""
+        for key, value in writes.items():
+            if not isinstance(value, bytes):
+                raise TypeError(f"Expected bytes for {key}, got {type(value).__name__}")
+        removes = list(removes)
+        clash = set(writes).intersection(removes)
+        if clash:
+            raise ValueError(f"keys both written and removed: {sorted(clash)}")
+        return removes
 
     @staticmethod
     def _normalize_keys(args) -> Iterable[str]:

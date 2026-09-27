@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`KVStore` requires `cas_many` and `keys(prefix)`.** `cas_many(expected,
+  writes, removes=())` applies a batch atomically if and only if every
+  expected key holds its value (`None` = absent); `keys(prefix="")` lists
+  the keys under a prefix, which an ordered backend answers without a
+  full scan. `cas` is now provided by the base class on top of
+  `cas_many`. `Memory`, `Disk`, `IndexedDB` and `Composite` implement
+  both; a custom backend must add them. (#42)
+
+- **Every sweep runs under the GC lease, and commits cannot land beside
+  one.** Each commit batch is a `cas_many` expecting the lease record
+  its writer read, and carries an `__inflight__<commit>` marker that the
+  publishing write removes; sweeps mark from in-flight markers as well
+  as branch heads. So:
+  - **`clean_orphans` reclaims content again** — blobs, HAMT nodes and
+    chunks only the orphans held, chunks included for the first time —
+    and `delete_branch` gives space back without a `deep_clean`.
+  - **`clean_orphans` is safe beside concurrent writers at any
+    `min_age`**, including 0. `min_age=0` could previously delete a
+    commit between its write batch and its HEAD advance, leaving a
+    branch head over a missing commit root.
+  - **`deep_clean` no longer sleeps.** Its `grace` parameter is gone,
+    along with the assumption that every writer finishes within it.
+    `deep_clean` now does only what `clean_orphans` cannot: scan for
+    content no commit references.
+  - `clean_orphans` waits for another sweep's lease rather than
+    running beside it; `deep_clean` still raises `GcBusy`.
+  - Writers wait while a sweep runs, mark phase included.
+
+- **HEAD and its backup move in one write.** `__branch_head_prev__` is
+  written in the same `cas_many` that moves HEAD, so it is always HEAD's
+  immediate predecessor, and a crash can no longer leave one moved
+  without the other. Tag creation writes its head and `__tag_info__`
+  record together; deleting a branch or tag removes its keys in one
+  call.
+
+- A commit makes fewer backend calls: 7 rather than 9 on an uncached
+  store, two of them the batch and the publish.
+
 - **Storage v4: everything below a commit is keyed by content.** A
   blob's key is the SHA-256 of its bytes (`kvgit:blob:<sha256>`), a
   keyset entry holds only what follows from those bytes (no
@@ -26,13 +64,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     sweep deletes by rules that are wrong for content it did not write.
     kvgit 0.3.9 refuses every open and sweep of a v4 store and leaves it
     byte-identical.
-  - **`clean_orphans` reclaims commit metadata, not content.** v4
-    blobs, HAMT nodes and chunks can be shared with a commit the sweep
-    never saw, so only `deep_clean` (under the GC lease) deletes them.
-    Blobs written before v4 are commit-scoped and still go
-    incrementally. Stores that relied on `clean_orphans` /
-    `delete_branch` alone to give space back need a scheduled
-    `deep_clean`.
   - The initial empty commit keeps its old fixed hash (`ROOT_COMMIT`),
     so branches minted before and after v4 still share an ancestor.
   - `MetaEntry.created_at` is `None` on entries written by v4.

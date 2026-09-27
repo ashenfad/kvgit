@@ -418,3 +418,89 @@ async def test_chunked_codec_round_trip(selenium_jspi):
     np.testing.assert_array_equal(s["full"], big)
     np.testing.assert_array_equal(s["head"], big[:1024])
     np.testing.assert_array_equal(s["tail"], big[-1024:])
+
+
+@run_in_pyodide(packages=["micropip"])
+async def test_cas_many_applies_or_changes_nothing(selenium_jspi):
+    import micropip
+    from pyodide.http import pyfetch
+
+    resp = await pyfetch("./_kvgit_whl.txt")
+    whl = (await resp.string()).strip()
+    await micropip.install(f"./{whl}", deps=False)
+
+    from kvgit.kv.indexeddb import IndexedDB
+
+    store = IndexedDB(db_name="test_cas_many")
+    store.set_many({"a": b"1", "gone": b"x", "keep": b"k"})
+
+    # Any failed expectation: nothing written, nothing removed.
+    assert not store.cas_many({"a": b"1", "keep": b"other"}, {"b": b"2"}, ["gone"])
+    assert not store.cas_many({"a": b"1", "absent": b"y"}, {"b": b"2"}, ["gone"])
+    assert store.get_many("a", "b", "gone") == {"a": b"1", "gone": b"x"}
+
+    # Every expectation holds: writes and removals land together.
+    assert store.cas_many({"a": b"1", "absent": None}, {"a": b"2", "b": b"3"}, ["gone"])
+    assert store.get_many("a", "b", "gone") == {"a": b"2", "b": b"3"}
+
+    # No expectations: an atomic batch.
+    assert store.cas_many({}, {"c": b"4"}, ["missing"])
+    assert store.get("c") == b"4"
+
+
+@run_in_pyodide(packages=["micropip"])
+async def test_keys_by_prefix(selenium_jspi):
+    import micropip
+    from pyodide.http import pyfetch
+
+    resp = await pyfetch("./_kvgit_whl.txt")
+    whl = (await resp.string()).strip()
+    await micropip.install(f"./{whl}", deps=False)
+
+    from kvgit.kv.indexeddb import IndexedDB
+
+    store = IndexedDB(db_name="test_keys_by_prefix")
+    store.set_many(
+        {
+            "__branch_head__main": b"",
+            "__branch_head__dev": b"",
+            "__branch_head_prev__main": b"",
+            "__branch_heae": b"",
+            "é/a": b"",
+            "ê": b"",
+            "🔑/x": b"",
+        }
+    )
+    assert sorted(store.keys("__branch_head__")) == [
+        "__branch_head__dev",
+        "__branch_head__main",
+    ]
+    assert sorted(store.keys("é/")) == ["é/a"]
+    assert list(store.keys("🔑")) == ["🔑/x"]
+    assert len(list(store.keys())) == 7
+
+
+@run_in_pyodide(packages=["micropip"])
+async def test_versioned_commits_and_sweeps(selenium_jspi):
+    """Commits publish through cas_many and a sweep reclaims an orphan."""
+    import micropip
+    from pyodide.http import pyfetch
+
+    resp = await pyfetch("./_kvgit_whl.txt")
+    whl = (await resp.string()).strip()
+    await micropip.install(f"./{whl}", deps=False)
+
+    from kvgit.kv.indexeddb import IndexedDB
+    from kvgit.versioned.kv import VersionedKV, blob_key, clean_orphans
+
+    backend = IndexedDB(db_name="test_versioned_sweeps")
+    main = VersionedKV(backend)
+    main.commit({"live": b"keep me"})
+    dev = main.create_branch("dev")
+    dev.commit({"tmp": b"throwaway"})
+    main.delete_branch("dev")
+
+    assert clean_orphans(backend, min_age=0) >= 1
+    assert backend.get(blob_key(b"throwaway")) is None
+    assert list(backend.keys("__inflight__")) == []
+    assert VersionedKV(backend).get("live") == b"keep me"

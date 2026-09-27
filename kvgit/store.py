@@ -189,8 +189,7 @@ def delete_branches(
         # its branch keys already gone.
         _assert_supported_version(backend)
         for name in doomed:
-            backend.remove(BRANCH_HEAD % name)
-            backend.remove(BRANCH_HEAD_PREV % name)
+            backend.remove_many([BRANCH_HEAD % name, BRANCH_HEAD_PREV % name])
         clean_orphans(backend, min_age=min_age)
     finally:
         close = getattr(backend, "close", None)
@@ -244,9 +243,13 @@ def delete_tags(
         # anything is removed.
         _assert_supported_version(backend)
         for name in doomed:
-            backend.remove(BRANCH_HEAD % (TAG_BRANCH_PREFIX + name))
-            backend.remove(BRANCH_HEAD_PREV % (TAG_BRANCH_PREFIX + name))
-            backend.remove(TAG_INFO_KEY % name)
+            backend.remove_many(
+                [
+                    BRANCH_HEAD % (TAG_BRANCH_PREFIX + name),
+                    BRANCH_HEAD_PREV % (TAG_BRANCH_PREFIX + name),
+                    TAG_INFO_KEY % name,
+                ]
+            )
         clean_orphans(backend, min_age=min_age)
     finally:
         close = getattr(backend, "close", None)
