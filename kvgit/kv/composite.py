@@ -27,9 +27,9 @@ Every mutable key kvgit writes starts with it — branch heads, their
 prev-HEAD backups, the storage version stamp, the GC lease — and so does
 commit metadata, which is immutable but small enough that reading it
 from the authoritative tier costs little. Everything else is derived
-from its own content (``kvgit:keyset:``, ``kvgit:chunk:``,
-``<commit>:<key>``): the same key always holds the same bytes, which is
-what makes it cacheable.
+from its own content (``kvgit:blob:``, ``kvgit:keyset:``,
+``kvgit:chunk:``, and ``<commit>:<key>`` blobs from before v4): the same
+key always holds the same bytes, which is what makes it cacheable.
 """
 
 
@@ -48,9 +48,9 @@ class Composite(KVStore):
     would let a process keep serving a branch head that another process
     has already moved: the handle would take a ``ConcurrencyError`` on
     commit, call ``refresh()``, and read the same stale head back out of
-    L1. Everything else is keyed by its own content
-    (``kvgit:keyset:``, ``kvgit:chunk:``, ``<commit>:<key>``), so a hit
-    at any tier is the right answer forever.
+    L1. Everything else is keyed by its own content (``kvgit:blob:``,
+    ``kvgit:keyset:``, ``kvgit:chunk:``, and ``<commit>:<key>`` blobs from
+    before v4), so a hit at any tier is the right answer forever.
 
     On get: for a ``__`` key, read Ln. Otherwise check L1, L2, ..., Ln
     in order; on hit at tier i, populate L1..L(i-1) and return.

@@ -169,10 +169,11 @@ def resolve_merge(
         their_val = None if their_removed else blob_reader(their_keyset[key])
 
         # Equal bytes under different pointers are still the same change.
-        # A blob identifier is commit-scoped, so two writers making the
-        # identical write from the same base end up with different
-        # pointers to identical content; take their pointer, with no
-        # merge function and no conflict. Both sides reading as None
+        # A blob written before storage v4 is keyed by the commit that
+        # wrote it, so identical content can sit under two pointers — an
+        # old blob on one side and a content-keyed one on the other, or
+        # two old ones; take their pointer, with no merge function and
+        # no conflict. Both sides reading as None
         # means both blobs are missing, which is damage rather than
         # agreement, so it stays contested.
         if (

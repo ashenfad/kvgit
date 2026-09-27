@@ -188,10 +188,11 @@ def commit_hash(
 
     Covers the parents, the keyset root, the commit time and the info,
     and is computed after the keyset is built, so a hash names exactly
-    one root. The time makes every ``__commit_*__<hash>`` key written
-    once and never rewritten: two writers making the same change mint
-    two commits rather than one hash with two roots, and merging them
-    is clean because both point at the same blobs.
+    one root, and every ``__commit_*__<hash>`` key is written once and
+    never rewritten. Two writers making the same change mint two
+    commits, and merging them is clean because both point at the same
+    blobs; making it at the same clock instant, they mint the very same
+    commit, byte for byte.
     """
     payload = json.dumps(
         ["kvgit/4", list(parents), root, created, info],
@@ -1385,9 +1386,9 @@ class VersionedKV(VersionedBase):
             )
 
         # Stage chunk writes under their content-addressed namespace.
-        # Existing chunks (already present in the store) are skipped to
-        # save a roundtrip on idempotent rewrites; the dedup property
-        # holds either way because the key is the hash.
+        # Like blobs, every chunk is written even when its key is
+        # already stored; the key is the hash, so the rewrite is a no-op
+        # for the data and a guarantee against a concurrent deep clean.
         if chunks:
             _stamp_version_at_least(self.store, CHUNK_STORAGE_VERSION)
             for chunk_hash, chunk_bytes in chunks.items():
