@@ -9,7 +9,7 @@ from collections.abc import Iterable, Mapping
 from .base import KVStore
 
 try:
-    from psycopg import sql
+    from psycopg import errors, sql
     from psycopg.pq import TransactionStatus
     from psycopg_pool import ConnectionPool
 except ImportError as e:  # pragma: no cover - exercised only without the extra
@@ -18,6 +18,27 @@ except ImportError as e:  # pragma: no cover - exercised only without the extra
     ) from e
 
 _TABLE_NAME = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
+_DEADLOCK_RETRIES = 5
+_MAX_CODE_POINT = 0x10FFFF
+
+
+def _prefix_upper_bound(prefix: str) -> str | None:
+    """The least string greater than every string starting with ``prefix``.
+
+    Under the C collation Postgres compares UTF-8 bytes, which order the
+    same as code points, so it is ``prefix`` with its last character
+    bumped by one — carried leftwards past characters already at
+    U+10FFFF, and stepped over the surrogates, which UTF-8 cannot hold.
+    None when every character is U+10FFFF: nothing is greater, and the
+    range is open above.
+    """
+    stem = prefix.rstrip(chr(_MAX_CODE_POINT))
+    if not stem:
+        return None
+    bumped = ord(stem[-1]) + 1
+    if 0xD800 <= bumped <= 0xDFFF:
+        bumped = 0xE000
+    return stem[:-1] + chr(bumped)
 
 
 class Postgres(KVStore):
@@ -30,13 +51,15 @@ class Postgres(KVStore):
     so two batches upserting overlapping keys lock their rows in the same
     order and cannot deadlock.
 
-    ``cas_many`` is one transaction: a transaction-scoped advisory lock
-    per expected key, taken in a fixed order, then the check, then the
-    writes. The locks serialize every batch that expects the same key —
-    one expecting it absent included, which no row lock could cover — and
-    under READ COMMITTED the check, a statement of its own after the
-    locks, reads the latest committed values. The statements are
-    pipelined, so a batch costs two round trips.
+    ``cas_many`` is one transaction that locks every expected key with
+    Postgres's own row locking, so that no write to it — by any method —
+    can land between the check and the batch: a key expected to hold a
+    value is read ``FOR UPDATE``, and a key expected absent gets a
+    placeholder row that a concurrent insert must wait on. Then the
+    writes, and the removal of placeholders the batch does not write. The
+    statements are pipelined, so a batch costs two round trips. A batch
+    Postgres aborts to break a deadlock is retried; one that fails
+    otherwise is rolled back.
 
     Several stores may share a database under different table names.
 
@@ -133,7 +156,8 @@ class Postgres(KVStore):
         items = self._normalize_items(items, kwargs)
         self._check_batch(items, ())
         if items:
-            self._exec(self._UPSERT, self._sorted_columns(items))
+            columns = self._sorted_columns(items)
+            self._retrying(lambda: self._exec(self._UPSERT, columns))
 
     def items(self) -> Iterable[tuple[str, bytes]]:
         return [(k, bytes(v)) for k, v in self._fetch("SELECT k, v FROM {t}")]
@@ -141,17 +165,18 @@ class Postgres(KVStore):
     def keys(self, prefix: str = "") -> Iterable[str]:
         """Every key, or only those starting with ``prefix``.
 
-        The prefix form is a range scan on the primary key: under the C
-        collation keys sort by code point, so the keys starting with
-        ``p`` are exactly those in ``[p, p')`` where ``p'`` bumps the
-        last character of ``p``.
+        The prefix form is a range scan on the primary key, from the
+        prefix up to :func:`_prefix_upper_bound`.
         """
         if not prefix:
             return [r[0] for r in self._fetch("SELECT k FROM {t}")]
-        upper = prefix[:-1] + chr(ord(prefix[-1]) + 1)
-        rows = self._fetch(
-            "SELECT k FROM {t} WHERE k >= %s AND k < %s", (prefix, upper)
-        )
+        upper = _prefix_upper_bound(prefix)
+        if upper is None:
+            rows = self._fetch("SELECT k FROM {t} WHERE k >= %s", (prefix,))
+        else:
+            rows = self._fetch(
+                "SELECT k FROM {t} WHERE k >= %s AND k < %s", (prefix, upper)
+            )
         return [r[0] for r in rows]
 
     def __contains__(self, key: str) -> bool:
@@ -161,9 +186,11 @@ class Postgres(KVStore):
         self._exec("DELETE FROM {t} WHERE k = %s", (key,))
 
     def remove_many(self, *args) -> None:
-        keys = list(self._normalize_keys(args))
+        keys = sorted(set(self._normalize_keys(args)))
         if keys:
-            self._exec("DELETE FROM {t} WHERE k = ANY(%s)", (keys,))
+            self._retrying(
+                lambda: self._exec("DELETE FROM {t} WHERE k = ANY(%s)", (keys,))
+            )
 
     def cas_many(
         self,
@@ -172,43 +199,38 @@ class Postgres(KVStore):
         removes: Iterable[str] = (),
     ) -> bool:
         removes = self._check_batch(writes, removes)
-        # The lock key names the table as well as the key, so stores
-        # sharing a database do not serialize each other.
-        lock_keys = [f"{self._table}|{key}" for key in expected]
+        return self._retrying(lambda: self._cas_many_once(expected, writes, removes))
+
+    def _cas_many_once(
+        self,
+        expected: Mapping[str, bytes | None],
+        writes: Mapping[str, bytes],
+        removes: list[str],
+    ) -> bool:
         with self._pool.connection() as conn:
             try:
                 # Explicit BEGIN/COMMIT rather than ``conn.transaction()``,
                 # which syncs the pipeline at every step: this way the
-                # locks and the check travel in one round trip, and the
+                # claim and the check travel in one round trip, and the
                 # writes and the commit in a second.
                 with conn.pipeline() as pipeline:
                     conn.execute("BEGIN")
-                    if expected:
-                        # One statement takes every lock, in hash order, so
-                        # two batches expecting overlapping keys cannot
-                        # deadlock.
-                        conn.execute(
-                            "SELECT pg_advisory_xact_lock(h) FROM ("
-                            "SELECT hashtextextended(x, 0) AS h "
-                            "FROM unnest(%s::text[]) AS x ORDER BY h) AS locks",
-                            (lock_keys,),
-                        )
-                        check = conn.execute(
-                            self._q("SELECT k, v FROM {t} WHERE k = ANY(%s)"),
-                            (list(expected),),
-                        )
-                        pipeline.sync()
-                        current = {k: bytes(v) for k, v in check.fetchall()}
-                        if any(current.get(k) != v for k, v in expected.items()):
-                            conn.execute("ROLLBACK")
-                            return False
+                    claimed = self._claim_and_check(conn, pipeline, expected)
+                    if claimed is None:
+                        conn.execute("ROLLBACK")
+                        return False
                     if writes:
                         conn.execute(
                             self._q(self._UPSERT), self._sorted_columns(writes)
                         )
-                    if removes:
+                    # A placeholder claimed for a key expected absent goes
+                    # again unless this batch writes that key.
+                    removals = sorted(
+                        {*removes, *(k for k in claimed if k not in writes)}
+                    )
+                    if removals:
                         conn.execute(
-                            self._q("DELETE FROM {t} WHERE k = ANY(%s)"), (removes,)
+                            self._q("DELETE FROM {t} WHERE k = ANY(%s)"), (removals,)
                         )
                     conn.execute("COMMIT")
                 return True
@@ -218,6 +240,64 @@ class Postgres(KVStore):
                 if conn.info.transaction_status != TransactionStatus.IDLE:
                     conn.execute("ROLLBACK")
                 raise
+
+    def _claim_and_check(
+        self, conn, pipeline, expected: Mapping[str, bytes | None]
+    ) -> list[str] | None:
+        """Lock every expected key against every other writer, then check.
+
+        A key expected to hold a value is read ``FOR UPDATE``: any other
+        write or delete of that row waits for this transaction. A key
+        expected absent has a placeholder row inserted for it: a
+        concurrent insert of the same key waits on the unique index, and
+        if the row already exists nothing is inserted and the check
+        fails. So no change to an expected key can land between the check
+        and the write, whichever method makes it.
+
+        Returns the keys given placeholders, or None if an expectation
+        does not hold.
+        """
+        absent = sorted(k for k, v in expected.items() if v is None)
+        present = sorted(k for k, v in expected.items() if v is not None)
+        claim = lock = None
+        if absent:
+            claim = conn.execute(
+                self._q(
+                    "INSERT INTO {t} (k, v) SELECT x, ''::bytea "
+                    "FROM unnest(%s::text[]) AS x ON CONFLICT (k) DO NOTHING RETURNING k"
+                ),
+                (absent,),
+            )
+        if present:
+            lock = conn.execute(
+                self._q("SELECT k, v FROM {t} WHERE k = ANY(%s) ORDER BY k FOR UPDATE"),
+                (present,),
+            )
+        pipeline.sync()
+        claimed = [row[0] for row in claim.fetchall()] if claim else []
+        if len(claimed) != len(absent):
+            return None
+        current = {k: bytes(v) for k, v in lock.fetchall()} if lock else {}
+        if any(current.get(k) != expected[k] for k in present):
+            return None
+        return claimed
+
+    def _retrying(self, attempt):
+        """Run a write, retrying one Postgres chose as a deadlock victim.
+
+        Batches lock their rows in key order, but a batch's claimed and
+        locked keys are two ordered runs, so two batches over overlapping
+        keys can still meet in opposite orders. Postgres breaks such a
+        cycle by aborting one side, which then changed nothing; running
+        it again is safe.
+        """
+        for remaining in range(_DEADLOCK_RETRIES, 0, -1):
+            try:
+                return attempt()
+            except errors.DeadlockDetected:
+                if remaining == 1:
+                    raise
+        raise AssertionError("unreachable")
 
     def clear(self) -> None:
         self._exec("DELETE FROM {t}")

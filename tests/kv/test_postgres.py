@@ -153,3 +153,86 @@ def test_a_failed_batch_leaves_nothing_and_the_connection_usable(table):
     assert s.get("ok") == b"x"
     s.drop()
     s.close()
+
+
+class RacingStore(Postgres):
+    """Runs ``race`` on another thread right after ``cas_many`` has
+    checked its expectations, and records whether it was still waiting
+    0.3 s later — that is, whether the check held it off."""
+
+    race = None
+    raced_blocked: bool | None = None
+
+    def _claim_and_check(self, conn, pipeline, expected):
+        claimed = super()._claim_and_check(conn, pipeline, expected)
+        race, type(self).race = type(self).race, None
+        if race is not None:
+            racer = threading.Thread(target=race)
+            racer.start()
+            racer.join(0.3)
+            type(self).raced_blocked = racer.is_alive()
+            type(self).racer = racer
+        return claimed
+
+
+@pytest.fixture
+def racing(table):
+    s = RacingStore(DSN, table=table)
+    other = Postgres(DSN, table=table)
+    RacingStore.raced_blocked = None
+    yield s, other
+    RacingStore.race = None
+    s.drop()
+    s.close()
+    other.close()
+
+
+class TestNoWriteLandsBetweenCheckAndBatch:
+    def test_a_plain_set_waits(self, racing):
+        s, other = racing
+        s.set("head", b"old")
+        RacingStore.race = lambda: other.set("head", b"theirs")
+        assert s.cas_many({"head": b"old"}, {"head": b"ours"})
+        RacingStore.racer.join(10)
+        assert RacingStore.raced_blocked is True
+        assert s.get("head") == b"theirs"  # landed after, not lost
+
+    def test_a_delete_waits_so_it_cannot_be_undone(self, racing):
+        """The branch-deletion race: a publish that checked HEAD must not
+        write it back over a delete that landed in between."""
+        s, other = racing
+        s.set("head", b"old")
+        RacingStore.race = lambda: other.remove("head")
+        assert s.cas_many({"head": b"old"}, {"head": b"new", "prev": b"old"})
+        RacingStore.racer.join(10)
+        assert RacingStore.raced_blocked is True
+        assert s.get("head") is None  # the delete came after, and stands
+
+    def test_an_insert_of_a_key_expected_absent_waits(self, racing):
+        s, other = racing
+        RacingStore.race = lambda: other.set("lease", b"a sweep")
+        assert s.cas_many({"lease": None}, {"batch": b"x"})
+        RacingStore.racer.join(10)
+        assert RacingStore.raced_blocked is True
+        assert s.get("lease") == b"a sweep"
+        assert s.get("batch") == b"x"
+
+    def test_a_key_expected_absent_is_left_absent(self, table):
+        s = Postgres(DSN, table=table)
+        assert s.cas_many({"lease": None, "gone": None}, {"gone": b"now here"})
+        assert s.get("lease") is None
+        assert s.get("gone") == b"now here"
+        assert not s.cas_many({"gone": None}, {"x": b"1"})
+        assert s.get("gone") == b"now here" and s.get("x") is None
+        s.drop()
+        s.close()
+
+
+def test_prefix_bounds_carry_past_the_last_code_point():
+    from kvgit.kv.postgres import _prefix_upper_bound
+
+    top = chr(0x10FFFF)
+    assert _prefix_upper_bound("ab") == "ac"
+    assert _prefix_upper_bound("a" + top) == "b"
+    assert _prefix_upper_bound(top + top) is None
+    assert _prefix_upper_bound("a퟿") == "a"

@@ -40,7 +40,13 @@ numpy = ["numpy>=1.24"]
 pandas = ["numpy>=1.24", "pandas>=2.0"]
 scientific = ["numpy>=1.24", "pandas>=2.0"]
 postgres = ["psycopg[binary]>=3.2", "psycopg-pool>=3.2"]
-all = ["diskcache", "numpy>=1.24", "pandas>=2.0"]
+all = [
+    "diskcache",
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "psycopg[binary]>=3.2",
+    "psycopg-pool>=3.2",
+]
 dev = [
     "pytest",
     "diskcache",
