@@ -96,14 +96,17 @@ commit hashes are not git's, and there are no remotes.
 
 `Worktree.merge()` merges a branch, tag or commit into the worktree's
 branch: lowest common ancestor, three-way resolve, and a two-parent
-merge commit guarded on your own head:
+merge commit guarded on your own head. As in git, a branch that has not
+moved since the fork fast-forwards instead, and `fast_forward=False`
+writes the merge commit anyway:
 
 ```python
 dev["score"] = 500
 dev.commit()
 
 result = main.merge(branch="dev")  # truthy when merged
-print(main["score"])  # 500 (main hadn't diverged, so dev's change wins)
+print(result.strategy)  # "fast_forward": main hadn't moved since dev forked
+print(main["score"])    # 500
 ```
 
 Overlapping changes need a merge function per key, or a `default_merge`

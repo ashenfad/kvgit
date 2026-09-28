@@ -207,6 +207,15 @@ Each of these refuses with `ValueError` while changes are pending — commit or 
 
 Merge another branch, tag or commit into this worktree's branch: lowest common ancestor (criss-cross ties go to the smallest hash), three-way resolve, and a two-parent merge commit whose first parent is this branch's head.
 
+| Case | Result |
+|------|--------|
+| The branch already contains theirs | `strategy="no_op"`; nothing written |
+| The branch has not moved since the fork, `fast_forward=True` (default) | `strategy="fast_forward"`: HEAD moves to theirs, no commit is written, so `info` is not recorded |
+| The branch has not moved since the fork, `fast_forward=False` | A merge commit, as below |
+| Both sides moved | `strategy="three_way"`: a merge commit |
+
+Finding the common ancestor costs a few batched reads however long the history: see [Generations](#generations).
+
 #### `apply(base, target, **options) -> MergeResult`
 
 Apply the change from commit `base` to commit `target` onto this branch, as an ordinary single-parent commit. `base` stands in for the common ancestor in a three-way merge between this branch's head and `target`, so keys the change did not touch are left as they are. A change already present is a no-op.
@@ -683,7 +692,7 @@ The `__kvgit_version__` key records the newest layout a store holds. Every layou
 |---------|------------|---------------|
 | 2 | — | The HAMT keyset layout. |
 | 3 | the first chunked write | `kvgit:chunk:<hash>` and `MetaEntry.chunks`. |
-| 4 | the first commit written by this code | Blobs keyed by content (`kvgit:blob:<sha256>`), keyset entries without a timestamp, and a commit hash over the parents, keyset root, time and info. |
+| 4 | the first commit written by this code | Blobs keyed by content (`kvgit:blob:<sha256>`), keyset entries without a timestamp, a commit hash over the parents, keyset root, time and info, and each commit's parents' [generations](#generations) (`__parent_gens__<commit>`). |
 
 v4 changes how *new* objects are keyed; nothing already stored is rewritten. Every existing commit hash, branch head and tag stays valid, a keyset may hold blobs of both kinds (`<commit_hash>:<key>` from before v4, `kvgit:blob:<sha256>` after), and an untouched entry keeps the bytes it was stored as. Two consequences follow from content keys:
 
@@ -691,6 +700,14 @@ v4 changes how *new* objects are keyed; nothing already stored is rewritten. Eve
 * **A commit hash names one root.** Because the time is part of the hash, two writers making the same change mint two commits rather than one hash over two different keysets, and every key under `__commit_*__<hash>` is written once and never rewritten.
 
 A stamp locks older code out, deliberately: an older sweep deletes by rules that are wrong for content it did not write. `Repo` and `gc()` refuse a store stamped above what they read with `StorageVersionError`, before writing anything. kvgit releases whose admin paths predate that check refuse to open such a store, and their sweeps fail on the first v4 entry they decode.
+
+### Generations
+
+A commit's generation is one more than its highest parent's, and 0 for a commit with no parents. Every commit sits above all of its ancestors, so a search for the common ancestor of two commits can visit commits highest generation first and stop as soon as it has found it — rather than reading both histories to the root.
+
+Each commit stores its parents' generations, in parent order, under `__parent_gens__<commit>`, beside `__parent_commit__<commit>`. Keeping the parents' generations with the child means one read tells the search both where a commit's parents are and where they fall, and every commit at the same generation is read in one `get_many`. Two tips that forked recently resolve in two or three reads, however long the history below the fork.
+
+Commits written before generations were stored have no `__parent_gens__` key. A search that reaches one falls back to walking both whole histories, which is exact but reads one commit at a time. A new commit whose parent is such a commit works out its parent's generation from history once, when it is written, so the history above it is searched quickly from then on. Garbage collection removes the key with the rest of a commit's metadata.
 
 ### Limitations
 
@@ -945,4 +962,4 @@ Tier failures that look operational (`OSError`, network errors, a Pyodide `JsExc
 
 A key starting with `__` names a value that changes under a fixed key — a branch head, its `__branch_head_prev__` backup, the `__kvgit_version__` stamp, the `__gc_lease__` record. Cached, those let a process keep serving state another process has already replaced: the worktree takes a `ConcurrencyError` on commit, calls `refresh()`, and reads the same stale head back out of L1, forever. So they are read from the authoritative tier alone.
 
-Everything else is keyed by its own content — `kvgit:blob:<hash>`, `kvgit:keyset:<hash>`, `kvgit:chunk:<hash>`, and `<commit>:<key>` blobs from before v4 — so the same key always holds the same bytes and a hit at any tier is the right answer. Those are what the cache tiers are for, and they are the bulk of the reads. Commit metadata (`__commit_root__`, `__parent_commit__`, `__commit_time__`, `__info__`) is immutable too, but it is small and `__`-prefixed, so it rides the same read-through rule rather than earning an exception.
+Everything else is keyed by its own content — `kvgit:blob:<hash>`, `kvgit:keyset:<hash>`, `kvgit:chunk:<hash>`, and `<commit>:<key>` blobs from before v4 — so the same key always holds the same bytes and a hit at any tier is the right answer. Those are what the cache tiers are for, and they are the bulk of the reads. Commit metadata (`__commit_root__`, `__parent_commit__`, `__parent_gens__`, `__commit_time__`, `__info__`) is immutable too, but it is small and `__`-prefixed, so it rides the same read-through rule rather than earning an exception.
