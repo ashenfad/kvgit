@@ -33,7 +33,7 @@ The built-in `IndexedDB` backend talks to IndexedDB's async API directly and bri
 
 ```python
 import kvgit
-wt = kvgit.store(kind="indexeddb", db_name="myapp")
+wt = kvgit.open("indexeddb", db_name="myapp")
 wt["key"] = "value"
 wt.commit()  # durable on return — no host-side flush needed
 ```
@@ -81,7 +81,7 @@ await pyodide.mountNativeFS("/persist", persistDir);
 
 ```python
 import kvgit
-wt = kvgit.store(kind="disk", path="/persist/mydb")
+wt = kvgit.open("disk", path="/persist/mydb")
 wt["key"] = "value"
 wt.commit()  # writes hit the in-memory mirror; see flush requirement below
 ```

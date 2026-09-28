@@ -29,7 +29,7 @@ pip install kvgit[scientific]  # adds chunked codecs for numpy / pandas
 ```python
 import kvgit
 
-main = kvgit.store()  # a Worktree on branch "main" of an in-memory Repo
+main = kvgit.open()  # a Worktree on branch "main" of an in-memory Repo
 repo = main.repo
 
 main["user"] = "alice"
@@ -207,7 +207,7 @@ Large numpy arrays and pandas DataFrames -- and any sliced views of them -- can 
 import kvgit
 import numpy as np
 
-s = kvgit.store(codec="scientific")
+s = kvgit.open(codec="scientific")
 
 big = np.arange(1_000_000, dtype="float64")  # ~8 MB
 s["full"] = big
