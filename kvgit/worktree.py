@@ -407,6 +407,7 @@ class Worktree(MutableMapping[str, Any]):
 
         Raises:
             UnknownCommitError: ``commit`` is not in the store.
+            UnknownBranchError: the branch was deleted.
         """
         if not self._engine.reset_to(commit):
             raise UnknownCommitError(f"Commit '{commit}' does not exist")

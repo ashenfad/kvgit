@@ -281,6 +281,13 @@ class TestCommits:
         assert repo.merge_base(c1, c2) == c1
         assert repo.merge_base(c2, c2) == c2
 
+    def test_merge_base_of_a_missing_commit_raises(self):
+        repo, _, _, c1, _ = repo_with_history()
+        missing = "0" * 40
+        for a, b in ((missing, missing), (missing, c1), (c1, missing)):
+            with pytest.raises(UnknownCommitError):
+                repo.merge_base(a, b)
+
 
 class TestSnapshots:
     def test_a_snapshot_is_a_read_only_mapping(self):

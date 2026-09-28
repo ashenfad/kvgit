@@ -298,7 +298,14 @@ class Repo:
 
     def merge_base(self, a: str, b: str) -> str | None:
         """The lowest common ancestor of two commits, or None if they share
-        no history — the base a merge of the two would use."""
+        no history — the base a merge of the two would use.
+
+        Raises:
+            UnknownCommitError: if either commit is not in the store.
+        """
+        for commit in (a, b):
+            if self._store.get(COMMIT_ROOT % commit) is None:
+                raise UnknownCommitError(f"Commit '{commit}' does not exist")
         return _kv.merge_base(self._store, a, b)
 
     def snapshot(

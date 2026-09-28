@@ -1931,7 +1931,12 @@ class VersionedKV(VersionedBase):
 
         Whatever HEAD held becomes the prev-HEAD backup in the same
         write. A concurrent writer moving HEAD in between does not stop
-        the reset; it is retried against the new HEAD.
+        the reset; it is retried against the new HEAD. A deleted branch
+        is not recreated: the write expects the HEAD bytes it read, so a
+        delete that lands first makes it fail and the retry raises.
+
+        Raises:
+            UnknownBranchError: the branch has no HEAD.
         """
         branch_key = BRANCH_HEAD % self._branch
         prev_key = BRANCH_HEAD_PREV % self._branch
@@ -1943,9 +1948,9 @@ class VersionedKV(VersionedBase):
             if self.store.get(COMMIT_ROOT % commit_hash) is None:
                 return False
             current = self.store.get(branch_key)
-            writes = {branch_key: dumps(commit_hash)}
-            if current is not None:
-                writes[prev_key] = current
+            if current is None:
+                raise UnknownBranchError(f"Branch '{self._branch}' does not exist")
+            writes = {branch_key: dumps(commit_hash), prev_key: current}
             if _try_land(self.store, lease, {branch_key: current}, writes):
                 break
         self._load_commit(commit_hash, update_base=True)
