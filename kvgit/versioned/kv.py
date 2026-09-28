@@ -719,19 +719,16 @@ def tags(store: KVStore) -> dict[str, str]:
     deleted. :func:`tag_info` says which is which.
     """
     prefix = BRANCH_HEAD % TAG_BRANCH_PREFIX
+    keys = [
+        key
+        for key in store.keys(prefix)
+        if isinstance(key, str) and key.startswith(prefix) and key != prefix
+    ]
     found: dict[str, str] = {}
-    for key in store.keys(prefix):
-        if not (isinstance(key, str) and key.startswith(prefix)):
-            continue
-        name = key[len(prefix) :]
-        if not name:
-            continue
-        raw = store.get(key)
-        if raw is None:
-            continue
+    for key, raw in store.get_many(keys).items() if keys else ():
         commit_hash = safe_loads(raw)
         if isinstance(commit_hash, str):
-            found[name] = commit_hash
+            found[key[len(prefix) :]] = commit_hash
     return dict(sorted(found.items()))
 
 

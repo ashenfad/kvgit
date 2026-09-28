@@ -113,8 +113,9 @@ class Tags(Mapping[str, str]):
         return len(_kv.tags(self._repo.store))
 
     def items(self) -> ItemsView[str, str]:
-        """Every tag and its commit, read in one pass over the store."""
-        return _kv.tags(self._repo.store).items()
+        """Every tag and its commit: a live view, like the mapping, that
+        reads all of them in one pass each time it is iterated."""
+        return _TagItems(self)
 
     def create(self, name: str, commit: str, *, info: dict | None = None) -> None:
         """Name ``commit`` permanently. A tag keeps its commit, and
@@ -146,3 +147,13 @@ class Tags(Mapping[str, str]):
         if found is None:
             raise UnknownTagError(f"Tag '{name}' does not exist")
         return found
+
+
+class _TagItems(ItemsView[str, str]):
+    """A live items view of :class:`Tags` that iterates in one pass,
+    rather than listing the names and then reading each tag again."""
+
+    _mapping: Tags
+
+    def __iter__(self) -> Iterator[tuple[str, str]]:
+        return iter(_kv.tags(self._mapping._repo.store).items())
