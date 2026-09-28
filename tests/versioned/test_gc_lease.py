@@ -24,9 +24,11 @@ import threading
 import time
 
 import pytest
+from support import fork, worktree
 
-from kvgit import ConcurrencyError, GcBusy, MergeConflict, Staged, VersionedKV
+from kvgit import ConcurrencyError, GcBusy, MergeConflict, Repo, Worktree
 from kvgit.encoding import dumps, loads
+from kvgit.errors import StorageVersionError, UnknownCommitError
 from kvgit.kv.memory import Memory
 from kvgit.versioned import kv as kv_module
 from kvgit.versioned.keyset import Keyset
@@ -37,6 +39,7 @@ from kvgit.versioned.kv import (
     GC_LEASE_KEY,
     IN_FLIGHT_KEY,
     STORAGE_VERSION_KEY,
+    VersionedKV,
     _acquire_gc_lease,
     _lease_expiry,
     _load_root,
@@ -108,7 +111,7 @@ class TestWritersUnderTheLease:
         there when both finish, and its commit must load.
         """
         store = LeaseHookStore()
-        s = Staged(VersionedKV(store), encoder=chunky_encoder, decoder=chunky_decoder)
+        s = worktree(store, codec=(chunky_encoder, chunky_decoder))
         s["base"] = "base value"
         s.commit()
         age_commits(store, 10_000)
@@ -122,9 +125,7 @@ class TestWritersUnderTheLease:
         landed: dict[str, object] = {}
 
         def writer():
-            other = Staged(
-                VersionedKV(store), encoder=chunky_encoder, decoder=chunky_decoder
-            )
+            other = worktree(store, codec=(chunky_encoder, chunky_decoder))
             other["late"] = "written as the sweep began"
             landed["commit"] = other.commit().commit
             landed["chunks"] = set(chunk_keys(store)) - before - {stray}
@@ -145,9 +146,7 @@ class TestWritersUnderTheLease:
             "the sweep took a chunk the new commit references"
         )
 
-        reader = Staged(
-            VersionedKV(store), encoder=chunky_encoder, decoder=chunky_decoder
-        )
+        reader = worktree(store, codec=(chunky_encoder, chunky_decoder))
         assert reader["late"] == "written as the sweep began"
         assert reader["base"] == "base value"
 
@@ -157,7 +156,7 @@ class TestWritersUnderTheLease:
         blocks on the lease instead, and its batch lands after the
         sweep."""
         store = ScanHookStore()
-        s = Staged(VersionedKV(store))
+        s = worktree(store)
         for i in range(20):
             s[f"key{i}"] = i
         s.commit()
@@ -166,7 +165,7 @@ class TestWritersUnderTheLease:
         landed: dict[str, object] = {}
 
         def writer():
-            other = Staged(VersionedKV(store))
+            other = worktree(store)
             other["late"] = "queued behind the sweep"
             landed["commit"] = other.commit().commit
             landed["nodes"] = node_hashes(store, landed["commit"])
@@ -180,11 +179,11 @@ class TestWritersUnderTheLease:
         head = _resolve_head(store, "main")
         assert head == landed["commit"]
         assert not missing_nodes(store, head, landed["nodes"])  # type: ignore[arg-type]
-        assert Staged(VersionedKV(store))["late"] == "queued behind the sweep"
+        assert worktree(store)["late"] == "queued behind the sweep"
 
     def test_a_writer_proceeds_once_the_lease_is_released(self):
         store = Memory()
-        s = Staged(VersionedKV(store))
+        s = worktree(store)
         s["seed"] = 1
         s.commit()
 
@@ -192,7 +191,7 @@ class TestWritersUnderTheLease:
         wrote = threading.Event()
 
         def writer():
-            other = Staged(VersionedKV(store))
+            other = worktree(store)
             other["late"] = "after the lease"
             other.commit()
             wrote.set()
@@ -206,7 +205,7 @@ class TestWritersUnderTheLease:
         finally:
             writer_thread.join(timeout=10)
 
-        assert Staged(VersionedKV(store))["late"] == "after the lease"
+        assert worktree(store)["late"] == "after the lease"
 
     def test_a_writer_does_not_wait_past_the_leases_expiry(self):
         """A holder that dies mid-sweep blocks writers for its term only."""
@@ -289,10 +288,10 @@ class TestLeaseArithmetic:
 
     def test_the_routine_sweep_takes_and_releases_the_lease(self):
         store = Memory()
-        s = Staged(VersionedKV(store))
+        s = worktree(store)
         s["k"] = 1
         s.commit()
-        s.versioned.clean_orphans(min_age=0)
+        s.repo.gc(min_age=0)
         assert store.get(GC_LEASE_KEY) is not None
         assert not lease_is_live(store)
 
@@ -346,7 +345,7 @@ class TestCommitsBetweenWriteAndPublish:
 
     def test_an_unpublished_commit_survives_a_min_age_zero_sweep(self):
         store = Memory()
-        s = Staged(VersionedKV(store), encoder=chunky_encoder, decoder=chunky_decoder)
+        s = worktree(store, codec=(chunky_encoder, chunky_decoder))
         s["base"] = "base value"
         s.commit()
         before = set(chunk_keys(store))
@@ -358,10 +357,9 @@ class TestCommitsBetweenWriteAndPublish:
         landed: dict[str, object] = {}
 
         def writer():
-            other = Staged(
+            other = Worktree(
+                Repo(store, codec=(chunky_encoder, chunky_decoder)),
                 PausedCommitKV(store, reached=reached, release=release),
-                encoder=chunky_encoder,
-                decoder=chunky_decoder,
             )
             other["late"] = "written before the lease, published after"
             landed["commit"] = other.commit().commit
@@ -391,9 +389,7 @@ class TestCommitsBetweenWriteAndPublish:
         Keyset(store, root=str(_load_root(store, commit))).walk()
         assert [k for k in landed["chunks"] if store.get(k) is None] == []  # type: ignore[union-attr]
 
-        reader = Staged(
-            VersionedKV(store), encoder=chunky_encoder, decoder=chunky_decoder
-        )
+        reader = worktree(store, codec=(chunky_encoder, chunky_decoder))
         assert reader["late"] == "written before the lease, published after"
         assert reader["base"] == "base value"
 
@@ -406,17 +402,19 @@ class TestCommitsBetweenWriteAndPublish:
         commit it is supposed to fold.
         """
         store = Memory()
-        s = Staged(VersionedKV(store))
+        s = worktree(store)
         s["base"] = "base"
         s.commit()
 
         reached, release = threading.Event(), threading.Event()
         # Opened before the other writer moves HEAD, so this handle's
         # base commit is stale by the time it commits — the merge path.
-        mine = Staged(PausedCommitKV(store, reached=reached, release=release))
+        mine = Worktree(
+            Repo(store), PausedCommitKV(store, reached=reached, release=release)
+        )
         mine["ours"] = "merged in"
 
-        theirs = Staged(VersionedKV(store))
+        theirs = worktree(store)
         theirs["theirs"] = "landed first"
         theirs.commit()
 
@@ -434,7 +432,7 @@ class TestCommitsBetweenWriteAndPublish:
 
         assert result["merge"].merged, result["merge"]  # type: ignore[union-attr]
 
-        reader = Staged(VersionedKV(store))
+        reader = worktree(store)
         assert reader["ours"] == "merged in"
         assert reader["theirs"] == "landed first"
         assert reader["base"] == "base"
@@ -461,7 +459,7 @@ class TestInFlightMarkers:
 
     def test_an_abandoned_attempt_withdraws_its_marker(self):
         store = Memory()
-        Staged(VersionedKV(store)).commit()
+        worktree(store).commit()
         first = VersionedKV(store)
         second = VersionedKV(store)
         first.commit({"k": b"ours"})
@@ -474,7 +472,7 @@ class TestInFlightMarkers:
         protects its commit only until it lapses; the next sweep then
         takes both."""
         store = Memory()
-        Staged(VersionedKV(store)).commit()
+        worktree(store).commit()
         dead = VersionedKV(store)
         dead._create_commit({"k": b"never published"})
         orphan = dead.current_commit
@@ -507,7 +505,7 @@ class LapsingCommitKV(VersionedKV):
 class TestALapsedMarker:
     def test_a_writer_whose_marker_lapsed_fails_rather_than_dangling(self):
         store = Memory()
-        Staged(VersionedKV(store)).commit()
+        worktree(store).commit()
         head_before = _resolve_head(store, "main")
 
         LapsingCommitKV.lapsed = False
@@ -689,22 +687,22 @@ class TestBranchRootWrites:
 
     def test_creating_a_branch_on_an_old_orphan_never_dangles(self):
         store = SlowRemovalStore()
-        s = Staged(VersionedKV(store))
+        s = worktree(store)
         s["live"] = "keep me"
         s.commit()
 
-        dev = s.create_branch("dev")
+        dev = fork(s, "dev")
         dev["work"] = "abandoned"
         orphan = dev.commit().commit
-        s.delete_branch("dev")
+        s.repo.delete_branch("dev")
         age_commits(store, 10_000)
 
         outcome: dict[str, object] = {}
 
         def creator():
             try:
-                outcome["branch"] = s.versioned.create_branch("revive", at=orphan)
-            except ValueError as exc:
+                outcome["branch"] = s.repo.create_branch("revive", at=orphan)
+            except UnknownCommitError as exc:
                 outcome["error"] = str(exc)
 
         creator_thread = threading.Thread(target=creator)
@@ -727,24 +725,30 @@ class TestBranchRootWrites:
             assert resolved == orphan, "branch 'revive' does not resolve"
             assert store.get(COMMIT_ROOT % orphan) is not None
             Keyset(store, root=str(_load_root(store, orphan))).walk()
-        assert Staged(VersionedKV(store))["live"] == "keep me"
+        assert worktree(store)["live"] == "keep me"
 
     def test_reset_to_a_swept_commit_reports_it_rather_than_dangling(self):
         store = SlowRemovalStore()
-        s = Staged(VersionedKV(store))
+        s = worktree(store)
         s["live"] = "keep me"
         s.commit()
 
-        dev = s.create_branch("dev")
+        dev = fork(s, "dev")
         dev["work"] = "abandoned"
         orphan = dev.commit().commit
-        s.delete_branch("dev")
+        s.repo.delete_branch("dev")
         age_commits(store, 10_000)
 
         outcome: dict[str, object] = {}
-        resetter = threading.Thread(
-            target=lambda: outcome.update(ok=s.versioned.reset_to(orphan))
-        )
+
+        def reset():
+            try:
+                s.reset(orphan)
+                outcome["ok"] = True
+            except UnknownCommitError:
+                outcome["ok"] = False
+
+        resetter = threading.Thread(target=reset)
         store.on_acquire(resetter.start)
         deep_clean(store, min_age=0)
         resetter.join(timeout=10)
@@ -752,7 +756,7 @@ class TestBranchRootWrites:
 
         assert outcome["ok"] is False, "HEAD was reset onto a collected commit"
         assert _resolve_head(store, "main") is not None
-        assert Staged(VersionedKV(store))["live"] == "keep me"
+        assert worktree(store)["live"] == "keep me"
 
 
 class TestVersionCheckBeforeTheLease:
@@ -764,9 +768,9 @@ class TestVersionCheckBeforeTheLease:
         """
         store = Memory()
         store.set(STORAGE_VERSION_KEY, dumps(99))
-        with pytest.raises(ValueError, match="storage version"):
+        with pytest.raises(StorageVersionError, match="storage version"):
             deep_clean(store, min_age=0)
-        with pytest.raises(ValueError, match="storage version"):
+        with pytest.raises(StorageVersionError, match="storage version"):
             clean_orphans(store, min_age=0)
         assert store.get(GC_LEASE_KEY) is None
         assert sorted(store.keys()) == [STORAGE_VERSION_KEY]

@@ -20,7 +20,8 @@ from __future__ import annotations
 import threading
 import time
 
-from kvgit import Staged, VersionedKV
+from support import fork, worktree
+
 from kvgit.encoding import dumps
 from kvgit.hamt import EMPTY_HASH
 from kvgit.kv.memory import Memory
@@ -137,7 +138,7 @@ class TestNodeRace:
         and lands after it.
         """
         store = ScanHookStore()
-        s = Staged(VersionedKV(store))
+        s = worktree(store)
         for i in range(20):
             s[f"key{i}"] = i
         s.commit()
@@ -146,7 +147,7 @@ class TestNodeRace:
         landed: dict[str, object] = {}
 
         def concurrent_writer():
-            other = Staged(VersionedKV(store))
+            other = worktree(store)
             other["late"] = "written mid-sweep"
             landed["commit"] = other.commit().commit
             landed["nodes"] = node_hashes(store, landed["commit"])
@@ -166,14 +167,14 @@ class TestNodeRace:
             f"(root {_load_root(store, head)}) — committed state is corrupt"
         )
 
-        reader = Staged(VersionedKV(store))
+        reader = worktree(store)
         assert reader["late"] == "written mid-sweep"
         assert reader["key0"] == 0
 
     def test_commit_landing_mid_sweep_keeps_its_chunks(self):
         """Same race, chunk namespace."""
         store = ScanHookStore()
-        s = Staged(VersionedKV(store), encoder=chunky_encoder, decoder=chunky_decoder)
+        s = worktree(store, codec=(chunky_encoder, chunky_decoder))
         s["base"] = "base value"
         s.commit()
         age_commits(store, 10_000)
@@ -182,9 +183,7 @@ class TestNodeRace:
         landed: dict[str, object] = {}
 
         def concurrent_writer():
-            other = Staged(
-                VersionedKV(store), encoder=chunky_encoder, decoder=chunky_decoder
-            )
+            other = worktree(store, codec=(chunky_encoder, chunky_decoder))
             other["late"] = "chunked mid-sweep"
             landed["commit"] = other.commit().commit
             landed["chunks"] = set(chunk_keys(store)) - before
@@ -202,9 +201,7 @@ class TestNodeRace:
             f"its blob payloads are unreadable"
         )
 
-        reader = Staged(
-            VersionedKV(store), encoder=chunky_encoder, decoder=chunky_decoder
-        )
+        reader = worktree(store, codec=(chunky_encoder, chunky_decoder))
         assert reader["late"] == "chunked mid-sweep"
 
     def test_writer_landing_before_the_sweep_is_untouched(self):
@@ -216,13 +213,13 @@ class TestNodeRace:
         would go red too.
         """
         store = ScanHookStore()
-        s = Staged(VersionedKV(store))
+        s = worktree(store)
         for i in range(20):
             s[f"key{i}"] = i
         s.commit()
         age_commits(store, 10_000)
 
-        other = Staged(VersionedKV(store))
+        other = worktree(store)
         other["late"] = "written before the sweep"
         late_commit = other.commit().commit
         late_nodes = node_hashes(store, late_commit)
@@ -230,36 +227,36 @@ class TestNodeRace:
         clean_orphans(store, min_age=3600)
 
         assert not missing_nodes(store, late_commit, late_nodes)
-        assert Staged(VersionedKV(store))["late"] == "written before the sweep"
+        assert worktree(store)["late"] == "written before the sweep"
 
 
 class TestSharedStructure:
     def test_subtree_shared_with_a_live_branch_survives(self):
         """Deleting an orphan must not take shared HAMT nodes with it."""
         store = Memory()
-        s = Staged(VersionedKV(store))
+        s = worktree(store)
         for i in range(60):  # >> bucket_max, so the HAMT actually branches
             s[f"key{i:03d}"] = i
         s.commit()
 
-        dev = s.create_branch("dev")
+        dev = fork(s, "dev")
         dev["dev_only"] = "orphan payload"
         dev_commit = dev.commit().commit
         dev_nodes = node_hashes(store, dev_commit)
 
-        main_commit = s.current_commit
+        main_commit = s.head
         main_nodes = node_hashes(store, main_commit)
         shared = main_nodes & dev_nodes
         assert shared, "test needs the two commits to actually share structure"
 
-        s.delete_branch("dev")
+        s.repo.delete_branch("dev")
         age_commits(store, 10_000)
         assert clean_orphans(store, min_age=3600) == 1
 
         assert not missing_nodes(store, main_commit, main_nodes), (
             "live branch 'main' lost nodes it shared with the deleted orphan"
         )
-        reader = Staged(VersionedKV(store))
+        reader = worktree(store)
         assert [reader[f"key{i:03d}"] for i in range(60)] == list(range(60))
 
         # The orphan's own, unshared nodes are gone.
@@ -270,42 +267,42 @@ class TestSharedStructure:
     def test_two_orphans_sharing_a_subtree_collect_cleanly(self):
         """Overlapping orphans may name the same hash twice; that's fine."""
         store = Memory()
-        s = Staged(VersionedKV(store))
+        s = worktree(store)
         for i in range(60):
             s[f"key{i:03d}"] = i
         base = s.commit().commit
 
-        one = s.create_branch("one", at=base)
+        one = fork(s, "one", at=base)
         one["a"] = "a"
         one.commit()
-        two = s.create_branch("two", at=base)
+        two = fork(s, "two", at=base)
         two["b"] = "b"
         two.commit()
 
-        s.delete_branch("one")
-        s.delete_branch("two")
+        s.repo.delete_branch("one")
+        s.repo.delete_branch("two")
         age_commits(store, 10_000)
         assert clean_orphans(store, min_age=3600) == 2
 
-        main_commit = s.current_commit
+        main_commit = s.head
         assert not missing_nodes(store, main_commit, node_hashes(store, main_commit))
-        assert Staged(VersionedKV(store))["key000"] == 0
+        assert worktree(store)["key000"] == 0
 
 
 class TestDamagedOrphans:
     def test_orphan_with_missing_nodes_does_not_crash(self):
         """Historical damage must not stall the sweep."""
         store = Memory()
-        s = Staged(VersionedKV(store))
+        s = worktree(store)
         s["live"] = "keep me"
         s.commit()
 
-        dev = s.create_branch("dev")
+        dev = fork(s, "dev")
         for i in range(40):
             dev[f"dev{i:03d}"] = i
         dev_commit = dev.commit().commit
         dev_root = _load_root(store, dev_commit)
-        s.delete_branch("dev")
+        s.repo.delete_branch("dev")
 
         # Blow a hole in the orphan's keyset before the sweep sees it.
         store.remove(NODE_PREFIX + str(dev_root))
@@ -313,27 +310,27 @@ class TestDamagedOrphans:
         age_commits(store, 10_000)
         assert clean_orphans(store, min_age=3600) == 1
         assert store.get(COMMIT_ROOT % dev_commit) is None
-        assert Staged(VersionedKV(store))["live"] == "keep me"
+        assert worktree(store)["live"] == "keep me"
 
     def test_orphan_with_corrupt_node_bytes_does_not_crash(self):
         store = Memory()
-        s = Staged(VersionedKV(store))
+        s = worktree(store)
         s["live"] = "keep me"
         s.commit()
 
-        dev = s.create_branch("dev")
+        dev = fork(s, "dev")
         for i in range(40):
             dev[f"dev{i:03d}"] = i
         dev_commit = dev.commit().commit
         dev_root = _load_root(store, dev_commit)
-        s.delete_branch("dev")
+        s.repo.delete_branch("dev")
 
         store.set(NODE_PREFIX + str(dev_root), b"not json at all")
 
         age_commits(store, 10_000)
         assert clean_orphans(store, min_age=3600) == 1
         assert store.get(COMMIT_ROOT % dev_commit) is None
-        assert Staged(VersionedKV(store))["live"] == "keep me"
+        assert worktree(store)["live"] == "keep me"
 
 
 class TestOrdinaryGarbage:
@@ -345,24 +342,22 @@ class TestOrdinaryGarbage:
         the live branch shares with it is.
         """
         store = Memory()
-        s = Staged(VersionedKV(store), encoder=chunky_encoder, decoder=chunky_decoder)
+        s = worktree(store, codec=(chunky_encoder, chunky_decoder))
         s["live"] = "keep me"
         s.commit()
         live_chunks = set(chunk_keys(store))
 
-        dev = s.create_branch("dev")  # inherits the chunked codec
+        dev = fork(s, "dev")  # inherits the chunked codec
         dev["dev_only"] = "throw me away"
         dev_commit = dev.commit().commit
         dev_root = _load_root(store, dev_commit)
-        dev_nodes = node_hashes(store, dev_commit) - node_hashes(
-            store, s.current_commit
-        )
+        dev_nodes = node_hashes(store, dev_commit) - node_hashes(store, s.head)
         dev_chunks = set(chunk_keys(store)) - live_chunks
-        dev_blob = dev.versioned._commit_keys["dev_only"]
+        dev_blob = dev._engine._commit_keys["dev_only"]
         assert dev_chunks
         assert store.get(dev_blob) is not None
 
-        s.delete_branch("dev")
+        s.repo.delete_branch("dev")
         age_commits(store, 10_000)
         assert clean_orphans(store, min_age=3600) == 1
 
@@ -378,9 +373,7 @@ class TestOrdinaryGarbage:
             "the sweep took a chunk the live branch still references"
         )
 
-        reader = Staged(
-            VersionedKV(store), encoder=chunky_encoder, decoder=chunky_decoder
-        )
+        reader = worktree(store, codec=(chunky_encoder, chunky_decoder))
         assert reader["live"] == "keep me"
 
 
@@ -388,10 +381,10 @@ class TestDeepClean:
     def test_deep_clean_reclaims_what_the_safe_sweep_leaves(self):
         """Nodes and chunks no commit points at need the deep sweep."""
         store = Memory()
-        s = Staged(VersionedKV(store))
+        s = worktree(store)
         s["live"] = "keep me"
         s.commit()
-        live_commit = s.current_commit
+        live_commit = s.head
         live_nodes = node_hashes(store, live_commit)
 
         # Leftovers with no owning commit: exactly what an interrupted
@@ -410,23 +403,23 @@ class TestDeepClean:
         assert store.get(stray_node) is None
         assert store.get(stray_chunk) is None
         assert not missing_nodes(store, live_commit, live_nodes)
-        assert Staged(VersionedKV(store))["live"] == "keep me"
+        assert worktree(store)["live"] == "keep me"
 
     def test_deep_clean_reclaims_a_damaged_orphans_stranded_nodes(self):
         """An orphan with a missing root strands its children."""
         store = Memory()
-        s = Staged(VersionedKV(store))
+        s = worktree(store)
         s["live"] = "keep me"
         s.commit()
-        live_nodes = node_hashes(store, s.current_commit)
+        live_nodes = node_hashes(store, s.head)
 
-        dev = s.create_branch("dev")
+        dev = fork(s, "dev")
         for i in range(40):
             dev[f"dev{i:03d}"] = i
         dev_commit = dev.commit().commit
         dev_nodes = node_hashes(store, dev_commit) - live_nodes
         dev_root = str(_load_root(store, dev_commit))
-        s.delete_branch("dev")
+        s.repo.delete_branch("dev")
         store.remove(NODE_PREFIX + dev_root)
 
         age_commits(store, 10_000)
@@ -438,7 +431,7 @@ class TestDeepClean:
 
         assert deep_clean(store, min_age=0) == 0
         assert [n for n in stranded if store.get(NODE_PREFIX + n)] == []
-        assert Staged(VersionedKV(store))["live"] == "keep me"
+        assert worktree(store)["live"] == "keep me"
 
     def test_no_batch_can_land_under_a_sweep(self):
         """The lease is load-bearing: a batch expecting the record read
@@ -446,7 +439,7 @@ class TestDeepClean:
         after it, and one expecting the current record lands once it is
         over."""
         store = ScanHookStore()
-        Staged(VersionedKV(store)).commit()
+        worktree(store).commit()
         before = store.get(GC_LEASE_KEY)
         attempts: list[bool] = []
 
@@ -476,29 +469,27 @@ class TestChunkDedupRace:
     def test_chunk_deduped_by_a_mid_sweep_commit_survives(self):
         """A live HEAD must not lose a chunk an orphan happened to own."""
         store = ScanHookStore()
-        s = Staged(VersionedKV(store), encoder=chunky_encoder, decoder=chunky_decoder)
+        s = worktree(store, codec=(chunky_encoder, chunky_decoder))
         s["live"] = "keep me"
         s.commit()
         live_chunks = set(chunk_keys(store))
 
         # The orphan owns a chunk nothing live references (yet).
         shared_value = "a payload two unrelated commits both store"
-        dev = s.create_branch("dev")
+        dev = fork(s, "dev")
         dev["dev_only"] = shared_value
         dev.commit()
         orphan_chunks = set(chunk_keys(store)) - live_chunks
         assert len(orphan_chunks) == 1, "test needs exactly one orphan-owned chunk"
         (shared_chunk,) = orphan_chunks
-        s.delete_branch("dev")
+        s.repo.delete_branch("dev")
         age_commits(store, 10_000)
 
         landed: dict[str, object] = {}
 
         def concurrent_writer():
             """Commit content that dedups to the orphan's chunk."""
-            other = Staged(
-                VersionedKV(store), encoder=chunky_encoder, decoder=chunky_decoder
-            )
+            other = worktree(store, codec=(chunky_encoder, chunky_decoder))
             other["late"] = shared_value
             landed["commit"] = other.commit().commit
 
@@ -515,9 +506,7 @@ class TestChunkDedupRace:
             f"its value for 'late' is unreadable"
         )
 
-        reader = Staged(
-            VersionedKV(store), encoder=chunky_encoder, decoder=chunky_decoder
-        )
+        reader = worktree(store, codec=(chunky_encoder, chunky_decoder))
         assert reader["late"] == shared_value
 
     def test_the_orphan_chunk_is_reclaimed(self):
@@ -527,18 +516,18 @@ class TestChunkDedupRace:
         orphan on the routine sweep.
         """
         store = Memory()
-        s = Staged(VersionedKV(store), encoder=chunky_encoder, decoder=chunky_decoder)
+        s = worktree(store, codec=(chunky_encoder, chunky_decoder))
         s["live"] = "keep me"
         s.commit()
         live_chunks = set(chunk_keys(store))
 
-        dev = s.create_branch("dev")
+        dev = fork(s, "dev")
         dev["dev_only"] = "orphan payload"
         dev_commit = dev.commit().commit
         orphan_chunks = set(chunk_keys(store)) - live_chunks
         assert orphan_chunks
 
-        s.delete_branch("dev")
+        s.repo.delete_branch("dev")
         age_commits(store, 10_000)
         assert clean_orphans(store, min_age=3600) == 1
 
@@ -546,7 +535,5 @@ class TestChunkDedupRace:
         assert [k for k in orphan_chunks if store.get(k) is not None] == []
         assert [k for k in live_chunks if store.get(k) is None] == []
 
-        reader = Staged(
-            VersionedKV(store), encoder=chunky_encoder, decoder=chunky_decoder
-        )
+        reader = worktree(store, codec=(chunky_encoder, chunky_decoder))
         assert reader["live"] == "keep me"

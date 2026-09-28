@@ -3,8 +3,8 @@
 import logging
 
 import pytest
+from support import worktree
 
-from kvgit import Staged, VersionedKV
 from kvgit.kv.composite import Composite
 from kvgit.kv.memory import Memory
 
@@ -287,18 +287,18 @@ class TestCompositeBackedHandle:
         shared = Memory()
         cached = Composite([Memory(), shared])
 
-        mine = Staged(VersionedKV(cached))
+        mine = worktree(cached)
         mine["k"] = "first"
         mine.commit()
 
         # A second handle on the authoritative store, standing in for
         # another process sharing the same backend.
-        theirs = Staged(VersionedKV(shared))
+        theirs = worktree(shared)
         theirs["k"] = "second"
         theirs.commit()
 
         mine.refresh()
-        assert mine.current_commit == theirs.current_commit, (
+        assert mine.head == theirs.head, (
             "the L1 tier served a branch head another writer had moved"
         )
         assert mine["k"] == "second"

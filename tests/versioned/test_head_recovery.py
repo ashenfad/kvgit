@@ -33,8 +33,9 @@ import time
 
 import pytest
 
-from kvgit import ConcurrencyError, MergeConflict, VersionedKV
+from kvgit import ConcurrencyError, MergeConflict
 from kvgit.encoding import dumps, loads
+from kvgit.errors import CorruptHeadError, UnknownBranchError
 from kvgit.kv.memory import Memory
 from kvgit.versioned.keyset import Keyset
 from kvgit.versioned.kv import (
@@ -43,6 +44,7 @@ from kvgit.versioned.kv import (
     COMMIT_ROOT,
     COMMIT_TIME,
     PARENT_COMMIT,
+    VersionedKV,
     _load_root,
     _resolve_head,
     blob_key,
@@ -514,7 +516,7 @@ class TestAbsentHeadCannotRecover:
 
         # Delete the branch just before the writer's publishing write.
         store.arm_set(BRANCH_HEAD_PREV % "doomed", delete_it_mid_write)
-        with pytest.raises(ValueError, match="no HEAD"):
+        with pytest.raises(UnknownBranchError, match="no HEAD"):
             doomed.commit({"secret": b"classified-v2"})
 
         assert store.get(BRANCH_HEAD % "doomed") is None, "the delete should have won"
@@ -746,7 +748,7 @@ class TestScanRecoveryIsOptIn:
             f"no backup must report None"
         )
 
-        with pytest.raises(ValueError, match="corrupt and unrecoverable"):
+        with pytest.raises(CorruptHeadError, match="corrupt and unrecoverable"):
             VersionedKV(store)
         assert repair_head(store, "main") is None
 
@@ -839,7 +841,7 @@ class TestRecovererThreading:
         assert v.current_commit == tip
         assert calls == ["main"]
 
-        with pytest.raises(ValueError, match="No HEAD commit found"):
+        with pytest.raises(CorruptHeadError, match="corrupt and unrecoverable"):
             VersionedKV(store, commit_hash=tip).refresh()
 
     def test_switch_branch_uses_the_recoverer(self):
@@ -851,7 +853,7 @@ class TestRecovererThreading:
         assert v.get("k") == b"payload"
         assert calls == ["dev"]
 
-        with pytest.raises(ValueError, match="corrupt and unrecoverable"):
+        with pytest.raises(CorruptHeadError, match="corrupt and unrecoverable"):
             VersionedKV(store).switch_branch("dev")
 
     def test_peek_uses_the_recoverer(self):
@@ -902,22 +904,24 @@ class TestRecovererThreading:
         )
 
     def test_the_documented_entry_point_can_opt_in(self):
-        """A seam unreachable through ``kvgit.store()`` is not a seam.
+        """A seam unreachable through ``Repo`` is not a seam.
 
-        ``store()`` is how the docs tell people to build a store, so the
-        opt-in has to be expressible there and not only by constructing
-        a ``VersionedKV`` by hand.
+        ``Repo`` is how the docs tell people to open a store with
+        options, so the opt-in has to be expressible there and not only
+        by constructing a ``VersionedKV`` by hand.
         """
-        import kvgit
+        from kvgit import Repo
         from kvgit.versioned.kv import recover_by_commit_scan
 
-        s = kvgit.store(recover_from_corrupt_head=recover_by_commit_scan)
-        s["k"] = 1
-        s.commit()
-        assert s["k"] == 1
-        assert s.versioned._recover_from_corrupt_head is recover_by_commit_scan
+        repo = Repo(Memory(), recover_from_corrupt_head=recover_by_commit_scan)
+        wt = repo.worktree("main", create=True)
+        wt["k"] = 1
+        wt.commit()
+        assert wt["k"] == 1
+        assert wt._engine._recover_from_corrupt_head is recover_by_commit_scan
 
-        assert kvgit.store().versioned._recover_from_corrupt_head is None
+        plain = Repo(Memory()).worktree("main", create=True)
+        assert plain._engine._recover_from_corrupt_head is None
 
     def test_a_recoverer_returning_a_dangling_hash_is_rejected(self):
         """A pluggable tier is not a trusted tier.

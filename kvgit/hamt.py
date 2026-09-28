@@ -357,7 +357,7 @@ class Hamt:
 
         Convenience for callers that don't need to batch writes with
         other store operations. Returns a fresh ``Hamt`` with empty
-        pending. Distinct from ``Versioned.commit``: a HAMT has no
+        pending. Distinct from ``VersionedKV.commit``: a HAMT has no
         notion of a commit history — this just flushes node bytes.
         """
         new_hamt, pending = self.updated(updates, removals)

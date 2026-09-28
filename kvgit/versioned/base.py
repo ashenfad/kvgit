@@ -3,7 +3,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 
-from ..errors import ConcurrencyError, MergeConflict
+from ..errors import ConcurrencyError, MergeConflict, UnknownBranchError
 from .helpers import diff_keysets, walk_history
 from .merge import MergeResolution, resolve_merge
 from .protocol import DiffResult, MergePolicy, MergeResult, PostCheck
@@ -223,7 +223,7 @@ class VersionedBase(ABC):
             # between our read and our CAS. Re-read HEAD and merge, the
             # way the base-behind-head case already does — in either
             # mode, so a lost race is never mistaken for a conflict and
-            # the caller never has to refresh (and drop staged work)
+            # the caller never has to refresh (and drop pending work)
             # just to replay a mergeable commit.
             try:
                 current_head = self.latest_head
@@ -246,7 +246,7 @@ class VersionedBase(ABC):
             # retry can have anything to restore.
             if ours_built:
                 self._restore_state(saved)
-            raise ValueError(f"Branch '{self._branch}' has no HEAD")
+            raise UnknownBranchError(f"Branch '{self._branch}' has no HEAD")
         if not ours_built:
             saved = self._snapshot_state()
             self._create_commit(
@@ -277,7 +277,9 @@ class VersionedBase(ABC):
         info: dict | None,
         saved_state: tuple | None = None,
         cas_from: str | None = None,
-        parents: tuple[str, str] | None = None,
+        parents: tuple[str, ...] | None = None,
+        base: str | None = None,
+        strategy: str = "three_way",
     ) -> MergeResult:
         """Perform a three-way merge between our branch and their HEAD.
 
@@ -286,8 +288,18 @@ class VersionedBase(ABC):
         (cross-branch merge). ``cas_from`` names the commit the merge
         commits on top of (defaults to ``their_head``, the concurrent
         case); cross-branch callers pass their own head.
+
+        ``base`` replaces the common ancestor, which is how a change is
+        applied rather than a history merged: the change from ``base`` to
+        ``their_head`` lands on ours as an ordinary commit (``parents``
+        of one), under ``strategy``. A change that leaves our state as it
+        is commits nothing.
         """
-        lca = self._find_lca(self._current_commit, their_head)
+        lca = (
+            base
+            if base is not None
+            else self._find_lca(self._current_commit, their_head)
+        )
         if lca is None:
             if saved_state is not None:
                 self._restore_state(saved_state)
@@ -295,7 +307,7 @@ class VersionedBase(ABC):
                 result = MergeResult(
                     merged=False,
                     commit=None,
-                    strategy="three_way",
+                    strategy=strategy,
                     auto_merged_keys=(),
                     carried_keys=(),
                 )
@@ -354,13 +366,29 @@ class VersionedBase(ABC):
                 result = MergeResult(
                     merged=False,
                     commit=None,
-                    strategy="three_way",
+                    strategy=strategy,
                     auto_merged_keys=(),
                     carried_keys=(),
                 )
                 self.last_merge_result = result
                 return result
             raise
+
+        if (
+            base is not None
+            and not resolution.merged_values
+            and resolution.merged_keyset == our_keyset
+        ):
+            # The change is already in our state, or changes nothing.
+            result = MergeResult(
+                merged=True,
+                commit=self._current_commit,
+                strategy="no_op",
+                auto_merged_keys=(),
+                carried_keys=(),
+            )
+            self.last_merge_result = result
+            return result
 
         auto_merged = resolution.auto_merged_keys
         # Membership set for the carried-keys scan below: a MergeChoice
@@ -373,7 +401,7 @@ class VersionedBase(ABC):
             # linear history stays on the merging branch (git convention).
             parents = (their_head, self._current_commit)
 
-        self._create_merge_commit(resolution, parents, info)
+        self._create_merge_commit(resolution, parents, info, sources=(their_head,))
         merge_hash = self._current_commit
         merged_keyset = self._commit_keys
 
@@ -384,7 +412,7 @@ class VersionedBase(ABC):
             result = MergeResult(
                 merged=True,
                 commit=merge_hash,
-                strategy="three_way",
+                strategy=strategy,
                 auto_merged_keys=tuple(auto_merged),
                 carried_keys=tuple(
                     k
@@ -401,7 +429,7 @@ class VersionedBase(ABC):
             result = MergeResult(
                 merged=False,
                 commit=None,
-                strategy="three_way",
+                strategy=strategy,
                 auto_merged_keys=(),
                 carried_keys=(),
             )
@@ -454,6 +482,48 @@ class VersionedBase(ABC):
             parents=(our_head, their_head),
         )
 
+    def apply_change(
+        self,
+        base: str,
+        target: str,
+        *,
+        on_conflict: str = "raise",
+        merge_fns: dict[str, MergePolicy] | None = None,
+        merge_prefixes: dict[str, MergePolicy] | None = None,
+        default_merge: MergePolicy | None = None,
+        post_check: PostCheck | None = None,
+        info: dict | None = None,
+    ) -> MergeResult:
+        """Apply the change from ``base`` to ``target`` as one commit.
+
+        A three-way merge with ``base`` in place of the common ancestor:
+        what ``target`` changed relative to ``base`` lands on our head,
+        and our own changes since then are kept, conflicts resolved (or
+        raised) as in a merge. The result is an ordinary single-parent
+        commit, CAS-guarded on our head — a cherry-pick is
+        ``apply_change(parent, commit)`` and a revert
+        ``apply_change(commit, parent)``.
+        """
+        if on_conflict not in ("raise", "abandon"):
+            raise ValueError(
+                f"on_conflict must be 'raise' or 'abandon', got {on_conflict!r}"
+            )
+        our_head = self._current_commit
+        return self._three_way_merge(
+            target,
+            on_conflict=on_conflict,
+            merge_fns=merge_fns,
+            merge_prefixes=merge_prefixes,
+            default_merge=default_merge,
+            post_check=post_check,
+            info=info,
+            saved_state=self._snapshot_state(),
+            cas_from=our_head,
+            parents=(our_head,),
+            base=base,
+            strategy="apply",
+        )
+
     # -- Abstract methods (implemented by subclasses) --
 
     @property
@@ -493,8 +563,10 @@ class VersionedBase(ABC):
         resolution: MergeResolution,
         parents: tuple[str, ...],
         info: dict | None,
+        sources: tuple[str, ...] = (),
     ) -> str:
-        """Create a multi-parent merge commit from a resolved merge.
+        """Create a commit from a resolved merge, on ``parents``; entry
+        metadata also comes from ``sources`` that are not parents.
 
         Must update ``self._commit_keys`` and ``self._current_commit``.
         """

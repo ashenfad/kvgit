@@ -101,7 +101,7 @@ class Disk(KVStore):
 
     def close(self) -> None:
         # diskcache holds SQLite connections (one per thread) open until
-        # closed. Admin teardown (kvgit.delete_branches) constructs a
-        # backend just to sweep and must release the handle so the next
-        # opener on the same directory isn't blocked.
+        # closed. A short-lived Repo (a one-off gc or teardown) must
+        # release the handle so the next opener on the same directory
+        # isn't blocked.
         self.store.close()

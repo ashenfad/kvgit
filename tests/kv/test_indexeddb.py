@@ -341,7 +341,7 @@ async def test_binary_roundtrip(selenium_jspi):
 
 @run_in_pyodide(packages=["micropip"])
 async def test_versioned_integration(selenium_jspi):
-    """Full integration: Staged -> VersionedKV -> IndexedDB."""
+    """Full integration: Repo -> Worktree -> IndexedDB."""
     import micropip
     from pyodide.http import pyfetch
 
@@ -349,28 +349,25 @@ async def test_versioned_integration(selenium_jspi):
     whl = (await resp.string()).strip()
     await micropip.install(f"./{whl}", deps=False)
 
+    from kvgit import Repo
     from kvgit.kv.indexeddb import IndexedDB
-    from kvgit.staged import Staged
-    from kvgit.versioned.kv import VersionedKV
 
-    backend = IndexedDB(db_name="test_versioned")
-    versioned = VersionedKV(backend)
-    staged = Staged(versioned)
+    repo = Repo(IndexedDB(db_name="test_versioned"))
+    wt = repo.worktree("main", create=True)
 
-    staged["greeting"] = "hello"
-    staged.commit()
+    wt["greeting"] = "hello"
+    wt.commit()
 
-    staged["greeting"] = "updated"
-    staged.commit()
+    wt["greeting"] = "updated"
+    wt.commit()
 
     # Verify current value
-    assert staged["greeting"] == "updated"
+    assert wt["greeting"] == "updated"
 
-    # Undo: reset to first commit
-    history = list(versioned.history())
-    versioned.reset_to(history[1])
-    staged.refresh()
-    assert staged["greeting"] == "hello"
+    # Undo: reset to the first commit
+    history = list(repo.log(branch="main"))
+    wt.reset(history[1].hash)
+    assert wt["greeting"] == "hello"
 
 
 @run_in_pyodide(packages=["micropip", "numpy"])
@@ -379,7 +376,7 @@ async def test_chunked_codec_round_trip(selenium_jspi):
 
     Smoke-tests the read/write path that motivates the chunked codec
     work in the first place — large array values stored under
-    ``kvgit:chunk:<hash>`` and retrieved across a fresh ``Staged``.
+    ``kvgit:chunk:<hash>`` and retrieved through a fresh ``Repo``.
     """
     import micropip
     from pyodide.http import pyfetch
@@ -390,15 +387,15 @@ async def test_chunked_codec_round_trip(selenium_jspi):
 
     import numpy as np
 
+    from kvgit import Repo
     from kvgit.codecs import compose
     from kvgit.codecs.numpy import NumpyCodec
     from kvgit.kv.indexeddb import IndexedDB
-    from kvgit.staged import Staged
-    from kvgit.versioned.kv import CHUNK_PREFIX, VersionedKV
+    from kvgit.versioned.kv import CHUNK_PREFIX
 
-    encoder, decoder = compose(NumpyCodec(min_bytes=64))
+    codec = compose(NumpyCodec(min_bytes=64))
     backend = IndexedDB(db_name="test_chunked_codec")
-    s = Staged(VersionedKV(backend), encoder=encoder, decoder=decoder)
+    s = Repo(backend, codec=codec).worktree("main", create=True)
 
     big = np.arange(4096, dtype="float64")
     s["full"] = big
@@ -412,9 +409,8 @@ async def test_chunked_codec_round_trip(selenium_jspi):
         f"expected one chunk on disk, got {len(chunk_keys)}: {chunk_keys}"
     )
 
-    # Drop the in-memory cache to force a real read from IndexedDB.
-    s.reset()
-    s._cache.clear()
+    # A fresh repo has no cache, so reads go to IndexedDB.
+    s = Repo(backend, codec=codec).worktree("main")
     np.testing.assert_array_equal(s["full"], big)
     np.testing.assert_array_equal(s["head"], big[:1024])
     np.testing.assert_array_equal(s["tail"], big[-1024:])

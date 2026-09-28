@@ -1,117 +1,117 @@
-"""Tests for the kvgit.store() factory function."""
+"""Tests for the kvgit.store() one-liner."""
 
 import os
 import tempfile
 
 import pytest
 
-from kvgit import Staged, store
+from kvgit import Repo, Worktree, store
+from kvgit.kv.memory import Memory
 
 
 class TestStoreFactory:
-    def test_default_returns_staged(self):
-        s = store()
-        assert isinstance(s, Staged)
+    def test_default_returns_a_worktree_on_main(self):
+        wt = store()
+        assert isinstance(wt, Worktree)
+        assert isinstance(wt.repo, Repo)
+        assert isinstance(wt.repo.store, Memory)
+        assert wt.branch == "main"
 
     def test_invalid_kind(self):
         with pytest.raises(ValueError, match="Unknown kind"):
-            store(kind="redis")
+            store(kind="redis")  # type: ignore[arg-type]
 
     def test_disk_requires_path(self):
         with pytest.raises(ValueError, match="path is required"):
             store(kind="disk")
 
-    def test_branch_parameter(self):
-        s = store(branch="dev")
-        assert isinstance(s, Staged)
-        assert s.versioned._branch == "dev"
+    def test_branch_parameter_creates_the_branch(self):
+        wt = store(branch="dev")
+        assert wt.branch == "dev"
+        assert wt.repo.branches() == ["dev"]
 
-    def test_branch_create_false_raises_on_fresh_store(self):
-        from kvgit import UnknownBranchError
-
-        with pytest.raises(UnknownBranchError):
-            store(branch="dev", create=False)
-
-    def test_branch_create_false_opens_shared_disk_branch(self):
-        from kvgit import UnknownBranchError
-
+    def test_opening_an_existing_branch_does_not_recreate_it(self):
         with tempfile.TemporaryDirectory() as path:
-            s = store(kind="disk", path=path)
-            s["k"] = "v"
-            s.commit()
-            s_main = store(kind="disk", path=path, branch="main", create=False)
-            assert s_main.get("k") == "v"
-            with pytest.raises(UnknownBranchError):
-                store(kind="disk", path=path, branch="dev", create=False)
+            first = store(kind="disk", path=path)
+            first["k"] = "v"
+            first.commit()
+            head = first.head
+            first.repo.close()
+
+            again = store(kind="disk", path=path)
+            assert again.head == head
+            assert again["k"] == "v"
+            again.repo.close()
+
+    def test_codec_is_passed_to_the_repo(self):
+        wt = store(codec="bytes")
+        wt["k"] = b"raw"
+        wt.commit()
+        assert wt.repo.snapshot(branch="main").raw["k"] == b"raw"
+        with pytest.raises(TypeError, match="bytes values only"):
+            wt["n"] = 1
+            wt.commit()
 
 
 class TestStoreFactoryRoundTrip:
     def test_set_commit_get(self):
-        s = store()
-        s["greeting"] = "hello"
-        result = s.commit()
+        wt = store()
+        wt["greeting"] = "hello"
+        result = wt.commit()
         assert result.merged
-        assert s.get("greeting") == "hello"
-
-    def test_create_branch(self):
-        s = store()
-        s["k"] = "v"
-        s.commit()
-        worker = s.create_branch("worker")
-        assert isinstance(worker, Staged)
-        assert worker.get("k") == "v"
+        assert wt.get("greeting") == "hello"
 
     def test_mutable_mapping(self):
-        s = store()
-        s["k"] = {"hello": "world"}
-        s.commit()
-        assert s["k"] == {"hello": "world"}
+        wt = store()
+        wt["k"] = {"hello": "world"}
+        wt.commit()
+        assert wt["k"] == {"hello": "world"}
 
 
 class TestDiskFactory:
-    """Round-trip tests against the disk-backed factory.
+    """Round trips against the disk-backed factory.
 
-    Regression: prior to this, store(kind='disk', path=...) passed
-    size_limit=0 to the diskcache backend, which is "0 bytes allowed"
-    rather than "no limit", so every write was evicted immediately
-    and the store appeared empty after commit.
+    A regression once passed size_limit=0 to the diskcache backend, which
+    means "0 bytes allowed" rather than "no limit", so every write was
+    evicted immediately and the store appeared empty after commit.
     """
 
     def test_disk_factory_round_trip_within_session(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "store")
-            s = store(kind="disk", path=p)
-            s["greeting"] = "hello"
-            s["count"] = 42
-            result = s.commit()
-            assert result.merged
-            assert s.get("greeting") == "hello"
-            assert s.get("count") == 42
+            wt = store(kind="disk", path=p)
+            wt["greeting"] = "hello"
+            wt["count"] = 42
+            assert wt.commit().merged
+            assert wt.get("greeting") == "hello"
+            assert wt.get("count") == 42
+            wt.repo.close()
 
     def test_disk_factory_persists_across_reopens(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "store")
+            first = store(kind="disk", path=p)
+            first["greeting"] = "hello"
+            first.commit()
+            first.repo.close()
 
-            s1 = store(kind="disk", path=p)
-            s1["greeting"] = "hello"
-            s1.commit()
-
-            # Re-open the same path; data must still be there.
-            s2 = store(kind="disk", path=p)
-            assert s2.get("greeting") == "hello"
+            again = store(kind="disk", path=p)
+            assert again.get("greeting") == "hello"
+            again.repo.close()
 
     def test_disk_factory_branches_persist(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "store")
-
-            s1 = store(kind="disk", path=p)
-            s1["base"] = "ok"
-            s1.commit()
-            worker = s1.create_branch("worker")
+            first = store(kind="disk", path=p)
+            first["base"] = "ok"
+            first.commit()
+            first.repo.create_branch("worker", at=first.head)
+            worker = first.repo.worktree("worker")
             worker["work"] = "done"
             worker.commit()
+            first.repo.close()
 
-            # Re-open and switch to the branch
-            s2 = store(kind="disk", path=p, branch="worker")
-            assert s2.get("base") == "ok"
-            assert s2.get("work") == "done"
+            again = store(kind="disk", path=p, branch="worker")
+            assert again.get("base") == "ok"
+            assert again.get("work") == "done"
+            again.repo.close()

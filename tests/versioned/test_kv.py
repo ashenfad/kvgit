@@ -2,17 +2,22 @@
 
 import pytest
 
-from kvgit import (
-    ConcurrencyError,
-    MergeChoice,
-    MergeConflict,
-    MergeResult,
-    UnknownBranchError,
-    VersionedKV as Versioned,
-)
+from kvgit import ConcurrencyError, MergeChoice, MergeConflict, MergeResult
 from kvgit.encoding import dumps
+from kvgit.errors import (
+    BranchExistsError,
+    CorruptHeadError,
+    KvgitError,
+    UnknownBranchError,
+    UnknownCommitError,
+)
 from kvgit.kv.memory import Memory
-from kvgit.versioned.kv import BRANCH_HEAD, _load_root, blob_key
+from kvgit.versioned.kv import (
+    BRANCH_HEAD,
+    VersionedKV as Versioned,
+    _load_root,
+    blob_key,
+)
 
 
 class TestVersionedBasic:
@@ -315,7 +320,7 @@ class TestFastForwardRace:
         v2 = Versioned(store)
         _race_once(v2, lambda: store.remove(BRANCH_HEAD % "main"))
 
-        with pytest.raises(ValueError, match="has no HEAD"):
+        with pytest.raises(UnknownBranchError, match="has no HEAD"):
             v2.commit({"mine": b"2"})
 
         assert v2.current_commit == base_head
@@ -377,8 +382,8 @@ class TestBranchOpen:
         with pytest.raises(UnknownBranchError):
             Versioned(store, branch="dev", create=False)
 
-    def test_named_error_is_a_value_error(self):
-        assert issubclass(UnknownBranchError, ValueError)
+    def test_named_error_is_a_kvgit_error(self):
+        assert issubclass(UnknownBranchError, KvgitError)
 
     def test_create_false_mints_no_branch(self):
         store = Memory()
@@ -635,7 +640,7 @@ class TestBranches:
     def test_create_branch_already_exists(self):
         store = Memory()
         v = Versioned(store)
-        with pytest.raises(ValueError, match="already exists"):
+        with pytest.raises(BranchExistsError, match="already exists"):
             v.create_branch("main")
 
     def test_create_branch_appears_in_branches_list(self):
@@ -684,7 +689,7 @@ class TestBranches:
 
     def test_delete_nonexistent_branch_raises(self):
         v = Versioned()
-        with pytest.raises(ValueError, match="does not exist"):
+        with pytest.raises(UnknownBranchError, match="does not exist"):
             v.delete_branch("nope")
 
     def test_current_branch_property(self):
@@ -709,7 +714,7 @@ class TestBranches:
 
     def test_switch_branch_nonexistent_raises(self):
         v = Versioned()
-        with pytest.raises(ValueError, match="does not exist"):
+        with pytest.raises(UnknownBranchError, match="does not exist"):
             v.switch_branch("nope")
 
     def test_create_branch_at_commit(self):
@@ -726,7 +731,7 @@ class TestBranches:
 
     def test_create_branch_at_nonexistent_raises(self):
         v = Versioned()
-        with pytest.raises(ValueError, match="does not exist"):
+        with pytest.raises(UnknownCommitError, match="does not exist"):
             v.create_branch("bad", at="nonexistent_hash")
 
     def test_peek_reads_other_branch(self):
@@ -1288,65 +1293,6 @@ class TestErgonomics:
         assert "dev" in r
 
 
-class TestStagedBranchOps:
-    """Test branch operations on the Staged layer."""
-
-    def test_staged_current_branch(self):
-        from kvgit import Staged
-
-        s = Staged(Versioned())
-        assert s.current_branch == "main"
-
-    def test_staged_switch_branch_clears_staging(self):
-        from kvgit import Staged
-
-        store = Memory()
-        v = Versioned(store)
-        v.commit({"x": b"1"})
-        v.create_branch("dev")
-
-        s = Staged(v)
-        s["pending"] = "staged_value"
-        assert s.has_changes
-
-        s.switch_branch("dev")
-        assert s.current_branch == "dev"
-        assert not s.has_changes
-
-    def test_staged_create_branch_at(self):
-        from kvgit import Staged
-
-        store = Memory()
-        v = Versioned(store)
-        s = Staged(v)
-        s["x"] = "hello"
-        s.commit()
-        initial = v.initial_commit
-
-        child = s.create_branch("fresh", at=initial)
-        assert child.current_branch == "fresh"
-        assert "x" not in child
-
-    def test_staged_peek(self):
-        from kvgit import Staged
-
-        store = Memory()
-        v = Versioned(store)
-        s = Staged(v)
-        s["title"] = "Main Session"
-        s.commit()
-
-        s.create_branch("dev")
-        dev = Staged(Versioned(store, branch="dev"))
-        dev["title"] = "Dev Session"
-        dev.commit()
-
-        # Peek from main at dev's title
-        assert s.peek("title", branch="dev") == "Dev Session"
-        # Peek at nonexistent branch
-        assert s.peek("title", branch="nope") is None
-
-
 class TestCleanOrphans:
     def test_delete_branch_cleans_orphaned_commits(self):
         """Deleting a branch should clean up commits only reachable from it."""
@@ -1520,7 +1466,7 @@ class TestHeadRecovery:
         store.set(BRANCH_HEAD % "main", b"")
         store.remove(BRANCH_HEAD_PREV % "main")
 
-        with pytest.raises(ValueError, match="corrupt and unrecoverable"):
+        with pytest.raises(CorruptHeadError, match="corrupt and unrecoverable"):
             Versioned(store)
 
     def test_scan_recovery_when_no_prev_head_if_asked_for(self):

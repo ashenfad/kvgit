@@ -3,20 +3,15 @@
 from collections.abc import MutableMapping
 
 import pytest
+from support import worktree
 
-from kvgit import (
-    MergeResult,
-    Namespaced,
-    Staged,
-    VersionedKV as Versioned,
-    counter,
-)
+from kvgit import MergeResult, Namespaced, counter
 from kvgit.kv.memory import Memory
 
 
-def _staged(store=None, **kwargs):
-    """Helper to create a Staged store."""
-    return Staged(Versioned(store, **kwargs))
+def _staged(store=None, branch="main"):
+    """A worktree to namespace over."""
+    return worktree(store, branch)
 
 
 class TestNamespacedBasic:
@@ -197,7 +192,7 @@ class TestNamespacedWrite:
         assert ns2.get("k") == 1
 
     def test_merge_fn_with_namespace(self):
-        """Merge functions are registered on Staged with full prefixed key."""
+        """Merge functions are registered on the worktree with the full prefixed key."""
         store = Memory()
 
         s1 = _staged(store)

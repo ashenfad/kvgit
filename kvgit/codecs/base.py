@@ -10,8 +10,9 @@ in a ``ChunkingPickler`` / ``ChunkingUnpickler`` pair. Pickle handles
 container traversal and primitive types; the codec only sees leaf
 objects it cares about.
 
-The kvgit core sees codecs as opaque ``(encoder, decoder)`` callables
-on ``Staged``. Users opt in by passing them at construction.
+The kvgit core sees codecs as opaque ``(encoder, decoder)`` callables.
+Users opt in by passing a pair (or the ``"scientific"`` preset) as a
+repository's ``codec``.
 """
 
 from __future__ import annotations

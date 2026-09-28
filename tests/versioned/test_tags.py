@@ -1,9 +1,8 @@
 """Tests for tags: immutable names for commits, and GC roots.
 
-Covers the tag API on ``VersionedKV`` and ``Staged``, the reachability
-rule that keeps a tagged commit's ancestry alive, the anchor-free admin
-paths, and the storage-version gate that stops older code from sweeping
-a store whose tags it cannot see.
+Covers the tag API on ``VersionedKV`` and on ``Repo``, the reachability
+rule that keeps a tagged commit's ancestry alive, and the storage-version
+gate that stops older code from sweeping a store whose tags it cannot see.
 """
 
 import os
@@ -11,10 +10,16 @@ import pickle
 import tempfile
 
 import pytest
+from support import fork, worktree
 
-import kvgit
-from kvgit import MergeConflict, VersionedKV as Versioned, store
+from kvgit import MergeConflict, Repo
 from kvgit.encoding import dumps, safe_loads
+from kvgit.errors import (
+    StorageVersionError,
+    TagExistsError,
+    UnknownCommitError,
+    UnknownTagError,
+)
 from kvgit.kv.disk import Disk
 from kvgit.kv.memory import Memory
 from kvgit.versioned.kv import (
@@ -24,6 +29,7 @@ from kvgit.versioned.kv import (
     STORAGE_VERSION_KEY,
     TAG_BRANCH_PREFIX,
     TAG_INFO_KEY,
+    VersionedKV as Versioned,
     _stamp_version_at_least,
     blob_key,
     clean_orphans,
@@ -88,7 +94,7 @@ class TestTagCreateListDelete:
         v = Versioned()
         second = v.commit({"x": b"1"}).commit
         v.tag("v1")
-        with pytest.raises(ValueError, match="already exists"):
+        with pytest.raises(TagExistsError, match="already exists"):
             v.tag("v1", at=second)
 
     def test_recreate_after_delete_moves_the_name(self):
@@ -104,12 +110,12 @@ class TestTagCreateListDelete:
 
     def test_unknown_commit_raises(self):
         v = Versioned()
-        with pytest.raises(ValueError, match="does not exist"):
+        with pytest.raises(UnknownCommitError, match="does not exist"):
             v.tag("bad", at="0" * 40)
 
     def test_delete_unknown_tag_raises(self):
         v = Versioned()
-        with pytest.raises(ValueError, match="does not exist"):
+        with pytest.raises(UnknownTagError, match="does not exist"):
             v.delete_tag("never-existed")
 
     def test_tag_info_unknown_name_is_none(self):
@@ -221,71 +227,43 @@ class TestTagsAsGCRoots:
         assert backend.get(COMMIT_ROOT % tagged) is not None
 
 
-class TestAnchorFreeTagPaths:
-    def test_delete_branches_respects_tags(self):
-        """The admin sweep marks from tags like every other caller."""
+class TestRepoTagPaths:
+    """Deleting through a Repo, with no worktree open."""
+
+    def test_deleting_every_branch_leaves_a_tag_readable(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "store")
-            s = store(kind="disk", path=p)
-            s["keep"] = "tagged value"
-            s.commit()
-            s.tag("v1")
-            s.versioned.store.close()
+            with Repo(Disk(p)) as repo:
+                wt = repo.worktree("main", create=True)
+                wt["keep"] = "tagged value"
+                wt.commit()
+                repo.create_tag("v1", wt.head)
 
-            kvgit.delete_branches("main", kind="disk", path=p, min_age=0)
+            with Repo(Disk(p)) as repo:
+                repo.delete_branch("main")
+                repo.gc(min_age=0)
+                assert repo.snapshot(tag="v1")["keep"] == "tagged value"
+                assert repo.worktree("main", create=True).get("keep") is None
 
-            s2 = store(kind="disk", path=p)  # mints a fresh empty main
-            assert s2.get("keep") is None
-            assert s2.checkout(tag="v1")["keep"] == "tagged value"
-
-    def test_delete_tags_removes_both_keys_and_sweeps(self):
+    def test_deleting_the_tag_too_frees_its_commit_and_content(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "store")
-            s = store(kind="disk", path=p)
-            s["keep"] = "tagged value"
-            s.commit()
-            s.tag("v1")
-            tagged = s.current_commit
-            pointer = s.versioned._commit_keys["keep"]
-            backend = s.versioned.store
-            backend.close()
+            with Repo(Disk(p)) as repo:
+                wt = repo.worktree("main", create=True)
+                wt["keep"] = "tagged value"
+                wt.commit()
+                repo.create_tag("v1", wt.head)
+                tagged = wt.head
+                pointer = wt._engine._commit_keys["keep"]
 
-            kvgit.delete_branches("main", kind="disk", path=p, min_age=0)
-            kvgit.delete_tags("v1", kind="disk", path=p, min_age=0)
-
-            s2 = store(kind="disk", path=p)
-            assert s2.tags() == {}
-            backend = s2.versioned.store
-            assert backend.get(TAG_INFO_KEY % "v1") is None
-            assert backend.get(COMMIT_ROOT % tagged) is None
-            s2.versioned.deep_clean(min_age=0)
-            assert backend.get(pointer) is None
-
-    def test_delete_tags_unknown_name_is_a_noop(self):
-        """Teardown is idempotent, like delete_branches."""
-        with tempfile.TemporaryDirectory() as d:
-            p = os.path.join(d, "store")
-            store(kind="disk", path=p)["x"] = "1"
-            kvgit.delete_tags(["never", "existed"], kind="disk", path=p)
-            assert store(kind="disk", path=p).tags() == {}
-
-    def test_delete_tags_bare_string_is_one_name(self):
-        with tempfile.TemporaryDirectory() as d:
-            p = os.path.join(d, "store")
-            s = store(kind="disk", path=p)
-            s.commit()
-            s.tag("v1")
-            s.versioned.store.close()
-
-            kvgit.delete_tags("v1", kind="disk", path=p)
-
-            assert store(kind="disk", path=p).tags() == {}
-
-    def test_delete_tags_empty_names_early_return(self):
-        with tempfile.TemporaryDirectory() as d:
-            p = os.path.join(d, "store")
-            kvgit.delete_tags([], kind="disk", path=p)
-            assert not os.path.exists(p)
+            with Repo(Disk(p)) as repo:
+                repo.delete_branch("main")
+                repo.delete_tag("v1")
+                repo.gc(min_age=0)
+                assert repo.tags() == {}
+                assert repo.store.get(TAG_INFO_KEY % "v1") is None
+                assert repo.store.get(COMMIT_ROOT % tagged) is None
+                assert repo.store.get(pointer) is None
 
 
 class TestCheckoutTag:
@@ -431,22 +409,17 @@ class TestTagKeyLayout:
         assert backend.get(BRANCH_HEAD_PREV % "refs/tags/v1") is None
         assert backend.get(TAG_INFO_KEY % "v1") is None
 
-    def test_anchor_free_delete_tags_removes_the_backup_too(self):
-        with tempfile.TemporaryDirectory() as d:
-            p = os.path.join(d, "store")
-            s = store(kind="disk", path=p)
-            s.commit()
-            s.tag("v1")
-            backend = s.versioned.store
-            backend.set(BRANCH_HEAD_PREV % "refs/tags/v1", dumps(s.current_commit))
-            backend.close()
+    def test_repo_delete_tag_removes_the_backup_too(self):
+        repo = Repo(Memory())
+        wt = repo.worktree("main", create=True)
+        repo.create_tag("v1", wt.head)
+        repo.store.set(BRANCH_HEAD_PREV % "refs/tags/v1", dumps(wt.head))
 
-            kvgit.delete_tags("v1", kind="disk", path=p)
+        repo.delete_tag("v1")
 
-            reopened = store(kind="disk", path=p).versioned.store
-            assert reopened.get(_tag_head("v1")) is None
-            assert reopened.get(BRANCH_HEAD_PREV % "refs/tags/v1") is None
-            assert reopened.get(TAG_INFO_KEY % "v1") is None
+        assert repo.store.get(_tag_head("v1")) is None
+        assert repo.store.get(BRANCH_HEAD_PREV % "refs/tags/v1") is None
+        assert repo.store.get(TAG_INFO_KEY % "v1") is None
 
 
 class TestReservedBranchNames:
@@ -548,101 +521,76 @@ class TestUnknownStorageVersionIsRefused:
         Versioned(backend).tag("v1")
         backend.set(STORAGE_VERSION_KEY, dumps(99))
 
-        with pytest.raises(ValueError, match="storage version"):
+        with pytest.raises(StorageVersionError, match="storage version"):
             clean_orphans(backend, min_age=0)
 
-    def test_anchor_free_paths_refuse_an_unknown_version(self):
-        """Checked before the first removal, so the store comes out
-        untouched rather than half-edited."""
-        with tempfile.TemporaryDirectory() as d:
-            p = os.path.join(d, "store")
-            s = store(kind="disk", path=p)
-            s.commit()
-            s.tag("v1")
-            s.versioned.store.set(STORAGE_VERSION_KEY, dumps(99))
-            s.versioned.store.close()
+    def test_a_repo_refuses_an_unknown_version_before_touching_it(self):
+        """Refused on opening, so no delete or sweep can run against a
+        store whose tags this code may not see."""
+        backend = Memory()
+        wt = Repo(backend).worktree("main", create=True)
+        wt.repo.create_tag("v1", wt.head)
+        backend.set(STORAGE_VERSION_KEY, dumps(99))
+        before = dict(backend.items())
 
-            with pytest.raises(ValueError, match="storage version"):
-                kvgit.delete_branches("main", kind="disk", path=p)
-            with pytest.raises(ValueError, match="storage version"):
-                kvgit.delete_tags("v1", kind="disk", path=p)
-
-            backend = Disk(p)
-            try:
-                assert backend.get(BRANCH_HEAD % "main") is not None
-                assert backend.get(_tag_head("v1")) is not None
-            finally:
-                backend.close()
+        with pytest.raises(StorageVersionError, match="storage version"):
+            Repo(backend)
+        assert dict(backend.items()) == before
 
 
-class TestStagedTagOps:
-    def test_staged_tag_round_trip(self):
-        s = store()
-        s["x"] = "hello"
-        s.commit()
+class TestRepoTagOps:
+    def test_tag_round_trip(self):
+        wt = worktree()
+        wt["x"] = "hello"
+        wt.commit()
+        repo = wt.repo
 
-        tagged = s.tag("v1", info={"by": "ann"})
+        repo.create_tag("v1", wt.head, info={"by": "ann"})
 
-        assert tagged == s.current_commit
-        assert s.tags() == {"v1": s.current_commit}
-        assert s.tag_info("v1").info == {"by": "ann"}
+        assert repo.tags() == {"v1": wt.head}
+        assert repo.tag_info("v1").info == {"by": "ann"}
+        repo.delete_tag("v1")
+        assert repo.tags() == {}
 
-        s.delete_tag("v1")
-        assert s.tags() == {}
+    def test_a_tag_names_a_commit_not_pending_changes(self):
+        wt = worktree()
+        wt["x"] = "committed"
+        wt.commit()
+        wt["x"] = "pending only"
 
-    def test_staged_tag_names_the_commit_not_the_staging_buffer(self):
-        s = store()
-        s["x"] = "committed"
-        s.commit()
-        s["x"] = "staged only"
+        wt.repo.create_tag("v1", wt.head)
 
-        s.tag("v1")
+        assert wt.repo.snapshot(tag="v1")["x"] == "committed"
+        assert wt["x"] == "pending only"
 
-        assert s.checkout(tag="v1")["x"] == "committed"
-        assert s["x"] == "staged only"
+    def test_reading_at_a_tag(self):
+        wt = worktree()
+        wt["title"] = "first"
+        wt.commit()
+        wt.repo.create_tag("v1", wt.head)
+        wt["title"] = "second"
+        wt.commit()
 
-    def test_staged_checkout_tag_returns_staged(self):
-        s = store()
-        s["x"] = "tagged"
-        s.commit()
-        s.tag("v1")
-        s["x"] = "later"
-        s.commit()
-
-        at_tag = s.checkout(tag="v1")
-        assert isinstance(at_tag, kvgit.Staged)
-        assert at_tag["x"] == "tagged"
-        assert s.checkout(tag="nope") is None
-
-    def test_staged_peek_tag(self):
-        s = store()
-        s["title"] = "first"
-        s.commit()
-        s.tag("v1")
-        s["title"] = "second"
-        s.commit()
-
-        assert s.peek("title", tag="v1") == "first"
+        assert wt.repo.snapshot(tag="v1")["title"] == "first"
+        assert wt["title"] == "second"
         with pytest.raises(ValueError, match="exactly one"):
-            s.peek("title", branch="main", tag="v1")
+            wt.repo.snapshot(branch="main", tag="v1")
 
-    def test_staged_delete_tag_releases_the_commit(self):
-        s = store()
-        s["x"] = "base"
-        s.commit()
-        dev = s.create_branch("dev")
+    def test_delete_tag_releases_the_commit(self):
+        wt = worktree()
+        wt["x"] = "base"
+        wt.commit()
+        dev = fork(wt, "dev")
         dev["secret"] = "tagged value"
         dev.commit()
-        dev.tag("v1")
-        s.delete_branch("dev")
+        repo = wt.repo
+        repo.create_tag("v1", dev.head)
+        repo.delete_branch("dev")
 
-        backend = s.versioned.store
-        assert s.versioned.clean_orphans(min_age=0) == 0
-
+        assert repo.gc(min_age=0) == 0
         pointer = blob_key(pickle.dumps("tagged value"))
-        assert backend.get(pointer) is not None
+        assert repo.store.get(pointer) is not None
 
-        s.delete_tag("v1")
-        assert s.versioned.clean_orphans(min_age=0) >= 1
-        s.versioned.deep_clean(min_age=0)
-        assert backend.get(pointer) is None
+        repo.delete_tag("v1")
+        assert repo.gc(min_age=0) >= 1
+        assert repo.store.get(pointer) is None

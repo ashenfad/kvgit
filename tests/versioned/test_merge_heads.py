@@ -1,11 +1,12 @@
-"""Tests for cross-branch merge: VersionedKV.merge_heads + Staged.merge."""
+"""Tests for cross-branch merge: VersionedKV.merge_heads + Worktree.merge."""
 
 import pytest
+from support import fork, worktree
 
-from kvgit import MergeConflict, VersionedKV as Versioned
+from kvgit import MergeConflict
 from kvgit.kv.memory import Memory
 from kvgit.merges import CantMark, text
-from kvgit.store import store
+from kvgit.versioned.kv import VersionedKV as Versioned
 
 
 def _branched_versioned():
@@ -17,11 +18,11 @@ def _branched_versioned():
 
 
 def _branched():
-    """Main + worker Staged pair sharing one memory store, diverged once."""
-    main = store(kind="memory", branch="main")
+    """Main + worker worktrees sharing one repo, forked after one commit."""
+    main = worktree()
     main["doc"] = b"a\nb\nc\nd\n"
     main.commit()
-    worker = main.create_branch("worker")
+    worker = fork(main, "worker")
     return main, worker
 
 
@@ -120,16 +121,16 @@ class TestMergeHeads:
         assert isinstance(exc_info.value.merge_errors["doc"], CantMark)
 
 
-class TestStagedMerge:
+class TestWorktreeMerge:
     def test_dirty_buffer_refuses(self):
         main, worker = _branched()
         worker["b"] = b"2"
         worker.commit()
         main["staged"] = b"pending"
 
-        with pytest.raises(ValueError, match="staged changes"):
-            main.merge(worker.versioned.current_commit)
-        # Refusal changes nothing: the staged write is still staged.
+        with pytest.raises(ValueError, match="pending changes"):
+            main.merge(commit=worker.head)
+        # Refusal changes nothing: the pending write is still pending.
         assert main["staged"] == b"pending"
 
     def test_end_to_end_cross_branch(self):
@@ -139,7 +140,7 @@ class TestStagedMerge:
         worker["b"] = b"2"
         worker.commit()
 
-        result = main.merge(worker.versioned.current_commit, default_merge=text)
+        result = main.merge(commit=worker.head, default_merge=text)
         assert result.merged
         assert main["a"] == b"1"
         assert main["b"] == b"2"
@@ -150,12 +151,12 @@ class TestStagedMerge:
         worker["doc"] = b"changed\n"
         worker.commit()
 
-        main.merge(worker.versioned.current_commit, default_merge=text)
+        main.merge(commit=worker.head, default_merge=text)
         assert main["doc"] == b"changed\n"
 
     def test_decoded_fn_wrapping(self):
         # `n` is added independently on both sides after the fork, so the
-        # LCA has no `n`: add(None, 30, 20) == 50. Exercises Staged's
+        # LCA has no `n`: add(None, 30, 20) == 50. Exercises the worktree's
         # decoded-value wrapping (not raw bytes) end to end.
         main, worker = _branched()
         main["n"] = 10
@@ -170,7 +171,7 @@ class TestStagedMerge:
             base = old if old is not None else 0
             return ours + theirs - base
 
-        result = main.merge(worker.versioned.current_commit, merge_fns={"n": add})
+        result = main.merge(commit=worker.head, merge_fns={"n": add})
         assert result.merged
         assert main["n"] == 50
 
@@ -191,7 +192,7 @@ class TestReviewRegression35:
         assert main.parents() == (our_head, worker.current_commit)
         assert our_head in list(main.history())
 
-    def test_staged_uses_registered_fns(self):
+    def test_worktree_uses_registered_fns(self):
         """set_default_merge applies to merge() without per-call args."""
         main, worker = _branched()
         main["doc"] = b"a\nB\nc\nd\n"
@@ -200,7 +201,7 @@ class TestReviewRegression35:
         worker.commit()
 
         main.set_default_merge(lambda old, ours, theirs: ours)
-        result = main.merge(worker.versioned.current_commit)
+        result = main.merge(commit=worker.head)
         assert result.merged
         assert main["doc"] == b"a\nB\nc\nd\n"
 
@@ -250,12 +251,12 @@ class TestMergeBase:
 
         assert main.merge_base(base, main.current_commit) == base
 
-    def test_staged_delegates_to_versioned(self):
+    def test_repo_merge_base_matches_the_engine(self):
         main, worker = _branched()
-        fork = main.current_commit
+        fork_point = main.head
         main["a"] = "1"
         main.commit()
         worker["b"] = "2"
         worker.commit()
 
-        assert main.merge_base(main.current_commit, worker.current_commit) == fork
+        assert main.repo.merge_base(main.head, worker.head) == fork_point

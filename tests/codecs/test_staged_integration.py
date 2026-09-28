@@ -1,4 +1,4 @@
-"""Tests that ``Staged`` correctly drives a chunked codec end-to-end."""
+"""Tests that a worktree drives a chunked codec end to end."""
 
 from __future__ import annotations
 
@@ -6,7 +6,8 @@ import pytest
 
 np = pytest.importorskip("numpy")
 
-from kvgit import Staged, VersionedKV
+from support import worktree
+
 from kvgit.codecs import compose
 from kvgit.codecs.numpy import NumpyCodec
 from kvgit.encoding import safe_loads
@@ -21,24 +22,24 @@ from kvgit.versioned.kv import (
 
 @pytest.fixture
 def chunked():
-    """Build a Staged on a fresh Memory store with the numpy codec."""
+    """A worktree on a fresh Memory store with the numpy codec."""
     encoder, decoder = compose(NumpyCodec(min_bytes=64))
     store = Memory()
-    s = Staged(VersionedKV(store), encoder=encoder, decoder=decoder)
+    s = worktree(store, codec=(encoder, decoder))
     return s, store
 
 
 class TestArityDetection:
     def test_chunked_encoder_detected(self, chunked):
         s, _ = chunked
-        assert s._encoder_chunked is True
-        assert s._decoder_chunked is True
+        assert s._codec.encoder_chunked is True
+        assert s._codec.decoder_chunked is True
 
     def test_default_pickle_not_detected_as_chunked(self):
         store = Memory()
-        s = Staged(VersionedKV(store))
-        assert s._encoder_chunked is False
-        assert s._decoder_chunked is False
+        s = worktree(store)
+        assert s._codec.encoder_chunked is False
+        assert s._codec.decoder_chunked is False
 
 
 class TestMergeWithChunkedCodec:
@@ -46,14 +47,14 @@ class TestMergeWithChunkedCodec:
     The chunked decoder must still read those plain blobs back, and the
     merge result must round-trip equal.
 
-    Three-way merge in kvgit triggers when a Staged commits to a branch
-    whose HEAD has advanced since this Staged read it — typically modeled
-    in tests by two Staged instances over the same store + branch.
+    Three-way merge in kvgit triggers when a worktree commits to a branch
+    whose HEAD has advanced since it read it — modeled here by two
+    worktrees over the same store and branch.
     """
 
     def _build_pair(self, store):
         encoder, decoder = compose(NumpyCodec(min_bytes=64))
-        return Staged(VersionedKV(store), encoder=encoder, decoder=decoder)
+        return worktree(store, codec=(encoder, decoder))
 
     def test_custom_merge_fn_resolves_conflict_with_chunked_codec(self):
         store = Memory()
@@ -80,7 +81,7 @@ class TestMergeWithChunkedCodec:
         # Re-read via the chunked decoder; the merged blob is plain pickle
         # but the chunked decoder handles plain pickle bytes naturally
         # (persistent_id simply never fires).
-        s2.reset()
+        s2.discard()
         s2._cache.clear()
         np.testing.assert_array_equal(s2["arr"], np.full(2048, 3.0, dtype="float64"))
 
@@ -105,41 +106,7 @@ class TestMergeWithChunkedCodec:
         result = s2.commit()
         assert result.strategy == "three_way"
 
-        assert not s2._versioned._meta["arr"].chunks
-
-
-class TestBackendCompatibility:
-    def test_chunked_codec_rejects_non_kv_backend(self):
-        """Pairing chunked codec with a non-KV Versioned must fail loud."""
-        encoder, decoder = compose(NumpyCodec(min_bytes=64))
-
-        class FakeVersioned:
-            """Stub Versioned that isn't a VersionedKV — should be rejected."""
-
-            store = None
-            current_commit = "x"
-            base_commit = "x"
-            current_branch = "main"
-            initial_commit = "x"
-            last_merge_result = None
-
-            def get(self, k):
-                return None
-
-            def get_many(self, *keys):
-                return {}
-
-            def keys(self):
-                return ()
-
-            def __contains__(self, k):
-                return False
-
-            def commit(self, *a, **kw):
-                raise NotImplementedError
-
-        with pytest.raises(TypeError, match="VersionedKV"):
-            Staged(FakeVersioned(), encoder=encoder, decoder=decoder)
+        assert not s2._engine._meta["arr"].chunks
 
 
 class TestRoundTripThroughStore:
@@ -149,7 +116,7 @@ class TestRoundTripThroughStore:
         s["x"] = arr
         s.commit()
         # Fresh staged, force a re-read from underlying store.
-        s.reset()
+        s.discard()
         s._cache.clear()
         np.testing.assert_array_equal(s["x"], arr)
 
@@ -201,7 +168,7 @@ class TestStorageVersioning:
         store = Memory()
         store.set(STORAGE_VERSION_KEY, dumps(2))
 
-        s = Staged(VersionedKV(store))  # default pickle, not chunked
+        s = worktree(store)  # default pickle, not chunked
         assert safe_loads(store.get(STORAGE_VERSION_KEY)) == 2
         s["x"] = "hello"
         s.commit()
@@ -214,7 +181,7 @@ class TestStorageVersioning:
         store.set(STORAGE_VERSION_KEY, dumps(2))
 
         # Plain pickle commit first.
-        s_plain = Staged(VersionedKV(store))
+        s_plain = worktree(store)
         s_plain["plain"] = {"a": 1}
         s_plain.commit()
         assert safe_loads(store.get(STORAGE_VERSION_KEY)) == BLOB_STORAGE_VERSION
@@ -222,7 +189,7 @@ class TestStorageVersioning:
         # Now open with chunked codec and write an array: the stamp,
         # already above what chunks need, stays where it is.
         encoder, decoder = compose(NumpyCodec(min_bytes=64))
-        s_chunked = Staged(VersionedKV(store), encoder=encoder, decoder=decoder)
+        s_chunked = worktree(store, codec=(encoder, decoder))
         s_chunked["arr"] = np.arange(2048, dtype="float64")
         s_chunked.commit()
         assert safe_loads(store.get(STORAGE_VERSION_KEY)) == BLOB_STORAGE_VERSION
@@ -239,15 +206,15 @@ class TestMetaEntryChunks:
         s, _ = chunked
         s["x"] = np.arange(2048, dtype="float64")
         s.commit()
-        meta = s._versioned._meta["x"]
+        meta = s._engine._meta["x"]
         assert meta.chunks
         assert isinstance(meta.chunks, list)
         assert all(isinstance(r, str) for r in meta.chunks)
 
     def test_chunks_field_omitted_for_plain_pickle(self):
         store = Memory()
-        s = Staged(VersionedKV(store))
+        s = worktree(store)
         s["x"] = "hello"
         s.commit()
-        meta = s._versioned._meta["x"]
+        meta = s._engine._meta["x"]
         assert meta.chunks is None

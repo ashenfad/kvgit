@@ -1,7 +1,19 @@
-"""kvgit: Versioned key-value store."""
+"""kvgit: versioned key-value store."""
 
 from .content_types import MergeFn, counter, last_writer_wins, text_merge
-from .errors import ConcurrencyError, GcBusy, MergeConflict, UnknownBranchError
+from .errors import (
+    BranchExistsError,
+    ConcurrencyError,
+    CorruptHeadError,
+    GcBusy,
+    KvgitError,
+    MergeConflict,
+    StorageVersionError,
+    TagExistsError,
+    UnknownBranchError,
+    UnknownCommitError,
+    UnknownTagError,
+)
 from .merges import (
     CantMark,
     TextMergeFn,
@@ -12,39 +24,52 @@ from .merges import (
     theirs,
 )
 from .namespaced import Namespaced
-from .staged import Staged
-from .store import delete_branches, delete_tags, store
-from .versioned.kv import VersionedKV
+from .repo import Commit, RawSnapshot, Repo, Snapshot
+from .store import store
+from .versioned.kv import ROOT_COMMIT, CorruptHeadRecoverer, recover_by_commit_scan
 from .versioned.protocol import (
+    DiffResult,
     MergeChoice,
     MergePolicy,
     MergeResult,
     TagInfo,
-    Versioned,
 )
+from .worktree import Status, Worktree
 
 __all__ = [
+    "ROOT_COMMIT",
+    "BranchExistsError",
     "CantMark",
+    "Commit",
     "ConcurrencyError",
+    "CorruptHeadError",
+    "CorruptHeadRecoverer",
+    "DiffResult",
     "GcBusy",
+    "KvgitError",
     "MergeChoice",
     "MergeConflict",
     "MergeFn",
     "MergePolicy",
     "MergeResult",
     "Namespaced",
-    "Staged",
+    "RawSnapshot",
+    "Repo",
+    "Snapshot",
+    "Status",
+    "StorageVersionError",
+    "TagExistsError",
     "TagInfo",
     "TextMergeFn",
     "UnknownBranchError",
-    "Versioned",
-    "VersionedKV",
+    "UnknownCommitError",
+    "UnknownTagError",
+    "Worktree",
     "counter",
-    "delete_branches",
-    "delete_tags",
     "last_writer_wins",
     "make_text_merge",
     "ours",
+    "recover_by_commit_scan",
     "store",
     "text",
     "text_merge",

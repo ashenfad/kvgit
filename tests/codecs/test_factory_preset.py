@@ -1,4 +1,4 @@
-"""Tests for ``kvgit.store(codecs=...)`` named-preset shortcut."""
+"""Tests for the ``codec="scientific"`` preset."""
 
 from __future__ import annotations
 
@@ -22,41 +22,32 @@ class TestScientificFactory:
         assert len(dec_params) == 2
 
 
-class TestStoreCodecsArg:
+class TestScientificCodec:
     def test_scientific_preset_round_trips_array(self):
-        s = kvgit.store(codecs="scientific")
+        wt = kvgit.store(codec="scientific")
         arr = np.arange(2048, dtype="float64")
-        s["x"] = arr
-        s.commit()
-        s.reset()
-        s._cache.clear()
-        np.testing.assert_array_equal(s["x"], arr)
+        wt["x"] = arr
+        wt.commit()
+        wt.discard()
+        wt._cache.clear()
+        np.testing.assert_array_equal(wt["x"], arr)
 
     def test_scientific_preset_dedups(self):
         from kvgit.versioned.kv import CHUNK_PREFIX
 
-        s = kvgit.store(codecs="scientific")
+        wt = kvgit.store(codec="scientific")
         big = np.arange(2048, dtype="float64")
-        s["a"] = big
-        s["b"] = big
-        s.commit()
-        chunk_keys = [k for k in s.versioned.store.keys() if k.startswith(CHUNK_PREFIX)]
+        wt["a"] = big
+        wt["b"] = big
+        wt.commit()
+        chunk_keys = [k for k in wt.repo.store.keys() if k.startswith(CHUNK_PREFIX)]
         assert len(chunk_keys) == 1
 
-    def test_unknown_preset_raises(self):
-        with pytest.raises(ValueError, match="unknown codec preset 'bogus'"):
-            kvgit.store(codecs="bogus")
+    def test_unknown_codec_raises(self):
+        with pytest.raises(ValueError, match="unknown codec 'bogus'"):
+            kvgit.store(codec="bogus")
 
-    def test_codecs_with_explicit_encoder_raises(self):
-        with pytest.raises(ValueError, match="mutually exclusive"):
-            kvgit.store(codecs="scientific", encoder=lambda v: v)
-
-    def test_codecs_with_explicit_decoder_raises(self):
-        with pytest.raises(ValueError, match="mutually exclusive"):
-            kvgit.store(codecs="scientific", decoder=lambda b: b)
-
-    def test_default_factory_unaffected(self):
-        """No regression: store() without codecs= still uses pickle."""
-        s = kvgit.store()
-        assert s._encoder_chunked is False
-        assert s._decoder_chunked is False
+    def test_default_codec_is_plain_pickle(self):
+        wt = kvgit.store()
+        assert wt._codec.encoder_chunked is False
+        assert wt._codec.decoder_chunked is False
