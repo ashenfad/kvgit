@@ -83,11 +83,12 @@ import os
 import time
 import uuid
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 
 from ..encoding import dumps, loads, safe_loads
 from ..errors import (
     BranchExistsError,
+    ConcurrencyError,
     CorruptHeadError,
     GcBusy,
     StorageVersionError,
@@ -103,9 +104,20 @@ from .base import VersionedBase
 from .helpers import walk_history
 from .keyset import Keyset, KeysetEntry, MetaEntry
 from .merge import MergeResolution
-from .protocol import TagInfo
+from .protocol import MergeResult, TagInfo
 
 PARENT_COMMIT = "__parent_commit__%s"
+PARENT_GENS = "__parent_gens__%s"
+"""Each parent's generation, in the order of ``__parent_commit__``.
+
+A commit's generation is one more than its highest parent's, and 0 for
+a commit with no parents, so every commit's generation is above all of
+its ancestors'. Storing the parents' generations with the child, rather
+than each commit's own, lets a search that pops a commit learn where
+its parents fall from the one record it reads. Commits written before
+generations were stored have no such key; a search that reaches one
+falls back to walking whole histories.
+"""
 COMMIT_ROOT = "__commit_root__%s"
 COMMIT_TIME = "__commit_time__%s"
 BRANCH_HEAD = "__branch_head__%s"
@@ -1004,17 +1016,186 @@ def delete_tag(store: KVStore, name: str) -> None:
     )
 
 
-def load_parents(store: KVStore, commit_hash: str) -> tuple[str, ...]:
-    """The parent commits of a commit, in order; () for a root or unknown commit."""
-    parent_bytes = store.get(PARENT_COMMIT % commit_hash)
-    if parent_bytes is None:
-        return ()
-    raw = loads(parent_bytes)
+def _decode_parents(raw: bytes | None) -> tuple[str, ...]:
     if raw is None:
         return ()
-    if isinstance(raw, str):
-        return (raw,)
-    return tuple(raw)
+    value = loads(raw)
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return (value,)
+    return tuple(value)
+
+
+def load_parents(store: KVStore, commit_hash: str) -> tuple[str, ...]:
+    """The parent commits of a commit, in order; () for a root or unknown commit."""
+    return _decode_parents(store.get(PARENT_COMMIT % commit_hash))
+
+
+_Record = tuple[tuple[str, ...], "tuple[int, ...] | None"]
+"""A commit's parents, and their generations if the commit stores them."""
+
+
+def _load_records(store: KVStore, commits: Iterable[str]) -> dict[str, _Record]:
+    """Parents and parent generations of several commits, in one read."""
+    commits = list(dict.fromkeys(commits))
+    keys = [key % c for c in commits for key in (PARENT_COMMIT, PARENT_GENS)]
+    found = store.get_many(*keys)
+    return {
+        c: _decode_record(found.get(PARENT_COMMIT % c), found.get(PARENT_GENS % c))
+        for c in commits
+    }
+
+
+def _decode_record(parents_raw: bytes | None, gens_raw: bytes | None) -> _Record:
+    parents = _decode_parents(parents_raw)
+    gens = safe_loads(gens_raw) if gens_raw is not None else None
+    if (
+        isinstance(gens, list)
+        and len(gens) == len(parents)
+        and all(type(g) is int and g >= 0 for g in gens)
+    ):
+        return parents, tuple(gens)
+    return parents, None
+
+
+def _generation(record: _Record) -> int | None:
+    """A commit's generation from its record; None if it stores none."""
+    parents, gens = record
+    if not parents:
+        return 0
+    if gens is None:
+        return None
+    return 1 + max(gens)
+
+
+def _generations(
+    store: KVStore,
+    commits: Iterable[str],
+    known: dict[str, int] | None = None,
+) -> dict[str, int]:
+    """The generation of each commit, reading as little as it can.
+
+    A commit that stores its parents' generations costs its own record.
+    One written before generations were stored costs a walk down its
+    history to commits that do store them (or to roots), one read per
+    level of the walk. ``known`` supplies and collects generations
+    already worked out.
+    """
+    memo: dict[str, int] = known if known is not None else {}
+    commits = list(commits)
+    records: dict[str, _Record] = {}
+    frontier = [c for c in commits if c not in memo]
+    while frontier:
+        records.update(_load_records(store, frontier))
+        next_frontier: list[str] = []
+        for c in frontier:
+            g = _generation(records[c])
+            if g is not None:
+                memo[c] = g
+                continue
+            for parent in records[c][0]:
+                if parent not in memo and parent not in records:
+                    next_frontier.append(parent)
+        frontier = list(dict.fromkeys(next_frontier))
+    # What is left is history without stored generations: fill it in
+    # from the parents up, deepest first.
+    for c in commits:
+        stack = [c]
+        while stack:
+            node = stack[-1]
+            if node in memo:
+                stack.pop()
+                continue
+            parents = records[node][0]
+            missing = [p for p in parents if p not in memo]
+            if missing:
+                stack.extend(missing)
+                continue
+            memo[node] = 1 + max(memo[p] for p in parents) if parents else 0
+            stack.pop()
+    return {c: memo[c] for c in commits}
+
+
+class _NoGenerations(Exception):
+    """The search reached history written before generations were stored."""
+
+
+_FROM_A, _FROM_B, _STALE = 1, 2, 4
+_FROM_BOTH = _FROM_A | _FROM_B
+
+
+def _merge_base_by_generation(
+    store: KVStore,
+    commit_a: str,
+    commit_b: str,
+    known: dict[str, int] | None,
+) -> str | None:
+    """The lowest common ancestor, searching down from both commits at once.
+
+    Commits are visited highest generation first, every commit of one
+    generation in one batched read. A commit is visited only after
+    every descendant the search reached, so the sides it was reached
+    from are final when it is popped. Reached from both, it is a common
+    ancestor, and a lowest one unless it was reached through a common
+    ancestor already found: finding one marks everything below it
+    stale. The search stops once every commit still queued is stale;
+    for two tips that forked recently, that is a few reads whatever the
+    length of the history below.
+
+    Raises:
+        _NoGenerations: the search reached a commit that stores no
+            generations for its parents.
+    """
+    records = _load_records(store, (commit_a, commit_b))
+    gens: dict[str, int] = {}
+    for c in (commit_a, commit_b):
+        g = _generation(records[c])
+        if g is None:
+            raise _NoGenerations
+        gens[c] = g
+    if known is not None:
+        known.update(gens)
+    flags = {commit_a: _FROM_A, commit_b: _FROM_B}
+    levels: dict[int, set[str]] = {}
+    for c in (commit_a, commit_b):
+        levels.setdefault(gens[c], set()).add(c)
+    active = {commit_a, commit_b}
+    found: list[str] = []
+    while active:
+        level_gen = max(levels)
+        level = levels.pop(level_gen)
+        unread = [c for c in level if c not in records]
+        if unread:
+            records.update(_load_records(store, unread))
+        for c in sorted(level):
+            active.discard(c)
+            f = flags[c]
+            if f & _FROM_BOTH == _FROM_BOTH and not f & _STALE:
+                found.append(c)
+                f |= _STALE
+                flags[c] = f
+            parents, parent_gens = records[c]
+            if parents and parent_gens is None:
+                raise _NoGenerations
+            for parent, parent_gen in zip(parents, parent_gens or (), strict=True):
+                if parent_gen >= level_gen:
+                    raise _NoGenerations  # inconsistent data: search the slow way
+                before = flags.get(parent, 0)
+                after = before | f
+                if after == before:
+                    continue
+                flags[parent] = after
+                if parent not in gens:
+                    gens[parent] = parent_gen
+                    levels.setdefault(parent_gen, set()).add(parent)
+                if after & _STALE:
+                    active.discard(parent)
+                else:
+                    active.add(parent)
+    if known is not None:
+        known.update(gens)
+    return min(found) if found else None
 
 
 def _walk_ancestors(
@@ -1037,10 +1218,11 @@ def _walk_ancestors(
     return ancestors
 
 
-def merge_base(store: KVStore, commit_a: str, commit_b: str) -> str | None:
-    """Find the lowest common ancestor of two commits.
+def _merge_base_by_walk(store: KVStore, commit_a: str, commit_b: str) -> str | None:
+    """The lowest common ancestor, from the two commits' whole histories.
 
-    Ancestor-set intersection with non-minimal candidates dropped
+    For history written before generations were stored. Ancestor-set
+    intersection with non-minimal candidates dropped
     (a candidate that is itself an ancestor of another candidate is
     not lowest). When several commits tie for lowest — criss-cross
     histories — the smallest hash wins: deterministic, but
@@ -1084,6 +1266,29 @@ def merge_base(store: KVStore, commit_a: str, commit_b: str) -> str | None:
                 queue.append(parent)
     best = {c for c in common if not below[c]}
     return min(best) if best else None
+
+
+def merge_base(
+    store: KVStore,
+    commit_a: str,
+    commit_b: str,
+    *,
+    known: dict[str, int] | None = None,
+) -> str | None:
+    """Find the lowest common ancestor of two commits, or None.
+
+    When several commits tie for lowest — criss-cross histories — the
+    smallest hash wins: deterministic, but arbitrary, so criss-cross
+    merges resolve cleanly rather than raising. ``known`` collects the
+    generations the search works out, for a caller that writes a commit
+    over these two next.
+    """
+    if commit_a == commit_b:
+        return commit_a
+    try:
+        return _merge_base_by_generation(store, commit_a, commit_b, known)
+    except _NoGenerations:
+        return _merge_base_by_walk(store, commit_a, commit_b)
 
 
 def gc(
@@ -1314,6 +1519,7 @@ def _sweep(store: KVStore, min_age: float, *, deep: bool) -> int:
             [
                 COMMIT_ROOT % orphan_hash,
                 PARENT_COMMIT % orphan_hash,
+                PARENT_GENS % orphan_hash,
                 COMMIT_TIME % orphan_hash,
                 INFO_KEY % orphan_hash,
             ]
@@ -1429,6 +1635,11 @@ class VersionedKV(VersionedBase):
         # The lease record this handle's latest batch landed against: a
         # publish expecting it cannot land while a sweep runs.
         self._lease_seen: bytes | None = None
+        # Generations of commits this handle has written, loaded or
+        # searched through. A generation never changes once its commit
+        # exists, so nothing here goes stale.
+        self._generations: dict[str, int] = {}
+        self._entry_cache: dict[str, dict[str, KeysetEntry]] = {}
 
         # Materialize keyset + meta from the HAMT
         self._meta: dict[str, MetaEntry] = {}
@@ -1442,8 +1653,25 @@ class VersionedKV(VersionedBase):
         Redis or IndexedDB are O(log_branching N) round-trips, not
         O(N).
         """
-        root = _load_root(self.store, commit_hash)
-        if root is None:
+        # The commit's parent record rides along with its root, so the
+        # handle knows the generation its next commit builds on without
+        # another read.
+        found = self.store.get_many(
+            COMMIT_ROOT % commit_hash,
+            PARENT_COMMIT % commit_hash,
+            PARENT_GENS % commit_hash,
+        )
+        generation = _generation(
+            _decode_record(
+                found.get(PARENT_COMMIT % commit_hash),
+                found.get(PARENT_GENS % commit_hash),
+            )
+        )
+        if generation is not None and COMMIT_ROOT % commit_hash in found:
+            self._remember_generations({commit_hash: generation})
+        root_raw = found.get(COMMIT_ROOT % commit_hash)
+        root = safe_loads(root_raw) if root_raw is not None else None
+        if not isinstance(root, str):
             self._commit_keys = {}
             self._meta = {}
             return
@@ -1593,10 +1821,12 @@ class VersionedKV(VersionedBase):
         new_ks, pending = parent_ks.updated(updates=keyset_updates, removals=removals)
         diffs.update(pending)
 
+        parent_gens = self._parent_generations((self._current_commit,))
         created = time.time()
         new_hash = commit_hash((self._current_commit,), new_ks.root, created, info)
         diffs[COMMIT_ROOT % new_hash] = dumps(new_ks.root)
         diffs[PARENT_COMMIT % new_hash] = dumps([self._current_commit])
+        diffs[PARENT_GENS % new_hash] = dumps(parent_gens)
         diffs[COMMIT_TIME % new_hash] = dumps(created)
         if info is not None:
             diffs[INFO_KEY % new_hash] = dumps(info)
@@ -1613,8 +1843,23 @@ class VersionedKV(VersionedBase):
         self._commit_keys = new_commit_keys
         self._current_commit = new_hash
         self._meta = new_meta
+        self._remember_generations({new_hash: 1 + max(parent_gens)})
 
         return new_hash
+
+    _GENERATION_CACHE_LIMIT = 10_000
+
+    def _remember_generations(self, generations: dict[str, int]) -> None:
+        if len(self._generations) + len(generations) > self._GENERATION_CACHE_LIMIT:
+            self._generations.clear()
+        self._generations.update(generations)
+
+    def _parent_generations(self, parents: tuple[str, ...]) -> list[int]:
+        """The generation of each parent of a commit about to be written."""
+        missing = [p for p in parents if p not in self._generations]
+        if missing:
+            self._remember_generations(_generations(self.store, missing))
+        return [self._generations[p] for p in parents]
 
     def _stamp_blob_version(self) -> None:
         """Stamp the store v4 before this handle's first commit batch."""
@@ -1659,10 +1904,10 @@ class VersionedKV(VersionedBase):
         meta_by_blob: dict[str, MetaEntry] = {}
         meta_by_key: dict[str, MetaEntry] = {}
         for parent in dict.fromkeys((*parents, *sources)):
-            parent_root = _load_root(self.store, parent)
-            if parent_root is None:
+            entries = self._entries(parent)
+            if entries is None:
                 continue
-            for key, entry in Keyset(self.store, root=parent_root).items():
+            for key, entry in entries.items():
                 meta_by_blob.setdefault(entry.blob, entry.meta)
                 meta_by_key.setdefault(key, entry.meta)
 
@@ -1704,10 +1949,12 @@ class VersionedKV(VersionedBase):
         )
         diffs.update(pending)
 
+        parent_gens = self._parent_generations(parents)
         created = time.time()
         merge_hash = commit_hash(parents, new_ks.root, created, info)
         diffs[COMMIT_ROOT % merge_hash] = dumps(new_ks.root)
         diffs[PARENT_COMMIT % merge_hash] = dumps(list(parents))
+        diffs[PARENT_GENS % merge_hash] = dumps(parent_gens)
         diffs[COMMIT_TIME % merge_hash] = dumps(created)
         if info is not None:
             diffs[INFO_KEY % merge_hash] = dumps(info)
@@ -1719,6 +1966,7 @@ class VersionedKV(VersionedBase):
         self._commit_keys = merged_keyset
         self._current_commit = merge_hash
         self._meta = merged_meta
+        self._remember_generations({merge_hash: 1 + max(parent_gens)})
 
         return merge_hash
 
@@ -1775,16 +2023,96 @@ class VersionedKV(VersionedBase):
         self._in_flight = {}
         return True
 
+    _ENTRY_CACHE_SIZE = 4
+
+    def _entries(self, commit_hash: str) -> dict[str, KeysetEntry] | None:
+        """A commit's whole keyset, or None if its root is missing.
+
+        Read with one batched fetch per HAMT level, and kept for the few
+        commits a merge touches — it reads each side's keyset to resolve,
+        then again for entry metadata. The current commit's comes from
+        memory. A keyset never changes once its commit exists.
+        """
+        if commit_hash == self._current_commit:
+            return {
+                key: KeysetEntry(blob=blob, meta=self._meta[key])
+                for key, blob in self._commit_keys.items()
+            }
+        cached = self._entry_cache.get(commit_hash)
+        if cached is not None:
+            return cached
+        root = _load_root(self.store, commit_hash)
+        if root is None:
+            return None
+        entries = Keyset(self.store, root=root).materialize()
+        if len(self._entry_cache) >= self._ENTRY_CACHE_SIZE:
+            self._entry_cache.pop(next(iter(self._entry_cache)))
+        self._entry_cache[commit_hash] = entries
+        return entries
+
+    def _forget_merge_inputs(self) -> None:
+        self._entry_cache.clear()
+
+    def _fast_forward(self, their_head: str, *, on_conflict: str) -> MergeResult:
+        """Move HEAD from our head to ``their_head``, a descendant of it.
+
+        The existence check and the write are decided against one lease
+        record, as in :meth:`reset_to`, so a sweep cannot take the commit
+        between them. The write expects HEAD to hold our head: a branch
+        that moved meanwhile fails it like a merge commit's publish would,
+        and a deleted one is not recreated.
+        """
+        our_head = self._current_commit
+        branch_key = BRANCH_HEAD % self._branch
+        expected = dumps(our_head)
+        writes = {
+            branch_key: dumps(their_head),
+            BRANCH_HEAD_PREV % self._branch: expected,
+        }
+        while True:
+            lease = _wait_for_gc(self.store)
+            if self.store.get(COMMIT_ROOT % their_head) is None:
+                raise UnknownCommitError(f"Commit '{their_head}' does not exist")
+            landed = _try_land(self.store, lease, {branch_key: expected}, writes)
+            if landed is None:
+                continue
+            if landed:
+                break
+            if self.store.get(branch_key) is None:
+                raise UnknownBranchError(f"Branch '{self._branch}' does not exist")
+            if _heal_head(self.store, self._branch, expected):
+                continue
+            if on_conflict == "abandon":
+                result = MergeResult(
+                    merged=False,
+                    commit=None,
+                    strategy="fast_forward",
+                    auto_merged_keys=(),
+                    carried_keys=(),
+                )
+                self.last_merge_result = result
+                return result
+            raise ConcurrencyError("HEAD changed during merge. Refresh and retry.")
+        self._load_commit(their_head, update_base=True)
+        result = MergeResult(
+            merged=True,
+            commit=their_head,
+            strategy="fast_forward",
+            auto_merged_keys=(),
+            carried_keys=tuple(self._commit_keys),
+        )
+        self.last_merge_result = result
+        return result
+
     def _load_keyset(self, commit_hash: str) -> dict[str, str]:
         """Load just the keyset for a commit (key -> versioned_key mapping).
 
         Used by the merge layer; returns a flat dict, dropping meta.
         """
-        root = _load_root(self.store, commit_hash)
-        if root is None:
+        entries = self._entries(commit_hash)
+        if entries is None:
             return {}
-        ks = Keyset(self.store, root=root)
-        return {key: entry.blob for key, entry in ks.items()}
+        return {key: entry.blob for key, entry in entries.items()}
 
     def _load_parents(self, commit_hash: str) -> tuple[str, ...]:
         """Load the parent tuple for a commit."""
@@ -1792,7 +2120,10 @@ class VersionedKV(VersionedBase):
 
     def _find_lca(self, commit_a: str, commit_b: str) -> str | None:
         """Lowest common ancestor of two commits; see :func:`merge_base`."""
-        return merge_base(self.store, commit_a, commit_b)
+        found: dict[str, int] = {}
+        base = merge_base(self.store, commit_a, commit_b, known=found)
+        self._remember_generations(found)
+        return base
 
     def _read_blob(self, content_id: str) -> bytes | None:
         """Read a blob by its versioned key."""

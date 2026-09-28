@@ -2,6 +2,7 @@
 
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
+from typing import Any
 
 from ..errors import ConcurrencyError, MergeConflict, UnknownBranchError
 from .helpers import diff_keysets, walk_history
@@ -265,7 +266,19 @@ class VersionedBase(ABC):
             saved_state=saved,
         )
 
-    def _three_way_merge(
+    def _three_way_merge(self, their_head: str, **options: Any) -> MergeResult:
+        """See :meth:`_three_way_merge_inputs`; releases what the merge
+        read once it is decided, however it ends."""
+        try:
+            return self._three_way_merge_inputs(their_head, **options)
+        finally:
+            self._forget_merge_inputs()
+
+    @abstractmethod
+    def _forget_merge_inputs(self) -> None:
+        """Drop whatever a merge kept of the commits it read."""
+
+    def _three_way_merge_inputs(
         self,
         their_head: str,
         *,
@@ -280,6 +293,7 @@ class VersionedBase(ABC):
         parents: tuple[str, ...] | None = None,
         base: str | None = None,
         strategy: str = "three_way",
+        ancestor: tuple[str | None] | None = None,
     ) -> MergeResult:
         """Perform a three-way merge between our branch and their HEAD.
 
@@ -294,12 +308,17 @@ class VersionedBase(ABC):
         ``their_head`` lands on ours as an ordinary commit (``parents``
         of one), under ``strategy``. A change that leaves our state as it
         is commits nothing.
+
+        ``ancestor`` passes in a common ancestor the caller has already
+        found, as a one-tuple, so that None (no common ancestor) can be
+        passed too.
         """
-        lca = (
-            base
-            if base is not None
-            else self._find_lca(self._current_commit, their_head)
-        )
+        if base is not None:
+            lca: str | None = base
+        elif ancestor is not None:
+            (lca,) = ancestor
+        else:
+            lca = self._find_lca(self._current_commit, their_head)
         if lca is None:
             if saved_state is not None:
                 self._restore_state(saved_state)
@@ -449,6 +468,7 @@ class VersionedBase(ABC):
         default_merge: MergePolicy | None = None,
         post_check: PostCheck | None = None,
         info: dict | None = None,
+        fast_forward: bool = True,
     ) -> MergeResult:
         """Merge another head into this branch.
 
@@ -460,6 +480,12 @@ class VersionedBase(ABC):
         ``ConcurrencyError`` likewise without changing anything; retrying
         cannot help that case, unlike a race.
 
+        A head our history already contains merges as a no-op. When ours
+        is an ancestor of theirs, the branch fast-forwards — HEAD moves
+        to ``their_head`` and no commit is written, so ``info`` is not
+        recorded — unless ``fast_forward=False``, which writes the merge
+        commit anyway.
+
         ``post_check`` runs over each merge-function-produced value;
         a False files that key as conflicted (handled per
         ``on_conflict`` like any other conflict).
@@ -469,6 +495,19 @@ class VersionedBase(ABC):
                 f"on_conflict must be 'raise' or 'abandon', got {on_conflict!r}"
             )
         our_head = self._current_commit
+        lca = self._find_lca(our_head, their_head)
+        if lca == their_head:
+            result = MergeResult(
+                merged=True,
+                commit=our_head,
+                strategy="no_op",
+                auto_merged_keys=(),
+                carried_keys=(),
+            )
+            self.last_merge_result = result
+            return result
+        if lca == our_head and fast_forward:
+            return self._fast_forward(their_head, on_conflict=on_conflict)
         return self._three_way_merge(
             their_head,
             on_conflict=on_conflict,
@@ -480,6 +519,7 @@ class VersionedBase(ABC):
             saved_state=self._snapshot_state(),
             cas_from=our_head,
             parents=(our_head, their_head),
+            ancestor=(lca,),
         )
 
     def apply_change(
@@ -525,6 +565,11 @@ class VersionedBase(ABC):
         )
 
     # -- Abstract methods (implemented by subclasses) --
+
+    @abstractmethod
+    def _fast_forward(self, their_head: str, *, on_conflict: str) -> MergeResult:
+        """Move this branch's HEAD from our head to ``their_head``, a
+        descendant of it, writing no commit."""
 
     @property
     @abstractmethod

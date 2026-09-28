@@ -17,6 +17,7 @@ from kvgit import (
     UnknownCommitError,
     text_merge,
 )
+from kvgit.encoding import dumps
 from kvgit.kv.memory import Memory
 from kvgit.versioned.kv import BRANCH_HEAD, BRANCH_HEAD_PREV, ROOT_COMMIT
 
@@ -365,6 +366,75 @@ class TestMerge:
     def test_abandon_returns_a_falsy_result(self):
         wt, _ = self._diverged()
         assert not wt.merge(branch="dev", on_conflict="abandon")
+
+
+class TestFastForward:
+    def _ahead(self):
+        """``dev`` two commits ahead of ``main``, which has not moved."""
+        wt = worktree()
+        wt["a"] = 1
+        wt.commit()
+        dev = fork(wt, "dev")
+        dev["b"] = 2
+        dev.commit()
+        dev["c"] = 3
+        dev.commit()
+        return wt, dev
+
+    def test_a_branch_that_has_not_moved_fast_forwards(self):
+        wt, dev = self._ahead()
+        before = wt.head
+        commits_before = set(wt.repo.store.keys("__commit_root__"))
+        result = wt.merge(branch="dev", info={"msg": "unused"})
+        assert result.merged
+        assert result.strategy == "fast_forward"
+        assert result.commit == dev.head == wt.head == wt.repo.head("main")
+        assert (wt["b"], wt["c"]) == (2, 3)
+        assert set(wt.repo.store.keys("__commit_root__")) == commits_before
+        assert wt.repo.store.get(BRANCH_HEAD_PREV % "main") == dumps(before)
+
+    def test_fast_forward_false_writes_a_merge_commit(self):
+        wt, dev = self._ahead()
+        before = wt.head
+        result = wt.merge(branch="dev", fast_forward=False, info={"msg": "m"})
+        assert result.strategy == "three_way"
+        commit = wt.repo.get_commit(wt.head)
+        assert commit.parents == (before, dev.head)
+        assert commit.info == {"msg": "m"}
+        assert (wt["b"], wt["c"]) == (2, 3)
+
+    def test_merging_what_the_branch_already_contains_is_a_no_op(self):
+        _, dev = self._ahead()
+        dev.merge(branch="main")  # main's head is dev's ancestor
+        head = dev.head
+        result = dev.merge(branch="main")
+        assert result.merged and result.strategy == "no_op"
+        assert dev.head == head == dev.repo.head("dev")
+        assert dev.merge(commit=head).strategy == "no_op"
+
+    def test_a_branch_that_moved_meanwhile_is_not_fast_forwarded(self):
+        wt, _ = self._ahead()
+        other = wt.repo.worktree("main")
+        other["x"] = 1
+        other.commit()
+        with pytest.raises(ConcurrencyError):
+            wt.merge(branch="dev")
+        assert not wt.merge(branch="dev", on_conflict="abandon")
+        assert wt.repo.head("main") == other.head
+
+    def test_fast_forwarding_a_deleted_branch_raises_and_does_not_recreate_it(self):
+        wt, _ = self._ahead()
+        wt.repo.delete_branch("main")
+        with pytest.raises(UnknownBranchError):
+            wt.merge(branch="dev")
+        assert not wt.repo.has_branch("main")
+
+    def test_a_fast_forwarded_worktree_commits_on_top(self):
+        wt, dev = self._ahead()
+        wt.merge(branch="dev")
+        wt["d"] = 4
+        wt.commit()
+        assert wt.repo.get_commit(wt.head).parents == (dev.head,)
 
 
 class TestApply:
