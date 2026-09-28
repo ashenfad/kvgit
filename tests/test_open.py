@@ -1,17 +1,18 @@
-"""Tests for the kvgit.store() one-liner."""
+"""Tests for the kvgit.open() one-liner."""
 
 import os
 import tempfile
 
 import pytest
 
-from kvgit import Repo, Worktree, store
+import kvgit
+from kvgit import Repo, Worktree
 from kvgit.kv.memory import Memory
 
 
-class TestStoreFactory:
+class TestOpen:
     def test_default_returns_a_worktree_on_main(self):
-        wt = store()
+        wt = kvgit.open()
         assert isinstance(wt, Worktree)
         assert isinstance(wt.repo, Repo)
         assert isinstance(wt.repo.store, Memory)
@@ -19,32 +20,32 @@ class TestStoreFactory:
 
     def test_invalid_kind(self):
         with pytest.raises(ValueError, match="Unknown kind"):
-            store(kind="redis")  # type: ignore[arg-type]
+            kvgit.open("redis")  # type: ignore[arg-type]
 
     def test_disk_requires_path(self):
         with pytest.raises(ValueError, match="path is required"):
-            store(kind="disk")
+            kvgit.open("disk")
 
     def test_branch_parameter_creates_the_branch(self):
-        wt = store(branch="dev")
+        wt = kvgit.open(branch="dev")
         assert wt.branch == "dev"
         assert wt.repo.branches() == ["dev"]
 
     def test_opening_an_existing_branch_does_not_recreate_it(self):
         with tempfile.TemporaryDirectory() as path:
-            first = store(kind="disk", path=path)
+            first = kvgit.open("disk", path=path)
             first["k"] = "v"
             first.commit()
             head = first.head
             first.repo.close()
 
-            again = store(kind="disk", path=path)
+            again = kvgit.open("disk", path=path)
             assert again.head == head
             assert again["k"] == "v"
             again.repo.close()
 
     def test_codec_is_passed_to_the_repo(self):
-        wt = store(codec="bytes")
+        wt = kvgit.open(codec="bytes")
         wt["k"] = b"raw"
         wt.commit()
         assert wt.repo.snapshot(branch="main").raw["k"] == b"raw"
@@ -53,22 +54,22 @@ class TestStoreFactory:
             wt.commit()
 
 
-class TestStoreFactoryRoundTrip:
+class TestOpenRoundTrip:
     def test_set_commit_get(self):
-        wt = store()
+        wt = kvgit.open()
         wt["greeting"] = "hello"
         result = wt.commit()
         assert result.merged
         assert wt.get("greeting") == "hello"
 
     def test_mutable_mapping(self):
-        wt = store()
+        wt = kvgit.open()
         wt["k"] = {"hello": "world"}
         wt.commit()
         assert wt["k"] == {"hello": "world"}
 
 
-class TestDiskFactory:
+class TestOpenDisk:
     """Round trips against the disk-backed factory.
 
     A regression once passed size_limit=0 to the diskcache backend, which
@@ -76,10 +77,10 @@ class TestDiskFactory:
     evicted immediately and the store appeared empty after commit.
     """
 
-    def test_disk_factory_round_trip_within_session(self):
+    def test_disk_round_trip_within_session(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "store")
-            wt = store(kind="disk", path=p)
+            wt = kvgit.open("disk", path=p)
             wt["greeting"] = "hello"
             wt["count"] = 42
             assert wt.commit().merged
@@ -87,22 +88,22 @@ class TestDiskFactory:
             assert wt.get("count") == 42
             wt.repo.close()
 
-    def test_disk_factory_persists_across_reopens(self):
+    def test_disk_persists_across_reopens(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "store")
-            first = store(kind="disk", path=p)
+            first = kvgit.open("disk", path=p)
             first["greeting"] = "hello"
             first.commit()
             first.repo.close()
 
-            again = store(kind="disk", path=p)
+            again = kvgit.open("disk", path=p)
             assert again.get("greeting") == "hello"
             again.repo.close()
 
-    def test_disk_factory_branches_persist(self):
+    def test_disk_branches_persist(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "store")
-            first = store(kind="disk", path=p)
+            first = kvgit.open("disk", path=p)
             first["base"] = "ok"
             first.commit()
             first.repo.create_branch("worker", at=first.head)
@@ -111,7 +112,7 @@ class TestDiskFactory:
             worker.commit()
             first.repo.close()
 
-            again = store(kind="disk", path=p, branch="worker")
+            again = kvgit.open("disk", path=p, branch="worker")
             assert again.get("base") == "ok"
             assert again.get("work") == "done"
             again.repo.close()

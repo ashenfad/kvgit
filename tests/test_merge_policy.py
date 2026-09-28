@@ -746,7 +746,7 @@ class TestReadmeExamples:
         import kvgit
         from kvgit import text_merge
 
-        main = kvgit.store()
+        main = kvgit.open()
         main["notes"] = "alpha\nbeta\n"
         main.commit()
 
@@ -764,7 +764,7 @@ class TestReadmeExamples:
         import kvgit
         from kvgit import MergeChoice, text_merge
 
-        main = kvgit.store()
+        main = kvgit.open()
         main.set_merge_prefix("runs/", MergeChoice.OURS)
         main.set_merge_fn("runs/index", text_merge())
 

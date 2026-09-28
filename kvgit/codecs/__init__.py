@@ -7,11 +7,11 @@ branches.
 
 Quick start::
 
-    from kvgit import store
+    import kvgit
     from kvgit.codecs import compose
     from kvgit.codecs.numpy import NumpyCodec
 
-    wt = store(codec=compose(NumpyCodec()))   # or codec="scientific"
+    wt = kvgit.open(codec=compose(NumpyCodec()))   # or codec="scientific"
 
 A composed pair is an ordinary ``(encoder, decoder)`` codec whose
 functions take a ``ChunkSink`` / ``ChunkReader`` second argument; a

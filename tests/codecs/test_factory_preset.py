@@ -24,7 +24,7 @@ class TestScientificFactory:
 
 class TestScientificCodec:
     def test_scientific_preset_round_trips_array(self):
-        wt = kvgit.store(codec="scientific")
+        wt = kvgit.open(codec="scientific")
         arr = np.arange(2048, dtype="float64")
         wt["x"] = arr
         wt.commit()
@@ -35,7 +35,7 @@ class TestScientificCodec:
     def test_scientific_preset_dedups(self):
         from kvgit.versioned.kv import CHUNK_PREFIX
 
-        wt = kvgit.store(codec="scientific")
+        wt = kvgit.open(codec="scientific")
         big = np.arange(2048, dtype="float64")
         wt["a"] = big
         wt["b"] = big
@@ -45,9 +45,9 @@ class TestScientificCodec:
 
     def test_unknown_codec_raises(self):
         with pytest.raises(ValueError, match="unknown codec 'bogus'"):
-            kvgit.store(codec="bogus")
+            kvgit.open(codec="bogus")
 
     def test_default_codec_is_plain_pickle(self):
-        wt = kvgit.store()
+        wt = kvgit.open()
         assert wt._codec.encoder_chunked is False
         assert wt._codec.decoder_chunked is False

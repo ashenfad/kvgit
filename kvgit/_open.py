@@ -1,4 +1,4 @@
-"""One-line entry point: a worktree on a fresh or existing store."""
+"""One-line entry point: open a store, and a worktree on one of its branches."""
 
 from typing import Literal
 
@@ -32,7 +32,7 @@ def _make_backend(
         raise ValueError(f"Unknown kind: {kind!r}")
 
 
-def store(
+def open(
     kind: Literal["memory", "disk", "indexeddb"] = "memory",
     *,
     path: str | None = None,
@@ -40,9 +40,12 @@ def store(
     branch: str = "main",
     codec: CodecSpec = "pickle",
 ) -> Worktree:
-    """A worktree on ``branch``, creating the branch if it is new.
+    """Open (or create) a store, and a worktree on ``branch`` of it.
 
-    Sugar for ``Repo(backend, codec=codec).worktree(branch, create=True)``
+    Like ``shelve.open``, it creates what is missing: the branch is
+    created if it is new, unlike :meth:`Repo.worktree`, which asks for
+    ``create=True``. Sugar for
+    ``Repo(backend, codec=codec).worktree(branch, create=True)``
     over the backend ``kind`` names; ``wt.repo`` is the repository, and
     ``wt.repo.close()`` releases the backend. Build a :class:`Repo` for
     anything more — another backend, merge rules, several branches.

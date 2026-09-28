@@ -6,6 +6,7 @@ import tempfile
 import pytest
 from support import fork, worktree
 
+import kvgit
 from kvgit import (
     BranchExistsError,
     Commit,
@@ -19,7 +20,6 @@ from kvgit import (
     UnknownBranchError,
     UnknownCommitError,
     UnknownTagError,
-    store,
 )
 from kvgit.encoding import dumps
 from kvgit.kv.disk import Disk
@@ -368,8 +368,8 @@ class TestGc:
             repo.gc(wait=False)
 
 
-def test_store_sugar_returns_a_worktree_of_a_repo():
-    wt = store()
+def test_open_returns_a_worktree_of_a_repo():
+    wt = kvgit.open()
     assert isinstance(wt.repo, Repo)
     other = fork(wt, "other")
     assert other.repo is wt.repo

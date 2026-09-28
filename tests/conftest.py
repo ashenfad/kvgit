@@ -27,11 +27,11 @@ def pytest_configure(config):
 # database (default: dbname=kvgit_test); it is dropped and recreated.
 if os.environ.get("KVGIT_TEST_BACKEND") == "postgres":
     import itertools
-    import sys
 
     import psycopg
     from psycopg_pool import ConnectionPool
 
+    import kvgit._open
     import kvgit.kv
     import kvgit.kv.memory
     import kvgit.versioned.kv
@@ -52,9 +52,7 @@ if os.environ.get("KVGIT_TEST_BACKEND") == "postgres":
         def __init__(self) -> None:
             super().__init__(pool=_pool, table=f"t{next(_ids)}")
 
-    # ``kvgit.store`` names the factory function, which shadows its module.
-    _store_module = sys.modules["kvgit.store"]
-    for _mod in (kvgit.kv, kvgit.kv.memory, _store_module, kvgit.versioned.kv):
+    for _mod in (kvgit.kv, kvgit.kv.memory, kvgit._open, kvgit.versioned.kv):
         _mod.Memory = _PostgresAsMemory
 
     def pytest_unconfigure(config):

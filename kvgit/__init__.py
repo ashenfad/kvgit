@@ -1,5 +1,6 @@
 """kvgit: versioned key-value store."""
 
+from ._open import open
 from .content_types import MergeFn, counter, last_writer_wins, text_merge
 from .errors import (
     BranchExistsError,
@@ -25,7 +26,6 @@ from .merges import (
 )
 from .namespaced import Namespaced
 from .repo import Commit, RawSnapshot, Repo, Snapshot
-from .store import store
 from .versioned.kv import ROOT_COMMIT, CorruptHeadRecoverer, recover_by_commit_scan
 from .versioned.protocol import (
     DiffResult,
@@ -68,9 +68,9 @@ __all__ = [
     "counter",
     "last_writer_wins",
     "make_text_merge",
+    "open",
     "ours",
     "recover_by_commit_scan",
-    "store",
     "text",
     "text_merge",
     "text_merge_result",

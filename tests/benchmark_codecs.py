@@ -182,9 +182,9 @@ def run_workload(name: str, build_data: Callable[[], dict]) -> None:
     print(f"workload keys:           {list(data.keys())}")
     print(f"in-memory footprint:     {fmt_bytes(int(in_mem))}")
 
-    plain = measure("plain pickle", data, lambda: kvgit.store())
+    plain = measure("plain pickle", data, lambda: kvgit.open())
     chunked = measure(
-        "chunked (scientific)", data, lambda: kvgit.store(codec="scientific")
+        "chunked (scientific)", data, lambda: kvgit.open(codec="scientific")
     )
 
     header = f"{'codec':<22}{'on-disk':>14}{'encode':>14}{'decode':>14}{'chunks':>10}"
