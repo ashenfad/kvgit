@@ -17,7 +17,7 @@ import base64
 import hashlib
 import json
 from collections.abc import Iterable, Iterator, Mapping
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 from .kv.base import KVStore
 
@@ -51,7 +51,7 @@ def _decode_value(s: str) -> bytes:
 # is represented by this hash; the node itself is never written to the
 # store. Reads short-circuit on EMPTY_HASH; writes materialize a fresh
 # leaf when needed.
-_EMPTY_LEAF = {"items": {}, "kind": "leaf"}
+_EMPTY_LEAF: dict[str, Any] = {"items": {}, "kind": "leaf"}
 _EMPTY_LEAF_BYTES = _node_bytes(_EMPTY_LEAF)
 EMPTY_HASH: str = _hash_bytes(_EMPTY_LEAF_BYTES)
 
@@ -598,75 +598,124 @@ class Hamt:
         Cost is O(changes + log N), not O(N), because identical
         subtrees (same node hash) are skipped wholesale. This is the
         primary payoff of structural sharing.
+
+        Both trees are walked level by level, with one batched fetch per
+        level, so the round trips are the depth of the trees rather than
+        the number of nodes that differ. Where one tree has a leaf and
+        the other a branch, the leaf's entries are split among the
+        branch's children by key hash and compared further down.
         """
         added: dict[str, bytes] = {}
         removed: dict[str, bytes] = {}
         modified: dict[str, tuple[bytes, bytes]] = {}
-        self._diff_walk(self.root, other.root, other, added, removed, modified)
+        # A side is a node hash, or the encoded entries of a leaf that
+        # was split to line up with the other side's branch.
+        level: list[tuple[str | dict[str, str], str | dict[str, str], int]] = (
+            [(self.root, other.root, 0)] if self.root != other.root else []
+        )
+        while level:
+            nodes = self._load_level(
+                [a for a, _, _ in level if isinstance(a, str)],
+                other,
+                [b for _, b, _ in level if isinstance(b, str)],
+            )
+            next_level: list[
+                tuple[str | dict[str, str], str | dict[str, str], int]
+            ] = []
+            for a, b, depth in level:
+                if isinstance(a, str) and isinstance(b, str) and a == b:
+                    continue  # identical subtrees — skip entirely
+                a_node = nodes[0].get(a) if isinstance(a, str) else _as_leaf(a)
+                b_node = nodes[1].get(b) if isinstance(b, str) else _as_leaf(b)
+                # A missing node reads as empty: its side's entries under
+                # it are unknown, and the other side's show as added or
+                # removed.
+                a_node = a_node or _EMPTY_LEAF
+                b_node = b_node or _EMPTY_LEAF
+                a_branch = a_node["kind"] == "branch"
+                b_branch = b_node["kind"] == "branch"
+                if not a_branch and not b_branch:
+                    _diff_items(
+                        a_node["items"], b_node["items"], added, removed, modified
+                    )
+                    continue
+                a_children = (
+                    a_node["children"]
+                    if a_branch
+                    else _split_items(a_node["items"], depth)
+                )
+                b_children = (
+                    b_node["children"]
+                    if b_branch
+                    else _split_items(b_node["items"], depth)
+                )
+                for chunk in a_children.keys() | b_children.keys():
+                    a_child = a_children.get(chunk, EMPTY_HASH)
+                    b_child = b_children.get(chunk, EMPTY_HASH)
+                    if a_child != b_child:  # identical subtrees are never read
+                        next_level.append((a_child, b_child, depth + 1))
+            level = next_level
         return HamtDiff(added=added, removed=removed, modified=modified)
 
-    def _diff_walk(
-        self,
-        a_hash: str,
-        b_hash: str,
-        other: "Hamt",
-        added: dict[str, bytes],
-        removed: dict[str, bytes],
-        modified: dict[str, tuple[bytes, bytes]],
-    ) -> None:
-        if a_hash == b_hash:
-            return  # identical subtrees — skip entirely
+    def _load_level(
+        self, ours: list[str], other: "Hamt", theirs: list[str]
+    ) -> tuple[dict[str, dict | None], dict[str, dict | None]]:
+        """Load one level of nodes from each tree, in as few reads as the
+        two trees' stores allow."""
+        shared = other.store is self.store and other.prefix == self.prefix
+        wanted: dict[str, None] = {}
+        for tree, hashes in ((self, ours), (other, theirs)):
+            for h in hashes:
+                key = tree.prefix + h
+                if h != EMPTY_HASH and key not in tree.pending:
+                    wanted[key] = None
+        fetched: dict[str, Mapping[str, bytes]] = {}
+        if shared:
+            got = self.store.get_many(list(wanted)) if wanted else {}
+            fetched = {"self": got, "other": got}
+        else:
+            for name, tree in (("self", self), ("other", other)):
+                keys = [k for k in wanted if k.startswith(tree.prefix)]
+                fetched[name] = tree.store.get_many(keys) if keys else {}
 
-        if a_hash == EMPTY_HASH:
-            for k, v in other._items_from(b_hash):
-                added[k] = v
-            return
-        if b_hash == EMPTY_HASH:
-            for k, v in self._items_from(a_hash):
-                removed[k] = v
-            return
+        def decode(tree: "Hamt", got: Mapping[str, bytes], h: str) -> dict | None:
+            if h == EMPTY_HASH:
+                return _EMPTY_LEAF
+            key = tree.prefix + h
+            raw = tree.pending.get(key) or got.get(key)
+            return json.loads(raw) if raw is not None else None
 
-        a_node = self._load(a_hash)
-        b_node = other._load(b_hash)
-        if a_node is None or b_node is None:
-            # Missing node — fall back to full walk for whichever side is intact.
-            if a_node is not None:
-                for k, v in self._items_from(a_hash):
-                    removed[k] = v
-            if b_node is not None:
-                for k, v in other._items_from(b_hash):
-                    added[k] = v
-            return
+        return (
+            {h: decode(self, fetched["self"], h) for h in ours},
+            {h: decode(other, fetched["other"], h) for h in theirs},
+        )
 
-        if a_node["kind"] == "leaf" and b_node["kind"] == "leaf":
-            a_items = {k: _decode_value(v) for k, v in a_node["items"].items()}
-            b_items = {k: _decode_value(v) for k, v in b_node["items"].items()}
-            for k, v in a_items.items():
-                if k not in b_items:
-                    removed[k] = v
-                elif b_items[k] != v:
-                    modified[k] = (v, b_items[k])
-            for k, v in b_items.items():
-                if k not in a_items:
-                    added[k] = v
-            return
 
-        if a_node["kind"] == "branch" and b_node["kind"] == "branch":
-            chunks = set(a_node["children"]) | set(b_node["children"])
-            for chunk in chunks:
-                a_child = a_node["children"].get(chunk, EMPTY_HASH)
-                b_child = b_node["children"].get(chunk, EMPTY_HASH)
-                self._diff_walk(a_child, b_child, other, added, removed, modified)
-            return
+def _as_leaf(items: dict[str, str]) -> dict:
+    return {"items": items, "kind": "leaf"}
 
-        # Mixed kinds (one leaf, one branch). Walk both fully and reconcile.
-        a_items = dict(self._items_from(a_hash))
-        b_items = dict(other._items_from(b_hash))
-        for k, v in a_items.items():
-            if k not in b_items:
-                removed[k] = v
-            elif b_items[k] != v:
-                modified[k] = (v, b_items[k])
-        for k, v in b_items.items():
-            if k not in a_items:
-                added[k] = v
+
+def _split_items(items: Mapping[str, str], depth: int) -> dict[str, dict[str, str]]:
+    """A leaf's encoded entries, grouped as a branch at ``depth`` would
+    hold them."""
+    groups: dict[str, dict[str, str]] = {}
+    for k, v in items.items():
+        groups.setdefault(_key_hash(k)[depth], {})[k] = v
+    return groups
+
+
+def _diff_items(
+    a: Mapping[str, str],
+    b: Mapping[str, str],
+    added: dict[str, bytes],
+    removed: dict[str, bytes],
+    modified: dict[str, tuple[bytes, bytes]],
+) -> None:
+    for k, v in a.items():
+        if k not in b:
+            removed[k] = _decode_value(v)
+        elif b[k] != v:
+            modified[k] = (_decode_value(v), _decode_value(b[k]))
+    for k, v in b.items():
+        if k not in a:
+            added[k] = _decode_value(v)

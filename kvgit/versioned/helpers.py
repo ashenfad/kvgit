@@ -1,35 +1,23 @@
 """Shared diff and history helpers."""
 
+from __future__ import annotations
+
 from collections import deque
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
+from typing import TYPE_CHECKING
 
 from .protocol import DiffResult
 
+if TYPE_CHECKING:
+    from .merge import Change
 
-def diff_keysets(
-    keyset_a: dict[str, str],
-    keyset_b: dict[str, str],
-) -> DiffResult:
-    """Compute key-level differences between two keysets.
 
-    Each keyset maps user-facing key names to opaque content identifiers
-    (versioned keys in KV, blob hex-SHAs in GP).  Two keys are considered
-    "modified" when present in both keysets but mapped to different
-    identifiers.
-    """
-    keys_a = set(keyset_a.keys())
-    keys_b = set(keyset_b.keys())
-
-    added = keys_b - keys_a
-    removed = keys_a - keys_b
-    common = keys_a & keys_b
-    modified = frozenset(k for k in common if keyset_a[k] != keyset_b[k])
-
-    return DiffResult(
-        added=frozenset(added),
-        removed=frozenset(removed),
-        modified=modified,
-    )
+def changes_as_diff(changes: Mapping[str, Change]) -> DiffResult:
+    """Group per-key changes into keys added, removed and modified."""
+    added = frozenset(k for k, c in changes.items() if c.old is None)
+    removed = frozenset(k for k, c in changes.items() if c.new is None)
+    modified = frozenset(changes.keys() - added - removed)
+    return DiffResult(added=added, removed=removed, modified=modified)
 
 
 def walk_history(

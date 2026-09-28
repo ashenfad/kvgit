@@ -103,7 +103,7 @@ from ..kv.memory import Memory
 from .base import VersionedBase
 from .helpers import walk_history
 from .keyset import Keyset, KeysetEntry, MetaEntry
-from .merge import MergeResolution
+from .merge import Change, MergeResolution
 from .protocol import MergeResult, TagInfo
 
 PARENT_COMMIT = "__parent_commit__%s"
@@ -1016,6 +1016,38 @@ def delete_tag(store: KVStore, name: str) -> None:
     )
 
 
+def commit_changes(
+    store: KVStore, commit_a: str | None, commit_b: str
+) -> dict[str, Change]:
+    """Each key whose value differs from commit ``a`` to commit ``b``.
+
+    A structural diff of the two keysets: subtrees the commits share are
+    skipped by hash, one batched read per tree level, so the cost follows
+    the size of the change rather than of the keysets. A key whose entry
+    differs only in metadata, with the same blob, is not a change. A
+    ``None`` or missing ``a`` reads as empty.
+    """
+    wanted = [COMMIT_ROOT % c for c in (commit_a, commit_b) if c is not None]
+    found = store.get_many(*wanted)
+
+    def root_of(commit: str | None) -> str:
+        if commit is None:
+            return EMPTY_HASH
+        raw = found.get(COMMIT_ROOT % commit)
+        root = safe_loads(raw) if raw is not None else None
+        return root if isinstance(root, str) else EMPTY_HASH
+
+    diff = Keyset(store, root=root_of(commit_a)).diff(
+        Keyset(store, root=root_of(commit_b))
+    )
+    changes = {key: Change(None, entry) for key, entry in diff.added.items()}
+    changes.update({key: Change(entry, None) for key, entry in diff.removed.items()})
+    for key, (old, new) in diff.modified.items():
+        if old.blob != new.blob:
+            changes[key] = Change(old, new)
+    return changes
+
+
 def _decode_parents(raw: bytes | None) -> tuple[str, ...]:
     if raw is None:
         return ()
@@ -1639,7 +1671,6 @@ class VersionedKV(VersionedBase):
         # searched through. A generation never changes once its commit
         # exists, so nothing here goes stale.
         self._generations: dict[str, int] = {}
-        self._entry_cache: dict[str, dict[str, KeysetEntry]] = {}
 
         # Materialize keyset + meta from the HAMT
         self._meta: dict[str, MetaEntry] = {}
@@ -1872,82 +1903,37 @@ class VersionedKV(VersionedBase):
         resolution: MergeResolution,
         parents: tuple[str, ...],
         info: dict | None,
-        sources: tuple[str, ...] = (),
     ) -> str:
-        """Create a commit from a resolved three-way merge.
+        """Create a commit from a resolved merge: our state with the
+        resolution's changes applied.
 
-        Entry metadata is taken from the commits the merged pointers came
-        from: the ``parents``, plus any ``sources`` that are not parents —
-        the target of an applied change, whose added keys no parent has.
+        An entry carried from either side keeps its own metadata, which
+        describes its blob. A value a merge function produced is a new
+        blob, never chunked, so its metadata lists no chunks.
         """
-        merged_keyset = resolution.merged_keyset
-        merged_values = resolution.merged_values
-
-        # Build write batch
         diffs: dict[str, bytes] = {}
-        for key, value in merged_values.items():
+        updates = dict(resolution.updates)
+        for key, value in resolution.merged_values.items():
             pointer = blob_key(value)
-            merged_keyset[key] = pointer
             diffs[pointer] = value
+            updates[key] = KeysetEntry(blob=pointer, meta=MetaEntry(size=len(value)))
 
-        # Build merged meta from the parents' meta, indexed by blob
-        # pointer. Metadata describes the blob, not the key: size is that
-        # blob's length and ``chunks`` lists the chunk references garbage
-        # collection traces from it. A merge that keeps one side's
-        # pointer must keep that side's meta with it, or the entry
-        # describes a blob it no longer points at — and a stale chunk
-        # list makes garbage collection trace the wrong chunks. Indexing
-        # by key instead cannot express that, since the two sides
-        # disagree about the key. A pointer names either the bytes it
-        # holds or the commit that wrote it, so one pointer has one meta
-        # and first-seen wins.
-        meta_by_blob: dict[str, MetaEntry] = {}
-        meta_by_key: dict[str, MetaEntry] = {}
-        for parent in dict.fromkeys((*parents, *sources)):
-            entries = self._entries(parent)
-            if entries is None:
-                continue
-            for key, entry in entries.items():
-                meta_by_blob.setdefault(entry.blob, entry.meta)
-                meta_by_key.setdefault(key, entry.meta)
-
-        merged_meta: dict[str, MetaEntry] = {}
-        for key, blob in merged_keyset.items():
-            if key in merged_values:
-                # A value the merge itself produced: new blob, new meta.
-                # Merge output is never chunked, so it lists no chunks.
-                merged_meta[key] = MetaEntry(size=len(merged_values[key]))
-                continue
-            meta = meta_by_blob.get(blob)
-            if meta is None and blob == self._commit_keys.get(key):
-                meta = self._meta.get(key)
-            if meta is None:
-                # A parent whose keyset would not load: fall back to
-                # whatever the key had rather than dropping the entry.
-                meta = meta_by_key.get(key) or self._meta.get(key)
-            if meta is not None:
-                merged_meta[key] = meta
-
-        # Apply the merge result on top of our parent's HAMT. We compute
-        # the minimal updates and removals so structural sharing kicks in
-        # for unchanged subtrees.
+        # Apply the changes on top of our HAMT, so structural sharing
+        # keeps every subtree the merge did not touch.
         our_root = _load_root(self.store, self._current_commit) or EMPTY_HASH
-        parent_ks = Keyset(self.store, root=our_root)
-
-        keyset_updates: dict[str, KeysetEntry] = {}
-        for key, blob in merged_keyset.items():
-            new_entry = KeysetEntry(blob=blob, meta=merged_meta[key])
-            old_blob = self._commit_keys.get(key)
-            old_meta = self._meta.get(key)
-            if old_blob != new_entry.blob or old_meta != new_entry.meta:
-                keyset_updates[key] = new_entry
-
-        keyset_removals = {key for key in self._commit_keys if key not in merged_keyset}
-
-        new_ks, pending = parent_ks.updated(
-            updates=keyset_updates, removals=keyset_removals
+        new_ks, pending = Keyset(self.store, root=our_root).updated(
+            updates=updates, removals=resolution.removals
         )
         diffs.update(pending)
+
+        merged_keyset = dict(self._commit_keys)
+        merged_meta = dict(self._meta)
+        for key, entry in updates.items():
+            merged_keyset[key] = entry.blob
+            merged_meta[key] = entry.meta
+        for key in resolution.removals:
+            merged_keyset.pop(key, None)
+            merged_meta.pop(key, None)
 
         parent_gens = self._parent_generations(parents)
         created = time.time()
@@ -2023,36 +2009,6 @@ class VersionedKV(VersionedBase):
         self._in_flight = {}
         return True
 
-    _ENTRY_CACHE_SIZE = 4
-
-    def _entries(self, commit_hash: str) -> dict[str, KeysetEntry] | None:
-        """A commit's whole keyset, or None if its root is missing.
-
-        Read with one batched fetch per HAMT level, and kept for the few
-        commits a merge touches — it reads each side's keyset to resolve,
-        then again for entry metadata. The current commit's comes from
-        memory. A keyset never changes once its commit exists.
-        """
-        if commit_hash == self._current_commit:
-            return {
-                key: KeysetEntry(blob=blob, meta=self._meta[key])
-                for key, blob in self._commit_keys.items()
-            }
-        cached = self._entry_cache.get(commit_hash)
-        if cached is not None:
-            return cached
-        root = _load_root(self.store, commit_hash)
-        if root is None:
-            return None
-        entries = Keyset(self.store, root=root).materialize()
-        if len(self._entry_cache) >= self._ENTRY_CACHE_SIZE:
-            self._entry_cache.pop(next(iter(self._entry_cache)))
-        self._entry_cache[commit_hash] = entries
-        return entries
-
-    def _forget_merge_inputs(self) -> None:
-        self._entry_cache.clear()
-
     def _fast_forward(self, their_head: str, *, on_conflict: str) -> MergeResult:
         """Move HEAD from our head to ``their_head``, a descendant of it.
 
@@ -2063,6 +2019,7 @@ class VersionedKV(VersionedBase):
         and a deleted one is not recreated.
         """
         our_head = self._current_commit
+        carried = tuple(sorted(self._changes(our_head, their_head)))
         branch_key = BRANCH_HEAD % self._branch
         expected = dumps(our_head)
         writes = {
@@ -2099,20 +2056,15 @@ class VersionedKV(VersionedBase):
             commit=their_head,
             strategy="fast_forward",
             auto_merged_keys=(),
-            carried_keys=tuple(self._commit_keys),
+            carried_keys=carried,
         )
         self.last_merge_result = result
         return result
 
-    def _load_keyset(self, commit_hash: str) -> dict[str, str]:
-        """Load just the keyset for a commit (key -> versioned_key mapping).
-
-        Used by the merge layer; returns a flat dict, dropping meta.
-        """
-        entries = self._entries(commit_hash)
-        if entries is None:
-            return {}
-        return {key: entry.blob for key, entry in entries.items()}
+    def _changes(self, commit_a: str | None, commit_b: str) -> dict[str, Change]:
+        """Each key whose value differs from commit ``a`` to ``b``; see
+        :func:`commit_changes`."""
+        return commit_changes(self.store, commit_a, commit_b)
 
     def _load_parents(self, commit_hash: str) -> tuple[str, ...]:
         """Load the parent tuple for a commit."""

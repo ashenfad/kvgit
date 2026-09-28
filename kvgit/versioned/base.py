@@ -2,11 +2,10 @@
 
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
-from typing import Any
 
 from ..errors import ConcurrencyError, MergeConflict, UnknownBranchError
-from .helpers import diff_keysets, walk_history
-from .merge import MergeResolution, resolve_merge
+from .helpers import changes_as_diff, walk_history
+from .merge import Change, MergeResolution, resolve_merge
 from .protocol import DiffResult, MergePolicy, MergeResult, PostCheck
 
 
@@ -102,7 +101,7 @@ class VersionedBase(ABC):
 
     def diff(self, commit_a: str, commit_b: str) -> DiffResult:
         """Compute key-level differences between two commits."""
-        return diff_keysets(self._load_keyset(commit_a), self._load_keyset(commit_b))
+        return changes_as_diff(self._changes(commit_a, commit_b))
 
     def history(
         self,
@@ -216,7 +215,7 @@ class VersionedBase(ABC):
                     commit=self._current_commit,
                     strategy="fast_forward",
                     auto_merged_keys=(),
-                    carried_keys=tuple(self._commit_keys.keys()),
+                    carried_keys=(),
                 )
                 self.last_merge_result = result
                 return result
@@ -266,19 +265,7 @@ class VersionedBase(ABC):
             saved_state=saved,
         )
 
-    def _three_way_merge(self, their_head: str, **options: Any) -> MergeResult:
-        """See :meth:`_three_way_merge_inputs`; releases what the merge
-        read once it is decided, however it ends."""
-        try:
-            return self._three_way_merge_inputs(their_head, **options)
-        finally:
-            self._forget_merge_inputs()
-
-    @abstractmethod
-    def _forget_merge_inputs(self) -> None:
-        """Drop whatever a merge kept of the commits it read."""
-
-    def _three_way_merge_inputs(
+    def _three_way_merge(
         self,
         their_head: str,
         *,
@@ -336,17 +323,11 @@ class VersionedBase(ABC):
                 "No common ancestor found between current commit and HEAD."
             )
 
-        # Load each unique commit's keyset exactly once. The naive
-        # form (calling self.diff() then self._load_keyset() three
-        # more times in resolve_merge) loads each commit twice or
-        # three times. For backends with non-trivial per-call
-        # latency, deduping cuts merge round-trips by ~60%.
-        lca_keyset = self._load_keyset(lca)
-        our_keyset = self._load_keyset(self._current_commit)
-        their_keyset = self._load_keyset(their_head)
-
-        our_diff = diff_keysets(lca_keyset, our_keyset)
-        their_diff = diff_keysets(lca_keyset, their_keyset)
+        # Each side's changes since the ancestor, read as structural
+        # diffs: subtrees the two commits share are never read, so the
+        # cost follows the size of the change rather than the keyset.
+        our_changes = self._changes(lca, self._current_commit)
+        their_changes = self._changes(lca, their_head)
 
         # Build effective merge function lookup
         effective_fns = dict(self._merge_fns)
@@ -360,11 +341,8 @@ class VersionedBase(ABC):
         # Resolve the merge
         try:
             resolution = resolve_merge(
-                lca_keyset=lca_keyset,
-                our_keyset=our_keyset,
-                their_keyset=their_keyset,
-                our_diff=our_diff,
-                their_diff=their_diff,
+                our_changes,
+                their_changes,
                 blob_reader=self._read_blob,
                 merge_fns=effective_fns,
                 default_merge=effective_default,
@@ -393,11 +371,7 @@ class VersionedBase(ABC):
                 return result
             raise
 
-        if (
-            base is not None
-            and not resolution.merged_values
-            and resolution.merged_keyset == our_keyset
-        ):
+        if base is not None and not resolution:
             # The change is already in our state, or changes nothing.
             result = MergeResult(
                 merged=True,
@@ -409,20 +383,14 @@ class VersionedBase(ABC):
             self.last_merge_result = result
             return result
 
-        auto_merged = resolution.auto_merged_keys
-        # Membership set for the carried-keys scan below: a MergeChoice
-        # policy can auto-merge as many keys as the prefix covers, and a
-        # list would make that scan quadratic.
-        auto_merged_keys = set(auto_merged)
         if parents is None:
             # Concurrent-write default: keep following the moved HEAD, as
             # before. Cross-branch callers pass (our_head, their_head) so
             # linear history stays on the merging branch (git convention).
             parents = (their_head, self._current_commit)
 
-        self._create_merge_commit(resolution, parents, info, sources=(their_head,))
+        self._create_merge_commit(resolution, parents, info)
         merge_hash = self._current_commit
-        merged_keyset = self._commit_keys
 
         # CAS HEAD onto the merge commit: from their_head in the
         # concurrent-write path, from our own head cross-branch.
@@ -432,12 +400,8 @@ class VersionedBase(ABC):
                 merged=True,
                 commit=merge_hash,
                 strategy=strategy,
-                auto_merged_keys=tuple(auto_merged),
-                carried_keys=tuple(
-                    k
-                    for k in merged_keyset
-                    if k not in auto_merged_keys and k not in resolution.merged_values
-                ),
+                auto_merged_keys=resolution.auto_merged_keys,
+                carried_keys=resolution.carried_keys,
             )
             self.last_merge_result = result
             return result
@@ -627,10 +591,9 @@ class VersionedBase(ABC):
         resolution: MergeResolution,
         parents: tuple[str, ...],
         info: dict | None,
-        sources: tuple[str, ...] = (),
     ) -> str:
-        """Create a commit from a resolved merge, on ``parents``; entry
-        metadata also comes from ``sources`` that are not parents.
+        """Create a commit from a resolved merge, on ``parents``: our
+        state with the resolution's changes applied.
 
         Must update ``self._commit_keys`` and ``self._current_commit``.
         """
@@ -640,8 +603,9 @@ class VersionedBase(ABC):
         """Atomically advance branch HEAD from expected to new_head."""
 
     @abstractmethod
-    def _load_keyset(self, commit_hash: str) -> dict[str, str]:
-        """Load the keyset for a commit (key -> content identifier)."""
+    def _changes(self, commit_a: str | None, commit_b: str) -> dict[str, Change]:
+        """Each key whose value differs from commit ``a`` to ``b``; a
+        ``None`` or missing ``a`` reads as empty."""
 
     @abstractmethod
     def _load_parents(self, commit_hash: str) -> tuple[str, ...]:

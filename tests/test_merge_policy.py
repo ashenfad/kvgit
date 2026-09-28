@@ -3,7 +3,7 @@
 import pickle
 
 import pytest
-from support import fork, worktree
+from support import fork, pointers, worktree
 
 from kvgit import MergeChoice, MergeConflict, Repo
 from kvgit.kv.memory import Memory
@@ -173,23 +173,23 @@ class TestOursTheirs:
         main, worker = _branched_versioned()
         main.commit({"k": b"our-value"})
         worker.commit({"k": b"their-value"})
-        their_pointer = worker._load_keyset(worker.current_commit)["k"]
+        their_pointer = pointers(worker.store, worker.current_commit)["k"]
 
         result = main.merge_heads(worker.current_commit, default_merge=theirs)
         assert result.merged
         assert main.get("k") == b"their-value"
-        assert main._load_keyset(result.commit)["k"] == their_pointer
+        assert pointers(main.store, result.commit)["k"] == their_pointer
 
     def test_ours_keeps_our_pointer_and_writes_no_blob(self):
         main, worker = _branched_versioned()
         main.commit({"k": b"our-value"})
         worker.commit({"k": b"their-value"})
-        our_pointer = main._load_keyset(main.current_commit)["k"]
+        our_pointer = pointers(main.store, main.current_commit)["k"]
 
         result = main.merge_heads(worker.current_commit, default_merge=ours)
         assert result.merged
         assert main.get("k") == b"our-value"
-        assert main._load_keyset(result.commit)["k"] == our_pointer
+        assert pointers(main.store, result.commit)["k"] == our_pointer
 
     def test_side_pick_counts_as_auto_merged(self):
         main, worker = _branched_versioned()
@@ -237,7 +237,7 @@ class TestOursTheirs:
         result = second.commit({"keep/1": b"ours"})
         assert result.merged
         assert second.get("keep/1") == b"ours"
-        assert second._load_keyset(result.commit)["keep/1"] == blob_key(b"ours")
+        assert pointers(second.store, result.commit)["keep/1"] == blob_key(b"ours")
 
 
 class TestByteEqualContested:
@@ -248,8 +248,8 @@ class TestByteEqualContested:
         main.commit({"k": b"same", "a": b"1"})
         worker.commit({"k": b"same", "b": b"2"})
         assert (
-            main._load_keyset(main.current_commit)["k"]
-            == worker._load_keyset(worker.current_commit)["k"]
+            pointers(main.store, main.current_commit)["k"]
+            == pointers(worker.store, worker.current_commit)["k"]
             == blob_key(b"same")
         )
 
@@ -258,8 +258,8 @@ class TestByteEqualContested:
         assert main.get("k") == b"same"
         assert "k" not in result.auto_merged_keys
         assert (
-            main._load_keyset(result.commit)["k"]
-            == worker._load_keyset(worker.current_commit)["k"]
+            pointers(main.store, result.commit)["k"]
+            == pointers(worker.store, worker.current_commit)["k"]
         )
 
     def test_identical_bytes_merge_clean_on_the_concurrent_commit_path(self):
@@ -389,12 +389,12 @@ class TestWorktreeMergePolicy:
         main.commit()
         worker["k"] = "their-value"
         worker.commit()
-        their_pointer = worker._engine._load_keyset(worker.head)["k"]
+        their_pointer = pointers(worker.repo.store, worker.head)["k"]
 
         result = main.merge(commit=worker.head, default_merge=theirs)
         assert result.merged
         assert main["k"] == "their-value"
-        keyset = main._engine._load_keyset(result.commit)
+        keyset = pointers(main.repo.store, result.commit)
         assert keyset["k"] == their_pointer
 
     def test_ours_keeps_our_pointer_through_staged_commit(self):
@@ -407,7 +407,7 @@ class TestWorktreeMergePolicy:
         result = second.commit()
         assert result.merged
         assert second["keep/1"] == "ours"
-        keyset = second._engine._load_keyset(result.commit)
+        keyset = pointers(second.repo.store, result.commit)
         assert keyset["keep/1"] == blob_key(pickle.dumps("ours"))
 
     def test_decoded_merge_fn_may_return_a_merge_choice(self):
@@ -423,13 +423,13 @@ class TestWorktreeMergePolicy:
         worker["doc/a"] = "short"
         worker["doc/b"] = "a longer value"
         worker.commit()
-        their_pointer = worker._engine._load_keyset(worker.head)["doc/b"]
+        their_pointer = pointers(worker.repo.store, worker.head)["doc/b"]
 
         result = main.merge(commit=worker.head)
         assert result.merged
         assert main["doc/a"] == "a longer value"
         assert main["doc/b"] == "a longer value"
-        assert main._engine._load_keyset(result.commit)["doc/b"] == their_pointer
+        assert pointers(main.repo.store, result.commit)["doc/b"] == their_pointer
 
     def test_identical_values_merge_clean_on_commit_path(self):
         first, second = _concurrent_staged()
@@ -568,10 +568,10 @@ class TestMergeChoicePolicy:
         main.set_merge_prefix("runs/", MergeChoice.OURS)
         main.commit({"runs/1": b"ours"})
         worker.commit({"runs/1": b"theirs"})
-        our_pointer = main._load_keyset(main.current_commit)["runs/1"]
+        our_pointer = pointers(main.store, main.current_commit)["runs/1"]
 
         result = main.merge_heads(worker.current_commit)
-        assert main._load_keyset(result.commit)["runs/1"] == our_pointer
+        assert pointers(main.store, result.commit)["runs/1"] == our_pointer
 
     def test_untouched_keys_outside_the_prefix_are_unaffected(self):
         main, worker = _branched_versioned({"kept": b"base"})
