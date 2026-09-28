@@ -108,9 +108,10 @@ class Hamt:
         self.prefix = prefix
         self.bucket_max = bucket_max
         self.pending = pending if pending is not None else {}
-        # Stored nodes already read for an update in progress, keyed like
-        # ``pending``. Filled only on the private view ``updated`` works
-        # through, so a shared ``Hamt`` never has two updates writing it.
+        # Stored nodes already read, keyed like ``pending``: by an update
+        # in progress, on the private view ``updated`` works through, and
+        # by ``get_many``. A node never changes once stored, so nothing
+        # here goes stale.
         self._fetched: dict[str, bytes] = {}
 
     # ---- internal helpers ----
@@ -178,6 +179,23 @@ class Hamt:
                 return None
             node_hash = node["children"][chunk]
             depth += 1
+
+    def get_many(self, keys: Iterable[str]) -> dict[str, bytes]:
+        """The values of the keys that are present, as ``{key: value}``.
+
+        Reads the paths to all of them level by level, one batched read
+        per level, rather than walking the tree once per key. The nodes
+        read stay cached on this view, so later lookups through it reuse
+        them.
+        """
+        keys = list(dict.fromkeys(keys))
+        self._prefetch_paths(keys, [])
+        found: dict[str, bytes] = {}
+        for key in keys:
+            value = self.get(key)
+            if value is not None:
+                found[key] = value
+        return found
 
     def __contains__(self, key: str) -> bool:
         return self.get(key) is not None

@@ -954,3 +954,21 @@ def test_an_update_leaves_the_shared_view_untouched():
     h = Hamt(_store(), bucket_max=2).persist({f"k{i}": b"v" for i in range(50)})
     h.updated({"x": b"1"}, ["k1"])
     assert h._fetched == {}
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_get_many_matches_get(seed):
+    rng = random.Random(seed)
+    items = {f"k{i}": b"%d" % i for i in range(rng.randrange(0, 300))}
+    h = Hamt(_store(), bucket_max=rng.choice([1, 2, 8])).persist(items)
+    keys = [f"k{rng.randrange(0, 400)}" for _ in range(rng.randrange(0, 80))]
+    assert h.get_many(keys) == {k: h.get(k) for k in keys if h.get(k) is not None}
+
+
+def test_get_many_reads_by_level():
+    store = _CountingStore()
+    h = Hamt(store, bucket_max=8).persist({f"k{i}": b"v" for i in range(5000)})
+    store.gets = store.batches = 0
+    found = h.get_many([f"k{i}" for i in range(0, 5000, 10)])
+    assert len(found) == 500
+    assert store.gets == 0 and store.batches <= 8
