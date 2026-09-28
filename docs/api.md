@@ -460,7 +460,7 @@ Frozen dataclass returned by `commit()`, `merge()`, `apply()`, `cherry_pick()` a
 | `auto_merged_keys` | `tuple[str, ...]` | Keys a merge rule decided: keys both sides changed that a merge function (or the `MergeChoice` it returned) resolved, and keys under a registered `MergeChoice` that either side changed |
 | `carried_keys` | `tuple[str, ...]` | Keys the other side changed that the merge took as they were — the other writer's changes on a lost race, the merged branch's on a merge or fast-forward, the picked change on `apply` |
 
-Both are empty for a commit with no other side (`fast_forward` on `commit()`) and for `no_op`. A key both sides changed identically appears in neither.
+Both are empty for a commit with no other side (`fast_forward` on `commit()`) and for `no_op`. A key both sides changed identically appears in neither, unless a registered `MergeChoice` covers it: the policy decides every key it covers, so the key is in `auto_merged_keys`.
 
 ### TagInfo
 

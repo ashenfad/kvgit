@@ -126,8 +126,9 @@ class MergeResult:
     """Keys the other side changed that the merge took as they were: the
     other writer's changes on a lost race, the merged branch's on a merge
     or fast-forward, the picked change on ``apply``. Empty for a commit
-    with no other side and for ``no_op``; a key both sides changed alike
-    appears in neither list."""
+    with no other side and for ``no_op``. A key both sides changed alike
+    appears in neither list, unless a registered ``MergeChoice`` covers
+    it: the policy decides every key it covers, so it is auto-merged."""
 
     def __bool__(self) -> bool:
         return self.merged
