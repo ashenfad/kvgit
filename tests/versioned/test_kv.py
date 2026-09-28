@@ -1039,6 +1039,38 @@ class TestThreeWayMerge:
         assert v2.get("new_key") == b"new"
         assert v2.get("keep") == b"yes"
 
+    def test_a_commit_reads_the_same_whatever_it_writes(self):
+        """A commit's HAMT update reads its paths level by level, so
+        writing or deleting many keys costs no more round trips than
+        writing a few."""
+
+        class Counting(Memory):
+            reads = 0
+
+            def get(self, key):
+                Counting.reads += 1
+                return super().get(key)
+
+            def get_many(self, *args):
+                Counting.reads += 1
+                return super().get_many(*args)
+
+        store = Counting()
+        v = Versioned(store)
+        v.commit({f"k{i}": b"%d" % i for i in range(5000)})
+
+        def reads(updates, removals=None):
+            Counting.reads = 0
+            v.commit(updates, removals)
+            return Counting.reads
+
+        few = reads({f"a{i}": b"1" for i in range(3)})
+        many = reads({f"b{i}": b"1" for i in range(200)})
+        deletes = reads({}, {f"k{i}" for i in range(0, 5000, 25)})
+        assert many <= few + 1
+        assert deletes <= few + 2
+        assert few < 15
+
     def test_a_merge_reads_the_change_not_the_keyset(self):
         """Each side's changes are read as structural diffs, so a merge
         of one-key changes over a large keyset reads a few HAMT nodes,
