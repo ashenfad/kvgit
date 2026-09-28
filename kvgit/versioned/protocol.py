@@ -91,13 +91,43 @@ class TagInfo:
 
 @dataclass(frozen=True)
 class MergeResult:
-    """Result of a merge operation."""
+    """What a commit, merge, or applied change did. Truthy when it landed.
+
+    Returned by ``Worktree.commit``, ``merge``, ``apply``,
+    ``cherry_pick`` and ``revert``.
+    """
 
     merged: bool
+    """Whether the call landed; False when it abandoned
+    (``on_conflict="abandon"``)."""
+
     commit: str | None
-    strategy: str  # "no_op", "fast_forward", "three_way"
+    """The commit the branch is at afterwards; None when abandoned."""
+
+    strategy: str
+    """How it landed:
+
+    * ``"no_op"`` -- nothing to do: no changes to commit, or the branch
+      already contains what was merged or applied.
+    * ``"fast_forward"`` -- a commit on a branch that had not moved, or a
+      merge that moved the branch to theirs without a merge commit.
+    * ``"three_way"`` -- a merge commit, from a merge or from a commit
+      that found the branch had moved.
+    * ``"apply"`` -- a change applied as a single-parent commit
+      (``apply``, ``cherry_pick``, ``revert``).
+    """
+
     auto_merged_keys: tuple[str, ...]
+    """Keys a merge rule decided: keys both sides changed that a merge
+    function (or the ``MergeChoice`` it returned) resolved, and keys under
+    a registered ``MergeChoice`` that either side changed."""
+
     carried_keys: tuple[str, ...]
+    """Keys the other side changed that the merge took as they were: the
+    other writer's changes on a lost race, the merged branch's on a merge
+    or fast-forward, the picked change on ``apply``. Empty for a commit
+    with no other side and for ``no_op``; a key both sides changed alike
+    appears in neither list."""
 
     def __bool__(self) -> bool:
         return self.merged
