@@ -255,7 +255,9 @@ class Repo:
         Name exactly one. The snapshot is pinned to the commit resolved
         now: a branch that moves later does not move it.
         """
-        return Snapshot(self, self._resolve_ref(commit=commit, branch=branch, tag=tag))
+        roots: dict[str, str] = {}
+        target = self._resolve_ref(commit=commit, branch=branch, tag=tag, roots=roots)
+        return Snapshot(self, target, root=roots.get(target))
 
     # -- Maintenance --
 
@@ -287,13 +289,18 @@ class Repo:
         commit: str | None = None,
         branch: str | None = None,
         tag: str | None = None,
+        roots: dict[str, str] | None = None,
     ) -> str:
-        """The commit a ref names; exactly one must be given."""
+        """The commit a ref names; exactly one must be given.
+
+        Checking that the commit exists reads its keyset root; ``roots``,
+        when given, keeps it, for a caller about to open that tree.
+        """
         given = [ref for ref in (commit, branch, tag) if ref is not None]
         if len(given) != 1:
             raise ValueError("name exactly one of commit, branch or tag")
         if branch is not None:
-            return self.branches[branch]
+            return self.branches._resolve(branch, roots)
         if tag is not None:
             tagged = _kv._resolve_tag(self._store, tag)
             if tagged is None:
@@ -301,7 +308,7 @@ class Repo:
             target = tagged
         else:
             target = commit  # type: ignore[assignment]
-        if self._store.get(COMMIT_ROOT % target) is None:
+        if not _kv._has_root(self._store, target, roots):
             raise UnknownCommitError(f"Commit '{target}' does not exist")
         return target
 
@@ -313,9 +320,11 @@ class Snapshot(Mapping[str, Any]):
     is the same state as stored bytes, whatever the codec.
     """
 
-    def __init__(self, repo: Repo, commit: str) -> None:
+    def __init__(self, repo: Repo, commit: str, *, root: str | None = None) -> None:
         self._repo = repo
         self.commit = commit
+        # The keyset root, when whoever made this snapshot already read it.
+        self._root = root
         self._keyset: Keyset | None = None
         # The whole keyset as key -> blob pointer, once something iterates
         # it; until then, reads look keys up in the tree one batch at a
@@ -328,10 +337,13 @@ class Snapshot(Mapping[str, Any]):
 
     def _tree(self) -> Keyset:
         if self._keyset is None:
-            root_raw = self._repo.store.get(COMMIT_ROOT % self.commit)
-            if root_raw is None:
-                raise UnknownCommitError(f"Commit '{self.commit}' does not exist")
-            self._keyset = Keyset(self._repo.store, root=loads(root_raw))
+            root = self._root
+            if root is None:
+                root_raw = self._repo.store.get(COMMIT_ROOT % self.commit)
+                if root_raw is None:
+                    raise UnknownCommitError(f"Commit '{self.commit}' does not exist")
+                root = loads(root_raw)
+            self._keyset = Keyset(self._repo.store, root=root)
         return self._keyset
 
     def _index(self) -> dict[str, str]:

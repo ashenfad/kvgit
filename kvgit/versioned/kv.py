@@ -84,6 +84,7 @@ import time
 import uuid
 from collections import deque
 from collections.abc import Callable, Iterable
+from typing import Any
 
 from ..encoding import dumps, loads, safe_loads
 from ..errors import (
@@ -327,6 +328,30 @@ def _check_storage_version(store: KVStore) -> None:
     store.set(STORAGE_VERSION_KEY, dumps(STORAGE_VERSION))
 
 
+# "Not read yet", for a value the caller may already hold, where None
+# already means "read, and absent".
+_UNREAD: Any = object()
+
+
+def _has_root(store: KVStore, commit_hash: Any, roots: dict[str, str] | None) -> bool:
+    """Whether ``commit_hash`` names a commit whose root is present.
+
+    The root read to answer that is recorded in ``roots`` when given:
+    whoever resolved a head is usually about to open its tree, and a
+    commit's root never changes, so there is no reason to read it twice.
+    """
+    if not isinstance(commit_hash, str):
+        return False
+    raw = store.get(COMMIT_ROOT % commit_hash)
+    if raw is None:
+        return False
+    if roots is not None:
+        root = safe_loads(raw)
+        if isinstance(root, str):
+            roots[commit_hash] = root
+    return True
+
+
 def _load_root(store: KVStore, commit_hash: str) -> str | None:
     """Load the keyset HAMT root hash for a commit, or None if missing."""
     raw = store.get(COMMIT_ROOT % commit_hash)
@@ -358,6 +383,8 @@ def _resolve_head(
     branch: str,
     *,
     recover_from_corrupt_head: CorruptHeadRecoverer | None = None,
+    head_bytes: Any = _UNREAD,
+    roots: dict[str, str] | None = None,
 ) -> str | None:
     """Resolve a branch HEAD, falling back to prev HEAD then an injected recoverer.
 
@@ -379,17 +406,19 @@ def _resolve_head(
             HEAD exists, is unusable, and the backup did not save it.
             Unset — the default — means such a branch resolves to None.
             See :data:`CorruptHeadRecoverer`.
+        head_bytes: HEAD's bytes when the caller has already read them,
+            in the same round trip as something else it needed.
+        roots: Where to record the root of the commit this resolves to,
+            read while checking it (see :func:`_has_root`).
 
     Returns a valid commit hash, or None if unrecoverable.
     """
     # 1. Try current HEAD
-    head_bytes = store.get(BRANCH_HEAD % branch)
+    if head_bytes is _UNREAD:
+        head_bytes = store.get(BRANCH_HEAD % branch)
     if head_bytes is not None:
         commit_hash = safe_loads(head_bytes)
-        if (
-            isinstance(commit_hash, str)
-            and store.get(COMMIT_ROOT % commit_hash) is not None
-        ):
+        if _has_root(store, commit_hash, roots):
             return commit_hash
 
     # 2. HEAD is present but unusable — try the backup.
@@ -406,10 +435,7 @@ def _resolve_head(
     )
     if prev_bytes is not None:
         commit_hash = safe_loads(prev_bytes)
-        if (
-            isinstance(commit_hash, str)
-            and store.get(COMMIT_ROOT % commit_hash) is not None
-        ):
+        if _has_root(store, commit_hash, roots):
             logger.warning(
                 "Branch '%s': HEAD corrupt, recovered from prev HEAD", branch
             )
@@ -428,10 +454,7 @@ def _resolve_head(
         # obviously-corrupt HEAD bytes with a plausible hash naming
         # nothing, which is harder to diagnose than the damage it
         # replaced.
-        if (
-            isinstance(commit_hash, str)
-            and store.get(COMMIT_ROOT % commit_hash) is not None
-        ):
+        if _has_root(store, commit_hash, roots):
             logger.warning(
                 "Branch '%s': HEAD corrupt, recovered via injected recoverer",
                 branch,
@@ -783,7 +806,7 @@ def _lease_expiry(raw: bytes | None) -> float:
     return 0.0
 
 
-def _wait_for_gc(store: KVStore) -> bytes | None:
+def _wait_for_gc(store: KVStore, raw: Any = _UNREAD) -> bytes | None:
     """Block until no live GC lease is held; return the lease record then.
 
     The bytes returned are what a write that must not land under a
@@ -793,13 +816,18 @@ def _wait_for_gc(store: KVStore) -> bytes | None:
     owner id — so a ``cas_many`` expecting them fails for as long as that
     sweep runs, and afterwards too; the writer comes back here and waits.
 
-    Costs one ``get`` when no lease is live, which is the common case.
+    Costs one ``get`` when no lease is live, which is the common case,
+    and none when the caller hands in the record (``raw``) it read in a
+    round trip it was making anyway. A record read a little earlier is
+    safe: every write it lets through expects it, so a sweep that has
+    replaced it since fails that write, and the writer comes back here.
     While a lease is live this polls, sleeping at most until that
     lease's own expiry, so a holder that died without releasing delays a
     writer by the remainder of its term and no longer. A fresh lease
     taken by a different sweep is waited out in turn.
     """
-    raw = store.get(GC_LEASE_KEY)
+    if raw is _UNREAD:
+        raw = store.get(GC_LEASE_KEY)
     while raw is not None:
         remaining = _lease_expiry(raw) - time.time()
         if remaining <= 0:
@@ -1671,6 +1699,13 @@ class VersionedKV(VersionedBase):
         # searched through. A generation never changes once its commit
         # exists, so nothing here goes stale.
         self._generations: dict[str, int] = {}
+        # Keyset roots of commits this handle has written, loaded or
+        # resolved a head to. A commit's root never changes, so nothing
+        # here goes stale either.
+        self._roots: dict[str, str] = {}
+        # The GC lease record read beside HEAD by the latest head read,
+        # for the next batch to land against without reading it again.
+        self._lease_hint: Any = _UNREAD
 
         # Materialize keyset + meta from the HAMT
         self._meta: dict[str, MetaEntry] = {}
@@ -1706,6 +1741,7 @@ class VersionedKV(VersionedBase):
             self._commit_keys = {}
             self._meta = {}
             return
+        self._remember_root(commit_hash, root)
 
         materialized = Keyset(self.store, root=root).materialize()
         self._commit_keys = {k: e.blob for k, e in materialized.items()}
@@ -1713,11 +1749,28 @@ class VersionedKV(VersionedBase):
 
     @property
     def latest_head(self) -> str | None:
-        """Read HEAD directly from the KV store (reflects other writers)."""
+        """Read HEAD directly from the KV store (reflects other writers).
+
+        One round trip in the common case. The GC lease record rides
+        along, since a commit reads HEAD on its way to landing a batch
+        that has to expect it. And a HEAD naming a commit this handle
+        already knows the root of needs no check that the commit exists:
+        it was read, or written, here.
+        """
+        branch_key = BRANCH_HEAD % self._branch
+        found = self.store.get_many(branch_key, GC_LEASE_KEY)
+        self._lease_hint = found.get(GC_LEASE_KEY)
+        head_bytes = found.get(branch_key)
+        if head_bytes is not None:
+            head = safe_loads(head_bytes)
+            if isinstance(head, str) and head in self._roots:
+                return head
         return _resolve_head(
             self.store,
             self._branch,
             recover_from_corrupt_head=self._recover_from_corrupt_head,
+            head_bytes=head_bytes,
+            roots=self._roots,
         )
 
     # -- Read operations --
@@ -1779,8 +1832,10 @@ class VersionedKV(VersionedBase):
         """
         marker = dumps(time.time() + IN_FLIGHT_TTL)
         diffs[IN_FLIGHT_KEY % commit] = marker
+        seen, self._lease_hint = self._lease_hint, _UNREAD
         while True:
-            lease = _wait_for_gc(self.store)
+            lease = _wait_for_gc(self.store, seen)
+            seen = _UNREAD
             if self.store.cas_many({GC_LEASE_KEY: lease}, diffs):
                 break
         self._in_flight[commit] = marker
@@ -1843,7 +1898,7 @@ class VersionedKV(VersionedBase):
         # Build the new keyset by applying changes to the parent's HAMT.
         # Only the explicitly changed keys generate new entries; structural
         # sharing reuses unchanged subtrees from the parent commit.
-        parent_root = _load_root(self.store, self._current_commit) or EMPTY_HASH
+        parent_root = self._root_of(self._current_commit)
         parent_ks = Keyset(self.store, root=parent_root)
         keyset_updates = {
             key: KeysetEntry(blob=new_commit_keys[key], meta=new_meta[key])
@@ -1869,6 +1924,7 @@ class VersionedKV(VersionedBase):
         # batch. (The version stamp above is not in it and needs no
         # cover: no sweep deletes it.)
         self._land_batch(new_hash, diffs)
+        self._remember_root(new_hash, new_ks.root)
 
         # Update in-memory state
         self._commit_keys = new_commit_keys
@@ -1879,6 +1935,22 @@ class VersionedKV(VersionedBase):
         return new_hash
 
     _GENERATION_CACHE_LIMIT = 10_000
+
+    def _remember_root(self, commit_hash: str, root: str) -> None:
+        if len(self._roots) >= self._GENERATION_CACHE_LIMIT:
+            self._roots.clear()
+        self._roots[commit_hash] = root
+
+    def _root_of(self, commit_hash: str) -> str:
+        """A commit's keyset root: remembered, or read and remembered.
+        A commit with no root reads as the empty tree."""
+        root = self._roots.get(commit_hash)
+        if root is None:
+            root = _load_root(self.store, commit_hash)
+            if root is None:
+                return EMPTY_HASH
+            self._remember_root(commit_hash, root)
+        return root
 
     def _remember_generations(self, generations: dict[str, int]) -> None:
         if len(self._generations) + len(generations) > self._GENERATION_CACHE_LIMIT:
@@ -1920,7 +1992,7 @@ class VersionedKV(VersionedBase):
 
         # Apply the changes on top of our HAMT, so structural sharing
         # keeps every subtree the merge did not touch.
-        our_root = _load_root(self.store, self._current_commit) or EMPTY_HASH
+        our_root = self._root_of(self._current_commit)
         new_ks, pending = Keyset(self.store, root=our_root).updated(
             updates=updates, removals=resolution.removals
         )
@@ -1947,6 +2019,7 @@ class VersionedKV(VersionedBase):
 
         self._stamp_blob_version()
         self._land_batch(merge_hash, diffs)
+        self._remember_root(merge_hash, new_ks.root)
 
         # Update in-memory state
         self._commit_keys = merged_keyset

@@ -35,10 +35,15 @@ class Branches(Mapping[str, str]):
         return f"Branches({list(self)!r})"
 
     def __getitem__(self, name: str) -> str:
+        return self._resolve(name)
+
+    def _resolve(self, name: str, roots: dict[str, str] | None = None) -> str:
+        """The branch's head, recording its root in ``roots`` when given
+        (see :meth:`Repo._resolve_ref`)."""
         _kv._reject_reserved_branch(name)
         store = self._repo.store
         commit = _kv._resolve_head(
-            store, name, recover_from_corrupt_head=self._repo._recover
+            store, name, recover_from_corrupt_head=self._repo._recover, roots=roots
         )
         if commit is not None:
             return commit
