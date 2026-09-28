@@ -1751,20 +1751,26 @@ class VersionedKV(VersionedBase):
     def latest_head(self) -> str | None:
         """Read HEAD directly from the KV store (reflects other writers).
 
-        One round trip in the common case. The GC lease record rides
-        along, since a commit reads HEAD on its way to landing a batch
-        that has to expect it. And a HEAD naming a commit this handle
-        already knows the root of needs no check that the commit exists:
-        it was read, or written, here.
+        One round trip in the common case, where HEAD is still the
+        commit this handle is based on. The read that fetches HEAD also
+        fetches that commit's root, so the check that HEAD names a
+        commit whose root is present costs nothing extra, and the GC
+        lease record, which a commit on its way to landing a batch has
+        to expect. Any other answer — HEAD moved, or its root is gone —
+        is resolved the full way, recovery tiers and all.
         """
         branch_key = BRANCH_HEAD % self._branch
-        found = self.store.get_many(branch_key, GC_LEASE_KEY)
+        base = self._base_commit
+        base_root = COMMIT_ROOT % base
+        found = self.store.get_many(branch_key, GC_LEASE_KEY, base_root)
         self._lease_hint = found.get(GC_LEASE_KEY)
         head_bytes = found.get(branch_key)
-        if head_bytes is not None:
-            head = safe_loads(head_bytes)
-            if isinstance(head, str) and head in self._roots:
-                return head
+        if (
+            head_bytes is not None
+            and safe_loads(head_bytes) == base
+            and found.get(base_root) is not None
+        ):
+            return base
         return _resolve_head(
             self.store,
             self._branch,

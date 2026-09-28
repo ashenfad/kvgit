@@ -9,8 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **A commit makes 6 round trips to the backend instead of 9.**
-  - It reads the branch head and the GC lease in one `get_many`. Before, the lease was a read of its own just before the landing write.
-  - It no longer re-reads anything the handle already holds. A head that names a commit the handle loaded or wrote is known to exist without reading that commit's root. The parent's root comes from memory rather than the store, since a commit's root never changes.
+  - It reads the branch head, the GC lease and the base commit's root in one `get_many`. Before, the lease was a read of its own just before the landing write.
+  - The check that HEAD names a commit whose root is present rides in that same read: the commit is almost always the one the handle is based on, known before HEAD is read. A HEAD that moved, or whose root is gone, is resolved the full way, recovery tiers and all.
+  - The parent's root, which the new commit's tree is built from, comes from memory instead of the store. A commit's root never changes.
   - A lease record that changes between the head read and the landing (a sweep came and went) makes the landing write fail. The commit then reads the lease again and lands, as it would have before.
 - **`repo.snapshot()` reads a commit's root once instead of twice.** Resolving the ref already reads the root to check that the commit exists. The snapshot now keeps it instead of fetching it again when first read. A missing commit still raises `UnknownCommitError` from `snapshot()` itself.
 

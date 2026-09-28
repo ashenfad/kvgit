@@ -560,7 +560,7 @@ class TestReadsAHandleAlreadyHas:
         store.reads.clear()
         return store, repo, wt
 
-    def test_a_commit_reads_head_and_lease_together_and_no_root(self):
+    def test_a_commit_reads_head_lease_and_root_together(self):
         from kvgit.versioned.kv import BRANCH_HEAD, COMMIT_ROOT, GC_LEASE_KEY
 
         store, _, wt = self._repo()
@@ -569,10 +569,12 @@ class TestReadsAHandleAlreadyHas:
         wt.commit()
 
         head = BRANCH_HEAD % "main"
-        assert (head, GC_LEASE_KEY) in store.reads
+        batch = (head, GC_LEASE_KEY, COMMIT_ROOT % parent)
+        assert batch in store.reads
         assert store.read(head) == 1
         assert store.read(GC_LEASE_KEY) == 1
-        assert store.read(COMMIT_ROOT % parent) == 0
+        # The parent's root is checked in that same read, never on its own.
+        assert store.read(COMMIT_ROOT % parent) == 1
 
     def test_back_to_back_commits_stay_that_cheap(self):
         from kvgit.versioned.kv import COMMIT_ROOT
@@ -583,7 +585,7 @@ class TestReadsAHandleAlreadyHas:
             store.reads.clear()
             wt["k1"] = n
             wt.commit()
-            assert store.read(COMMIT_ROOT % parent) == 0
+            assert store.read(COMMIT_ROOT % parent) == 1
 
     def test_a_head_another_writer_moved_is_checked_as_before(self):
         from kvgit.versioned.kv import COMMIT_ROOT
@@ -602,6 +604,23 @@ class TestReadsAHandleAlreadyHas:
             "k1": "ours",
             "k2": "theirs",
         }
+
+    def test_a_head_whose_root_is_gone_falls_back_to_the_backup(self):
+        """The handle knows its tip, but the store is the authority on
+        whether it still holds that commit: a root lost under a
+        long-lived handle sends the head read down the recovery tiers,
+        as it would for a fresh one, rather than trusting memory."""
+        from kvgit.versioned.kv import COMMIT_ROOT
+
+        store, repo, wt = self._repo()
+        backup = wt.head
+        wt["k1"] = "tip"
+        wt.commit()
+        tip = wt.head
+        store.remove(COMMIT_ROOT % tip)
+
+        assert wt._engine.latest_head == backup
+        assert repo.branches["main"] == backup
 
     def test_a_lease_that_changed_after_the_head_read_is_read_again(self):
         """The lease rides along with HEAD, some time before the batch
