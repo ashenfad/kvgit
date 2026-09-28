@@ -311,6 +311,7 @@ class Worktree(MutableMapping[str, Any]):
         merge_prefixes: dict[str, MergeRule] | None = None,
         default_merge: MergeRule | None = None,
         post_check: PostCheck | None = None,
+        fast_forward: bool = True,
     ) -> MergeResult:
         """Merge a commit, branch or tag into this worktree's branch.
 
@@ -318,6 +319,12 @@ class Worktree(MutableMapping[str, Any]):
         resolve, and a two-parent merge commit published on this
         worktree's head. ``post_check(key, merged_bytes)`` may refuse a
         merge-produced value, filing it as a conflict.
+
+        When this branch has not moved since the two forked, it
+        fast-forwards instead, as git does: HEAD moves to theirs and no
+        commit is written, so ``info`` is not recorded.
+        ``fast_forward=False`` writes the merge commit regardless. A
+        commit this branch already contains merges as a no-op.
 
         Raises:
             ValueError: with pending changes — commit or discard first.
@@ -332,6 +339,7 @@ class Worktree(MutableMapping[str, Any]):
             on_conflict=on_conflict,
             post_check=post_check,
             info=info,
+            fast_forward=fast_forward,
             **self._rules(merge_fns, merge_prefixes, default_merge),
         )
         if result.merged:
