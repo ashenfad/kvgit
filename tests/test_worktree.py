@@ -412,6 +412,26 @@ class TestFastForward:
         assert dev.head == head == dev.repo.head("dev")
         assert dev.merge(commit=head).strategy == "no_op"
 
+    def test_a_no_op_checks_the_branch_has_not_moved(self):
+        """Another worktree resets the branch to history without theirs:
+        the merge must not report the branch as already containing it."""
+        wt, dev = self._ahead()
+        wt.merge(branch="dev")  # main == dev's head
+        other = wt.repo.worktree("main")
+        other.reset(ROOT_COMMIT)
+        with pytest.raises(ConcurrencyError):
+            wt.merge(commit=dev.head)
+        assert not wt.merge(commit=dev.head, on_conflict="abandon")
+        assert wt.repo.head("main") == ROOT_COMMIT
+
+    def test_a_no_op_on_a_deleted_branch_raises(self):
+        wt, dev = self._ahead()
+        wt.merge(branch="dev")
+        wt.repo.delete_branch("main")
+        with pytest.raises(UnknownBranchError):
+            wt.merge(commit=dev.head)
+        assert not wt.repo.has_branch("main")
+
     def test_a_branch_that_moved_meanwhile_is_not_fast_forwarded(self):
         wt, _ = self._ahead()
         other = wt.repo.worktree("main")
