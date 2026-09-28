@@ -108,6 +108,10 @@ class Hamt:
         self.prefix = prefix
         self.bucket_max = bucket_max
         self.pending = pending if pending is not None else {}
+        # Stored nodes already read for an update in progress, keyed like
+        # ``pending``. Filled only on the private view ``updated`` works
+        # through, so a shared ``Hamt`` never has two updates writing it.
+        self._fetched: dict[str, bytes] = {}
 
     # ---- internal helpers ----
 
@@ -124,7 +128,9 @@ class Hamt:
             return json.loads(pending[prefixed])
         if prefixed in self.pending:
             return json.loads(self.pending[prefixed])
-        raw = self.store.get(prefixed)
+        raw = self._fetched.get(prefixed)
+        if raw is None:
+            raw = self.store.get(prefixed)
         if raw is None:
             return None
         return json.loads(raw)
@@ -327,13 +333,28 @@ class Hamt:
         store write batch. The returned ``new_hamt.pending`` is the
         same dict, so reads on the new view work before flushing.
         """
+        updates = updates or {}
+        removals = list(removals)
+        # Every insert and delete walks from the root to its key. Read all
+        # of those paths up front, one batched read per level, so a commit
+        # that touches many keys costs the depth of the tree in round
+        # trips rather than a read per node per key.
+        worker = Hamt(
+            self.store,
+            self.root,
+            prefix=self.prefix,
+            bucket_max=self.bucket_max,
+            pending=self.pending,
+        )
+        worker._prefetch_paths(list(updates), removals)
+
         pending = dict(self.pending)
         current_root = self.root
 
-        for key, value in (updates or {}).items():
-            current_root = self._insert(current_root, key, value, pending)
+        for key, value in updates.items():
+            current_root = worker._insert(current_root, key, value, pending)
         for key in removals:
-            current_root = self._delete(current_root, key, pending)
+            current_root = worker._delete(current_root, key, pending)
 
         # Drop any pending node that's no longer reachable from the new root
         # (intermediate nodes that were superseded by later updates).
@@ -534,6 +555,13 @@ class Hamt:
     ) -> str | None:
         """If every child is a leaf and the union of their entries fits
         in ``bucket_max``, return the merged leaf hash. Otherwise None."""
+        self._fetch(
+            [
+                self.prefix + h
+                for h in children.values()
+                if h != EMPTY_HASH and self.prefix + h not in pending
+            ]
+        )
         merged: dict[str, str] = {}
         for child_hash in children.values():
             child = self._load(child_hash, pending)
@@ -545,6 +573,59 @@ class Hamt:
                 if len(merged) > self.bucket_max:
                     return None
         return self._store_leaf(merged, pending)
+
+    # ---- batched reads for updates ----
+
+    def _fetch(self, prefixed_keys: list[str]) -> None:
+        """Read the stored nodes among ``prefixed_keys`` not already at
+        hand, in one batched read."""
+        wanted = [
+            k for k in prefixed_keys if k not in self.pending and k not in self._fetched
+        ]
+        if wanted:
+            self._fetched.update(self.store.get_many(wanted))
+
+    def _prefetch_paths(self, updated: list[str], removed: list[str]) -> None:
+        """Read every stored node on the paths from the root to the keys
+        an update touches, level by level, one batched read per level.
+
+        A removal can collapse a branch it passes through, which reads
+        every child of that branch; for those branches all children are
+        read in the same batch as the path.
+        """
+        frontier: dict[str, list[tuple[str, bool]]] = {}
+        if self.root != EMPTY_HASH:
+            for keys, removing in ((updated, False), (removed, True)):
+                for key in keys:
+                    frontier.setdefault(self.root, []).append(
+                        (_key_hash(key), removing)
+                    )
+        extra: set[str] = set()
+        depth = 0
+        while frontier and depth < _HASH_LEN:
+            self._fetch([self.prefix + h for h in (*frontier, *extra)])
+            next_frontier: dict[str, list[tuple[str, bool]]] = {}
+            next_extra: set[str] = set()
+            for node_hash, paths in frontier.items():
+                prefixed = self.prefix + node_hash
+                raw = self.pending.get(prefixed) or self._fetched.get(prefixed)
+                if raw is None:
+                    continue  # missing: the update reads it, and copes, as before
+                node = json.loads(raw)
+                if node["kind"] != "branch":
+                    continue
+                children = node["children"]
+                if any(removing for _, removing in paths):
+                    next_extra.update(h for h in children.values() if h != EMPTY_HASH)
+                for key_hash, removing in paths:
+                    child = children.get(key_hash[depth])
+                    if child is not None and child != EMPTY_HASH:
+                        next_frontier.setdefault(child, []).append((key_hash, removing))
+            frontier = next_frontier
+            extra = next_extra - frontier.keys()
+            depth += 1
+        if extra:
+            self._fetch([self.prefix + h for h in extra])
 
     # ---- pending management ----
 

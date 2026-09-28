@@ -891,3 +891,66 @@ def test_walk_skip_nodes_none_matches_no_arg():
     c_items, c_nodes = h.walk(skip_nodes=set())
     assert a_items == b_items == c_items
     assert a_nodes == b_nodes == c_nodes
+
+
+# ---- batched reads in updated() ----
+
+
+class _CountingStore(Memory):
+    def __init__(self):
+        super().__init__()
+        self.gets = 0
+        self.batches = 0
+
+    def get(self, key):
+        self.gets += 1
+        return super().get(key)
+
+    def get_many(self, *args):
+        self.batches += 1
+        return super().get_many(*args)
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_batched_update_matches_a_tree_built_from_scratch(seed):
+    rng = random.Random(seed)
+    bucket_max = rng.choice([1, 2, 3, 8])
+    base = {f"k{i}": b"%d" % rng.randrange(9) for i in range(rng.randrange(0, 200))}
+    h = Hamt(_store(), bucket_max=bucket_max).persist(base)
+    if rng.random() < 0.3:
+        h, _ = h.updated({"pending-only": b"p"})  # an unflushed tree
+        base["pending-only"] = b"p"
+    updates = {
+        f"k{rng.randrange(0, 260)}": b"%d" % rng.randrange(9)
+        for _ in range(rng.randrange(0, 60))
+    }
+    heavy_removal = rng.random() < 0.5
+    removals = [k for k in base if rng.random() < (0.8 if heavy_removal else 0.2)] + [
+        f"absent{i}" for i in range(3)
+    ]
+
+    new, _ = h.updated(updates, removals)
+
+    expected = {**base, **updates}
+    for key in removals:
+        expected.pop(key, None)
+    assert new.materialize() == expected
+    scratch = Hamt(_store(), bucket_max=bucket_max).persist(expected)
+    assert new.root == scratch.root
+
+
+def test_an_update_reads_by_level_not_by_key():
+    store = _CountingStore()
+    h = Hamt(store, bucket_max=8).persist({f"k{i}": b"v" for i in range(5000)})
+    store.gets = store.batches = 0
+    updates = {f"new{i}": b"n" for i in range(100)}
+    removals = [f"k{i}" for i in range(0, 5000, 50)]
+    h.updated(updates, removals)
+    assert store.gets == 0
+    assert store.batches <= 8  # about the depth of the tree, not per key
+
+
+def test_an_update_leaves_the_shared_view_untouched():
+    h = Hamt(_store(), bucket_max=2).persist({f"k{i}": b"v" for i in range(50)})
+    h.updated({"x": b"1"}, ["k1"])
+    assert h._fetched == {}
