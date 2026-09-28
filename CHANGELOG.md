@@ -17,11 +17,18 @@ store written by 0.3.x opens as it is.
 
 - **`Repo(backend, *, codec=, merge_fns=, merge_prefixes=,
   default_merge=, recover_from_corrupt_head=)`** owns the backend and
-  everything store-wide: `worktree(name, create=)`, `create_branch`,
-  `delete_branch`, `branches`, `has_branch`, `head`, `create_tag`,
-  `delete_tag`, `tags`, `tag_info`, `get_commit`, `log`, `diff`,
-  `merge_base`, `snapshot`, `gc`, `repair_head`. Merge rules and HEAD
-  recovery set here apply to every worktree it opens.
+  everything store-wide: `worktree(name, create=)`, `branches`, `tags`,
+  `get_commit`, `log`, `diff`, `merge_base`, `snapshot`, `gc`,
+  `repair_head`. Merge rules and HEAD recovery set here apply to every
+  worktree it opens.
+- **`repo.branches` and `repo.tags` are collections**, shaped like
+  pygit2's `repo.branches`: live `Mapping`s of name to commit
+  (`list(repo.branches)`, `"x" in repo.branches`, `repo.branches["x"]`,
+  `repo.branches.get("x")`), with `create(name, at=None)` /
+  `delete(name)`, and `repo.tags.create(name, commit, info=)`,
+  `repo.tags.delete(name)` and `repo.tags.info(name)`. A missing name
+  raises `UnknownBranchError` / `UnknownTagError`, which are now also
+  `KeyError`s.
 - **`Worktree`** replaces `Staged`: a `MutableMapping` bound to one
   branch for its whole life, with `head`, `status()`, `commit`,
   `merge(commit=|branch=|tag=)`, `cherry_pick`, `revert`, `apply`,
@@ -73,18 +80,18 @@ store written by 0.3.x opens as it is.
 | `current_branch` | `branch` |
 | `initial_commit` | removed (always `ROOT_COMMIT`) |
 | `last_merge_result` | removed (returned by the call) |
-| `create_branch`, `delete_branch`, `list_branches`, `branch_exists` on a handle | `Repo.create_branch` / `delete_branch` / `branches` / `has_branch` |
+| `create_branch`, `delete_branch`, `list_branches`, `branch_exists` on a handle | `repo.branches.create` / `.delete`, `list(repo.branches)`, `name in repo.branches` |
 | `switch_branch`, `checkout(commit)`, `checkout(branch=)` | `repo.worktree(name)` or `repo.snapshot(...)` |
 | `checkout(tag=)`, `peek(key, branch=, tag=)` | `repo.snapshot(tag=...)[key]` |
-| `tag(name, at=, info=)` | `Repo.create_tag(name, commit, info=)` |
-| `tags`, `tag_info`, `delete_tag` on a handle | on `Repo` |
+| `tag(name, at=, info=)` | `repo.tags.create(name, commit, info=)` |
+| `tags`, `tag_info`, `delete_tag` on a handle | `dict(repo.tags)`, `repo.tags.info`, `repo.tags.delete` |
 | `history(c, all_parents=)` | `Repo.log(commit=..., first_parent=)`, yielding `Commit` |
 | `commit_info(c)`, `parents(c)` | `Repo.get_commit(c).info` / `.parents` |
 | `diff`, `merge_base` on `.versioned` | on `Repo` |
 | `merge(their_head)`, `merge_heads` | `Worktree.merge(commit=...)` / `branch=` / `tag=` |
 | `clean_orphans(min_age)`, `deep_clean(...)` | `Repo.gc(min_age=, deep=)` |
 | `repair_head` (method and module function) | `Repo.repair_head(name)` |
-| `kvgit.delete_branches(...)`, `kvgit.delete_tags(...)` | `Repo(backend).delete_branch` / `delete_tag`, then `gc()` |
+| `kvgit.delete_branches(...)`, `kvgit.delete_tags(...)` | `Repo(backend).branches.delete` / `.tags.delete`, then `gc()` |
 | `kvgit.store(..., create=, encoder=, decoder=, codecs=)` | `kvgit.open(..., codec=)` |
 | `Versioned` protocol, `VersionedKV`, `.versioned` | removed from the public API |
 
