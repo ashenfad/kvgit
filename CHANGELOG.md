@@ -109,6 +109,16 @@ store written by 0.3.x opens as it is.
   ancestor is found. A lost commit race over a 3,000-commit history went
   from 3,099 reads (86 ms on local Postgres) to 2 for the search; history
   written before generations falls back to the full walk.
+- **A commit costs the same few round trips however many keys it writes
+  or deletes.** Building a commit's keyset walked from the root to each
+  written key reading one HAMT node per `get`, so a commit's reads grew
+  with its keys; deleting also read every sibling of each branch it
+  passed, to check for a collapse. The paths for all of a commit's keys
+  are now read up front, one batched `get_many` per tree level, with the
+  siblings a removal needs in the same batches. On a 5,000-file
+  workspace (monkeyfs over a worktree, a key and a metadata row per
+  file), a commit writing 50 files went from 205 round trips to 12, and
+  one deleting 50 files from 678 to 13.
 - **A merge costs what changed, not the size of the keyset.** Each side's
   changes since the common ancestor are read as a structural diff of the
   two keysets: subtrees they share are skipped by hash, and the rest is
