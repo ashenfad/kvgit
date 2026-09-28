@@ -55,8 +55,11 @@ store written by 0.3.x opens as it is.
 - **A merged value is encoded with the repo's codec** (a merge function
   under `codec="bytes"` returns bytes, stored as they are); chunked codecs
   still store merge results as plain pickle.
-- `kvgit.store(kind=, *, path=, db_name=, branch=, codec=)` returns a
-  `Worktree` and always opens or creates its branch.
+- **`kvgit.store()` is now `kvgit.open()`**: `kvgit.open(kind="memory",
+  *, path=, db_name=, branch="main", codec="pickle")` returns a
+  `Worktree`, and always opens or creates its branch, as `shelve.open`
+  creates a missing shelf. The old name returned a worktree while
+  `Repo.store` is the backend, and the function shadowed its own module.
 - `recover_by_commit_scan`, `CorruptHeadRecoverer` and `ROOT_COMMIT` are
   exported from `kvgit`.
 
@@ -82,7 +85,7 @@ store written by 0.3.x opens as it is.
 | `clean_orphans(min_age)`, `deep_clean(...)` | `Repo.gc(min_age=, deep=)` |
 | `repair_head` (method and module function) | `Repo.repair_head(name)` |
 | `kvgit.delete_branches(...)`, `kvgit.delete_tags(...)` | `Repo(backend).delete_branch` / `delete_tag`, then `gc()` |
-| `store(..., create=, encoder=, decoder=, codecs=)` | `store(..., codec=)` |
+| `kvgit.store(..., create=, encoder=, decoder=, codecs=)` | `kvgit.open(..., codec=)` |
 | `Versioned` protocol, `VersionedKV`, `.versioned` | removed from the public API |
 
 ### Added

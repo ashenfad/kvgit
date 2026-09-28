@@ -5,19 +5,19 @@
 ```python
 import kvgit
 
-wt = kvgit.store()
+wt = kvgit.open()
 ```
 
 That's it: a `Worktree` on branch `main` of an in-memory `Repo`. For persistence, pass a backend:
 
 ```python
-wt = kvgit.store(kind="disk", path="/tmp/mydb")       # SQLite-backed via diskcache
-wt = kvgit.store(kind="indexeddb", db_name="myapp")    # browser-persistent via IndexedDB
+wt = kvgit.open("disk", path="/tmp/mydb")      # SQLite-backed via diskcache
+wt = kvgit.open("indexeddb", db_name="myapp")  # browser-persistent via IndexedDB
 ```
 
 `kind="disk"` requires `pip install kvgit[disk]`. `kind="indexeddb"` is available in Pyodide (browser) environments but has portability and durability tradeoffs — see [Browser persistence in Pyodide](pyodide.md) for the full picture and the recommended cross-browser alternative.
 
-`kvgit.store()` is sugar. It builds a `Repo` over the backend and opens (or creates) one branch. Build the `Repo` yourself for any other backend, or to set repo-wide options:
+`kvgit.open()` is sugar. It builds a `Repo` over the backend and opens (or creates) one branch. Build the `Repo` yourself for any other backend, or to set repo-wide options:
 
 ```python
 from kvgit import Repo
@@ -42,7 +42,7 @@ Three objects make up the API:
 A worktree is a `MutableMapping[str, Any]`. Values are pickle-serialized by default (see [Codecs and trust](#codecs-and-trust)).
 
 ```python
-wt = kvgit.store()
+wt = kvgit.open()
 wt["user"] = "alice"
 wt["score"] = 42
 wt["tags"] = ["admin", "active"]
@@ -119,7 +119,7 @@ wt.discard()
 Branches are cheap. A branch is created on the repo, and a worktree checks one out:
 
 ```python
-wt = kvgit.store()
+wt = kvgit.open()
 repo = wt.repo
 wt["shared"] = "hello"
 wt.commit()
@@ -150,7 +150,7 @@ print(len(repo.worktree("clean")))  # 0
 A snapshot reads any branch, tag or commit without a worktree, and stays pinned to the commit it resolved:
 
 ```python
-wt = kvgit.store()
+wt = kvgit.open()
 repo = wt.repo
 wt["config"] = "v1"
 wt.commit()
@@ -172,7 +172,7 @@ repo.snapshot(commit=wt.head)["config"]  # "v1"
 A tag is an immutable name for a commit. Unlike a branch head, it never moves:
 
 ```python
-wt = kvgit.store()
+wt = kvgit.open()
 repo = wt.repo
 wt["config"] = "v1"
 wt.commit()
@@ -205,7 +205,7 @@ Under the hood a tag is a branch head under the reserved name `refs/tags/<name>`
 Several worktrees may hold the same branch — in one process or many. When a commit finds the branch has moved since the worktree's `head`, kvgit performs a three-way merge automatically:
 
 ```python
-wt = kvgit.store()
+wt = kvgit.open()
 repo = wt.repo
 wt["a"] = 1
 wt["b"] = 1
@@ -247,7 +247,7 @@ w2.refresh()  # drop the pending change and move to the branch tip
 `merge()` brings another branch, tag or commit into the worktree's branch with a two-parent merge commit. It refuses while changes are pending. When the worktree's branch has not moved since the two forked, it fast-forwards instead, as git does — the branch simply moves to theirs — and `fast_forward=False` writes a merge commit regardless. Merging something the branch already contains is a no-op.
 
 ```python
-wt = kvgit.store()
+wt = kvgit.open()
 repo = wt.repo
 wt["a"] = 1
 wt.commit()
@@ -284,7 +284,7 @@ Register a merge function to resolve conflicts automatically.
 ```python
 from kvgit import counter, last_writer_wins
 
-wt = kvgit.store()
+wt = kvgit.open()
 repo = wt.repo
 wt["hits"] = 100
 wt.commit()
@@ -391,7 +391,7 @@ print(d.modified)  # frozenset of modified keys
 ```python
 from kvgit import Namespaced
 
-wt = kvgit.store()
+wt = kvgit.open()
 agent = Namespaced(wt, "agent")
 config = Namespaced(wt, "config")
 
@@ -422,7 +422,7 @@ Committing creates history. When a branch is deleted, the commits it referenced 
 Deleting a branch does not sweep; collection is its own step, run when it suits you:
 
 ```python
-wt = kvgit.store(kind="disk", path="/tmp/mydb")
+wt = kvgit.open("disk", path="/tmp/mydb")
 repo = wt.repo
 repo.create_branch("experiment", at=wt.head)
 # ... work on the branch ...
@@ -508,7 +508,7 @@ Pickle is what makes a worktree a dict of anything. But unpickling can execute c
 ```python
 import json
 
-wt = kvgit.store(codec="bytes")
+wt = kvgit.open(codec="bytes")
 wt["config"] = json.dumps({"retries": 3}).encode()
 wt.commit()
 json.loads(wt["config"])  # {"retries": 3}
@@ -517,7 +517,7 @@ json.loads(wt["config"])  # {"retries": 3}
 A pair of your own works the same way — JSON throughout, say:
 
 ```python
-as_json = kvgit.store(codec=(lambda v: json.dumps(v).encode(), json.loads))
+as_json = kvgit.open(codec=(lambda v: json.dumps(v).encode(), json.loads))
 ```
 
 Whatever the codec, a snapshot's `.raw` view reads the stored bytes without decoding them:
@@ -541,7 +541,7 @@ The `kvgit.codecs` package solves this by externalizing large numpy buffers as c
 import numpy as np
 import kvgit
 
-wt = kvgit.store(codec="scientific")  # numpy + pandas
+wt = kvgit.open(codec="scientific")  # numpy + pandas
 
 big = np.arange(1_000_000, dtype="float64")  # ~8 MB
 
@@ -560,7 +560,7 @@ from kvgit.codecs import compose
 from kvgit.codecs.numpy import NumpyCodec
 
 codec = compose(NumpyCodec(min_bytes=4096))  # higher threshold
-wt = kvgit.store(codec=codec)
+wt = kvgit.open(codec=codec)
 ```
 
 Pandas DataFrames work without a separate codec -- their underlying block ndarrays are visible to the numpy codec during pickling:
@@ -581,8 +581,8 @@ wt.commit()
 Current kvgit reads every older store in place; see [Storage versions](api.md#storage-versions). Chunked codecs need no migration either -- a store takes chunked writes as it is. To reclaim disk from arrays an older store pickled once per key, import its values into a fresh chunked store -- the dedup happens during the copy:
 
 ```python
-old = kvgit.store(kind="disk", path="/old/store")  # plain pickle
-new = kvgit.store(kind="disk", path="/new/store", codec=codec)
+old = kvgit.open("disk", path="/old/store")  # plain pickle
+new = kvgit.open("disk", path="/new/store", codec=codec)
 for k in old.keys():
     new[k] = old[k]
 new.commit()

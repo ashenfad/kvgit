@@ -24,12 +24,12 @@ Commit hashes are plain `str`s; a `Commit` record describes one. Every ref argum
 
 ---
 
-## `kvgit.store()`
+## `kvgit.open()`
 
-The one-line happy path: build a `Repo` over a backend and open (or create) one branch.
+The one-line happy path: open a store, creating it if it is new, and a worktree on one of its branches — as `shelve.open` does for a shelf.
 
 ```python
-kvgit.store(
+kvgit.open(
     kind="memory",       # "memory", "disk", or "indexeddb"
     *,
     path=None,           # required for "disk"
@@ -48,6 +48,14 @@ kvgit.store(
 | `codec` | see [Codecs](#codecs) | `"pickle"` | How values become stored bytes |
 
 The returned worktree's `repo` is the repository; close it with `wt.repo.close()`. For any other backend, or repo-wide options, construct a [`Repo`](#repo).
+
+`kvgit.open()` creates a missing branch; `repo.worktree(name)` does not, unless asked with `create=True`. Opening is where creating by default belongs, and a repository's API stays strict.
+
+```python
+wt = kvgit.open()                                    # in-memory
+wt = kvgit.open("disk", path="/tmp/db")              # opens or creates branch "main"
+wt = kvgit.open("disk", path="/tmp/db", branch="dev", codec="bytes")
+```
 
 ---
 
@@ -147,7 +155,7 @@ Nothing sweeps implicitly — deleting a branch or tag doesn't. Run `gc()` when 
 
 A branch checked out for work: a `MutableMapping[str, Any]` bound to one branch for its whole life. Writes are pending until `commit()` — there is no separate index to stage into. Several worktrees may hold the same branch, in one process or many; a commit that finds the branch moved merges automatically.
 
-Get one from `repo.worktree(name)` or `kvgit.store()`.
+Get one from `repo.worktree(name)` or `kvgit.open()`.
 
 ### Reading and writing
 
@@ -296,7 +304,7 @@ class Status:
 
 ## Codecs
 
-A repo's codec turns values into stored bytes and back. It is chosen when the repo is opened (`Repo(..., codec=)` or `kvgit.store(codec=)`):
+A repo's codec turns values into stored bytes and back. It is chosen when the repo is opened (`Repo(..., codec=)` or `kvgit.open(codec=)`):
 
 | `codec=` | Values | Stored as |
 |----------|--------|-----------|
