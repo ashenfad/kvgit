@@ -42,6 +42,13 @@ store written by 0.3.x opens as it is.
   `CorruptHeadError` and `StorageVersionError` join `ConcurrencyError`,
   `MergeConflict`, `UnknownBranchError` and `GcBusy`. None subclasses
   `ValueError` any more; `ValueError` is left for invalid arguments.
+- **`MergeResult.auto_merged_keys` and `carried_keys` mean what they say.**
+  `auto_merged_keys` is the keys a merge rule decided — contested keys a
+  merge function resolved, and keys under a registered `MergeChoice` —
+  where it used to include every key only our side changed.
+  `carried_keys` is the keys the other side changed that the merge took
+  as they were, where it used to list nearly every key in the store.
+  Both are empty for a plain commit.
 - **Deleting a branch or tag no longer sweeps.** Collection is
   `repo.gc()`, run when it suits the deployment. Any branch can be
   deleted, the last one included.
@@ -92,9 +99,15 @@ store written by 0.3.x opens as it is.
   ancestor is found. A lost commit race over a 3,000-commit history went
   from 3,099 reads (86 ms on local Postgres) to 2 for the search; history
   written before generations falls back to the full walk.
-- **Merges read keysets in batches**, one `get_many` per HAMT level rather
-  than one read per node, and read each commit's keyset once. The same
-  lost race (50 keys) dropped from 98 reads to 19.
+- **A merge costs what changed, not the size of the keyset.** Each side's
+  changes since the common ancestor are read as a structural diff of the
+  two keysets: subtrees they share are skipped by hash, and the rest is
+  read one batched `get_many` per tree level. The resolver works from
+  those changes and returns only what to change on our side, and entry
+  metadata comes with the diffs rather than from reloading both parents.
+  A lost race over 50,000 keys (one key changed on each side, local
+  Postgres) went from 774 ms and 20 MB read to 16 ms and 0.03 MB.
+  `Repo.diff` is the same structural diff.
 - **PostgreSQL backend** (`kvgit.kv.postgres.Postgres`, `pip install
   kvgit[postgres]`). One table with a `text COLLATE "C"` key, so
   `keys(prefix)` is an index range scan. `cas_many` is one transaction
