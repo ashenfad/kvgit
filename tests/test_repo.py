@@ -2,6 +2,7 @@
 
 import os
 import tempfile
+from collections.abc import Mapping
 
 import pytest
 from support import fork, worktree
@@ -45,7 +46,7 @@ def repo_with_history():
     wt["b"] = 1
     wt.commit(info={"n": 2})
     c2 = wt.head
-    repo.create_branch("dev", at=c1)
+    repo.branches.create("dev", at=c1)
     dev = repo.worktree("dev")
     dev["d"] = 1
     dev.commit()
@@ -55,12 +56,12 @@ def repo_with_history():
 class TestOpening:
     def test_a_fresh_store_has_no_branches_until_one_is_made(self):
         repo = Repo(Memory())
-        assert repo.branches() == []
+        assert list(repo.branches) == []
         with pytest.raises(UnknownBranchError):
             repo.worktree("main")
         wt = repo.worktree("main", create=True)
         assert wt.head == ROOT_COMMIT
-        assert repo.branches() == ["main"]
+        assert list(repo.branches) == ["main"]
 
     def test_create_is_open_or_create(self):
         repo = Repo(Memory())
@@ -111,39 +112,39 @@ class TestOpening:
 class TestBranches:
     def test_create_at_root_by_default(self):
         repo = Repo(Memory())
-        assert repo.create_branch("dev") == ROOT_COMMIT
-        assert repo.head("dev") == ROOT_COMMIT
-        assert repo.has_branch("dev")
+        assert repo.branches.create("dev") == ROOT_COMMIT
+        assert repo.branches["dev"] == ROOT_COMMIT
+        assert "dev" in repo.branches
 
     def test_create_at_a_commit(self):
         repo, _, _, c1, _ = repo_with_history()
-        assert repo.create_branch("from-c1", at=c1) == c1
+        assert repo.branches.create("from-c1", at=c1) == c1
         assert repo.snapshot(branch="from-c1")["a"] == 1
 
     def test_create_errors(self):
         repo, *_ = repo_with_history()
         with pytest.raises(BranchExistsError):
-            repo.create_branch("dev")
+            repo.branches.create("dev")
         with pytest.raises(UnknownCommitError):
-            repo.create_branch("x", at="0" * 40)
+            repo.branches.create("x", at="0" * 40)
 
     def test_branches_are_sorted_and_exclude_tags(self):
         repo, wt, *_ = repo_with_history()
-        repo.create_tag("v1", wt.head)
-        assert repo.branches() == ["dev", "main"]
+        repo.tags.create("v1", wt.head)
+        assert list(repo.branches) == ["dev", "main"]
 
     def test_delete_any_branch(self):
         repo, *_ = repo_with_history()
-        repo.delete_branch("main")  # even one with a worktree open
-        assert repo.branches() == ["dev"]
-        assert not repo.has_branch("main")
+        repo.branches.delete("main")  # even one with a worktree open
+        assert list(repo.branches) == ["dev"]
+        assert "main" not in repo.branches
         with pytest.raises(UnknownBranchError):
-            repo.delete_branch("main")
+            repo.branches.delete("main")
 
     def test_delete_does_not_sweep(self):
         repo, _, dev, *_ = repo_with_history()
         orphan = dev.head
-        repo.delete_branch("dev")
+        repo.branches.delete("dev")
         assert repo.get_commit(orphan)  # collectable, not yet collected
         assert repo.gc(min_age=0) == 1
         with pytest.raises(UnknownCommitError):
@@ -152,71 +153,130 @@ class TestBranches:
     def test_head_errors(self):
         repo, *_ = repo_with_history()
         with pytest.raises(UnknownBranchError):
-            repo.head("nope")
+            repo.branches["nope"]
         repo.store.set(BRANCH_HEAD % "main", b"garbage")
         repo.store.remove(BRANCH_HEAD_PREV % "main")
         with pytest.raises(CorruptHeadError):
-            repo.head("main")
+            repo.branches["main"]
 
     def test_repair_head(self):
         repo, wt, *_ = repo_with_history()
         good = wt.head
         repo.store.set(BRANCH_HEAD % "main", b"garbage")
-        assert repo.head("main") != good  # recovered in memory, from the backup
+        assert repo.branches["main"] != good  # recovered in memory, from the backup
         assert repo.repair_head("main") is not None
         assert repo.store.get(BRANCH_HEAD % "main") != b"garbage"
+
+
+class TestRefCollections:
+    """``repo.branches`` and ``repo.tags`` are live mappings, shaped like
+    pygit2's ``repo.branches``."""
+
+    def test_branches_is_a_mapping_of_name_to_tip(self):
+        repo, wt, dev, *_ = repo_with_history()
+        assert isinstance(repo.branches, Mapping)
+        assert dict(repo.branches) == {"dev": dev.head, "main": wt.head}
+        assert len(repo.branches) == 2
+        assert repo.branches.get("nope") is None
+        assert repo.branches.get("main") == wt.head
+        assert 42 not in repo.branches
+
+    def test_a_missing_ref_is_a_key_error_that_reads_cleanly(self):
+        repo, *_ = repo_with_history()
+        with pytest.raises(KeyError) as missing_branch:
+            repo.branches["nope"]
+        assert isinstance(missing_branch.value, UnknownBranchError)
+        assert str(missing_branch.value) == "Branch 'nope' does not exist"
+        with pytest.raises(KeyError) as missing_tag:
+            repo.tags["nope"]
+        assert isinstance(missing_tag.value, UnknownTagError)
+        assert str(missing_tag.value) == "Tag 'nope' does not exist"
+
+    def test_damage_is_not_absence(self):
+        repo, *_ = repo_with_history()
+        repo.store.set(BRANCH_HEAD % "main", b"garbage")
+        repo.store.remove(BRANCH_HEAD_PREV % "main")
+        assert "main" in repo.branches
+        with pytest.raises(CorruptHeadError):
+            repo.branches.get("main")
+
+    def test_views_are_live(self):
+        repo, wt, *_ = repo_with_history()
+        branches, tags = repo.branches, repo.tags
+        other = Repo(repo.store)
+        other.branches.create("late", wt.head)
+        other.tags.create("v9", wt.head)
+        assert "late" in branches and branches["late"] == wt.head
+        assert list(tags) == ["v9"] and dict(tags.items()) == {"v9": wt.head}
+        moved = other.worktree("late")
+        moved["x"] = 1
+        moved.commit()
+        assert branches["late"] == moved.head
+
+    def test_create_takes_the_commit_positionally_too(self):
+        repo, wt, *_ = repo_with_history()
+        assert repo.branches.create("pos", wt.head) == wt.head
+        assert repo.branches["pos"] == wt.head
+
+    def test_a_dangling_tag_still_maps_to_its_commit(self):
+        repo, _, dev, *_ = repo_with_history()
+        repo.tags.create("keep", dev.head)
+        repo.store.remove(COMMIT_ROOT % dev.head)
+        assert repo.tags["keep"] == dev.head
+        assert repo.tags.info("keep").dangling
 
 
 class TestTags:
     def test_create_list_info_delete(self):
         repo, wt, *_ = repo_with_history()
-        repo.create_tag("v1", wt.head, info={"why": "release"})
-        assert repo.tags() == {"v1": wt.head}
-        info = repo.tag_info("v1")
+        repo.tags.create("v1", wt.head, info={"why": "release"})
+        assert dict(repo.tags) == {"v1": wt.head}
+        info = repo.tags.info("v1")
         assert info.commit == wt.head and info.info == {"why": "release"}
-        repo.delete_tag("v1")
-        assert repo.tags() == {}
-        assert repo.tag_info("v1") is None
+        repo.tags.delete("v1")
+        assert dict(repo.tags) == {}
+        with pytest.raises(UnknownTagError):
+            repo.tags.info("v1")
 
     def test_tag_errors(self):
         repo, wt, *_ = repo_with_history()
-        repo.create_tag("v1", wt.head)
+        repo.tags.create("v1", wt.head)
         with pytest.raises(TagExistsError):
-            repo.create_tag("v1", wt.head)
+            repo.tags.create("v1", wt.head)
         with pytest.raises(UnknownCommitError):
-            repo.create_tag("v2", "0" * 40)
+            repo.tags.create("v2", "0" * 40)
         with pytest.raises(UnknownTagError):
-            repo.delete_tag("v2")
+            repo.tags.delete("v2")
 
     def test_a_tag_keeps_its_commit_alive(self):
         repo, _, dev, *_ = repo_with_history()
-        repo.create_tag("keep", dev.head)
-        repo.delete_branch("dev")
+        repo.tags.create("keep", dev.head)
+        repo.branches.delete("dev")
         repo.gc(min_age=0)
         assert repo.snapshot(tag="keep")["d"] == 1
 
     def test_branch_and_tag_namespaces_are_separate(self):
         repo, wt, dev, *_ = repo_with_history()
-        repo.create_tag("dev", wt.head)
+        repo.tags.create("dev", wt.head)
         assert repo.snapshot(branch="dev").commit == dev.head
         assert repo.snapshot(tag="dev").commit == wt.head
 
     def test_the_branch_api_refuses_a_tags_reserved_name(self):
         repo, wt, *_ = repo_with_history()
-        repo.create_tag("v1", wt.head)
+        repo.tags.create("v1", wt.head)
         reserved = "refs/tags/v1"
         for attempt in (
             lambda: repo.worktree(reserved),
-            lambda: repo.create_branch(reserved),
-            lambda: repo.delete_branch(reserved),
-            lambda: repo.head(reserved),
+            lambda: repo.branches.create(reserved),
+            lambda: repo.branches.delete(reserved),
+            lambda: repo.branches[reserved],
             lambda: repo.repair_head(reserved),
             lambda: repo.snapshot(branch=reserved),
         ):
             with pytest.raises(ValueError, match="reserved"):
                 attempt()
-        assert not repo.has_branch(reserved)
-        assert repo.tags() == {"v1": wt.head}
+        assert reserved not in repo.branches
+        assert dict(repo.tags) == {"v1": wt.head}
 
 
 class TestCommits:
@@ -259,7 +319,7 @@ class TestCommits:
 
     def test_log_from_a_tag_and_errors(self):
         repo, wt, *_ = repo_with_history()
-        repo.create_tag("v1", wt.head)
+        repo.tags.create("v1", wt.head)
         assert next(repo.log(tag="v1")).hash == wt.head
         with pytest.raises(ValueError, match="exactly one"):
             list(repo.log())
@@ -324,7 +384,7 @@ class TestSnapshots:
 
     def test_snapshot_refs_and_errors(self):
         repo, wt, *_ = repo_with_history()
-        repo.create_tag("v1", wt.head)
+        repo.tags.create("v1", wt.head)
         assert repo.snapshot(tag="v1").commit == wt.head
         with pytest.raises(ValueError, match="exactly one"):
             repo.snapshot(branch="main", tag="v1")
@@ -337,7 +397,7 @@ class TestSnapshots:
 
     def test_a_tag_naming_a_missing_commit_is_unknown(self):
         repo, wt, *_ = repo_with_history()
-        repo.create_tag("v1", wt.head)
+        repo.tags.create("v1", wt.head)
         repo.store.set(BRANCH_HEAD % "refs/tags/v1", dumps("0" * 40))
         with pytest.raises(UnknownCommitError):
             repo.snapshot(tag="v1")
@@ -347,7 +407,7 @@ class TestGc:
     def test_gc_reclaims_a_deleted_branch(self):
         repo, _, dev, *_ = repo_with_history()
         orphan = dev.head
-        repo.delete_branch("dev")
+        repo.branches.delete("dev")
         assert repo.gc() == 0  # younger than the default hour
         assert repo.gc(min_age=0) == 1
         assert repo.store.get(COMMIT_ROOT % orphan) is None

@@ -158,7 +158,7 @@ class TestCommit:
         wt["k"] = 1
         wt.commit()
         assert wt.head != ROOT_COMMIT
-        assert wt.repo.head("main") == wt.head
+        assert wt.repo.branches["main"] == wt.head
 
 
 class TestPartialCommit:
@@ -226,7 +226,7 @@ class TestDiscardResetRefresh:
         wt.reset(first)
         assert not wt.status()
         assert wt["k"] == "v1"
-        assert wt.head == first == wt.repo.head("main")
+        assert wt.head == first == wt.repo.branches["main"]
 
     def test_reset_to_an_unknown_commit_raises_and_keeps_pending(self):
         wt = worktree()
@@ -252,17 +252,17 @@ class TestDiscardResetRefresh:
     def test_refresh_of_a_deleted_branch_raises(self):
         wt = worktree()
         dev = fork(wt, "dev")
-        wt.repo.delete_branch("dev")
+        wt.repo.branches.delete("dev")
         with pytest.raises(UnknownBranchError):
             dev.refresh()
 
     def test_reset_of_a_deleted_branch_raises_and_does_not_recreate_it(self):
         wt = worktree()
         dev = fork(wt, "dev")
-        wt.repo.delete_branch("dev")
+        wt.repo.branches.delete("dev")
         with pytest.raises(UnknownBranchError):
             dev.reset(wt.head)
-        assert not wt.repo.has_branch("dev")
+        assert "dev" not in wt.repo.branches
 
     def test_a_delete_landing_mid_reset_is_not_undone(self):
         """The delete lands between reset's read of HEAD and its write."""
@@ -284,7 +284,7 @@ class TestDiscardResetRefresh:
         store.armed = True
         with pytest.raises(UnknownBranchError):
             dev.reset(ROOT_COMMIT)
-        assert not wt.repo.has_branch("dev")
+        assert "dev" not in wt.repo.branches
 
 
 class TestSharedBranch:
@@ -307,7 +307,7 @@ class TestSharedBranch:
     def test_a_commit_to_a_deleted_branch_raises(self):
         wt = worktree()
         dev = fork(wt, "dev")
-        wt.repo.delete_branch("dev")
+        wt.repo.branches.delete("dev")
         assert dev.get("missing") is None  # still readable from its head
         dev["k"] = "v"
         with pytest.raises(UnknownBranchError):
@@ -338,7 +338,7 @@ class TestMerge:
 
     def test_merge_a_commit_or_a_tag(self):
         wt, dev = self._diverged()
-        wt.repo.create_tag("dev-v1", dev.head)
+        wt.repo.tags.create("dev-v1", dev.head)
         assert wt.merge(tag="dev-v1", default_merge=text_merge()).merged
         wt2, dev2 = self._diverged()
         assert wt2.merge(commit=dev2.head, default_merge=text_merge()).merged
@@ -361,7 +361,7 @@ class TestMerge:
         head = wt.head
         with pytest.raises(MergeConflict):
             wt.merge(branch="dev")
-        assert wt.head == head == wt.repo.head("main")
+        assert wt.head == head == wt.repo.branches["main"]
 
     def test_abandon_returns_a_falsy_result(self):
         wt, _ = self._diverged()
@@ -388,7 +388,7 @@ class TestFastForward:
         result = wt.merge(branch="dev", info={"msg": "unused"})
         assert result.merged
         assert result.strategy == "fast_forward"
-        assert result.commit == dev.head == wt.head == wt.repo.head("main")
+        assert result.commit == dev.head == wt.head == wt.repo.branches["main"]
         assert (wt["b"], wt["c"]) == (2, 3)
         assert set(wt.repo.store.keys("__commit_root__")) == commits_before
         assert wt.repo.store.get(BRANCH_HEAD_PREV % "main") == dumps(before)
@@ -409,7 +409,7 @@ class TestFastForward:
         head = dev.head
         result = dev.merge(branch="main")
         assert result.merged and result.strategy == "no_op"
-        assert dev.head == head == dev.repo.head("dev")
+        assert dev.head == head == dev.repo.branches["dev"]
         assert dev.merge(commit=head).strategy == "no_op"
 
     def test_a_no_op_checks_the_branch_has_not_moved(self):
@@ -422,15 +422,15 @@ class TestFastForward:
         with pytest.raises(ConcurrencyError):
             wt.merge(commit=dev.head)
         assert not wt.merge(commit=dev.head, on_conflict="abandon")
-        assert wt.repo.head("main") == ROOT_COMMIT
+        assert wt.repo.branches["main"] == ROOT_COMMIT
 
     def test_a_no_op_on_a_deleted_branch_raises(self):
         wt, dev = self._ahead()
         wt.merge(branch="dev")
-        wt.repo.delete_branch("main")
+        wt.repo.branches.delete("main")
         with pytest.raises(UnknownBranchError):
             wt.merge(commit=dev.head)
-        assert not wt.repo.has_branch("main")
+        assert "main" not in wt.repo.branches
 
     def test_a_branch_that_moved_meanwhile_is_not_fast_forwarded(self):
         wt, _ = self._ahead()
@@ -440,14 +440,14 @@ class TestFastForward:
         with pytest.raises(ConcurrencyError):
             wt.merge(branch="dev")
         assert not wt.merge(branch="dev", on_conflict="abandon")
-        assert wt.repo.head("main") == other.head
+        assert wt.repo.branches["main"] == other.head
 
     def test_fast_forwarding_a_deleted_branch_raises_and_does_not_recreate_it(self):
         wt, _ = self._ahead()
-        wt.repo.delete_branch("main")
+        wt.repo.branches.delete("main")
         with pytest.raises(UnknownBranchError):
             wt.merge(branch="dev")
-        assert not wt.repo.has_branch("main")
+        assert "main" not in wt.repo.branches
 
     def test_a_fast_forwarded_worktree_commits_on_top(self):
         wt, dev = self._ahead()
@@ -547,7 +547,7 @@ class TestApply:
         with pytest.raises(ConcurrencyError):
             stale.apply(base, target, merge_fns={})
         assert stale.head == base
-        assert wt.repo.head("main") == tip
+        assert wt.repo.branches["main"] == tip
 
 
 class TestMergeRules:
@@ -556,7 +556,7 @@ class TestMergeRules:
         wt = repo.worktree("main", create=True)
         wt["runs/1"] = "base"
         wt.commit()
-        repo.create_branch("dev", at=wt.head)
+        repo.branches.create("dev", at=wt.head)
         dev = repo.worktree("dev")
         dev["runs/1"] = "theirs"
         dev["runs/2"] = "theirs only"
@@ -575,7 +575,7 @@ class TestMergeRules:
         wt.commit()
 
         def diverge():
-            repo.create_branch(f"dev{diverge.n}", at=wt.head)
+            repo.branches.create(f"dev{diverge.n}", at=wt.head)
             dev = repo.worktree(f"dev{diverge.n}")
             dev["k"] = f"theirs{diverge.n}"
             dev.commit()
@@ -602,7 +602,7 @@ class TestMergeRules:
         wt = repo.worktree("main", create=True)
         wt["k"] = b"base"
         wt.commit()
-        repo.create_branch("dev", at=wt.head)
+        repo.branches.create("dev", at=wt.head)
         dev = repo.worktree("dev")
         dev["k"] = b"theirs"
         dev.commit()

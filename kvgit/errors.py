@@ -37,13 +37,22 @@ class MergeConflict(KvgitError):
         super().__init__(f"Merge conflict on keys: {keys_str}")
 
 
-class UnknownBranchError(KvgitError):
+class UnknownBranchError(KvgitError, KeyError):
     """Raised for a branch that does not exist — opening it, reading its
-    head, deleting it, or committing to it after it was deleted."""
+    head, deleting it, or committing to it after it was deleted.
+
+    A ``KeyError`` too, since ``repo.branches`` is a mapping: its
+    ``get()`` and ``in`` answer for a missing branch rather than raise.
+    """
+
+    __str__ = Exception.__str__  # the message, unquoted as KeyError would
 
 
-class UnknownTagError(KvgitError):
-    """Raised for a tag that does not exist."""
+class UnknownTagError(KvgitError, KeyError):
+    """Raised for a tag that does not exist. A ``KeyError`` too, since
+    ``repo.tags`` is a mapping."""
+
+    __str__ = Exception.__str__
 
 
 class UnknownCommitError(KvgitError):

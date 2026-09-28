@@ -25,6 +25,7 @@ from .merges import (
     theirs,
 )
 from .namespaced import Namespaced
+from .refs import Branches, Tags
 from .repo import Commit, RawSnapshot, Repo, Snapshot
 from .versioned.kv import ROOT_COMMIT, CorruptHeadRecoverer, recover_by_commit_scan
 from .versioned.protocol import (
@@ -39,6 +40,7 @@ from .worktree import Status, Worktree
 __all__ = [
     "ROOT_COMMIT",
     "BranchExistsError",
+    "Branches",
     "CantMark",
     "Commit",
     "ConcurrencyError",
@@ -60,6 +62,7 @@ __all__ = [
     "StorageVersionError",
     "TagExistsError",
     "TagInfo",
+    "Tags",
     "TextMergeFn",
     "UnknownBranchError",
     "UnknownCommitError",

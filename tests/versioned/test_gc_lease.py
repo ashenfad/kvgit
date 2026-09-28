@@ -701,14 +701,14 @@ class TestBranchRootWrites:
         dev = fork(s, "dev")
         dev["work"] = "abandoned"
         orphan = dev.commit().commit
-        s.repo.delete_branch("dev")
+        s.repo.branches.delete("dev")
         age_commits(store, 10_000)
 
         outcome: dict[str, object] = {}
 
         def creator():
             try:
-                outcome["branch"] = s.repo.create_branch("revive", at=orphan)
+                outcome["branch"] = s.repo.branches.create("revive", at=orphan)
             except UnknownCommitError as exc:
                 outcome["error"] = str(exc)
 
@@ -743,7 +743,7 @@ class TestBranchRootWrites:
         dev = fork(s, "dev")
         dev["work"] = "abandoned"
         orphan = dev.commit().commit
-        s.repo.delete_branch("dev")
+        s.repo.branches.delete("dev")
         age_commits(store, 10_000)
 
         outcome: dict[str, object] = {}
