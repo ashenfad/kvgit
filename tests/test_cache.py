@@ -205,6 +205,33 @@ def test_a_budget_must_be_positive():
         ContentCache(max_bytes=0)
 
 
+def test_a_negative_budget_is_an_error_not_a_cache_turned_off():
+    with pytest.raises(ValueError):
+        Repo(Memory(), cache_bytes=-1)
+
+
+def test_the_read_that_reveals_a_sweep_answers_nothing_from_before_it():
+    """A read asking for the lease and a cached key together, after a
+    sweep removed that key: the answer is the store's, not the cache's."""
+    from kvgit.encoding import dumps
+
+    backend = Memory()
+    cache = ContentCache()
+    cached = CachedStore(backend, cache)
+    node = "kvgit:keyset:swept"
+    backend.set(node, b"node")
+    assert cached.get_many(GC_LEASE_KEY, node) == {node: b"node"}  # warm
+
+    # Another process sweeps: the node goes, the lease record changes.
+    backend.remove(node)
+    backend.set(GC_LEASE_KEY, dumps({"owner": "sweep", "expires": 0}))
+
+    found = cached.get_many(GC_LEASE_KEY, node)
+    assert node not in found
+    assert cache.clears == 1
+    assert cached.get(node) is None
+
+
 # -- the backend stays the backend ---------------------------------------------
 
 

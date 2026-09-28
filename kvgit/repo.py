@@ -94,8 +94,10 @@ class Repo:
     ) -> None:
         _kv._check_storage_version(backend)
         self._backend = backend
+        # 0 turns the cache off; anything else is a budget, and
+        # ContentCache refuses one that is negative.
         self.cache: ContentCache | None = (
-            ContentCache(cache_bytes) if cache_bytes > 0 else None
+            ContentCache(cache_bytes) if cache_bytes != 0 else None
         )
         """What this repository remembers of its store, with its hit and
         miss counts; ``None`` with ``cache_bytes=0``."""
