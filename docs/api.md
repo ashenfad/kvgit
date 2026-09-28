@@ -36,6 +36,7 @@ kvgit.open(
     db_name="kvgit",     # IndexedDB database name (only for "indexeddb")
     branch="main",
     codec="pickle",
+    cache_bytes=32 * 1024 * 1024,
 ) -> Worktree
 ```
 
@@ -46,6 +47,7 @@ kvgit.open(
 | `db_name` | `str` | `"kvgit"` | IndexedDB database name. Only used with `"indexeddb"`. |
 | `branch` | `str` | `"main"` | Branch to open; created at the empty root commit if missing |
 | `codec` | see [Codecs](#codecs) | `"pickle"` | How values become stored bytes |
+| `cache_bytes` | `int` | 32 MB | See [The cache](#the-cache) |
 
 The returned worktree's `repo` is the repository; close it with `wt.repo.close()`. For any other backend, or repo-wide options, construct a [`Repo`](#repo).
 
@@ -72,6 +74,7 @@ repo = Repo(
     merge_prefixes=None,
     default_merge=None,
     recover_from_corrupt_head=None,
+    cache_bytes=32 * 1024 * 1024,
 )
 ```
 
@@ -83,6 +86,7 @@ repo = Repo(
 | `merge_prefixes` | `dict[str, MergeFn \| MergeChoice] \| None` | `None` | Merge rules by key prefix, likewise |
 | `default_merge` | `MergeFn \| MergeChoice \| None` | `None` | The rule for keys no other rule covers |
 | `recover_from_corrupt_head` | `CorruptHeadRecoverer \| None` | `None` | Last-resort HEAD recovery; see [HEAD Recovery](#head-recovery) |
+| `cache_bytes` | `int` | 32 MB | Memory for what the store never rewrites; `0` turns it off. See [The cache](#the-cache) |
 
 None of these settings is written to the store: they belong to the process that opens it. Opening reads the store's version stamp once and raises [`StorageVersionError`](#errors) for a layout this code does not read; it never writes.
 
@@ -168,11 +172,23 @@ History ends at the empty root commit every branch starts from (`ROOT_COMMIT`, t
 
 Nothing sweeps implicitly — deleting a branch or tag doesn't. Run `gc()` when it suits the deployment: a scheduled job for a shared Postgres store, a quiet moment in the embedding process for a local one. See [Orphan Cleanup](#orphan-cleanup).
 
+### The cache
+
+A repository remembers what its store never rewrites: tree nodes, and each commit's parents, generations, time and info. Every worktree and snapshot of the repository shares that memory, from any thread. Over a networked backend it turns most of a commit's reads, and most of a snapshot's, into none: a commit on a warm repository makes one read and two writes.
+
+- **What it never holds.** A commit's root, which is the store's answer to whether a commit exists, so `snapshot(commit=)` of a swept commit still raises and a tag on one still reads as `dangling`. Blobs and chunks, which can be large and are rarely read twice. Branch heads, tags, the GC lease, anything else that changes. Absence: a key missing now can be written by the next commit.
+- **When it empties.** Every sweep rewrites the GC lease record, and every commit reads that record beside HEAD. A record different from the last one seen means a sweep ran, in this process or any other, on this host or another, so the cache empties before the commit builds on anything the sweep may have removed. A sweep that finds nothing to delete empties it too. With `gc()` on a schedule the cost is one re-warm per run; in a tight loop the cache would stay cold.
+- **What it can't see.** Keys removed outside kvgit: a `DELETE` in SQL, a truncated table, a directory emptied under a running process. Existence checks still go to the store, so those read as missing where it matters. But restart processes after editing a store by hand. Reads and removals made through `repo.store`, the backend itself, bypass the cache the same way.
+- **Its size.** `cache_bytes` bounds it, least recently used first out, 32 MB by default: tens of thousands of tree nodes. Each `Repo` has its own, so a process that opens many pays for each; share one `Repo` per store instead.
+
+`repo.cache` is the cache, with `hits`, `misses`, `clears`, `size_bytes` and `clear()`; it is `None` with `cache_bytes=0`.
+
 ### Other members
 
 | Member | Description |
 |--------|-------------|
-| `store` | The backend `KVStore` |
+| `store` | The backend `KVStore`, as handed in. Reads and removals through it bypass [the cache](#the-cache). |
+| `cache` | The [`ContentCache`](#the-cache), or `None` with `cache_bytes=0` |
 | `close()` | Close the backend; also `__enter__` / `__exit__` |
 
 ---

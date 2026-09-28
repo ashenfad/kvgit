@@ -3,6 +3,7 @@
 from typing import Literal
 
 from ._codec import CodecSpec
+from .cache import DEFAULT_CACHE_BYTES
 from .kv.base import KVStore
 from .kv.memory import Memory
 from .repo import Repo
@@ -39,6 +40,7 @@ def open(
     db_name: str = "kvgit",
     branch: str = "main",
     codec: CodecSpec = "pickle",
+    cache_bytes: int = DEFAULT_CACHE_BYTES,
 ) -> Worktree:
     """Open (or create) a store, and a worktree on ``branch`` of it.
 
@@ -57,6 +59,10 @@ def open(
         db_name: The IndexedDB database name, for ``kind="indexeddb"``.
         branch: The branch to check out (default ``"main"``).
         codec: How values are stored; see :class:`Repo`.
+        cache_bytes: Memory for what the store never changes; see
+            :class:`Repo`.
     """
     backend = _make_backend(kind, path=path, db_name=db_name)
-    return Repo(backend, codec=codec).worktree(branch, create=True)
+    return Repo(backend, codec=codec, cache_bytes=cache_bytes).worktree(
+        branch, create=True
+    )

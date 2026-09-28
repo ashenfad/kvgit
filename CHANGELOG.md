@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **A repository caches what its store never rewrites.** Tree nodes and commit records (parents, generations, time and info) are written once and never changed, so `Repo` now keeps them in a bounded LRU cache that its worktrees and snapshots share: `Repo(backend, cache_bytes=...)`, 32 MB by default, `0` to turn it off. `kvgit.open(cache_bytes=)` passes it through.
+  - On a warm repository, a commit makes 3 round trips instead of 6 (one read, two writes), and a snapshot read makes 2 instead of 5. nontainer's `ws-git commit` on a 200-file workspace drops from 25 to 13, and `ws-git status` from 12 to 6.
+  - A sweep by any process empties the cache. Every sweep rewrites the GC lease record, and every commit reads that record with HEAD, so a commit never builds on something a sweep may have removed.
+  - A commit's root is never cached, because it's the store's answer to whether a commit exists: `snapshot(commit=)` of a swept commit still raises. Blobs, chunks, heads, tags and absent keys aren't cached either.
+  - `repo.cache` exposes `hits`, `misses`, `clears`, `size_bytes` and `clear()`. `repo.store` is still the backend as handed in; reads and removals through it bypass the cache.
+
 ### Changed
 - **A commit makes 6 round trips to the backend instead of 9.**
   - It reads the branch head, the GC lease and the base commit's root in one `get_many`. Before, the lease was a read of its own just before the landing write.
