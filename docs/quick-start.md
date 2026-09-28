@@ -661,8 +661,8 @@ result = wt.commit()
 result.merged            # True if commit succeeded
 result.commit            # new commit hash
 result.strategy          # "no_op", "fast_forward", "three_way", or "apply"
-result.auto_merged_keys  # keys resolved by merge functions
-result.carried_keys      # keys carried from the other side
+result.auto_merged_keys  # keys a merge rule decided
+result.carried_keys      # keys the other side changed, taken as they were
 ```
 
 Use `on_conflict="abandon"` to get a falsy result instead of an exception:

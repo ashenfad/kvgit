@@ -113,7 +113,7 @@ See [Tags](#tags) for the semantics.
 |--------|---------|-------------|
 | `get_commit(commit)` | `Commit` | One commit's record. `UnknownCommitError` if missing. |
 | `log(*, commit=None, branch=None, tag=None, limit=None, first_parent=False)` | `Iterator[Commit]` | Commits reachable from the one starting point named, newest first. Follows every parent of a merge; `first_parent=True` follows only the line made on the branch itself. |
-| `diff(a, b)` | `DiffResult` | Keys added, removed and modified going from commit `a` to `b` |
+| `diff(a, b)` | `DiffResult` | Keys added, removed and modified going from commit `a` to `b`. A structural diff: it reads only the parts of the two keysets that differ. |
 | `merge_base(a, b)` | `str \| None` | Lowest common ancestor, or `None` if the two share no history. Criss-cross ties go to the smallest hash. `UnknownCommitError` if either is not in the store. |
 | `snapshot(*, commit=None, branch=None, tag=None)` | `Snapshot` | Read-only view of the commit the ref resolves to now |
 
@@ -214,7 +214,7 @@ Merge another branch, tag or commit into this worktree's branch: lowest common a
 | The branch has not moved since the fork, `fast_forward=False` | A merge commit, as below |
 | Both sides moved | `strategy="three_way"`: a merge commit |
 
-Finding the common ancestor costs a few batched reads however long the history: see [Generations](#generations).
+Finding the common ancestor costs a few batched reads however long the history: see [Generations](#generations). Resolving reads each side's changes since the ancestor as a structural diff of the two keysets — subtrees they share are skipped by hash, one batched read per tree level — so a merge costs what changed, not the size of the keyset.
 
 #### `apply(base, target, **options) -> MergeResult`
 
@@ -423,8 +423,10 @@ Frozen dataclass returned by `commit()`, `merge()`, `apply()`, `cherry_pick()` a
 | `merged` | `bool` | Whether the commit succeeded |
 | `commit` | `str \| None` | New commit hash |
 | `strategy` | `str` | `"no_op"`, `"fast_forward"`, `"three_way"`, or `"apply"` (a change applied as a single-parent commit) |
-| `auto_merged_keys` | `tuple[str, ...]` | Keys resolved by merge functions |
-| `carried_keys` | `tuple[str, ...]` | Keys carried forward from the other side |
+| `auto_merged_keys` | `tuple[str, ...]` | Keys a merge rule decided: keys both sides changed that a merge function (or the `MergeChoice` it returned) resolved, and keys under a registered `MergeChoice` that either side changed |
+| `carried_keys` | `tuple[str, ...]` | Keys the other side changed that the merge took as they were — the other writer's changes on a lost race, the merged branch's on a merge or fast-forward, the picked change on `apply` |
+
+Both are empty for a commit with no other side (`fast_forward` on `commit()`) and for `no_op`. A key both sides changed identically appears in neither.
 
 ### TagInfo
 
