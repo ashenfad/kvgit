@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.2] - 2026-09-28
 
 ### Added
 - **A repository caches what its store never rewrites.** Tree nodes and commit records (parents, generations, time and info) are written once and never changed, so `Repo` now keeps them in a bounded LRU cache that its worktrees and snapshots share: `Repo(backend, cache_bytes=...)`, 32 MB by default, `0` to turn it off. `kvgit.open(cache_bytes=)` passes it through.
