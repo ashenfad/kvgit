@@ -202,14 +202,18 @@ class CachedStore(KVStore):
     def get_many(self, *args) -> Mapping[str, bytes]:
         keys = list(dict.fromkeys(self._normalize_keys(args)))
         wanted = [k for k in keys if cacheable(k)]
-        held = self.cache.lookup(wanted) if wanted else {}
-        rest = [k for k in keys if k not in held]
-        found = dict(self.backend.get_many(rest)) if rest else {}
-        if GC_LEASE_KEY in rest:
-            # Before anything read in this call is remembered: a sweep
-            # this record reveals empties the cache, and what came back
-            # beside it is as fresh as the record is.
+        if GC_LEASE_KEY in keys:
+            # A read of the lease may reveal a sweep, and nothing the
+            # cache held before it may be answered beside it: the whole
+            # call goes to the store, and the record is noted before
+            # anything it brought back is remembered.
+            held: dict[str, bytes] = {}
+            found = dict(self.backend.get_many(keys))
             self.cache.saw_lease(found.get(GC_LEASE_KEY))
+        else:
+            held = self.cache.lookup(wanted) if wanted else {}
+            rest = [k for k in keys if k not in held]
+            found = dict(self.backend.get_many(rest)) if rest else {}
         fetched = {k: v for k, v in found.items() if cacheable(k)}
         if wanted:
             self.cache.count(len(held), len(wanted) - len(held))
