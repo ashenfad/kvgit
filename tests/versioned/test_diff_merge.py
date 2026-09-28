@@ -224,6 +224,22 @@ class TestReportedKeys:
         assert (wt["both"], wt["mine"], wt["yours"], wt["new"]) == (3, 1, 2, 2)
         assert (wt["owned/x"], wt["same"]) == (0, 9)
 
+    def test_an_identical_change_is_reported_only_under_a_policy(self):
+        wt = worktree()
+        wt["owned/x"] = 0
+        wt["plain"] = 0
+        wt.commit()
+        dev = fork(wt, "dev")
+        dev["owned/x"] = 5
+        dev["plain"] = 5
+        dev.commit()
+        wt["owned/x"] = 5
+        wt["plain"] = 5
+        wt.commit()
+        result = wt.merge(branch="dev", merge_prefixes={"owned/": MergeChoice.OURS})
+        assert result.auto_merged_keys == ("owned/x",)
+        assert result.carried_keys == ()
+
     def test_a_plain_commit_carries_nothing(self):
         wt = worktree()
         wt["k"] = 1
