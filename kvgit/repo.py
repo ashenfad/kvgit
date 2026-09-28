@@ -11,17 +11,15 @@ from .content_types import MergeFn
 from .encoding import loads, safe_loads
 from .errors import (
     BranchExistsError,
-    CorruptHeadError,
-    UnknownBranchError,
     UnknownCommitError,
     UnknownTagError,
 )
 from .kv.base import KVStore
+from .refs import Branches, Tags
 from .versioned import kv as _kv
 from .versioned.helpers import changes_as_diff, walk_history
 from .versioned.keyset import Keyset
 from .versioned.kv import (
-    BRANCH_HEAD,
     COMMIT_ROOT,
     COMMIT_TIME,
     GC_LEASE_TTL,
@@ -31,7 +29,7 @@ from .versioned.kv import (
     CorruptHeadRecoverer,
     VersionedKV,
 )
-from .versioned.protocol import DiffResult, MergeChoice, TagInfo
+from .versioned.protocol import DiffResult, MergeChoice
 from .worktree import Worktree
 
 MergeRule = MergeFn | MergeChoice
@@ -94,6 +92,12 @@ class Repo:
         self._merge_prefixes = dict(merge_prefixes or {})
         self._default_merge = default_merge
         self._recover = recover_from_corrupt_head
+        self.branches = Branches(self)
+        """Every branch, as a live mapping of name to tip commit, with
+        ``create`` and ``delete``."""
+        self.tags = Tags(self)
+        """Every tag, as a live mapping of name to commit, with ``create``,
+        ``delete`` and ``info``."""
 
     def __repr__(self) -> str:
         return f"Repo({type(self._store).__name__})"
@@ -125,7 +129,7 @@ class Repo:
                 ``create=True``, which creates it at the empty root commit.
             CorruptHeadError: if its HEAD is damaged beyond recovery.
         """
-        if create and not self.has_branch(name):
+        if create and name not in self.branches:
             try:
                 _kv.create_branch(self._store, name, ROOT_COMMIT)
             except BranchExistsError:
@@ -139,53 +143,6 @@ class Repo:
         )
         return Worktree(self, engine)
 
-    def create_branch(self, name: str, *, at: str | None = None) -> str:
-        """Create branch ``name`` at commit ``at`` (default: the empty root
-        commit); return the commit it points at.
-
-        Raises:
-            BranchExistsError: if the name is taken.
-            UnknownCommitError: if ``at`` is not in the store.
-        """
-        target = at or ROOT_COMMIT
-        _kv.create_branch(self._store, name, target)
-        return target
-
-    def delete_branch(self, name: str) -> None:
-        """Delete a branch. Its commits become collectable at the next
-        :meth:`gc`; worktrees still holding it read from their heads and
-        raise :class:`UnknownBranchError` on commit.
-
-        Raises:
-            UnknownBranchError: if there is no such branch.
-        """
-        _kv.delete_branch(self._store, name)
-
-    def branches(self) -> list[str]:
-        """Every branch name, sorted. Tags are not included."""
-        return VersionedKV.branches(self._store)
-
-    def has_branch(self, name: str) -> bool:
-        """Whether a branch exists. Never writes."""
-        return VersionedKV.exists(self._store, name)
-
-    def head(self, name: str) -> str:
-        """The commit branch ``name`` points at.
-
-        Raises:
-            UnknownBranchError: if there is no such branch.
-            CorruptHeadError: if its HEAD is damaged beyond recovery.
-        """
-        _kv._reject_reserved_branch(name)
-        commit = _kv._resolve_head(
-            self._store, name, recover_from_corrupt_head=self._recover
-        )
-        if commit is not None:
-            return commit
-        if self._store.get(BRANCH_HEAD % name) is not None:
-            raise CorruptHeadError(f"Branch '{name}' HEAD is corrupt and unrecoverable")
-        raise UnknownBranchError(f"Branch '{name}' does not exist")
-
     def repair_head(self, name: str) -> str | None:
         """Persist a recovered HEAD for a damaged branch; return the commit
         it now names, or None if nothing was recoverable. Reads recover in
@@ -194,35 +151,6 @@ class Repo:
         return _kv.repair_head(
             self._store, name, recover_from_corrupt_head=self._recover
         )
-
-    # -- Tags --
-
-    def create_tag(self, name: str, commit: str, *, info: dict | None = None) -> None:
-        """Name ``commit`` permanently. A tag never moves and keeps its
-        commit, and everything that commit descends from, alive.
-
-        Raises:
-            TagExistsError: if the name is taken.
-            UnknownCommitError: if ``commit`` is not in the store.
-        """
-        _kv.create_tag(self._store, name, commit, info)
-
-    def delete_tag(self, name: str) -> None:
-        """Delete a tag. A commit it alone kept alive becomes collectable
-        at the next :meth:`gc`.
-
-        Raises:
-            UnknownTagError: if there is no such tag.
-        """
-        _kv.delete_tag(self._store, name)
-
-    def tags(self) -> dict[str, str]:
-        """Every tag, mapped to the commit it names."""
-        return _kv.tags(self._store)
-
-    def tag_info(self, name: str) -> TagInfo | None:
-        """A tag's commit, creation time and info; None if there is none."""
-        return _kv.tag_info(self._store, name)
 
     # -- Commits and history --
 
@@ -365,7 +293,7 @@ class Repo:
         if len(given) != 1:
             raise ValueError("name exactly one of commit, branch or tag")
         if branch is not None:
-            return self.head(branch)
+            return self.branches[branch]
         if tag is not None:
             tagged = _kv._resolve_tag(self._store, tag)
             if tagged is None:

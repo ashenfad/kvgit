@@ -31,8 +31,8 @@ class TestDeleteBranch:
                 wt.commit()
 
             with Repo(Disk(p)) as repo:
-                repo.delete_branch("main")
-                assert repo.branches() == []
+                repo.branches.delete("main")
+                assert list(repo.branches) == []
                 fresh = repo.worktree("main", create=True)
                 assert fresh.get("x") is None
 
@@ -44,21 +44,21 @@ class TestDeleteBranch:
                 wt["base"] = "ok"
                 wt.commit()
                 for name in ("dev", "feature"):
-                    repo.create_branch(name, at=wt.head)
-                assert repo.branches() == ["dev", "feature", "main"]
+                    repo.branches.create(name, at=wt.head)
+                assert list(repo.branches) == ["dev", "feature", "main"]
 
             with Repo(Disk(p)) as repo:
-                repo.delete_branch("dev")
-                repo.delete_branch("feature")
-                assert repo.branches() == ["main"]
+                repo.branches.delete("dev")
+                repo.branches.delete("feature")
+                assert list(repo.branches) == ["main"]
                 assert repo.snapshot(branch="main")["base"] == "ok"
 
     def test_deleting_an_unknown_branch_raises(self):
         repo = Repo(Memory())
         repo.worktree("main", create=True)
         with pytest.raises(UnknownBranchError):
-            repo.delete_branch("never-existed")
-        assert repo.branches() == ["main"]
+            repo.branches.delete("never-existed")
+        assert list(repo.branches) == ["main"]
 
     def test_the_backup_goes_with_the_head(self):
         """Left behind, a same-named branch created later could 'recover'
@@ -74,7 +74,7 @@ class TestDeleteBranch:
                 dev.commit()
 
             with Repo(Disk(p)) as repo:
-                repo.delete_branch("dev")
+                repo.branches.delete("dev")
                 again = repo.worktree("dev", create=True)
                 assert again.get("secret") is None
                 assert again.get("more") is None
@@ -96,7 +96,7 @@ class TestDeleteBranch:
                 pointer = dev._engine._commit_keys["secret"]
 
             with Repo(Disk(p)) as repo:
-                repo.delete_branch("dev")
+                repo.branches.delete("dev")
                 assert repo.store.get(pointer) is not None
                 repo.gc(min_age=0)
                 assert repo.store.get(COMMIT_ROOT % dev_commit) is None
@@ -107,9 +107,9 @@ class TestDeleteBranch:
             p = os.path.join(d, "store")
             with Repo(Disk(p)) as repo:
                 repo.worktree("main", create=True)
-                repo.delete_branch("main")
+                repo.branches.delete("main")
             with Repo(Disk(p)) as repo:
-                assert repo.branches() == []
+                assert list(repo.branches) == []
 
 
 class TestSharedOrphanSweep:
@@ -133,7 +133,7 @@ class TestSharedOrphanSweep:
         dev = fork(wt, "dev")
         dev["k"] = "v"
         dev.commit()
-        wt.repo.delete_branch("dev")
+        wt.repo.branches.delete("dev")
         assert _resolve_head(wt.repo.store, "dev") is None
         assert wt.repo.gc(min_age=0) >= 1
         assert clean_orphans(wt.repo.store, min_age=0) == 0

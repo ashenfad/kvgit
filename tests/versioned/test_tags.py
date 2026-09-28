@@ -237,10 +237,10 @@ class TestRepoTagPaths:
                 wt = repo.worktree("main", create=True)
                 wt["keep"] = "tagged value"
                 wt.commit()
-                repo.create_tag("v1", wt.head)
+                repo.tags.create("v1", wt.head)
 
             with Repo(Disk(p)) as repo:
-                repo.delete_branch("main")
+                repo.branches.delete("main")
                 repo.gc(min_age=0)
                 assert repo.snapshot(tag="v1")["keep"] == "tagged value"
                 assert repo.worktree("main", create=True).get("keep") is None
@@ -252,15 +252,15 @@ class TestRepoTagPaths:
                 wt = repo.worktree("main", create=True)
                 wt["keep"] = "tagged value"
                 wt.commit()
-                repo.create_tag("v1", wt.head)
+                repo.tags.create("v1", wt.head)
                 tagged = wt.head
                 pointer = wt._engine._commit_keys["keep"]
 
             with Repo(Disk(p)) as repo:
-                repo.delete_branch("main")
-                repo.delete_tag("v1")
+                repo.branches.delete("main")
+                repo.tags.delete("v1")
                 repo.gc(min_age=0)
-                assert repo.tags() == {}
+                assert dict(repo.tags) == {}
                 assert repo.store.get(TAG_INFO_KEY % "v1") is None
                 assert repo.store.get(COMMIT_ROOT % tagged) is None
                 assert repo.store.get(pointer) is None
@@ -412,10 +412,10 @@ class TestTagKeyLayout:
     def test_repo_delete_tag_removes_the_backup_too(self):
         repo = Repo(Memory())
         wt = repo.worktree("main", create=True)
-        repo.create_tag("v1", wt.head)
+        repo.tags.create("v1", wt.head)
         repo.store.set(BRANCH_HEAD_PREV % "refs/tags/v1", dumps(wt.head))
 
-        repo.delete_tag("v1")
+        repo.tags.delete("v1")
 
         assert repo.store.get(_tag_head("v1")) is None
         assert repo.store.get(BRANCH_HEAD_PREV % "refs/tags/v1") is None
@@ -529,7 +529,7 @@ class TestUnknownStorageVersionIsRefused:
         store whose tags this code may not see."""
         backend = Memory()
         wt = Repo(backend).worktree("main", create=True)
-        wt.repo.create_tag("v1", wt.head)
+        wt.repo.tags.create("v1", wt.head)
         backend.set(STORAGE_VERSION_KEY, dumps(99))
         before = dict(backend.items())
 
@@ -545,12 +545,12 @@ class TestRepoTagOps:
         wt.commit()
         repo = wt.repo
 
-        repo.create_tag("v1", wt.head, info={"by": "ann"})
+        repo.tags.create("v1", wt.head, info={"by": "ann"})
 
-        assert repo.tags() == {"v1": wt.head}
-        assert repo.tag_info("v1").info == {"by": "ann"}
-        repo.delete_tag("v1")
-        assert repo.tags() == {}
+        assert dict(repo.tags) == {"v1": wt.head}
+        assert repo.tags.info("v1").info == {"by": "ann"}
+        repo.tags.delete("v1")
+        assert dict(repo.tags) == {}
 
     def test_a_tag_names_a_commit_not_pending_changes(self):
         wt = worktree()
@@ -558,7 +558,7 @@ class TestRepoTagOps:
         wt.commit()
         wt["x"] = "pending only"
 
-        wt.repo.create_tag("v1", wt.head)
+        wt.repo.tags.create("v1", wt.head)
 
         assert wt.repo.snapshot(tag="v1")["x"] == "committed"
         assert wt["x"] == "pending only"
@@ -567,7 +567,7 @@ class TestRepoTagOps:
         wt = worktree()
         wt["title"] = "first"
         wt.commit()
-        wt.repo.create_tag("v1", wt.head)
+        wt.repo.tags.create("v1", wt.head)
         wt["title"] = "second"
         wt.commit()
 
@@ -584,13 +584,13 @@ class TestRepoTagOps:
         dev["secret"] = "tagged value"
         dev.commit()
         repo = wt.repo
-        repo.create_tag("v1", dev.head)
-        repo.delete_branch("dev")
+        repo.tags.create("v1", dev.head)
+        repo.branches.delete("dev")
 
         assert repo.gc(min_age=0) == 0
         pointer = blob_key(pickle.dumps("tagged value"))
         assert repo.store.get(pointer) is not None
 
-        repo.delete_tag("v1")
+        repo.tags.delete("v1")
         assert repo.gc(min_age=0) >= 1
         assert repo.store.get(pointer) is None

@@ -101,7 +101,7 @@ class TestReading:
         store, manifest = load_v3()
         repo = Repo(store)
         for name, expected in manifest["branches"].items():
-            assert repo.head(name) == expected["head"]
+            assert repo.branches[name] == expected["head"]
             assert repo.worktree(name).head == expected["head"]
             assert [c.hash for c in repo.log(branch=name)] == expected["history"]
 
@@ -114,7 +114,7 @@ class TestReading:
     def test_tags(self):
         store, manifest = load_v3()
         repo = Repo(store)
-        assert repo.tags() == manifest["tags"]
+        assert dict(repo.tags) == manifest["tags"]
         expected = manifest["branches"]["main"]["values"]
         assert values(repo.snapshot(tag="v1")) == expected
 
@@ -172,8 +172,8 @@ class TestWriting:
         main["count"] = 3
         main.commit()
 
-        assert main.repo.head("dev") == manifest["branches"]["dev"]["head"]
-        assert main.repo.tags() == manifest["tags"]
+        assert main.repo.branches["dev"] == manifest["branches"]["dev"]["head"]
+        assert dict(main.repo.tags) == manifest["tags"]
         check_every_branch(store, {"branches": {"dev": manifest["branches"]["dev"]}})
 
     def test_equal_bytes_share_one_blob(self):
@@ -192,7 +192,7 @@ class TestWriting:
     def test_fork_from_a_legacy_head(self):
         store, manifest = load_v3()
         repo = Repo(store)
-        repo.create_branch("fork", at=repo.head("dev"))
+        repo.branches.create("fork", at=repo.branches["dev"])
         fork = repo.worktree("fork")
         fork["extra"] = "v4"
         fork.commit()
@@ -355,12 +355,12 @@ class TestSweepingAMixedStore:
     def test_a_content_orphan_goes_with_its_commit(self):
         store, manifest = load_v3()
         repo = Repo(store)
-        repo.create_branch("scratch", at=repo.head("main"))
+        repo.branches.create("scratch", at=repo.branches["main"])
         scratch = repo.worktree("scratch")
         scratch["tmp"] = "throwaway"
         scratch.commit()
         pointer = blob_key(pickled("throwaway"))
-        repo.delete_branch("scratch")
+        repo.branches.delete("scratch")
 
         repo.gc(min_age=0)
         assert store.get(pointer) is None
@@ -379,11 +379,11 @@ class TestSweepingAMixedStore:
         live = dict(manifest["branches"]["main"]["values"], count=3)
 
         # An orphan holding the same bytes as a live key: shared content.
-        repo.create_branch("shared", at=main.head)
+        repo.branches.create("shared", at=main.head)
         shared = repo.worktree("shared")
         shared["also_three"] = 3
         shared.commit()
-        repo.delete_branch("shared")
+        repo.branches.delete("shared")
 
         repo.gc(min_age=0, deep=True)
         assert store.get(blob_key(pickled(3))) is not None

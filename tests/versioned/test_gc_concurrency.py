@@ -249,7 +249,7 @@ class TestSharedStructure:
         shared = main_nodes & dev_nodes
         assert shared, "test needs the two commits to actually share structure"
 
-        s.repo.delete_branch("dev")
+        s.repo.branches.delete("dev")
         age_commits(store, 10_000)
         assert clean_orphans(store, min_age=3600) == 1
 
@@ -279,8 +279,8 @@ class TestSharedStructure:
         two["b"] = "b"
         two.commit()
 
-        s.repo.delete_branch("one")
-        s.repo.delete_branch("two")
+        s.repo.branches.delete("one")
+        s.repo.branches.delete("two")
         age_commits(store, 10_000)
         assert clean_orphans(store, min_age=3600) == 2
 
@@ -302,7 +302,7 @@ class TestDamagedOrphans:
             dev[f"dev{i:03d}"] = i
         dev_commit = dev.commit().commit
         dev_root = _load_root(store, dev_commit)
-        s.repo.delete_branch("dev")
+        s.repo.branches.delete("dev")
 
         # Blow a hole in the orphan's keyset before the sweep sees it.
         store.remove(NODE_PREFIX + str(dev_root))
@@ -323,7 +323,7 @@ class TestDamagedOrphans:
             dev[f"dev{i:03d}"] = i
         dev_commit = dev.commit().commit
         dev_root = _load_root(store, dev_commit)
-        s.repo.delete_branch("dev")
+        s.repo.branches.delete("dev")
 
         store.set(NODE_PREFIX + str(dev_root), b"not json at all")
 
@@ -357,7 +357,7 @@ class TestOrdinaryGarbage:
         assert dev_chunks
         assert store.get(dev_blob) is not None
 
-        s.repo.delete_branch("dev")
+        s.repo.branches.delete("dev")
         age_commits(store, 10_000)
         assert clean_orphans(store, min_age=3600) == 1
 
@@ -419,7 +419,7 @@ class TestDeepClean:
         dev_commit = dev.commit().commit
         dev_nodes = node_hashes(store, dev_commit) - live_nodes
         dev_root = str(_load_root(store, dev_commit))
-        s.repo.delete_branch("dev")
+        s.repo.branches.delete("dev")
         store.remove(NODE_PREFIX + dev_root)
 
         age_commits(store, 10_000)
@@ -482,7 +482,7 @@ class TestChunkDedupRace:
         orphan_chunks = set(chunk_keys(store)) - live_chunks
         assert len(orphan_chunks) == 1, "test needs exactly one orphan-owned chunk"
         (shared_chunk,) = orphan_chunks
-        s.repo.delete_branch("dev")
+        s.repo.branches.delete("dev")
         age_commits(store, 10_000)
 
         landed: dict[str, object] = {}
@@ -527,7 +527,7 @@ class TestChunkDedupRace:
         orphan_chunks = set(chunk_keys(store)) - live_chunks
         assert orphan_chunks
 
-        s.repo.delete_branch("dev")
+        s.repo.branches.delete("dev")
         age_commits(store, 10_000)
         assert clean_orphans(store, min_age=3600) == 1
 

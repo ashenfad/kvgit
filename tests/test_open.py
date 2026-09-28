@@ -29,7 +29,7 @@ class TestOpen:
     def test_branch_parameter_creates_the_branch(self):
         wt = kvgit.open(branch="dev")
         assert wt.branch == "dev"
-        assert wt.repo.branches() == ["dev"]
+        assert list(wt.repo.branches) == ["dev"]
 
     def test_opening_an_existing_branch_does_not_recreate_it(self):
         with tempfile.TemporaryDirectory() as path:
@@ -106,7 +106,7 @@ class TestOpenDisk:
             first = kvgit.open("disk", path=p)
             first["base"] = "ok"
             first.commit()
-            first.repo.create_branch("worker", at=first.head)
+            first.repo.branches.create("worker", at=first.head)
             worker = first.repo.worktree("worker")
             worker["work"] = "done"
             worker.commit()

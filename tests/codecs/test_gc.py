@@ -50,7 +50,7 @@ class TestChunkSweepOnDeleteBranch:
 
         # delete_branch sweeps with the default one-hour ``min_age``,
         # which spares commits this young; sweep again at 0.
-        s.repo.delete_branch("dev")
+        s.repo.branches.delete("dev")
         s.repo.gc(min_age=0)
 
         assert len(chunk_keys(store)) == 1
@@ -70,7 +70,7 @@ class TestChunkSweepOnDeleteBranch:
         dev.commit()
         assert len(chunk_keys(store)) == 1
 
-        s.repo.delete_branch("dev")
+        s.repo.branches.delete("dev")
         s.repo.gc(min_age=0)
         # main still references the chunk.
         assert len(chunk_keys(store)) == 1
@@ -125,7 +125,7 @@ class TestOrphanCommitChunks:
         # Capture the dev commit hash before deleting the branch.
         dev_commit = dev.head
         # Detach the branch — the commit becomes unreachable.
-        s.repo.delete_branch("dev")
+        s.repo.branches.delete("dev")
 
         # Make sure the commit is in the store but is now an orphan,
         # and is "young" (timestamp recent).
@@ -165,7 +165,7 @@ class TestOrphanCommitChunks:
         dev["only"] = np.arange(2048, dtype="float64") + 1
         dev.commit()
         dev_commit = dev.head
-        s.repo.delete_branch("dev")
+        s.repo.branches.delete("dev")
 
         # Backdate the commit so it's outside the cutoff.
         store.set(COMMIT_TIME % dev_commit, dumps(time.time() - 7200))
@@ -188,7 +188,7 @@ class TestCleanOrphansHandlesPureV2Stores:
         dev["b"] = "goodbye"
         dev.commit()
 
-        s.repo.delete_branch("dev")
+        s.repo.branches.delete("dev")
         # Should run without error, sweep nothing chunk-related.
         s.repo.gc(min_age=0)
         assert chunk_keys(store) == []

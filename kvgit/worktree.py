@@ -79,7 +79,7 @@ class Worktree(MutableMapping[str, Any]):
         """The commit this worktree is based on.
 
         The branch itself may have moved on since, if another worktree
-        committed to it; ``repo.head(wt.branch)`` reads the branch's tip.
+        committed to it; ``repo.branches[wt.branch]`` reads the branch's tip.
         """
         return self._engine.current_commit
 
