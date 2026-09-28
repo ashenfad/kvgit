@@ -902,7 +902,9 @@ class TestThreeWayMerge:
         assert result is not None
         assert result.merged is True
         assert result.strategy == "three_way"
-        assert "b" in result.auto_merged_keys
+        # The other writer's change, taken as it was; nothing contested.
+        assert result.carried_keys == ("a",)
+        assert result.auto_merged_keys == ()
 
     def test_history_all_parents_after_merge(self):
         """After merge, history(all_parents=True) traverses both branches."""
@@ -1037,44 +1039,35 @@ class TestThreeWayMerge:
         assert v2.get("new_key") == b"new"
         assert v2.get("keep") == b"yes"
 
-    def test_three_way_merge_loads_each_keyset_at_most_once(self):
-        """Regression: ``_three_way_merge`` should load LCA / ours / theirs
-        once each, not once per consumer.
+    def test_a_merge_reads_the_change_not_the_keyset(self):
+        """Each side's changes are read as structural diffs, so a merge
+        of one-key changes over a large keyset reads a few HAMT nodes,
+        not all of them."""
 
-        The naive form (``self.diff()`` building each diff and then
-        ``resolve_merge`` re-loading each keyset) loaded each commit's
-        keyset 2-3 times — 7 calls total per merge. The dedup makes
-        merges noticeably faster on high-latency stores.
-        """
-        store = Memory()
+        class Counting(Memory):
+            nodes_read = 0
+
+            def get_many(self, *args):
+                keys = self._normalize_keys(args)
+                Counting.nodes_read += sum(k.startswith("kvgit:keyset:") for k in keys)
+                return super().get_many(*args)
+
+            def get(self, key):
+                Counting.nodes_read += key.startswith("kvgit:keyset:")
+                return super().get(key)
+
+        store = Counting()
         v1 = Versioned(store)
-        v1.commit({"base": b"0"})
+        v1.commit({f"k{i}": b"%d" % i for i in range(2000)})
+        total_nodes = sum(1 for k in store.keys("kvgit:keyset:"))
 
         v2 = Versioned(store)
         v1.commit({"a": b"1"})
-
-        # Patch _load_keyset to record every call.
-        call_log: list[str] = []
-        original = v2._load_keyset
-
-        def counting(commit_hash: str):
-            call_log.append(commit_hash)
-            return original(commit_hash)
-
-        v2._load_keyset = counting  # type: ignore[method-assign]
-
-        v2.commit({"b": b"2"})  # triggers a three-way merge
-
-        # Three-way merge needs LCA, ours, theirs — three unique commits.
-        # Each should appear at most once in the call log.
-        assert len(call_log) == len(set(call_log)), (
-            f"_load_keyset called multiple times for the same commit: {call_log}"
-        )
-        # And there should be exactly three unique loads.
-        assert len(set(call_log)) == 3, (
-            f"expected 3 unique _load_keyset calls, got {len(set(call_log))}: "
-            f"{call_log}"
-        )
+        Counting.nodes_read = 0
+        result = v2.commit({"b": b"2"})  # loses the race: a three-way merge
+        assert result.strategy == "three_way"
+        assert v2.get("a") == b"1" and v2.get("b") == b"2"
+        assert Counting.nodes_read < 40 < total_nodes
 
 
 class TestMergeResultReturn:

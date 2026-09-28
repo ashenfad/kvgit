@@ -13,6 +13,7 @@ import pickle
 from pathlib import Path
 
 import pytest
+from support import pointers
 
 from kvgit import Repo, Worktree, text_merge
 from kvgit.encoding import safe_loads
@@ -261,9 +262,9 @@ class TestMergingAcrossFormats:
         store, manifest = load_v3()
         dev_head = manifest["branches"]["dev"]["head"]
         main = VersionedKV(store)
-        theirs = main._load_keyset(dev_head)["notes"]
+        theirs = pointers(main.store, dev_head)["notes"]
         main.commit({"notes": store.get(theirs)})
-        ours = main._load_keyset(main.current_commit)["notes"]
+        ours = pointers(main.store, main.current_commit)["notes"]
         assert ours.startswith(BLOB_PREFIX) and not theirs.startswith(BLOB_PREFIX)
 
         result = main.merge_heads(dev_head)

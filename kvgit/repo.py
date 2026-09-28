@@ -18,7 +18,7 @@ from .errors import (
 )
 from .kv.base import KVStore
 from .versioned import kv as _kv
-from .versioned.helpers import diff_keysets, walk_history
+from .versioned.helpers import changes_as_diff, walk_history
 from .versioned.keyset import Keyset
 from .versioned.kv import (
     BRANCH_HEAD,
@@ -291,10 +291,17 @@ class Repo:
     def diff(self, a: str, b: str) -> DiffResult:
         """Keys added, removed and modified going from commit ``a`` to ``b``.
 
+        A structural diff: the cost follows the size of the change, not
+        of the two keysets.
+
         Raises:
             UnknownCommitError: if either commit is not in the store.
         """
-        return diff_keysets(self._pointers(a), self._pointers(b))
+        found = self._store.get_many(COMMIT_ROOT % a, COMMIT_ROOT % b)
+        for commit in (a, b):
+            if COMMIT_ROOT % commit not in found:
+                raise UnknownCommitError(f"Commit '{commit}' does not exist")
+        return changes_as_diff(_kv.commit_changes(self._store, a, b))
 
     def merge_base(self, a: str, b: str) -> str | None:
         """The lowest common ancestor of two commits, or None if they share
