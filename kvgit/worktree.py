@@ -40,7 +40,7 @@ class Worktree(MutableMapping[str, Any]):
     raises only when the two changed the same key in ways no merge rule
     resolves.
 
-    Obtain one from :meth:`Repo.worktree`, or :func:`kvgit.store` for
+    Obtain one from :meth:`Repo.worktree`, or :func:`kvgit.open` for
     the one-line case.
     """
 
