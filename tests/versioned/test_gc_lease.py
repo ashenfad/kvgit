@@ -37,6 +37,7 @@ from kvgit.versioned.kv import (
     CHUNK_PREFIX,
     COMMIT_ROOT,
     GC_LEASE_KEY,
+    GC_WAIT_POLL,
     IN_FLIGHT_KEY,
     STORAGE_VERSION_KEY,
     VersionedKV,
@@ -635,13 +636,19 @@ class TestSweepsBesideWriters:
         for t in threads:
             t.start()
         sweeps = 0
-        deadline = time.monotonic() + 1.0
-        while time.monotonic() < deadline:
+        start = time.monotonic()
+        # Sweep for at least a second, and on until the writers have
+        # landed enough commits between sweeps to mean something — a slow
+        # backend makes each sweep longer — within a generous cap.
+        while time.monotonic() - start < 1.0 or (
+            sum(counts.values()) <= 10 and time.monotonic() - start < 30.0
+        ):
             clean_orphans(store, min_age=0)
             sweeps += 1
-            # Writers wait while a sweep holds the lease and poll for its
-            # release; sweeping back to back with no gap starves them.
-            time.sleep(0.01)
+            # Writers wait while a sweep holds the lease, polling every
+            # GC_WAIT_POLL seconds. A gap shorter than a poll lets through
+            # only writers whose poll happens to land inside it.
+            time.sleep(2 * GC_WAIT_POLL)
         stop.set()
         for t in threads:
             t.join(timeout=10)
