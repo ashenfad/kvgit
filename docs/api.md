@@ -209,7 +209,7 @@ Merge another branch, tag or commit into this worktree's branch: lowest common a
 
 | Case | Result |
 |------|--------|
-| The branch already contains theirs | `strategy="no_op"`; nothing written |
+| The branch already contains theirs | `strategy="no_op"`; nothing written. The branch must still be at the worktree's `head`, as for the other outcomes: `ConcurrencyError` (or a falsy result under `"abandon"`) if it moved, `UnknownBranchError` if it was deleted. |
 | The branch has not moved since the fork, `fast_forward=True` (default) | `strategy="fast_forward"`: HEAD moves to theirs, no commit is written, so `info` is not recorded |
 | The branch has not moved since the fork, `fast_forward=False` | A merge commit, as below |
 | Both sides moved | `strategy="three_way"`: a merge commit |

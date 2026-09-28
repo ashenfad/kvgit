@@ -480,7 +480,8 @@ class VersionedBase(ABC):
         ``ConcurrencyError`` likewise without changing anything; retrying
         cannot help that case, unlike a race.
 
-        A head our history already contains merges as a no-op. When ours
+        A head our history already contains merges as a no-op, provided
+        the branch is still at our head. When ours
         is an ancestor of theirs, the branch fast-forwards — HEAD moves
         to ``their_head`` and no commit is written, so ``info`` is not
         recorded — unless ``fast_forward=False``, which writes the merge
@@ -497,6 +498,24 @@ class VersionedBase(ABC):
         our_head = self._current_commit
         lca = self._find_lca(our_head, their_head)
         if lca == their_head:
+            # Nothing is written, so no publish guards this answer the way
+            # the other outcomes' CAS on our head does: check the branch
+            # is still where this handle left it.
+            live = self.latest_head
+            if live is None:
+                raise UnknownBranchError(f"Branch '{self._branch}' has no HEAD")
+            if live != our_head:
+                if on_conflict == "abandon":
+                    result = MergeResult(
+                        merged=False,
+                        commit=None,
+                        strategy="no_op",
+                        auto_merged_keys=(),
+                        carried_keys=(),
+                    )
+                    self.last_merge_result = result
+                    return result
+                raise ConcurrencyError("HEAD changed during merge. Refresh and retry.")
             result = MergeResult(
                 merged=True,
                 commit=our_head,
