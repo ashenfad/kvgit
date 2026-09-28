@@ -10,6 +10,8 @@ at it, from outside the repository so the checkout cannot shadow it:
 ``probe`` tries every entry point that opens or sweeps a store and
 reports whether each refused, then whether the store is byte-identical.
 Probe a copy: an older release may do part of what it is asked.
+``build`` runs on this checkout's API; ``probe`` runs on the released
+one, so the two halves call different entry points.
 """
 
 import base64
@@ -29,9 +31,9 @@ def build(path: str) -> None:
     data = json.loads(fixture.read_text())
     disk = Disk(path)
     disk.set_many({k: base64.b64decode(v) for k, v in data["store"].items()})
-    s = kvgit.Staged(kvgit.VersionedKV(disk))
-    s["count"] = 3
-    s.commit()
+    wt = kvgit.Repo(disk).worktree("main")
+    wt["count"] = 3
+    wt.commit()
     print("stamp", disk.get("__kvgit_version__"), "keys", len(list(disk.keys())))
     disk.close()
 

@@ -8,9 +8,10 @@ from pathlib import Path
 
 import pytest
 
-from kvgit import MergeConflict, VersionedKV as Versioned
+from kvgit import MergeConflict
 from kvgit.kv.memory import Memory
 from kvgit.merges import CantMark, make_text_merge, text, text_merge_result
+from kvgit.versioned.kv import VersionedKV as Versioned
 
 GIT = shutil.which("git")
 needs_git = pytest.mark.skipif(GIT is None, reason="git binary not available")

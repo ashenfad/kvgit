@@ -13,7 +13,7 @@ class Namespaced(MutableMapping[str, Any]):
     supported by wrapping another Namespaced instance.
 
     Args:
-        store: Any MutableMapping (Staged, Live, or another Namespaced).
+        store: Any MutableMapping (a Worktree, or another Namespaced).
         namespace: The namespace name (must not contain ``/``).
     """
 

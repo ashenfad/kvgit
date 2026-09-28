@@ -35,16 +35,16 @@ def time_it(fn: Callable, repeat: int = 5) -> tuple[float, float]:
     )
 
 
-def store_bytes(s: kvgit.Staged) -> int:
+def store_bytes(s: kvgit.Worktree) -> int:
     """Sum every entry in the underlying KV. Closest thing to 'on-disk size'."""
     total = 0
-    for _, v in s.versioned.store.items():
+    for _, v in s.repo.store.items():
         total += len(v)
     return total
 
 
-def chunk_count(s: kvgit.Staged) -> int:
-    return sum(1 for k in s.versioned.store.keys() if k.startswith(CHUNK_PREFIX))
+def chunk_count(s: kvgit.Worktree) -> int:
+    return sum(1 for k in s.repo.store.keys() if k.startswith(CHUNK_PREFIX))
 
 
 def fmt_bytes(n: int) -> str:
@@ -125,7 +125,7 @@ def workload_duplicates(df: pd.DataFrame) -> dict[str, object]:
 def measure(
     label: str,
     data: dict,
-    store_factory: Callable[[], kvgit.Staged],
+    store_factory: Callable[[], kvgit.Worktree],
 ) -> dict[str, float | int | str]:
     def write():
         s = store_factory()
@@ -138,7 +138,7 @@ def measure(
     s = write()
 
     def read():
-        s.reset()
+        s.discard()
         s._cache.clear()
         for k in data:
             _ = s[k]
@@ -146,7 +146,7 @@ def measure(
     dec_med, _ = time_it(read, repeat=5)
 
     # Verify round-trip equality
-    s.reset()
+    s.discard()
     s._cache.clear()
     for k, v_orig in data.items():
         v_round = s[k]
@@ -184,7 +184,7 @@ def run_workload(name: str, build_data: Callable[[], dict]) -> None:
 
     plain = measure("plain pickle", data, lambda: kvgit.store())
     chunked = measure(
-        "chunked (scientific)", data, lambda: kvgit.store(codecs="scientific")
+        "chunked (scientific)", data, lambda: kvgit.store(codec="scientific")
     )
 
     header = f"{'codec':<22}{'on-disk':>14}{'encode':>14}{'decode':>14}{'chunks':>10}"

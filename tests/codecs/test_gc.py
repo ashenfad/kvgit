@@ -8,7 +8,8 @@ import pytest
 
 np = pytest.importorskip("numpy")
 
-from kvgit import Staged, VersionedKV
+from support import fork, worktree
+
 from kvgit.codecs import compose
 from kvgit.codecs.numpy import NumpyCodec
 from kvgit.encoding import dumps
@@ -22,10 +23,7 @@ from kvgit.versioned.kv import (
 def make_staged(store=None):
     encoder, decoder = compose(NumpyCodec(min_bytes=64))
     store = store or Memory()
-    return (
-        Staged(VersionedKV(store), encoder=encoder, decoder=decoder),
-        store,
-    )
+    return worktree(store, codec=(encoder, decoder)), store
 
 
 def chunk_keys(store):
@@ -45,15 +43,15 @@ class TestChunkSweepOnDeleteBranch:
         s.commit()
 
         # New branch with a unique chunk.
-        dev = s.create_branch("dev")
+        dev = fork(s, "dev")
         dev["only_on_dev"] = np.arange(2048, dtype="float64") + 100
         dev.commit()
         assert len(chunk_keys(store)) == 2
 
         # delete_branch sweeps with the default one-hour ``min_age``,
         # which spares commits this young; sweep again at 0.
-        s.delete_branch("dev")
-        s.versioned.clean_orphans(min_age=0)
+        s.repo.delete_branch("dev")
+        s.repo.gc(min_age=0)
 
         assert len(chunk_keys(store)) == 1
         assert np.array_equal(
@@ -67,13 +65,13 @@ class TestChunkSweepOnDeleteBranch:
         s["x"] = big
         s.commit()
 
-        dev = s.create_branch("dev")
+        dev = fork(s, "dev")
         dev["y"] = big  # shares the same chunk via dedup
         dev.commit()
         assert len(chunk_keys(store)) == 1
 
-        s.delete_branch("dev")
-        s.versioned.clean_orphans(min_age=0)
+        s.repo.delete_branch("dev")
+        s.repo.gc(min_age=0)
         # main still references the chunk.
         assert len(chunk_keys(store)) == 1
 
@@ -97,10 +95,10 @@ class TestCommitlessChunks:
         rogue_hash = "deadbeef" * 5  # 40 chars
         store.set(CHUNK_PREFIX + rogue_hash, b"unreferenced bytes")
 
-        s.versioned.clean_orphans(min_age=0)
+        s.repo.gc(min_age=0)
         assert (CHUNK_PREFIX + rogue_hash) in store.keys()
 
-        s.versioned.deep_clean(min_age=0)
+        s.repo.gc(min_age=0, deep=True)
         assert (CHUNK_PREFIX + rogue_hash) not in store.keys()
         # The referenced chunk survives both sweeps.
         assert len(chunk_keys(store)) == 1
@@ -121,13 +119,13 @@ class TestOrphanCommitChunks:
         # Stage an orphan commit by creating the commit but not
         # advancing any branch head. Easiest path: create-and-delete a
         # branch, leaving the commit metadata behind in the store.
-        dev = s.create_branch("dev")
+        dev = fork(s, "dev")
         dev["only"] = big
         dev.commit()
         # Capture the dev commit hash before deleting the branch.
-        dev_commit = dev.current_commit
+        dev_commit = dev.head
         # Detach the branch — the commit becomes unreachable.
-        s.delete_branch("dev")
+        s.repo.delete_branch("dev")
 
         # Make sure the commit is in the store but is now an orphan,
         # and is "young" (timestamp recent).
@@ -139,7 +137,7 @@ class TestOrphanCommitChunks:
         assert before
         # The dev chunk is unique to the dev branch (different content),
         # so without protection it would be swept.
-        s.versioned.clean_orphans(min_age=3600)
+        s.repo.gc(min_age=3600)
         assert set(chunk_keys(store)) == set(before), (
             "young orphan commit's chunks were swept; this defeats the "
             "in-flight writer protection"
@@ -149,30 +147,30 @@ class TestOrphanCommitChunks:
         # deep_clean: its namespace scan would otherwise take any chunk
         # not reachable from a live head, including one an in-flight
         # writer has staged but not yet linked to a branch.
-        s.versioned.deep_clean(min_age=3600)
+        s.repo.gc(min_age=3600, deep=True)
         assert set(chunk_keys(store)) == set(before), (
             "deep_clean swept a young orphan commit's chunks"
         )
 
         # Once the commit ages out, the deep sweep is free to take them.
         store.set(COMMIT_TIME % dev_commit, dumps(time.time() - 7200))
-        s.versioned.deep_clean(min_age=3600)
+        s.repo.gc(min_age=3600, deep=True)
         assert chunk_keys(store) == []
 
     def test_old_orphan_commit_chunks_are_swept(self):
         """An aged-out orphan's chunks go with it."""
         s, store = make_staged()
 
-        dev = s.create_branch("dev")
+        dev = fork(s, "dev")
         dev["only"] = np.arange(2048, dtype="float64") + 1
         dev.commit()
-        dev_commit = dev.current_commit
-        s.delete_branch("dev")
+        dev_commit = dev.head
+        s.repo.delete_branch("dev")
 
         # Backdate the commit so it's outside the cutoff.
         store.set(COMMIT_TIME % dev_commit, dumps(time.time() - 7200))
 
-        s.versioned.clean_orphans(min_age=3600)
+        s.repo.gc(min_age=3600)
         assert store.get(COMMIT_TIME % dev_commit) is None, "commit not collected"
         assert chunk_keys(store) == []
 
@@ -180,18 +178,17 @@ class TestOrphanCommitChunks:
 class TestCleanOrphansHandlesPureV2Stores:
     def test_no_chunks_no_chunk_pass(self):
         """A store with no chunked codec ever used should still GC cleanly."""
-        from kvgit import VersionedKV
 
         store = Memory()
-        s = Staged(VersionedKV(store))
+        s = worktree(store)
         s["a"] = "hello"
         s.commit()
 
-        dev = s.create_branch("dev")
+        dev = fork(s, "dev")
         dev["b"] = "goodbye"
         dev.commit()
 
-        s.delete_branch("dev")
+        s.repo.delete_branch("dev")
         # Should run without error, sweep nothing chunk-related.
-        s.versioned.clean_orphans(min_age=0)
+        s.repo.gc(min_age=0)
         assert chunk_keys(store) == []

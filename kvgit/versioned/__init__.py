@@ -1,4 +1,4 @@
-"""Versioned store implementations."""
+"""The commit log kvgit's public API is built on."""
 
 from .kv import VersionedKV
 from .protocol import (
@@ -8,7 +8,6 @@ from .protocol import (
     MergePolicy,
     MergeResult,
     TagInfo,
-    Versioned,
 )
 
 __all__ = [
@@ -18,6 +17,5 @@ __all__ = [
     "MergePolicy",
     "MergeResult",
     "TagInfo",
-    "Versioned",
     "VersionedKV",
 ]

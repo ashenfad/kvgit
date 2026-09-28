@@ -14,8 +14,8 @@ from pathlib import Path
 
 import pytest
 
-from kvgit import Staged, VersionedKV, text_merge
-from kvgit.encoding import loads, safe_loads
+from kvgit import Repo, Worktree, text_merge
+from kvgit.encoding import safe_loads
 from kvgit.kv.memory import Memory
 from kvgit.versioned.keyset import Keyset
 from kvgit.versioned.kv import (
@@ -24,16 +24,12 @@ from kvgit.versioned.kv import (
     BRANCH_HEAD,
     BRANCH_HEAD_PREV,
     COMMIT_ROOT,
-    COMMIT_TIME,
-    INFO_KEY,
-    PARENT_COMMIT,
     ROOT_COMMIT,
     STORAGE_VERSION_KEY,
+    VersionedKV,
     _load_root,
     blob_key,
-    clean_orphans,
     commit_hash,
-    deep_clean,
 )
 
 FIXTURE = Path(__file__).parent / "fixtures" / "v3_store.json"
@@ -62,17 +58,20 @@ def entries(store, commit: str) -> dict:
     return dict(Keyset(store, root=_load_root(store, commit)).items())
 
 
-def values(s: Staged) -> dict:
-    return {k: s[k] for k in sorted(s.keys())}
+def values(mapping) -> dict:
+    return {k: mapping[k] for k in sorted(mapping.keys())}
+
+
+def main_of(store, **repo_options) -> Worktree:
+    return Repo(store, **repo_options).worktree("main")
 
 
 def check_every_branch(store, manifest) -> None:
     """Every branch the older kvgit wrote still reads as it wrote it."""
+    repo = Repo(store)
     for name, expected in manifest["branches"].items():
         if "values" in expected:
-            assert (
-                values(Staged(VersionedKV(store, branch=name))) == (expected["values"])
-            ), name
+            assert values(repo.snapshot(branch=name)) == expected["values"], name
 
 
 def pickled(value) -> bytes:
@@ -99,10 +98,11 @@ class TestReading:
 
     def test_heads_and_history_are_the_old_hashes(self):
         store, manifest = load_v3()
+        repo = Repo(store)
         for name, expected in manifest["branches"].items():
-            v = VersionedKV(store, branch=name)
-            assert v.current_commit == expected["head"]
-            assert list(v.history(all_parents=True)) == expected["history"]
+            assert repo.head(name) == expected["head"]
+            assert repo.worktree(name).head == expected["head"]
+            assert [c.hash for c in repo.log(branch=name)] == expected["history"]
 
     def test_every_branch_descends_from_the_shared_root_commit(self):
         _, manifest = load_v3()
@@ -112,9 +112,18 @@ class TestReading:
 
     def test_tags(self):
         store, manifest = load_v3()
-        main = Staged(VersionedKV(store))
-        assert main.tags() == manifest["tags"]
-        assert values(main.checkout(tag="v1")) == manifest["branches"]["main"]["values"]
+        repo = Repo(store)
+        assert repo.tags() == manifest["tags"]
+        expected = manifest["branches"]["main"]["values"]
+        assert values(repo.snapshot(tag="v1")) == expected
+
+    def test_commit_records(self):
+        store, manifest = load_v3()
+        repo = Repo(store)
+        head = repo.get_commit(manifest["branches"]["main"]["head"])
+        assert head.info == {"step": "main edit"}
+        assert head.parents and head.time is not None
+        assert repo.get_commit(ROOT_COMMIT).parents == ()
 
     def test_chunked_branch(self):
         np = pytest.importorskip("numpy")
@@ -122,8 +131,8 @@ class TestReading:
         from kvgit.codecs.numpy import NumpyCodec
 
         store, _ = load_v3()
-        encoder, decoder = compose(NumpyCodec(min_bytes=64))
-        sci = Staged(VersionedKV(store, branch="sci"), encoder=encoder, decoder=decoder)
+        repo = Repo(store, codec=compose(NumpyCodec(min_bytes=64)))
+        sci = repo.snapshot(branch="sci")
         np.testing.assert_array_equal(sci["arr"], np.arange(4096, dtype="float64"))
         np.testing.assert_array_equal(sci["arr_copy"], sci["arr"])
 
@@ -131,25 +140,25 @@ class TestReading:
 class TestWriting:
     def test_first_commit_stamps_v4_and_extends_the_old_history(self):
         store, manifest = load_v3()
-        main = Staged(VersionedKV(store))
+        main = main_of(store)
         main["count"] = 3
         main.commit()
 
         assert version(store) == BLOB_STORAGE_VERSION
         old = manifest["branches"]["main"]["history"]
-        assert list(main.history(all_parents=True)) == [main.current_commit, *old]
+        assert [c.hash for c in main.repo.log(branch="main")] == [main.head, *old]
         expected = dict(manifest["branches"]["main"]["values"], count=3)
-        assert values(Staged(VersionedKV(store))) == expected
+        assert values(main_of(store)) == expected
 
     def test_one_keyset_holds_both_kinds_of_blob(self):
         store, manifest = load_v3()
         head = manifest["branches"]["main"]["head"]
         old = entries(store, head)
-        main = Staged(VersionedKV(store))
+        main = main_of(store)
         main["count"] = 3
         main.commit()
 
-        new = entries(store, main.current_commit)
+        new = entries(store, main.head)
         assert new["count"].blob == blob_key(pickled(3))
         assert new["count"].meta.created_at is None
         # An untouched entry is carried as it was stored, timestamp included.
@@ -158,23 +167,22 @@ class TestWriting:
 
     def test_other_branches_and_tags_are_untouched(self):
         store, manifest = load_v3()
-        main = Staged(VersionedKV(store))
+        main = main_of(store)
         main["count"] = 3
         main.commit()
 
-        dev = VersionedKV(store, branch="dev")
-        assert dev.current_commit == manifest["branches"]["dev"]["head"]
-        assert main.tags() == manifest["tags"]
+        assert main.repo.head("dev") == manifest["branches"]["dev"]["head"]
+        assert main.repo.tags() == manifest["tags"]
         check_every_branch(store, {"branches": {"dev": manifest["branches"]["dev"]}})
 
     def test_equal_bytes_share_one_blob(self):
         store, _ = load_v3()
-        main = Staged(VersionedKV(store))
+        main = main_of(store)
         main["copy_one"] = "hello"
         main["copy_two"] = "hello"
         main.commit()
 
-        ptrs = main.versioned._load_keyset(main.current_commit)
+        ptrs = {k: e.blob for k, e in entries(store, main.head).items()}
         assert ptrs["copy_one"] == ptrs["copy_two"] == blob_key(pickled("hello"))
         # The legacy blob holding the same bytes is left as it is.
         assert ptrs["greeting"] != ptrs["copy_one"]
@@ -182,8 +190,9 @@ class TestWriting:
 
     def test_fork_from_a_legacy_head(self):
         store, manifest = load_v3()
-        dev = Staged(VersionedKV(store, branch="dev"))
-        fork = dev.create_branch("fork")
+        repo = Repo(store)
+        repo.create_branch("fork", at=repo.head("dev"))
+        fork = repo.worktree("fork")
         fork["extra"] = "v4"
         fork.commit()
         assert values(fork) == dict(manifest["branches"]["dev"]["values"], extra="v4")
@@ -203,25 +212,37 @@ class TestKeysSharingABlob:
         }
         assert v.get_many("a", "a") == {"a": b"x"}
 
-    def test_staged_get_many_decodes_each_key_on_its_own(self):
-        s = Staged(VersionedKV(Memory()))
-        s["a"] = [1, 2]
-        s["b"] = [1, 2]
-        s.commit()
-        reader = Staged(VersionedKV(s.versioned.store))
+    def test_worktree_get_many_decodes_each_key_on_its_own(self):
+        wt = Repo(Memory()).worktree("main", create=True)
+        wt["a"] = [1, 2]
+        wt["b"] = [1, 2]
+        wt.commit()
+        reader = main_of(wt.repo.store)
 
         got = reader.get_many("a", "b")
         assert got == {"a": [1, 2], "b": [1, 2]}
         got["a"].append(3)
         assert reader["b"] == [1, 2]
 
+    def test_snapshot_get_many_answers_every_key(self):
+        wt = Repo(Memory()).worktree("main", create=True)
+        wt["a"] = [1, 2]
+        wt["b"] = [1, 2]
+        wt.commit()
+        snap = wt.repo.snapshot(branch="main")
+        assert snap.get_many("a", "b") == {"a": [1, 2], "b": [1, 2]}
+        assert snap.raw.get_many("a", "b") == {
+            "a": pickled([1, 2]),
+            "b": pickled([1, 2]),
+        }
+
     def test_a_legacy_store_extended_with_a_shared_blob(self):
         store, _ = load_v3()
-        main = Staged(VersionedKV(store))
+        main = main_of(store)
         main["twin_one"] = "twin"
         main["twin_two"] = "twin"
         main.commit()
-        reader = Staged(VersionedKV(store))
+        reader = main_of(store)
         got = reader.get_many("greeting", "twin_one", "twin_two")
         assert got == {"greeting": "hello", "twin_one": "twin", "twin_two": "twin"}
 
@@ -248,19 +269,17 @@ class TestMergingAcrossFormats:
         result = main.merge_heads(dev_head)
         assert result.merged
         assert "notes" not in result.auto_merged_keys
-        merged = Staged(VersionedKV(store))
+        merged = main_of(store)
         assert merged["notes"] == "alpha\nBETA\ngamma\n"
         assert merged["dev_only"] == "only on dev"
 
     def test_text_merge_across_formats(self):
-        store, manifest = load_v3()
-        main = Staged(VersionedKV(store))
+        store, _ = load_v3()
+        main = main_of(store)
         main["notes"] = "ALPHA\nbeta\ngamma\n"
         main.commit()
 
-        result = main.merge(
-            manifest["branches"]["dev"]["head"], default_merge=text_merge()
-        )
+        result = main.merge(branch="dev", default_merge=text_merge())
         assert result.merged
         assert main["notes"] == "ALPHA\nBETA\ngamma\n"
 
@@ -279,22 +298,17 @@ class TestMergingAcrossFormats:
 
 class TestHonestCommitHash:
     def test_the_hash_is_recomputable_from_what_is_stored(self):
-        store, manifest = load_v3()
-        main = Staged(VersionedKV(store))
+        store, _ = load_v3()
+        main = main_of(store)
         main["count"] = 3
         main.commit(info={"why": "check"})
-        main.merge(manifest["branches"]["dev"]["head"], default_merge=text_merge())
+        main.merge(branch="dev", default_merge=text_merge())
 
-        for commit in list(main.history(all_parents=True))[:2]:
+        for record in list(main.repo.log(branch="main"))[:2]:
             recomputed = commit_hash(
-                tuple(loads(store.get(PARENT_COMMIT % commit))),
-                loads(store.get(COMMIT_ROOT % commit)),
-                loads(store.get(COMMIT_TIME % commit)),
-                loads(store.get(INFO_KEY % commit))
-                if store.get(INFO_KEY % commit) is not None
-                else None,
+                record.parents, record.root, record.time, record.info
             )
-            assert recomputed == commit
+            assert recomputed == record.hash
 
     def test_a_commit_rewrites_nothing_already_stored(self):
         """Every key a commit writes is new or holds the bytes it had, so
@@ -332,21 +346,22 @@ class TestSweepingAMixedStore:
         orphan = manifest["orphan"]
         assert store.get(f"{orphan}:gone_only") is not None
 
-        assert clean_orphans(store, min_age=0) == 1
+        assert Repo(store).gc(min_age=0) == 1
         assert store.get(COMMIT_ROOT % orphan) is None
         assert store.get(f"{orphan}:gone_only") is None
         check_every_branch(store, manifest)
 
     def test_a_content_orphan_goes_with_its_commit(self):
         store, manifest = load_v3()
-        main = Staged(VersionedKV(store))
-        scratch = main.create_branch("scratch")
+        repo = Repo(store)
+        repo.create_branch("scratch", at=repo.head("main"))
+        scratch = repo.worktree("scratch")
         scratch["tmp"] = "throwaway"
         scratch.commit()
         pointer = blob_key(pickled("throwaway"))
-        main.delete_branch("scratch")
+        repo.delete_branch("scratch")
 
-        clean_orphans(store, min_age=0)
+        repo.gc(min_age=0)
         assert store.get(pointer) is None
         check_every_branch(store, manifest)
 
@@ -356,23 +371,27 @@ class TestSweepingAMixedStore:
         from kvgit.codecs.numpy import NumpyCodec
 
         store, manifest = load_v3()
-        main = Staged(VersionedKV(store))
+        repo = Repo(store)
+        main = repo.worktree("main")
         main["count"] = 3
         main.commit()
         live = dict(manifest["branches"]["main"]["values"], count=3)
 
         # An orphan holding the same bytes as a live key: shared content.
-        shared = main.create_branch("shared")
+        repo.create_branch("shared", at=main.head)
+        shared = repo.worktree("shared")
         shared["also_three"] = 3
         shared.commit()
-        main.delete_branch("shared")
+        repo.delete_branch("shared")
 
-        deep_clean(store, min_age=0)
+        repo.gc(min_age=0, deep=True)
         assert store.get(blob_key(pickled(3))) is not None
-        assert values(Staged(VersionedKV(store))) == live
+        assert values(main_of(store)) == live
         dev_only = {"dev": manifest["branches"]["dev"]}
         check_every_branch(store, {"branches": dev_only})
-        assert values(main.checkout(tag="v1")) == manifest["branches"]["main"]["values"]
-        encoder, decoder = compose(NumpyCodec(min_bytes=64))
-        sci = Staged(VersionedKV(store, branch="sci"), encoder=encoder, decoder=decoder)
+        expected = manifest["branches"]["main"]["values"]
+        assert values(repo.snapshot(tag="v1")) == expected
+        sci = Repo(store, codec=compose(NumpyCodec(min_bytes=64))).snapshot(
+            branch="sci"
+        )
         np.testing.assert_array_equal(sci["arr"], np.arange(4096, dtype="float64"))

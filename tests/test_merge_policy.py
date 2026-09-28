@@ -3,12 +3,12 @@
 import pickle
 
 import pytest
+from support import fork, worktree
 
-from kvgit import MergeChoice, MergeConflict, Staged, VersionedKV as Versioned
+from kvgit import MergeChoice, MergeConflict, Repo
 from kvgit.kv.memory import Memory
 from kvgit.merges import ours, theirs
-from kvgit.store import store
-from kvgit.versioned.kv import blob_key
+from kvgit.versioned.kv import VersionedKV as Versioned, blob_key
 
 
 def _mark(tag: bytes):
@@ -34,21 +34,21 @@ def _concurrent_versioned(base: dict[str, bytes] | None = None):
 
 
 def _branched_staged(base_key: str = "seed", base_value=0):
-    """Main + worker Staged pair sharing one memory store."""
-    main = store(kind="memory", branch="main")
+    """Main + worker worktrees on one repository."""
+    main = worktree()
     main[base_key] = base_value
     main.commit()
-    worker = main.create_branch("worker")
+    worker = fork(main, "worker")
     return main, worker
 
 
 def _concurrent_staged(base_key: str = "seed", base_value=0):
-    """Two Staged writers on one branch, both at the same base commit."""
+    """Two worktrees on one branch, both at the same base commit."""
     kv = Memory()
-    first = Staged(Versioned(kv))
+    first = worktree(kv)
     first[base_key] = base_value
     first.commit()
-    second = Staged(Versioned(kv))
+    second = worktree(kv)
     return first, second
 
 
@@ -316,7 +316,7 @@ class TestByteEqualContested:
         assert exc_info.value.conflicting_keys == {"k"}
 
 
-class TestStagedMergePolicy:
+class TestWorktreeMergePolicy:
     def test_prefix_registration_on_commit_path(self):
         first, second = _concurrent_staged()
         second.set_merge_prefix("runs/", lambda old, our, their: our + their)
@@ -364,7 +364,7 @@ class TestStagedMergePolicy:
         worker["runs/1"] = "theirs"
         worker.commit()
 
-        result = main.merge(worker.current_commit)
+        result = main.merge(commit=worker.head)
         assert result.merged
         assert main["runs/1"] == "by-prefix"
 
@@ -377,7 +377,7 @@ class TestStagedMergePolicy:
         worker.commit()
 
         result = main.merge(
-            worker.current_commit,
+            commit=worker.head,
             merge_prefixes={"runs/": lambda old, our, their: "per-call"},
         )
         assert result.merged
@@ -389,12 +389,12 @@ class TestStagedMergePolicy:
         main.commit()
         worker["k"] = "their-value"
         worker.commit()
-        their_pointer = worker.versioned._load_keyset(worker.current_commit)["k"]
+        their_pointer = worker._engine._load_keyset(worker.head)["k"]
 
-        result = main.merge(worker.current_commit, default_merge=theirs)
+        result = main.merge(commit=worker.head, default_merge=theirs)
         assert result.merged
         assert main["k"] == "their-value"
-        keyset = main.versioned._load_keyset(result.commit)
+        keyset = main._engine._load_keyset(result.commit)
         assert keyset["k"] == their_pointer
 
     def test_ours_keeps_our_pointer_through_staged_commit(self):
@@ -407,7 +407,7 @@ class TestStagedMergePolicy:
         result = second.commit()
         assert result.merged
         assert second["keep/1"] == "ours"
-        keyset = second.versioned._load_keyset(result.commit)
+        keyset = second._engine._load_keyset(result.commit)
         assert keyset["keep/1"] == blob_key(pickle.dumps("ours"))
 
     def test_decoded_merge_fn_may_return_a_merge_choice(self):
@@ -423,13 +423,13 @@ class TestStagedMergePolicy:
         worker["doc/a"] = "short"
         worker["doc/b"] = "a longer value"
         worker.commit()
-        their_pointer = worker.versioned._load_keyset(worker.current_commit)["doc/b"]
+        their_pointer = worker._engine._load_keyset(worker.head)["doc/b"]
 
-        result = main.merge(worker.current_commit)
+        result = main.merge(commit=worker.head)
         assert result.merged
         assert main["doc/a"] == "a longer value"
         assert main["doc/b"] == "a longer value"
-        assert main.versioned._load_keyset(result.commit)["doc/b"] == their_pointer
+        assert main._engine._load_keyset(result.commit)["doc/b"] == their_pointer
 
     def test_identical_values_merge_clean_on_commit_path(self):
         first, second = _concurrent_staged()
@@ -454,7 +454,7 @@ class TestStagedMergePolicy:
         worker["b"] = 2
         worker.commit()
 
-        result = main.merge(worker.current_commit)
+        result = main.merge(commit=worker.head)
         assert result.merged
         assert main["k"] == {"same": [1, 2, 3]}
         assert main["b"] == 2
@@ -467,7 +467,7 @@ class TestStagedMergePolicy:
         worker.commit()
 
         with pytest.raises(MergeConflict) as exc_info:
-            main.merge(worker.current_commit)
+            main.merge(commit=worker.head)
         assert exc_info.value.conflicting_keys == {"k"}
 
 
@@ -678,7 +678,7 @@ class TestMergeChoicePolicy:
         assert second.get("elsewhere") == b"theirs"
 
 
-class TestStagedMergeChoicePolicy:
+class TestWorktreeMergeChoicePolicy:
     def test_their_added_key_is_dropped_under_an_ours_prefix(self):
         main, worker = _branched_staged()
         main.set_merge_prefix("runs/", MergeChoice.OURS)
@@ -687,7 +687,7 @@ class TestStagedMergeChoicePolicy:
         worker["runs/theirs"] = "theirs"
         worker.commit()
 
-        result = main.merge(worker.current_commit)
+        result = main.merge(commit=worker.head)
         assert result.merged
         assert "runs/theirs" not in main
         assert main["runs/mine"] == "ours"
@@ -712,7 +712,7 @@ class TestStagedMergeChoicePolicy:
             decoded.append(raw)
             return pickle.loads(raw)
 
-        main = Staged(main.versioned, decoder=spy_decoder)
+        main = Repo(main.repo.store, codec=(pickle.dumps, spy_decoder)).worktree("main")
         main.set_merge_prefix("runs/", MergeChoice.THEIRS)
         main["runs/1"] = "ours"
         main.commit()
@@ -720,7 +720,7 @@ class TestStagedMergeChoicePolicy:
         worker.commit()
 
         decoded.clear()
-        result = main.merge(worker.current_commit)
+        result = main.merge(commit=worker.head)
         assert result.merged
         assert decoded == []
         assert main["runs/1"] == "theirs"
@@ -733,7 +733,7 @@ class TestStagedMergeChoicePolicy:
         worker.commit()
 
         result = main.merge(
-            worker.current_commit, merge_prefixes={"runs/": MergeChoice.OURS}
+            commit=worker.head, merge_prefixes={"runs/": MergeChoice.OURS}
         )
         assert result.merged
         assert "runs/1" not in main
@@ -750,14 +750,14 @@ class TestReadmeExamples:
         main["notes"] = "alpha\nbeta\n"
         main.commit()
 
-        edits = main.create_branch("edits")
+        edits = fork(main, "edits")
         edits["notes"] = "alpha\nBETA\n"
         edits.commit()
 
         main["notes"] = "ALPHA\nbeta\n"
         main.commit()
 
-        main.merge(edits.current_commit, default_merge=text_merge())
+        main.merge(commit=edits.head, default_merge=text_merge())
         assert main["notes"] == "ALPHA\nBETA\n"
 
     def test_registration_example(self):
@@ -771,14 +771,14 @@ class TestReadmeExamples:
         main["runs/index"] = "base\n"
         main["runs/1"] = "ours"
         main.commit()
-        worker = main.create_branch("worker")
+        worker = fork(main, "worker")
         worker["runs/index"] = "theirs\n"
         worker["runs/2"] = "theirs"
         worker.commit()
         main["runs/index"] = "ours\n"
         main.commit()
 
-        result = main.merge(worker.current_commit)
+        result = main.merge(commit=worker.head)
         assert result.merged
         # The exact-key text merge marks the contested index...
         assert main["runs/index"] == (

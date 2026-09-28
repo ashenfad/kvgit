@@ -86,7 +86,16 @@ from collections import deque
 from collections.abc import Callable
 
 from ..encoding import dumps, loads, safe_loads
-from ..errors import GcBusy, UnknownBranchError
+from ..errors import (
+    BranchExistsError,
+    CorruptHeadError,
+    GcBusy,
+    StorageVersionError,
+    TagExistsError,
+    UnknownBranchError,
+    UnknownCommitError,
+    UnknownTagError,
+)
 from ..hamt import EMPTY_HASH
 from ..kv.base import KVStore
 from ..kv.memory import Memory
@@ -244,7 +253,7 @@ def _assert_supported_version(store: KVStore) -> None:
         return
     version = safe_loads(raw)
     if version not in SUPPORTED_READ_VERSIONS:
-        raise ValueError(
+        raise StorageVersionError(
             f"Store has kvgit storage version {version!r}, "
             f"this code supports {sorted(SUPPORTED_READ_VERSIONS)}. "
             "Use a fresh store."
@@ -298,7 +307,7 @@ def _check_storage_version(store: KVStore) -> None:
     branch_prefix = BRANCH_HEAD.replace("%s", "")
     has_existing = any(True for _ in store.keys(branch_prefix))
     if has_existing:
-        raise ValueError(
+        raise StorageVersionError(
             "Store appears to use an older kvgit storage format. "
             f"This version requires storage v{min(SUPPORTED_READ_VERSIONS)} "
             "or higher. Use a fresh store."
@@ -865,108 +874,283 @@ def _release_gc_lease(
     store.cas(GC_LEASE_KEY, dumps({"owner": owner, "expires": 0}), expected=ours)
 
 
-def clean_orphans(store: KVStore, min_age: float = 3600) -> int:
-    """Remove orphaned commits unreachable from any branch HEAD.
+def _root_commit_writes() -> dict[str, bytes]:
+    """The empty root commit's metadata, for a store that lacks it."""
+    return {
+        COMMIT_ROOT % ROOT_COMMIT: dumps(EMPTY_HASH),
+        PARENT_COMMIT % ROOT_COMMIT: dumps([]),
+        COMMIT_TIME % ROOT_COMMIT: dumps(time.time()),
+    }
 
-    Traces all reachable commits from live branch HEADs, then deletes
-    the orphaned commits' metadata and everything in their keysets —
-    blobs, HAMT nodes, chunks — that nothing live shares. Tags need no
-    special handling: a tag is a branch head under a reserved name, so
-    it keeps its commit's whole ancestry alive by being walked with
-    everything else.
 
-    Handle-independent by design: it marks from ALL live branch HEADs
-    and touches nothing but ``store``, so it works with or without a
-    ``VersionedKV`` anchored on it. :meth:`VersionedKV.clean_orphans`
-    and the anchor-free admin paths (:func:`kvgit.delete_branches`,
-    :func:`kvgit.delete_tags`) share this one implementation.
+def create_branch(store: KVStore, name: str, target: str) -> None:
+    """Create branch ``name`` pointing at commit ``target``.
 
-    Runs under the store's GC lease, waiting out another sweep's lease
-    first rather than failing. While it holds the lease no commit batch
-    can land, and every commit written but not yet published carries an
-    in-flight marker the sweep marks from, so it is safe beside
-    concurrent writers at any ``min_age`` — including 0. ``min_age`` is
-    policy alone: how long abandoned work lingers before it is taken.
+    ``target`` may be :data:`ROOT_COMMIT`, which the store holds as soon
+    as any branch has been created: the first branch in a store writes
+    it, in the same write as its head.
 
-    Returns:
-        Number of orphaned commits removed.
+    "The commit is here" and "the head names it" are decided against one
+    lease record: a sweep that starts between the check and the write
+    makes the write fail, and the check runs again. So the outcomes are
+    a branch on a commit that loads, or a refusal — never a head
+    pointing at nothing. The write also drops any backup under this
+    name: a branch just created has no previous HEAD, and a stale backup
+    left by an earlier branch of the same name would otherwise be what
+    head recovery serves if this HEAD were ever damaged.
 
     Raises:
-        ValueError: if the store is stamped above the layout this code
-            reads. Nothing is written, the lease key included.
+        BranchExistsError: if the name is taken.
+        UnknownCommitError: if ``target`` is not in the store.
     """
-    _assert_supported_version(store)
+    _reject_reserved_branch(name)
+    branch_key = BRANCH_HEAD % name
     while True:
-        _wait_for_gc(store)
-        try:
-            ours, _acquired, expires = _acquire_gc_lease(store, GC_LEASE_TTL)
-        except GcBusy:
+        lease = _wait_for_gc(store)
+        expected: dict[str, bytes | None] = {branch_key: None}
+        writes = {branch_key: dumps(target)}
+        if store.get(COMMIT_ROOT % target) is None:
+            if target != ROOT_COMMIT:
+                raise UnknownCommitError(f"Commit '{target}' does not exist")
+            # Minted with the head, and only if nobody minted it first.
+            expected[COMMIT_ROOT % ROOT_COMMIT] = None
+            writes.update(_root_commit_writes())
+        landed = _try_land(store, lease, expected, writes, (BRANCH_HEAD_PREV % name,))
+        if landed:
+            return
+        if landed is False and store.get(branch_key) is not None:
+            raise BranchExistsError(f"Branch '{name}' already exists")
+        # A sweep moved the lease, or another writer minted the root
+        # commit first: decide again.
+
+
+def delete_branch(store: KVStore, name: str) -> None:
+    """Delete a branch: its head and its backup, in one removal.
+
+    Its commits become collectable at the next :func:`gc`.
+
+    Raises:
+        UnknownBranchError: if there is no such branch.
+    """
+    _reject_reserved_branch(name)
+    branch_key = BRANCH_HEAD % name
+    if store.get(branch_key) is None:
+        raise UnknownBranchError(f"Branch '{name}' does not exist")
+    store.remove_many([branch_key, BRANCH_HEAD_PREV % name])
+
+
+def create_tag(
+    store: KVStore, name: str, target: str, info: dict | None = None
+) -> None:
+    """Name commit ``target`` permanently, keeping it and its ancestry alive.
+
+    A tag is immutable: creating one over an existing name raises, and
+    there is no move. It is a GC root, so it must not be planted under a
+    sweep that has already decided what is reachable, and the existence
+    check must still hold when it lands: both are decided against one
+    lease record, and a sweep in between sends them round again. The
+    head is claimed against absence, so two writers racing the same name
+    cannot both win; the info record lands with it, and any backup left
+    under the name by an earlier tag goes in the same write.
+
+    Raises:
+        TagExistsError: if the name is taken.
+        UnknownCommitError: if ``target`` is not in the store.
+    """
+    _validate_tag_name(name)
+    # Encoded before anything is written, so info that cannot be
+    # serialized raises without leaving a tag behind.
+    dumps(info)
+    head_key = BRANCH_HEAD % _tag_branch(name)
+    while True:
+        lease = _wait_for_gc(store)
+        if store.get(COMMIT_ROOT % target) is None:
+            raise UnknownCommitError(f"Commit '{target}' does not exist")
+        # Built after the wait, so its time is when the tag lands.
+        record = dumps({"time": time.time(), "info": info})
+        landed = _try_land(
+            store,
+            lease,
+            {head_key: None},
+            {head_key: dumps(target), TAG_INFO_KEY % name: record},
+            (BRANCH_HEAD_PREV % _tag_branch(name),),
+        )
+        if landed is None:
             continue
-        break
-    try:
-        return _sweep(store, min_age, deep=False)
-    finally:
-        _release_gc_lease(store, ours, expires, GC_LEASE_TTL)
+        if not landed:
+            raise TagExistsError(f"Tag '{name}' already exists")
+        return
 
 
-def deep_clean(
+def delete_tag(store: KVStore, name: str) -> None:
+    """Delete a tag: its reserved head, that head's backup and its record.
+
+    A commit the tag was the last root for becomes collectable at the
+    next :func:`gc`. This code never writes a backup for a tag, since it
+    never moves one; the removal is for a backup written by something
+    that treated the tag as an ordinary branch, which would otherwise
+    let head resolution serve the deleted tag's commit under a later
+    branch of the same reserved name.
+
+    Raises:
+        UnknownTagError: if there is no such tag.
+    """
+    _validate_tag_name(name)
+    head_key = BRANCH_HEAD % _tag_branch(name)
+    if store.get(head_key) is None:
+        raise UnknownTagError(f"Tag '{name}' does not exist")
+    store.remove_many(
+        [head_key, BRANCH_HEAD_PREV % _tag_branch(name), TAG_INFO_KEY % name]
+    )
+
+
+def load_parents(store: KVStore, commit_hash: str) -> tuple[str, ...]:
+    """The parent commits of a commit, in order; () for a root or unknown commit."""
+    parent_bytes = store.get(PARENT_COMMIT % commit_hash)
+    if parent_bytes is None:
+        return ()
+    raw = loads(parent_bytes)
+    if raw is None:
+        return ()
+    if isinstance(raw, str):
+        return (raw,)
+    return tuple(raw)
+
+
+def _walk_ancestors(
+    store: KVStore, start: str, parents: dict[str, tuple[str, ...]]
+) -> set[str]:
+    """All ancestors of ``start`` (itself included), recording each
+    visited commit's parents in ``parents`` for later passes."""
+    ancestors = {start}
+    stack = [start]
+    while stack:
+        current = stack.pop()
+        if current in parents:
+            continue
+        node_parents = load_parents(store, current)
+        parents[current] = node_parents
+        for parent in node_parents:
+            if parent not in ancestors:
+                ancestors.add(parent)
+                stack.append(parent)
+    return ancestors
+
+
+def merge_base(store: KVStore, commit_a: str, commit_b: str) -> str | None:
+    """Find the lowest common ancestor of two commits.
+
+    Ancestor-set intersection with non-minimal candidates dropped
+    (a candidate that is itself an ancestor of another candidate is
+    not lowest). When several commits tie for lowest — criss-cross
+    histories — the smallest hash wins: deterministic, but
+    arbitrary, so criss-cross merges resolve cleanly rather than
+    raising.
+    """
+    if commit_a == commit_b:
+        return commit_a
+
+    parents: dict[str, tuple[str, ...]] = {}
+    ancestors_a = _walk_ancestors(store, commit_a, parents)
+    # Fast path: b inside a's history (or vice versa) names the
+    # lowest directly — every other common ancestor sits above it.
+    if commit_b in ancestors_a:
+        return commit_b
+    ancestors_b = _walk_ancestors(store, commit_b, parents)
+    if commit_a in ancestors_b:
+        return commit_a
+
+    common = ancestors_a & ancestors_b
+    if not common:
+        return None
+    # Minimality in one bottom-up pass: a candidate is lowest when
+    # no other candidate sits below it. Propagate "a candidate is
+    # at-or-below here" from tips to roots over the in-memory
+    # parent map — no further store reads, linear in the history.
+    children: dict[str, list[str]] = {node: [] for node in parents}
+    for node, node_parents in parents.items():
+        for parent in node_parents:
+            children[parent].append(node)
+    below: dict[str, bool] = dict.fromkeys(parents, False)
+    remaining = {node: len(kids) for node, kids in children.items()}
+    queue = deque(node for node, kids in children.items() if not kids)
+    while queue:
+        node = queue.popleft()
+        for parent in parents[node]:
+            if node in common or below[node]:
+                below[parent] = True
+            remaining[parent] -= 1
+            if remaining[parent] == 0:
+                queue.append(parent)
+    best = {c for c in common if not below[c]}
+    return min(best) if best else None
+
+
+def gc(
     store: KVStore,
     min_age: float = 3600,
     *,
+    deep: bool = False,
+    wait: bool = True,
     lease_ttl: float = GC_LEASE_TTL,
 ) -> int:
-    """:func:`clean_orphans`, plus a scan for content nothing references.
+    """Sweep what no live commit reaches; return how many commits went.
 
-    Sweeps orphans the way :func:`clean_orphans` does, then scans the
-    whole ``kvgit:blob:``, ``kvgit:keyset:`` and ``kvgit:chunk:``
-    namespaces and deletes anything no live branch head, young orphan or
-    in-flight commit reaches. That scan is the only way to reclaim
-    content no commit references any more — leftovers from a crash,
-    from an interrupted write, or from a store swept by an earlier
-    kvgit — because no orphan keyset points at them. Run it as an
-    occasional maintenance pass; :func:`clean_orphans` is the routine
-    one.
+    A commit is live if a branch head or a tag reaches it, if it is in
+    flight (written, not yet published), or if it is younger than
+    ``min_age`` seconds — which is policy alone: how long abandoned work
+    lingers. Everything an orphan alone held goes with it: its commit
+    metadata, blobs, HAMT nodes and chunks. ``deep=True`` adds a scan of
+    the whole ``kvgit:blob:``, ``kvgit:keyset:`` and ``kvgit:chunk:``
+    namespaces for content no commit references at all — leftovers from
+    a crash or an interrupted write, or from a store swept by an earlier
+    kvgit, which no orphan keyset points at.
 
-    1. It refuses a store stamped above the layout this code reads,
-       before touching the lease key, so such a store comes out of the
-       call with nothing written to it at all.
-    2. It takes the ``__gc_lease__`` key by CAS, raising :class:`GcBusy`
-       if another sweep holds an unexpired one.
-    3. It marks and sweeps. Every commit batch is written conditionally
-       on the lease record, so none can land while the lease is held;
-       batches that landed before carry in-flight markers the mark
-       phase reads, so their commits survive until published.
-    4. It releases the lease, in a ``finally``.
-
-    A ``lease_ttl`` shorter than the sweep takes is not extended
-    silently: the sweep finishes and logs a warning naming the overrun,
-    during which writers are free to write. Set it above the longest
-    sweep this store has taken.
-
-    Args:
-        min_age: Unreachable commits younger than this many seconds are
-            kept, along with everything they reference.
-        lease_ttl: Seconds the lease stays live. A holder that crashes
-            blocks writers for at most this long.
-
-    Returns:
-        Number of orphaned commits removed.
+    Runs under the store's GC lease. No commit batch can land while it
+    is held, and every commit written but not yet published carries an
+    in-flight marker the sweep marks from, so this is safe beside
+    concurrent writers at any ``min_age``, 0 included. If another sweep
+    holds the lease, ``wait=True`` waits it out and ``wait=False``
+    raises :class:`GcBusy`. ``lease_ttl`` bounds what a sweep that
+    crashes holding the lease costs writers; a sweep that outlives it
+    finishes and logs a warning rather than extending it.
 
     Raises:
-        GcBusy: if another sweep holds a live lease.
-        ValueError: if the store is stamped above the layout this code
-            reads. Nothing is written, the lease key included.
+        GcBusy: with ``wait=False``, if another sweep holds the lease.
+        StorageVersionError: if the store is stamped above the layout
+            this code reads. Nothing is written, the lease key included.
     """
     # Before the lease, not after: a store this code must not touch has
     # to come out of the call untouched, and an acquire-then-fail would
     # leave an expired lease record behind in a store kvgit had no
     # business writing to.
     _assert_supported_version(store)
-    ours, _acquired, expires = _acquire_gc_lease(store, lease_ttl)
+    while True:
+        if wait:
+            _wait_for_gc(store)
+        try:
+            ours, _acquired, expires = _acquire_gc_lease(store, lease_ttl)
+        except GcBusy:
+            if wait:
+                continue
+            raise
+        break
     try:
-        return _sweep(store, min_age, deep=True)
+        return _sweep(store, min_age, deep=deep)
     finally:
         _release_gc_lease(store, ours, expires, lease_ttl)
+
+
+def clean_orphans(store: KVStore, min_age: float = 3600) -> int:
+    """:func:`gc` without the namespace scan, waiting on a busy lease."""
+    return gc(store, min_age)
+
+
+def deep_clean(
+    store: KVStore, min_age: float = 3600, *, lease_ttl: float = GC_LEASE_TTL
+) -> int:
+    """:func:`gc` with the namespace scan, raising on a busy lease."""
+    return gc(store, min_age, deep=True, wait=False, lease_ttl=lease_ttl)
 
 
 def _sweep(store: KVStore, min_age: float, *, deep: bool) -> int:
@@ -1184,6 +1368,7 @@ class VersionedKV(VersionedBase):
         branch: str = "main",
         create: bool = True,
         recover_from_corrupt_head: CorruptHeadRecoverer | None = None,
+        check_version: bool = True,
     ) -> None:
         if store is None:
             store = Memory()
@@ -1195,34 +1380,37 @@ class VersionedKV(VersionedBase):
         # hand back, so a caller opts in once rather than per call.
         self._recover_from_corrupt_head = recover_from_corrupt_head
 
-        _check_storage_version(store)
+        # A Repo checks once for all the handles it opens.
+        if check_version:
+            _check_storage_version(store)
 
         if commit_hash is None:
             commit_hash = _resolve_head(
                 store, branch, recover_from_corrupt_head=recover_from_corrupt_head
             )
             if commit_hash is None and store.get(BRANCH_HEAD % branch) is not None:
-                raise ValueError(f"Branch '{branch}' HEAD is corrupt and unrecoverable")
+                raise CorruptHeadError(
+                    f"Branch '{branch}' HEAD is corrupt and unrecoverable"
+                )
             if commit_hash is None:
                 if not create:
                     raise UnknownBranchError(
                         f"Branch '{branch}' does not exist "
                         "(open with create=True to create it)"
                     )
-                # Create initial empty commit
-                commit_hash = ROOT_COMMIT
-                initial = {
-                    COMMIT_ROOT % commit_hash: dumps(EMPTY_HASH),
-                    PARENT_COMMIT % commit_hash: dumps([]),
-                    COMMIT_TIME % commit_hash: dumps(time.time()),
-                    BRANCH_HEAD % branch: dumps(commit_hash),
-                }
-                store.set_many(initial)
-                # Same reasoning as ``create_branch``: this name had no HEAD
-                # a moment ago, so it has no previous HEAD either, and a
-                # backup that outlived a delete must not become reachable
-                # again through the anchor we just installed.
-                store.remove(BRANCH_HEAD_PREV % branch)
+                # A new branch starts at the empty root commit. Another
+                # opener may create it first; either way it now exists.
+                try:
+                    create_branch(store, branch, ROOT_COMMIT)
+                except BranchExistsError:
+                    pass
+                commit_hash = _resolve_head(
+                    store, branch, recover_from_corrupt_head=recover_from_corrupt_head
+                )
+                if commit_hash is None:
+                    raise CorruptHeadError(
+                        f"Branch '{branch}' HEAD is corrupt and unrecoverable"
+                    )
 
         if not isinstance(commit_hash, str):
             raise TypeError(
@@ -1439,8 +1627,14 @@ class VersionedKV(VersionedBase):
         resolution: MergeResolution,
         parents: tuple[str, ...],
         info: dict | None,
+        sources: tuple[str, ...] = (),
     ) -> str:
-        """Create a merge commit from a resolved three-way merge."""
+        """Create a commit from a resolved three-way merge.
+
+        Entry metadata is taken from the commits the merged pointers came
+        from: the ``parents``, plus any ``sources`` that are not parents —
+        the target of an applied change, whose added keys no parent has.
+        """
         merged_keyset = resolution.merged_keyset
         merged_values = resolution.merged_values
 
@@ -1464,7 +1658,7 @@ class VersionedKV(VersionedBase):
         # and first-seen wins.
         meta_by_blob: dict[str, MetaEntry] = {}
         meta_by_key: dict[str, MetaEntry] = {}
-        for parent in parents:
+        for parent in dict.fromkeys((*parents, *sources)):
             parent_root = _load_root(self.store, parent)
             if parent_root is None:
                 continue
@@ -1594,82 +1788,11 @@ class VersionedKV(VersionedBase):
 
     def _load_parents(self, commit_hash: str) -> tuple[str, ...]:
         """Load the parent tuple for a commit."""
-        parent_bytes = self.store.get(PARENT_COMMIT % commit_hash)
-        if parent_bytes is None:
-            return ()
-        raw = loads(parent_bytes)
-        if raw is None:
-            return ()
-        if isinstance(raw, str):
-            return (raw,)
-        return tuple(raw)
+        return load_parents(self.store, commit_hash)
 
     def _find_lca(self, commit_a: str, commit_b: str) -> str | None:
-        """Find the lowest common ancestor of two commits.
-
-        Ancestor-set intersection with non-minimal candidates dropped
-        (a candidate that is itself an ancestor of another candidate is
-        not lowest). When several commits tie for lowest — criss-cross
-        histories — the smallest hash wins: deterministic, but
-        arbitrary, so criss-cross merges resolve cleanly rather than
-        raising.
-        """
-        if commit_a == commit_b:
-            return commit_a
-
-        parents: dict[str, tuple[str, ...]] = {}
-        ancestors_a = self._walk_ancestors(commit_a, parents)
-        # Fast path: b inside a's history (or vice versa) names the
-        # lowest directly — every other common ancestor sits above it.
-        if commit_b in ancestors_a:
-            return commit_b
-        ancestors_b = self._walk_ancestors(commit_b, parents)
-        if commit_a in ancestors_b:
-            return commit_a
-
-        common = ancestors_a & ancestors_b
-        if not common:
-            return None
-        # Minimality in one bottom-up pass: a candidate is lowest when
-        # no other candidate sits below it. Propagate "a candidate is
-        # at-or-below here" from tips to roots over the in-memory
-        # parent map — no further store reads, linear in the history.
-        children: dict[str, list[str]] = {node: [] for node in parents}
-        for node, node_parents in parents.items():
-            for parent in node_parents:
-                children[parent].append(node)
-        below: dict[str, bool] = dict.fromkeys(parents, False)
-        remaining = {node: len(kids) for node, kids in children.items()}
-        queue = deque(node for node, kids in children.items() if not kids)
-        while queue:
-            node = queue.popleft()
-            for parent in parents[node]:
-                if node in common or below[node]:
-                    below[parent] = True
-                remaining[parent] -= 1
-                if remaining[parent] == 0:
-                    queue.append(parent)
-        best = {c for c in common if not below[c]}
-        return min(best) if best else None
-
-    def _walk_ancestors(
-        self, start: str, parents: dict[str, tuple[str, ...]]
-    ) -> set[str]:
-        """All ancestors of ``start`` (itself included), recording each
-        visited commit's parents in ``parents`` for later passes."""
-        ancestors = {start}
-        stack = [start]
-        while stack:
-            current = stack.pop()
-            if current in parents:
-                continue
-            node_parents = self._load_parents(current)
-            parents[current] = node_parents
-            for parent in node_parents:
-                if parent not in ancestors:
-                    ancestors.add(parent)
-                    stack.append(parent)
-        return ancestors
+        """Lowest common ancestor of two commits; see :func:`merge_base`."""
+        return merge_base(self.store, commit_a, commit_b)
 
     def _read_blob(self, content_id: str) -> bytes | None:
         """Read a blob by its versioned key."""
@@ -1685,7 +1808,11 @@ class VersionedKV(VersionedBase):
             recover_from_corrupt_head=self._recover_from_corrupt_head,
         )
         if commit_hash is None:
-            raise ValueError(f"No HEAD commit found for branch {self._branch}")
+            if self.store.get(BRANCH_HEAD % self._branch) is not None:
+                raise CorruptHeadError(
+                    f"Branch '{self._branch}' HEAD is corrupt and unrecoverable"
+                )
+            raise UnknownBranchError(f"Branch '{self._branch}' does not exist")
         self._load_commit(commit_hash, update_base=True)
 
     def checkout(
@@ -1728,35 +1855,8 @@ class VersionedKV(VersionedBase):
 
         Returns a new VersionedKV instance on the new branch.
         """
-        _reject_reserved_branch(name)
-        branch_key = BRANCH_HEAD % name
         target = at or self._current_commit
-        # "The commit is here" and "the head names it" are decided
-        # against one lease record: a sweep that starts between the
-        # check and the write makes the write fail, and the check runs
-        # again. So the outcomes are a branch on a commit that loads, or
-        # a refusal — never a head pointing at nothing.
-        #
-        # The write also drops any backup under this name. A branch that
-        # has just been created has no previous HEAD, and a stale backup
-        # left by an earlier branch of the same name would otherwise be
-        # what head recovery serves if this HEAD were ever damaged.
-        while True:
-            lease = _wait_for_gc(self.store)
-            if at is not None and self.store.get(COMMIT_ROOT % at) is None:
-                raise ValueError(f"Commit '{at}' does not exist")
-            landed = _try_land(
-                self.store,
-                lease,
-                {branch_key: None},
-                {branch_key: dumps(target)},
-                (BRANCH_HEAD_PREV % name,),
-            )
-            if landed is None:
-                continue
-            if not landed:
-                raise ValueError(f"Branch '{name}' already exists")
-            break
+        create_branch(self.store, name, target)
         return VersionedKV(
             self.store,
             commit_hash=target,
@@ -1769,14 +1869,7 @@ class VersionedKV(VersionedBase):
         _reject_reserved_branch(name)
         if name == self._branch:
             raise ValueError("Cannot delete the current branch")
-        branch_key = BRANCH_HEAD % name
-        if self.store.get(branch_key) is None:
-            raise ValueError(f"Branch '{name}' does not exist")
-        # The prev-HEAD recovery backup goes in the same removal: left
-        # behind, it would be a lone backup naming the deleted state.
-        # Both go before clean_orphans, so commits only they referenced
-        # are collectable.
-        self.store.remove_many([branch_key, BRANCH_HEAD_PREV % name])
+        delete_branch(self.store, name)
         self.clean_orphans()
 
     def switch_branch(self, name: str) -> None:
@@ -1789,7 +1882,9 @@ class VersionedKV(VersionedBase):
         )
         if commit_hash is None:
             if self.store.get(BRANCH_HEAD % name) is not None:
-                raise ValueError(f"Branch '{name}' HEAD is corrupt and unrecoverable")
+                raise CorruptHeadError(
+                    f"Branch '{name}' HEAD is corrupt and unrecoverable"
+                )
             raise UnknownBranchError(f"Branch '{name}' does not exist")
         self._branch = name
         self._load_commit(commit_hash, update_base=True)
@@ -1927,9 +2022,8 @@ class VersionedKV(VersionedBase):
 
         Args:
             at: Commit to tag. Defaults to this handle's current commit,
-                which for a ``Staged`` wrapper means the last *committed*
-                state — staged changes are not part of any commit yet and
-                are not tagged.
+                the last *committed* state — pending changes are not part
+                of any commit yet and are not tagged.
             info: Optional caller metadata, stored beside the tag. Must
                 be JSON-serializable, like commit info.
 
@@ -1950,39 +2044,9 @@ class VersionedKV(VersionedBase):
         head descends from — and a commit a branch reaches is never a
         sweep candidate.
         """
-        _validate_tag_name(name)
         target = at or self._current_commit
-        # Encoded before anything is written, so info that cannot be
-        # serialized raises without leaving a tag behind. The record
-        # itself is built after the wait below, so its time is when the
-        # tag lands, not when the call began waiting on a sweep.
-        dumps(info)
-        head_key = BRANCH_HEAD % _tag_branch(name)
-        # A tag is a GC root, so it must not be planted under a sweep
-        # that has already decided what is reachable, and the existence
-        # check must still hold when it lands: both are decided against
-        # one lease record, and a sweep in between sends them round
-        # again. The head is claimed against absence, so two writers
-        # racing the same name cannot both win and an existing tag is
-        # never overwritten; the record lands with it, and any backup
-        # left under the name by an earlier tag goes in the same write.
-        while True:
-            lease = _wait_for_gc(self.store)
-            if self.store.get(COMMIT_ROOT % target) is None:
-                raise ValueError(f"Commit '{target}' does not exist")
-            record = dumps({"time": time.time(), "info": info})
-            landed = _try_land(
-                self.store,
-                lease,
-                {head_key: None},
-                {head_key: dumps(target), TAG_INFO_KEY % name: record},
-                (BRANCH_HEAD_PREV % _tag_branch(name),),
-            )
-            if landed is None:
-                continue
-            if not landed:
-                raise ValueError(f"Tag '{name}' already exists")
-            return target
+        create_tag(self.store, name, target, info)
+        return target
 
     def tags(self) -> dict[str, str]:
         """Map every tag in the store to the commit it names."""
@@ -2008,13 +2072,7 @@ class VersionedKV(VersionedBase):
         serve the deleted tag's commit under a later branch of the same
         reserved name.
         """
-        _validate_tag_name(name)
-        head_key = BRANCH_HEAD % _tag_branch(name)
-        if self.store.get(head_key) is None:
-            raise ValueError(f"Tag '{name}' does not exist")
-        self.store.remove_many(
-            [head_key, BRANCH_HEAD_PREV % _tag_branch(name), TAG_INFO_KEY % name]
-        )
+        delete_tag(self.store, name)
         self.clean_orphans()
 
     def commit_info(self, commit_hash: str | None = None) -> dict | None:

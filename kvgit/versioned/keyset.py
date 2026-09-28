@@ -233,7 +233,7 @@ class Keyset:
     ) -> "Keyset":
         """Apply updates and write any new nodes to the store immediately.
 
-        Distinct from ``Versioned.commit``: a Keyset has no notion of
+        Distinct from ``VersionedKV.commit``: a Keyset has no notion of
         a commit history — this just flushes HAMT node bytes.
         """
         encoded_updates: dict[str, bytes] | None = None

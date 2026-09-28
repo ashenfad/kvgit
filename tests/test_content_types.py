@@ -1,15 +1,9 @@
 """Tests for merge functions."""
 
 import pytest
+from support import fork, worktree
 
-from kvgit import (
-    MergeConflict,
-    Staged,
-    VersionedKV as Versioned,
-    counter,
-    last_writer_wins,
-    text_merge,
-)
+from kvgit import MergeConflict, counter, last_writer_wins, text_merge
 from kvgit.kv.memory import Memory
 from kvgit.merges import CantMark
 
@@ -37,11 +31,11 @@ class TestMergeFnIntegration:
         """Full cycle: two branches increment counter, merge produces sum."""
         store = Memory()
 
-        s1 = Staged(Versioned(store))
+        s1 = worktree(store)
         s1["hits"] = 10
         s1.commit()
 
-        s2 = Staged(Versioned(store))
+        s2 = worktree(store)
         s2.set_merge_fn("hits", counter())
 
         # s1 increments to 15
@@ -58,11 +52,11 @@ class TestMergeFnIntegration:
         """set_merge_fn registers the merge function."""
         store = Memory()
 
-        s1 = Staged(Versioned(store))
+        s1 = worktree(store)
         s1["x"] = 0
         s1.commit()
 
-        s2 = Staged(Versioned(store))
+        s2 = worktree(store)
         s2.set_merge_fn("x", counter())
 
         s1["x"] = 5
@@ -82,11 +76,11 @@ class TestMergeFnIntegration:
 
         store = Memory()
 
-        s1 = Staged(Versioned(store))
+        s1 = worktree(store)
         s1["tags"] = ["a", "b"]
         s1.commit()
 
-        s2 = Staged(Versioned(store))
+        s2 = worktree(store)
         s2.set_merge_fn("tags", merge_lists)
 
         s1["tags"] = ["a", "b", "c"]
@@ -98,13 +92,12 @@ class TestMergeFnIntegration:
 
 
 def _diverged(value_main, value_dev, base):
-    """Main + dev Staged pair, each with its own change to "doc"."""
-    from kvgit.store import store
+    """Main + dev worktree pair, each with its own change to "doc"."""
 
-    main = store(kind="memory", branch="main")
+    main = worktree()
     main["doc"] = base
     main.commit()
-    dev = main.create_branch("dev")
+    dev = fork(main, "dev")
     dev["doc"] = value_dev
     dev.commit()
     main["doc"] = value_main
@@ -113,12 +106,12 @@ def _diverged(value_main, value_dev, base):
 
 
 class TestTextMerge:
-    """The value-level text merge, as registered on a Staged."""
+    """The value-level text merge, as registered on a worktree."""
 
     def test_str_values_merge_to_str_with_markers(self):
         main, dev = _diverged("ours\n", "theirs\n", "base\n")
 
-        result = main.merge(dev.current_commit, default_merge=text_merge())
+        result = main.merge(commit=dev.head, default_merge=text_merge())
         assert result.merged
         merged = main["doc"]
         assert isinstance(merged, str)
@@ -127,7 +120,7 @@ class TestTextMerge:
     def test_str_values_merge_disjoint_lines_cleanly(self):
         main, dev = _diverged("ALPHA\nbeta\n", "alpha\nBETA\n", "alpha\nbeta\n")
 
-        result = main.merge(dev.current_commit, default_merge=text_merge())
+        result = main.merge(commit=dev.head, default_merge=text_merge())
         assert result.merged
         assert main["doc"] == "ALPHA\nBETA\n"
 
@@ -135,7 +128,7 @@ class TestTextMerge:
         main, dev = _diverged("ours\n", "theirs\n", "base\n")
 
         main.merge(
-            dev.current_commit,
+            commit=dev.head,
             default_merge=text_merge(ours_label="main", theirs_label="dev"),
         )
         assert main["doc"].startswith("<<<<<<< main\n")
@@ -144,7 +137,7 @@ class TestTextMerge:
     def test_bytes_values_merge_to_bytes(self):
         main, dev = _diverged(b"ALPHA\nbeta\n", b"alpha\nBETA\n", b"alpha\nbeta\n")
 
-        result = main.merge(dev.current_commit, default_merge=text_merge())
+        result = main.merge(commit=dev.head, default_merge=text_merge())
         assert result.merged
         assert main["doc"] == b"ALPHA\nBETA\n"
 
@@ -153,7 +146,7 @@ class TestTextMerge:
         del dev["doc"]
         dev.commit()
 
-        result = main.merge(dev.current_commit, default_merge=text_merge())
+        result = main.merge(commit=dev.head, default_merge=text_merge())
         assert result.merged
         assert main["doc"] == ("<<<<<<< ours\nours\nkept\n=======\n>>>>>>> theirs\n")
 
@@ -162,7 +155,7 @@ class TestTextMerge:
         del dev["doc"]
         dev.commit()
 
-        result = main.merge(dev.current_commit, default_merge=text_merge())
+        result = main.merge(commit=dev.head, default_merge=text_merge())
         assert result.merged
         assert "doc" not in main
 
@@ -170,7 +163,7 @@ class TestTextMerge:
         main, dev = _diverged(b"\x00ours", b"\x00theirs", b"\x00base")
 
         with pytest.raises(MergeConflict) as exc_info:
-            main.merge(dev.current_commit, default_merge=text_merge())
+            main.merge(commit=dev.head, default_merge=text_merge())
         assert exc_info.value.conflicting_keys == {"doc"}
         assert isinstance(exc_info.value.merge_errors["doc"], CantMark)
 
@@ -178,7 +171,7 @@ class TestTextMerge:
         main, dev = _diverged(1, 2, 0)
 
         with pytest.raises(MergeConflict) as exc_info:
-            main.merge(dev.current_commit, default_merge=text_merge())
+            main.merge(commit=dev.head, default_merge=text_merge())
         assert isinstance(exc_info.value.merge_errors["doc"], CantMark)
 
     def test_mixed_str_and_bytes_sides_come_back_as_str(self):
@@ -200,14 +193,14 @@ class TestTextMerge:
         assert fn("a\nb\n", "a\nB\n", "a\nb\n") == "a\nB\n"
 
     def test_strict_conflict_aborts_staged_merge(self):
-        main = Staged(Versioned(Memory()))
+        main = worktree()
         main["doc"] = "a\nb\nc\nd\n"
         main.commit()
-        dev = main.create_branch("dev")
+        dev = fork(main, "dev")
         dev["doc"] = "a\nY\nc\nd\n"
         dev.commit()
         main["doc"] = "a\nX\nc\nd\n"
         main.commit()
         with pytest.raises(MergeConflict) as exc_info:
-            main.merge(dev.current_commit, default_merge=text_merge(strict=True))
+            main.merge(commit=dev.head, default_merge=text_merge(strict=True))
         assert "doc" in exc_info.value.conflicting_keys

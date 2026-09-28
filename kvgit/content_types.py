@@ -37,9 +37,9 @@ def text_merge(
     theirs_label: str = "theirs",
     strict: bool = False,
 ) -> MergeFn:
-    """Marker merge for ``str`` (or ``bytes``) values, for use with ``Staged``.
+    """Marker merge for ``str`` (or ``bytes``) values, for use with a ``Worktree``.
 
-    The value-level counterpart to :func:`kvgit.merges.text`. ``Staged``
+    The value-level counterpart to :func:`kvgit.merges.text`. A worktree
     decodes both sides before calling a merge function, so a key holding
     ``str`` reaches a bytes-level function as ``str`` and fails there;
     this one encodes ``str`` sides as UTF-8, marker-merges, and decodes

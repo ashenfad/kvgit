@@ -8,7 +8,7 @@ class KVStore(ABC):
     """Key-value store operating on bytes only.
 
     All values are stored and retrieved as bytes. Serialization is
-    handled at higher layers (e.g., Versioned).
+    handled at higher layers (a repository's codec).
 
     Beyond reads and writes, a backend owes kvgit two things:
 

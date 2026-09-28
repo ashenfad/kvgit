@@ -11,12 +11,11 @@ Quick start::
     from kvgit.codecs import compose
     from kvgit.codecs.numpy import NumpyCodec
 
-    encoder, decoder = compose(NumpyCodec())
-    s = store(encoder=encoder, decoder=decoder)
+    wt = store(codec=compose(NumpyCodec()))   # or codec="scientific"
 
-The encoder/decoder pair is plug-compatible with ``Staged``'s
-existing slots: it accepts a ``ChunkSink`` / ``ChunkReader`` second
-argument, and ``Staged`` detects the extended arity automatically.
+A composed pair is an ordinary ``(encoder, decoder)`` codec whose
+functions take a ``ChunkSink`` / ``ChunkReader`` second argument; a
+repository detects the extended arity automatically.
 """
 
 from __future__ import annotations
@@ -74,7 +73,7 @@ def scientific():
     return compose(NumpyCodec())
 
 
-# Registry of named codec presets used by ``kvgit.store(codecs=...)``.
+# Registry of named codec presets, selected by ``codec="<name>"``.
 # Keep this sparse: each preset is a deliberate, well-documented bundle.
 _NAMED_PRESETS = {
     "scientific": scientific,
@@ -84,7 +83,7 @@ _NAMED_PRESETS = {
 def _resolve_named(name: str):
     """Resolve a named codec preset to an ``(encoder, decoder)`` pair.
 
-    Internal helper used by ``kvgit.store(codecs=...)``. Raises
+    Internal helper behind ``codec="<name>"``. Raises
     ``ValueError`` for unknown names with a list of valid options.
     """
     factory = _NAMED_PRESETS.get(name)
