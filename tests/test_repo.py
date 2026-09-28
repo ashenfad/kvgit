@@ -1,6 +1,7 @@
 """Tests for Repo: branches, tags, the commit graph, snapshots and gc."""
 
 import os
+import random
 import tempfile
 from collections.abc import Mapping
 
@@ -413,6 +414,87 @@ class TestSnapshots:
         repo.store.set(BRANCH_HEAD % "refs/tags/v1", dumps("0" * 40))
         with pytest.raises(UnknownCommitError):
             repo.snapshot(tag="v1")
+
+
+class TestSnapshotPointReads:
+    """Reading a few keys at a commit costs the tree's depth in batched
+    reads, not the whole keyset; iterating reads the keyset once."""
+
+    class Counting(Memory):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+            self.nodes = 0
+
+        def get(self, key):
+            self.calls += 1
+            self.nodes += key.startswith("kvgit:keyset:")
+            return super().get(key)
+
+        def get_many(self, *args):
+            keys = self._normalize_keys(args)
+            self.calls += 1
+            self.nodes += sum(k.startswith("kvgit:keyset:") for k in keys)
+            return super().get_many(*args)
+
+    def _big(self):
+        store = self.Counting()
+        repo = Repo(store)
+        wt = repo.worktree("main", create=True)
+        for i in range(5000):
+            wt[f"k{i}"] = i
+        wt.commit()
+        total = sum(1 for k in store.keys("kvgit:keyset:"))
+        store.calls = store.nodes = 0
+        return store, repo, wt, total
+
+    def test_one_key_reads_a_path_not_the_keyset(self):
+        store, repo, _, total = self._big()
+        snap = repo.snapshot(branch="main")
+        assert snap["k4321"] == 4321
+        assert store.calls <= 8
+        assert store.nodes < 10 < total
+
+    def test_many_keys_read_by_level_in_batches(self):
+        store, repo, _, total = self._big()
+        snap = repo.snapshot(branch="main")
+        keys = [f"k{i}" for i in range(0, 5000, 100)] + ["absent"]
+        found = snap.get_many(*keys)
+        assert found == {k: int(k[1:]) for k in keys if k != "absent"}
+        assert store.calls <= 8
+        assert store.nodes < total
+
+    def test_a_key_read_twice_is_looked_up_once(self):
+        store, repo, _, _ = self._big()
+        snap = repo.snapshot(branch="main")
+        snap["k1"]
+        before = store.calls
+        assert snap["k1"] == 1 and "k1" in snap and snap.raw["k1"]
+        assert store.calls - before == 2  # the blob, twice; no tree reads
+        assert "nope" not in snap
+        with pytest.raises(KeyError):
+            snap["nope"]
+
+    def test_point_reads_agree_with_the_whole_keyset(self):
+        wt = worktree()
+        rng = random.Random(7)
+        for i in range(300):
+            wt[f"k{i}"] = i
+        wt.commit()
+        for i in rng.sample(range(300), 60):
+            del wt[f"k{i}"]
+        wt.commit()
+        repo = wt.repo
+        full = dict(repo.snapshot(commit=wt.head))
+        probe = [f"k{i}" for i in range(0, 320, 7)]
+        lazy = repo.snapshot(commit=wt.head)
+        assert {k: lazy.get(k) for k in probe} == {k: full.get(k) for k in probe}
+        assert [k in lazy for k in probe] == [k in full for k in probe]
+        assert lazy.get_many(*probe) == {k: full[k] for k in probe if k in full}
+        assert dict(lazy) == full  # iterating after point reads
+        assert {k: lazy.get(k) for k in probe} == {k: full.get(k) for k in probe}
+        raw = repo.snapshot(commit=wt.head).raw
+        assert set(raw.get_many(*probe)) == {k for k in probe if k in full}
 
 
 class TestGc:

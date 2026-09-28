@@ -305,14 +305,6 @@ class Repo:
             raise UnknownCommitError(f"Commit '{target}' does not exist")
         return target
 
-    def _pointers(self, commit: str) -> dict[str, str]:
-        """A commit's keyset as key -> blob pointer."""
-        root_raw = self._store.get(COMMIT_ROOT % commit)
-        if root_raw is None:
-            raise UnknownCommitError(f"Commit '{commit}' does not exist")
-        entries = Keyset(self._store, root=loads(root_raw)).materialize()
-        return {key: entry.blob for key, entry in entries.items()}
-
 
 class Snapshot(Mapping[str, Any]):
     """The state of the repository at one commit, read-only.
@@ -324,23 +316,59 @@ class Snapshot(Mapping[str, Any]):
     def __init__(self, repo: Repo, commit: str) -> None:
         self._repo = repo
         self.commit = commit
+        self._keyset: Keyset | None = None
+        # The whole keyset as key -> blob pointer, once something iterates
+        # it; until then, reads look keys up in the tree one batch at a
+        # time and remember what they found (None: absent).
         self._pointers: dict[str, str] | None = None
+        self._looked_up: dict[str, str | None] = {}
 
     def __repr__(self) -> str:
         return f"Snapshot(commit={self.commit[:8]}...)"
 
+    def _tree(self) -> Keyset:
+        if self._keyset is None:
+            root_raw = self._repo.store.get(COMMIT_ROOT % self.commit)
+            if root_raw is None:
+                raise UnknownCommitError(f"Commit '{self.commit}' does not exist")
+            self._keyset = Keyset(self._repo.store, root=loads(root_raw))
+        return self._keyset
+
     def _index(self) -> dict[str, str]:
+        """The whole keyset, read once, for iteration and length."""
         if self._pointers is None:
-            self._pointers = self._repo._pointers(self.commit)
+            entries = self._tree().materialize()
+            self._pointers = {key: entry.blob for key, entry in entries.items()}
         return self._pointers
 
+    def _pointers_of(self, keys: tuple[str, ...]) -> dict[str, str]:
+        """The blob pointers of those keys that exist.
+
+        Once the whole keyset has been read, from that; before, by looking
+        just these keys up in the tree — its depth in batched reads, not
+        the whole keyset — so reading a few keys at a commit stays cheap
+        however many the commit holds.
+        """
+        if self._pointers is not None:
+            return {k: self._pointers[k] for k in keys if k in self._pointers}
+        unknown = [k for k in dict.fromkeys(keys) if k not in self._looked_up]
+        if unknown:
+            found = self._tree().get_many(unknown)
+            for key in unknown:
+                entry = found.get(key)
+                self._looked_up[key] = None if entry is None else entry.blob
+        return {
+            key: pointer
+            for key in keys
+            if (pointer := self._looked_up.get(key)) is not None
+        }
+
     def _raw_many(self, keys: tuple[str, ...]) -> dict[str, bytes]:
-        index = self._index()
         wanted: dict[str, list[str]] = {}
-        for key in keys:
-            pointer = index.get(key)
-            if pointer is not None:
-                wanted.setdefault(pointer, []).append(key)
+        for key, pointer in self._pointers_of(keys).items():
+            wanted.setdefault(pointer, []).append(key)
+        if not wanted:
+            return {}
         found = self._repo.store.get_many(wanted.keys())
         return {key: raw for pointer, raw in found.items() for key in wanted[pointer]}
 
@@ -362,7 +390,7 @@ class Snapshot(Mapping[str, Any]):
         return len(self._index())
 
     def __contains__(self, key: object) -> bool:
-        return isinstance(key, str) and key in self._index()
+        return isinstance(key, str) and bool(self._pointers_of((key,)))
 
     @property
     def raw(self) -> RawSnapshot:

@@ -155,6 +155,11 @@ class Keyset:
             return None
         return decode_entry(raw)
 
+    def get_many(self, keys: Iterable[str]) -> dict[str, KeysetEntry]:
+        """The entries of the keys that are present, reading their paths
+        in one batched read per tree level; see ``Hamt.get_many``."""
+        return {k: decode_entry(v) for k, v in self._hamt.get_many(keys).items()}
+
     def get_blob(self, key: str) -> str | None:
         """Shortcut: just the blob pointer, no meta."""
         entry = self.get(key)
