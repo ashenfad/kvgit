@@ -213,6 +213,18 @@ class TestRefCollections:
         moved.commit()
         assert branches["late"] == moved.head
 
+    def test_a_kept_items_view_stays_live(self):
+        repo, wt, *_ = repo_with_history()
+        tag_items, branch_items = repo.tags.items(), repo.branches.items()
+        other = Repo(repo.store)
+        other.tags.create("v1", wt.head)
+        other.branches.create("late", wt.head)
+        assert list(tag_items) == [("v1", wt.head)]
+        assert ("late", wt.head) in branch_items
+        assert ("v1", wt.head) in tag_items and len(tag_items) == 1
+        other.tags.delete("v1")
+        assert list(tag_items) == [] and len(tag_items) == 0
+
     def test_create_takes_the_commit_positionally_too(self):
         repo, wt, *_ = repo_with_history()
         assert repo.branches.create("pos", wt.head) == wt.head
