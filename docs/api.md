@@ -1,8 +1,32 @@
 # API Reference
 
+kvgit's public API is three objects over one backend:
+
+| Object | What it is |
+|--------|------------|
+| [`Repo`](#repo) | The repository: owns the `KVStore`, and everything store-wide — branches, tags, history, snapshots, garbage collection. Safe to share across threads and processes. |
+| [`Worktree`](#worktree) | One branch checked out for work: a `MutableMapping[str, Any]` whose writes stay pending until `commit()`. Belongs to one thread at a time. |
+| [`Snapshot`](#snapshot) | A read-only `Mapping[str, Any]` pinned to one commit. |
+
+```python
+from kvgit import Repo
+from kvgit.kv.disk import Disk
+
+with Repo(Disk("/tmp/db")) as repo:
+    wt = repo.worktree("main", create=True)
+    wt["k"] = "v"
+    wt.commit(info={"msg": "first"})
+    repo.create_tag("v1", wt.head)
+    repo.snapshot(tag="v1")["k"]  # "v"
+```
+
+Commit hashes are plain `str`s; a `Commit` record describes one. Every ref argument that names a starting point — `snapshot`, `log`, `Worktree.merge` — takes exactly one of `commit=` / `branch=` / `tag=`.
+
+---
+
 ## `kvgit.store()`
 
-Factory function that returns a configured `Staged` instance.
+The one-line happy path: build a `Repo` over a backend and open (or create) one branch.
 
 ```python
 kvgit.store(
@@ -11,11 +35,8 @@ kvgit.store(
     path=None,           # required for "disk"
     db_name="kvgit",     # IndexedDB database name (only for "indexeddb")
     branch="main",
-    create=True,         # False raises UnknownBranchError instead of minting
-    encoder=pickle.dumps,
-    decoder=pickle.loads,
-    codecs=None,         # named codec preset (mutually exclusive with encoder/decoder)
-)
+    codec="pickle",
+) -> Worktree
 ```
 
 | Parameter | Type | Default | Description |
@@ -23,287 +44,306 @@ kvgit.store(
 | `kind` | `Literal["memory", "disk", "indexeddb"]` | `"memory"` | Backend type |
 | `path` | `str \| None` | `None` | Required for `"disk"` |
 | `db_name` | `str` | `"kvgit"` | IndexedDB database name. Only used with `"indexeddb"`. |
-| `branch` | `str` | `"main"` | Branch name |
-| `create` | `bool` | `True` | Mint the branch with an initial commit when missing. `False` raises `UnknownBranchError` instead, so a read after a delete cannot resurrect the branch. |
-| `encoder` | `Callable[..., bytes]` | `pickle.dumps` | Value encoder. Pass a `compose()` pair to enable [chunked codecs](#chunked-codecs). |
-| `decoder` | `Callable[..., Any]` | `pickle.loads` | Value decoder. |
-| `codecs` | `str \| None` | `None` | Named codec preset shortcut. Currently `"scientific"` (numpy + pandas chunked codecs). Mutually exclusive with explicit `encoder` / `decoder`. |
+| `branch` | `str` | `"main"` | Branch to open; created at the empty root commit if missing |
+| `codec` | see [Codecs](#codecs) | `"pickle"` | How values become stored bytes |
 
-**Named codec presets** (passed via `codecs="..."`):
-
-| Name | Codecs included | Required dependency |
-|------|-----------------|---------------------|
-| `"scientific"` | `NumpyCodec()` (catches pandas DataFrame block buffers too) | `pip install kvgit[scientific]` |
+The returned worktree's `repo` is the repository; close it with `wt.repo.close()`. For any other backend, or repo-wide options, construct a [`Repo`](#repo).
 
 ---
 
-## `kvgit.delete_branches()`
-
-Admin teardown: delete one or more branches directly on the backend, with no branch anchor, then sweep orphaned commits.
+## Repo
 
 ```python
-kvgit.delete_branches(
-    names,               # one branch name, or an iterable of them
+from kvgit import Repo
+
+repo = Repo(
+    backend,                          # any KVStore
     *,
-    kind="disk",         # "memory", "disk", or "indexeddb"
-    path=None,           # required for "disk"
-    db_name="kvgit",     # IndexedDB database name (only for "indexeddb")
-    min_age=3600,        # sweep guard: commits younger than this survive
+    codec="pickle",
+    merge_fns=None,
+    merge_prefixes=None,
+    default_merge=None,
+    recover_from_corrupt_head=None,
 )
 ```
 
-`Staged.delete_branch` / `VersionedKV.delete_branch` refuse to delete the branch the handle is anchored on, and a handle always has a current branch — so when the doomed branch is the store's only branch, there is nothing safe to anchor on. `delete_branches` opens the raw backend (no `VersionedKV`, hence no current branch) and edits the branch keys itself, so any branch — including the last one — can be removed.
-
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `names` | `str \| Iterable[str]` | — | Branch names to delete. Missing names are no-ops (idempotent teardown). A bare string is one name, not iterated per character. |
-| `kind` | `Literal["memory", "disk", "indexeddb"]` | `"disk"` | Backend type |
-| `path` | `str \| None` | `None` | Required for `"disk"` |
-| `db_name` | `str` | `"kvgit"` | IndexedDB database name. Only used with `"indexeddb"`. |
-| `min_age` | `float` | `3600` | Passed to the orphan sweep — commits younger than this many seconds survive. `0` reclaims immediately (only when no concurrent writers). |
+| `backend` | `KVStore` | (required) | `Memory()`, `Disk(path)`, `Postgres(dsn)`, `IndexedDB(...)`, a `Composite`, or your own |
+| `codec` | `str \| (encoder, decoder)` | `"pickle"` | See [Codecs](#codecs) |
+| `merge_fns` | `dict[str, MergeFn \| MergeChoice] \| None` | `None` | Merge rules by key, for every worktree this repo opens |
+| `merge_prefixes` | `dict[str, MergeFn \| MergeChoice] \| None` | `None` | Merge rules by key prefix, likewise |
+| `default_merge` | `MergeFn \| MergeChoice \| None` | `None` | The rule for keys no other rule covers |
+| `recover_from_corrupt_head` | `CorruptHeadRecoverer \| None` | `None` | Last-resort HEAD recovery; see [HEAD Recovery](#head-recovery) |
 
-Each name's `__branch_head__` and its `__branch_head_prev__` recovery backup are removed (the backup too, so a later same-named branch can't resurrect the deleted state), then a single [`clean_orphans`](#orphan-cleanup) sweep — at `min_age` (default: the one-hour concurrent-writer guard) — reclaims commits only the deleted branches referenced, with the content only they held. Deleting every branch is legal; the store mints a fresh empty `main` on next open. [Tags](#tags) are branch heads under a reserved name, so a tagged commit survives the deletion of every ordinary branch that reached it — the sweep marks from it like any other head.
+None of these settings is written to the store: they belong to the process that opens it. Opening reads the store's version stamp once and raises [`StorageVersionError`](#errors) for a layout this code does not read; it never writes.
+
+A `Repo` is a context manager; `close()` closes the backend.
+
+### Branches
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `worktree(name, *, create=False)` | `Worktree` | Check out a branch. Raises `UnknownBranchError` if missing — unless `create=True`, which creates it at the empty root commit first. `CorruptHeadError` if its HEAD is damaged beyond recovery. |
+| `create_branch(name, *, at=None)` | `str` | Create a branch at commit `at` (default: the empty root commit); returns that commit. `BranchExistsError` if taken, `UnknownCommitError` if `at` is not in the store. |
+| `delete_branch(name)` | `None` | Delete any branch, including the last one and one with open worktrees. Removes its HEAD and HEAD backup; its commits become collectable at the next [`gc()`](#garbage-collection). `UnknownBranchError` if missing. |
+| `branches()` | `list[str]` | Every branch name, sorted. Tags are not included. |
+| `has_branch(name)` | `bool` | Whether a branch exists. Never writes. |
+| `head(name)` | `str` | The commit a branch points at. `UnknownBranchError`, `CorruptHeadError`. |
+| `repair_head(name)` | `str \| None` | Persist a recovered HEAD; see [HEAD Recovery](#head-recovery). |
+
+Branch names are any non-empty string without `%`, `/` included, except the reserved `refs/tags/` prefix, which every branch method refuses with `ValueError`.
+
+A worktree on a deleted branch still reads from its `head`; its next `commit()` raises `UnknownBranchError`.
+
+### Tags
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `create_tag(name, commit, *, info=None)` | `None` | Name a commit permanently. `TagExistsError` if taken, `UnknownCommitError` if the commit is not in the store. `info` must be JSON-serializable. |
+| `delete_tag(name)` | `None` | Remove a tag. A commit only it kept alive becomes collectable at the next `gc()`. `UnknownTagError` if missing. |
+| `tags()` | `dict[str, str]` | Every tag, name → commit |
+| `tag_info(name)` | `TagInfo \| None` | Details for one tag, or `None` |
+
+See [Tags](#tags) for the semantics.
+
+### Commits and history
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `get_commit(commit)` | `Commit` | One commit's record. `UnknownCommitError` if missing. |
+| `log(*, commit=None, branch=None, tag=None, limit=None, first_parent=False)` | `Iterator[Commit]` | Commits reachable from the one starting point named, newest first. Follows every parent of a merge; `first_parent=True` follows only the line made on the branch itself. |
+| `diff(a, b)` | `DiffResult` | Keys added, removed and modified going from commit `a` to `b` |
+| `merge_base(a, b)` | `str \| None` | Lowest common ancestor, or `None` if the two share no history. Criss-cross ties go to the smallest hash. |
+| `snapshot(*, commit=None, branch=None, tag=None)` | `Snapshot` | Read-only view of the commit the ref resolves to now |
+
+History ends at the empty root commit every branch starts from (`ROOT_COMMIT`, the same hash in every store).
+
+### Garbage collection
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `gc(*, min_age=3600, deep=False, wait=True, lease_ttl=600)` | `int` | Reclaim what no branch, tag or in-flight commit reaches; returns how many commits were removed |
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `min_age` | `3600` | Orphans younger than this many seconds survive. Policy only: any value, `0` included, is safe beside concurrent writers. |
+| `deep` | `False` | Also scan the content namespaces for anything no commit references — crash leftovers. See [`deep=True`](#deeptrue--reclaiming-commit-less-artifacts). |
+| `wait` | `True` | Wait for another sweep's lease; `False` raises [`GcBusy`](#errors) instead |
+| `lease_ttl` | `600` | Seconds a crashed sweep can hold writers up. See [The GC lease](#the-gc-lease). |
+
+Nothing sweeps implicitly — deleting a branch or tag doesn't. Run `gc()` when it suits the deployment: a scheduled job for a shared Postgres store, a quiet moment in the embedding process for a local one. See [Orphan Cleanup](#orphan-cleanup).
+
+### Other members
+
+| Member | Description |
+|--------|-------------|
+| `store` | The backend `KVStore` |
+| `close()` | Close the backend; also `__enter__` / `__exit__` |
 
 ---
 
-## `kvgit.delete_tags()`
+## Worktree
 
-The tag counterpart of `delete_branches`, anchor-free for the same reason: teardown shouldn't need a handle, and a handle always has a current branch to open on.
+A branch checked out for work: a `MutableMapping[str, Any]` bound to one branch for its whole life. Writes are pending until `commit()` — there is no separate index to stage into. Several worktrees may hold the same branch, in one process or many; a commit that finds the branch moved merges automatically.
 
-```python
-kvgit.delete_tags(
-    names,               # one tag name, or an iterable of them
-    *,
-    kind="disk",         # "memory", "disk", or "indexeddb"
-    path=None,           # required for "disk"
-    db_name="kvgit",     # IndexedDB database name (only for "indexeddb")
-    min_age=3600,        # sweep guard: commits younger than this survive
-)
-```
+Get one from `repo.worktree(name)` or `kvgit.store()`.
 
-Each name's reserved branch head (`__branch_head__refs/tags/<name>`), that head's `__branch_head_prev__` backup and its `__tag_info__` record are removed, then one [`clean_orphans`](#orphan-cleanup) sweep reclaims commits that only the deleted tags kept alive. Missing names are no-ops, and a bare string is one name rather than one per character — both matching `delete_branches`.
+### Reading and writing
 
----
-
-## Staged
-
-`Staged` wraps a `Versioned` implementation and provides a `MutableMapping[str, Any]` interface with buffered writes. Individual `set()` / `__setitem__()` calls are held in memory; `commit()` encodes and flushes them atomically.
-
-### Construction
-
-```python
-from kvgit import Staged, VersionedKV
-
-s = Staged(VersionedKV(), encoder=pickle.dumps, decoder=pickle.loads)
-```
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `versioned` | `Versioned` | (required) | Any `Versioned` implementation |
-| `encoder` | `Callable[..., bytes]` | `pickle.dumps` | Serializes values to bytes on commit |
-| `decoder` | `Callable[..., Any]` | `pickle.loads` | Deserializes bytes to values on read |
-
-`VersionedKV(store, branch=name)` opens (or creates) a branch; pass `create=False` to raise [`UnknownBranchError`](#unknownbrancherror) instead of minting a missing one.
-
-#### Chunked encoder/decoder
-
-`Staged` autodetects the encoder/decoder shape by signature:
-
-* **1-arg** -- `encoder(value) -> bytes` and `decoder(bytes) -> value` use the legacy in-blob serialization. The store layout stays v2-compatible.
-* **2-arg with required second parameter** -- `encoder(value, sink) -> bytes` and `decoder(blob, reader) -> value` route through a `ChunkSink` / `ChunkReader`, enabling content-addressed chunk dedup. The first chunked write upgrades the store to v3.
-
-The arity check is "second positional parameter has no default" -- so `pickle.dumps` (whose `protocol` arg has a default) stays 1-arg, and the encoders returned by `kvgit.codecs.compose(...)` are detected as 2-arg automatically. See [Chunked codecs](#chunked-codecs).
-
-### Reading
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| `get` | `(key, default=None) -> Any` | Check staged buffer first, then committed state |
-| `get_many` | `(*keys) -> dict[str, Any]` | Batch get; only includes existing keys |
-| `keys` | `() -> set[str]` | All keys (staged + committed, minus staged removals) |
-| `__getitem__` | `(key) -> Any` | Raises `KeyError` if missing |
-| `__contains__` | `(key) -> bool` | Check existence |
-| `__iter__` | `() -> Iterator[str]` | Iterate over keys |
-| `__len__` | `() -> int` | Number of keys |
-| `is_staged` | `(key) -> bool` | Whether this key has uncommitted changes |
-
-### Writing
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| `__setitem__` | `(key, value) -> None` | Stage a value |
-| `__delitem__` | `(key) -> None` | Stage a removal. Raises `KeyError` if missing. |
-| `set` | `(key, value) -> None` | Same as `__setitem__` |
-| `remove` | `(key) -> None` | Same as `__delitem__` |
-
-### Committing
-
-#### `commit(*, keys=None, on_conflict="raise", merge_fns=None, merge_prefixes=None, default_merge=None, info=None) -> MergeResult`
-
-Encode staged changes and flush as a single atomic commit. If HEAD has diverged, a three-way merge is performed.
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `keys` | `set[str] \| None` | `None` | If provided, only commit these keys. Uncommitted keys remain staged. |
-| `on_conflict` | `str` | `"raise"` | `"raise"` or `"abandon"` |
-| `merge_fns` | `dict[str, MergeFn \| MergeChoice] \| None` | `None` | Per-key registrations for this commit |
-| `merge_prefixes` | `dict[str, MergeFn \| MergeChoice] \| None` | `None` | Registrations by key prefix for this commit |
-| `default_merge` | `MergeFn \| MergeChoice \| None` | `None` | Fallback registration for this commit |
-| `info` | `dict \| None` | `None` | Metadata attached to the commit |
-
-Per-call `merge_fns` / `merge_prefixes` / `default_merge` layer over the registrations made with [`set_merge_fn`](#merge-functions) and friends.
-
-**Partial commits:** Pass `keys` to commit only a subset of staged changes. Keys not in `_updates` or `_removals` are silently ignored. Uncommitted keys remain staged for a future `commit()`.
-
-```python
-s["a"] = b"alpha"
-s["b"] = b"beta"
-s.commit(keys={"a"}, info={"message": "just a"})
-# "a" is committed; "b" remains staged
-```
-
-#### `merge(their_head, *, on_conflict="raise", merge_fns=None, merge_prefixes=None, default_merge=None, post_check=None, info=None) -> MergeResult`
-
-Merge another head — any commit in the store, usually another branch's HEAD — into this branch: lowest common ancestor (criss-cross ties go to the smallest hash), three-way resolve, two-parent merge commit guarded on your own head. Refuses with `ValueError` when the staging buffer holds uncommitted changes; commit or reset first.
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `their_head` | `str` | — | Commit to merge in |
-| `on_conflict` | `str` | `"raise"` | `"raise"` or `"abandon"` (leaves the branch untouched) |
-| `merge_fns` | `dict[str, MergeFn \| MergeChoice] \| None` | `None` | Per-key registrations for this merge |
-| `merge_prefixes` | `dict[str, MergeFn \| MergeChoice] \| None` | `None` | Registrations by key prefix for this merge |
-| `default_merge` | `MergeFn \| MergeChoice \| None` | `None` | Fallback registration for this merge |
-| `post_check` | `PostCheck \| None` | `None` | `(key, merged_bytes) -> bool` over each merge-produced value; `False` files that key as conflicted. A key resolved by a [`MergeChoice`](#mergechoice) produces no new value, so nothing is checked for it. |
-| `info` | `dict \| None` | `None` | Metadata attached to the merge commit |
-
-#### `reset() -> None`
-
-Discard all staged (uncommitted) changes.
-
-#### `refresh() -> None`
-
-Reload from HEAD and discard staged changes. Use this to see writes from other branches or processes.
-
-### Merge functions
-
-Each registration holds either a merge function — `fn(old, ours, theirs) -> merged` — or a [`MergeChoice`](#mergechoice). See [MergePolicy](#mergepolicy) for how far each kind reaches.
-
-A function registered here receives **decoded values**, not bytes, so pick one written for that level: `text_merge()` rather than `kvgit.merges.text` for a key holding `str`. See [Built-in merge functions](#built-in-merge-functions).
-
-#### `set_merge_fn(key, fn) -> None`
-
-Register a persistent merge function, or a `MergeChoice`, for one key.
-
-#### `set_merge_prefix(prefix, fn) -> None`
-
-Register a persistent merge function, or a `MergeChoice`, for every key starting with `prefix`. Use it for keys whose names are not known when the policy is set (`"runs/"` covering `runs/<id>`).
-
-#### `set_default_merge(fn) -> None`
-
-Register a fallback for any key no exact-key or prefix registration covers.
-
-**Resolution order.** A key takes the most specific registration that applies: its exact key, else the longest registered prefix it starts with, else the default. Merge functions and `MergeChoice` policies compete in that one order, so a longer prefix wins whichever kind each holds. A contested key no registration covers is a conflict.
-
-```python
-s.set_merge_prefix("runs/", MergeChoice.OURS)  # this branch owns runs/
-s.set_merge_prefix("runs/counts/", counter())  # except these
-s.set_merge_fn("runs/counts/total", theirs)    # and this one exactly
-```
-
-### Branching
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| `create_branch` | `(name, *, at=None) -> Staged` | Fork onto a new branch. Returns a new `Staged`. |
-| `checkout` | `(commit_hash=None, *, branch=None, tag=None) -> Staged \| None` | Open a specific commit, or a [tag](#tags). Exactly one of `commit_hash` / `tag`. Returns `None` if not found. |
-| `switch_branch` | `(name) -> None` | Switch to an existing branch (clears staged buffer). |
-| `delete_branch` | `(name) -> None` | Delete a branch and clean up orphaned commits. Cannot delete the current branch. |
-| `list_branches` | `() -> list[str]` | All branch names in the store. |
-| `branch_exists` | `(name) -> bool` | Whether a branch has a HEAD entry. Never writes, so it cannot resurrect a deleted branch. |
-| `peek` | `(key, *, branch=None, tag=None) -> Any \| None` | Read a decoded value from another branch's HEAD, or from a [tag](#tags). Exactly one of `branch` / `tag`. |
-| `reset_to` | `(commit_hash) -> bool` | Force HEAD to a specific commit. Returns `False` if not found. |
-
-### Tagging
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| `tag` | `(name, *, at=None, info=None) -> str` | Name a commit permanently. Returns the tagged commit hash. Raises `ValueError` if the name is taken. |
-| `tags` | `() -> dict[str, str]` | Every tag in the store, name -> commit hash. |
-| `tag_info` | `(name) -> TagInfo \| None` | Details for one tag, or `None` if there is no such tag. |
-| `delete_tag` | `(name) -> None` | Remove a tag, then sweep orphans. Raises `ValueError` if the tag does not exist. |
-
-`s.tag("v1")` names the **current commit** — the last committed state. The staging buffer is not part of any commit yet, so it is never what gets tagged; commit first if you meant to name those changes. See [Tags](#tags) for the semantics and their effect on garbage collection.
-
-### History
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| `history` | `(commit_hash=None, *, all_parents=False) -> Iterable[str]` | Walk commit chain from newest to oldest. `all_parents=True` for full DAG (BFS). |
-
-Access `commit_info()` and `diff()` via `s.versioned`:
-
-```python
-s.versioned.commit_info()              # info dict for current commit
-s.versioned.commit_info(some_hash)     # info dict for specific commit
-s.versioned.diff(hash_a, hash_b)       # DiffResult between two commits
-s.versioned.parents()                  # parent hashes of current commit
-s.versioned.merge_base(hash_a, hash_b) # lowest common ancestor, or None;
-                                       # criss-cross ties go to the smallest hash
-```
+| Member | Description |
+|--------|-------------|
+| `wt[key]`, `get(key, default=None)` | A value, pending changes included. `wt[key]` raises `KeyError` if absent. |
+| `get_many(*keys)` | `dict` of the keys that exist |
+| `keys()`, `iter(wt)`, `len(wt)`, `key in wt` | Committed keys plus pending writes, minus pending deletions |
+| `wt[key] = value` | A pending write |
+| `del wt[key]` | A pending deletion; `KeyError` if absent. Deleting a key that exists only as a pending write just drops the write. |
+| `status()` | `Status(updated, removed)`: the pending keys, as `frozenset`s. Falsy when nothing is pending. |
 
 ### Properties
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `versioned` | `Versioned` | The underlying versioned engine |
-| `current_commit` | `str` | Current commit hash |
-| `base_commit` | `str` | Commit hash at branch creation |
-| `current_branch` | `str` | Name of the current branch |
-| `initial_commit` | `str` | Root commit (oldest in linear history) |
-| `last_merge_result` | `MergeResult \| None` | Result of the last `commit()` |
-| `has_changes` | `bool` | Whether the staging buffer is non-empty |
+| `repo` | `Repo` | The repository |
+| `branch` | `str` | The branch this worktree holds |
+| `head` | `str` | The commit this worktree is based on. The branch tip may have moved since: `repo.head(wt.branch)`. |
+
+### Committing
+
+#### `commit(*, keys=None, info=None, on_conflict="raise", merge_fns=None, merge_prefixes=None, default_merge=None) -> MergeResult`
+
+Encode pending changes and write them as one atomic commit. If the branch has moved past `head`, a three-way merge is performed.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `keys` | `set[str] \| None` | `None` | Commit only these pending keys; the rest stay pending. Keys with nothing pending are ignored. |
+| `info` | `dict \| None` | `None` | Metadata attached to the commit (JSON-serializable) |
+| `on_conflict` | `str` | `"raise"` | `"raise"` or `"abandon"` (a falsy result, nothing written) |
+| `merge_fns` | `dict[str, MergeFn \| MergeChoice] \| None` | `None` | Per-key rules for this call |
+| `merge_prefixes` | `dict[str, MergeFn \| MergeChoice] \| None` | `None` | Rules by key prefix for this call |
+| `default_merge` | `MergeFn \| MergeChoice \| None` | `None` | Fallback rule for this call |
+
+Raises `MergeConflict` on a conflict in `"raise"` mode, `ConcurrencyError` if the commit keeps losing the race to publish, and `UnknownBranchError` if the branch was deleted.
+
+```python
+wt["a"] = b"alpha"
+wt["b"] = b"beta"
+wt.commit(keys={"a"}, info={"message": "just a"})
+# "a" is committed; "b" is still pending
+```
+
+### Merging and applying changes
+
+Each of these refuses with `ValueError` while changes are pending — commit or `discard()` first — and takes the same options:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `info` | `None` | Metadata attached to the new commit |
+| `on_conflict` | `"raise"` | `"raise"` or `"abandon"` (leaves the branch untouched) |
+| `merge_fns`, `merge_prefixes`, `default_merge` | `None` | Rules for this call, layered over the registered ones |
+| `post_check` | `None` | `(key, merged_bytes) -> bool` over each merge-produced value; `False` files that key as conflicted. A key resolved by a [`MergeChoice`](#mergechoice) produces no new value, so nothing is checked for it. |
+
+#### `merge(*, commit=None, branch=None, tag=None, **options) -> MergeResult`
+
+Merge another branch, tag or commit into this worktree's branch: lowest common ancestor (criss-cross ties go to the smallest hash), three-way resolve, and a two-parent merge commit whose first parent is this branch's head.
+
+#### `apply(base, target, **options) -> MergeResult`
+
+Apply the change from commit `base` to commit `target` onto this branch, as an ordinary single-parent commit. `base` stands in for the common ancestor in a three-way merge between this branch's head and `target`, so keys the change did not touch are left as they are. A change already present is a no-op.
+
+#### `cherry_pick(commit, **options) -> MergeResult`
+
+`apply(first parent of commit, commit)`: the change one commit made.
+
+#### `revert(commit, **options) -> MergeResult`
+
+`apply(commit, first parent of commit)`: undo the change one commit made.
+
+### Moving
+
+| Method | Description |
+|--------|-------------|
+| `discard()` | Drop pending changes (`git restore .`) |
+| `reset(commit)` | Move the branch to `commit` and drop pending changes (`git reset --hard`). `UnknownCommitError` if not in the store. |
+| `refresh()` | Move to the branch's current tip, dropping pending changes. `UnknownBranchError` if the branch was deleted. |
+
+### Merge rules
+
+Each rule is either a merge function — `fn(old, ours, theirs) -> merged` — or a [`MergeChoice`](#mergechoice). See [MergePolicy](#mergepolicy) for how far each kind reaches.
+
+A merge function receives **decoded values**, not bytes, so pick one written for that level: `text_merge()` rather than `kvgit.merges.text` for a key holding `str`. A merged value is encoded with the repo's codec. See [Built-in merge functions](#built-in-merge-functions).
+
+| Method | Description |
+|--------|-------------|
+| `set_merge_fn(key, fn)` | Register a rule for one key |
+| `set_merge_prefix(prefix, fn)` | Register a rule for every key starting with `prefix` — keys whose names are not known when the policy is set (`"runs/"` covering `runs/<id>`) |
+| `set_default_merge(fn)` | Register the rule for keys no exact-key or prefix rule covers |
+
+**Layering.** The repository's rules (`Repo(merge_fns=...)`), then this worktree's registrations, then a call's `merge_fns=` / `merge_prefixes=` / `default_merge=`, each overriding the one before for the same key or prefix.
+
+**Resolution order.** A key takes the most specific rule that applies: its exact key, else the longest registered prefix it starts with, else the default. Merge functions and `MergeChoice` policies compete in that one order, so a longer prefix wins whichever kind each holds. A contested key no rule covers is a conflict.
+
+```python
+wt.set_merge_prefix("runs/", MergeChoice.OURS)  # this branch owns runs/
+wt.set_merge_prefix("runs/counts/", counter())  # except these
+wt.set_merge_fn("runs/counts/total", theirs)    # and this one exactly
+```
+
+---
+
+## Snapshot
+
+A read-only `Mapping[str, Any]` pinned to one commit, from `repo.snapshot(commit=... | branch=... | tag=...)`. A branch that moves later does not move the snapshot.
+
+| Member | Description |
+|--------|-------------|
+| `snap[key]`, `get`, `keys`, `items`, `values`, `in`, `len`, `iter` | The usual `Mapping` reads, decoded with the repo's codec |
+| `get_many(*keys)` | `dict` of the keys that exist |
+| `commit` | The commit hash |
+| `raw` | The same snapshot as a read-only `Mapping[str, bytes]` of stored bytes, whatever the codec (`RawSnapshot`, with `get_many` too) |
+
+`raw` reads bytes without decoding them — what a caller that encodes its own values, or does not trust a store's pickles, reads through. It exists only on snapshots: a worktree's pending values are not encoded until commit, so read its committed state as `repo.snapshot(commit=wt.head).raw`. Under the `"scientific"` codec the stored bytes are an envelope that refers to chunks elsewhere in the store, so they are not self-contained outside it; `"pickle"` and `"bytes"` values are.
+
+---
+
+## Commit and Status
+
+```python
+@dataclass(frozen=True)
+class Commit:
+    hash: str
+    parents: tuple[str, ...]  # first parent is the branch's own line
+    time: float | None
+    info: dict | None         # what commit(info=...) attached
+    root: str                 # keyset root: equal roots mean equal contents
+
+@dataclass(frozen=True)
+class Status:
+    updated: frozenset[str]   # keys with pending writes
+    removed: frozenset[str]   # keys with pending deletions
+```
+
+---
+
+## Codecs
+
+A repo's codec turns values into stored bytes and back. It is chosen when the repo is opened (`Repo(..., codec=)` or `kvgit.store(codec=)`):
+
+| `codec=` | Values | Stored as |
+|----------|--------|-----------|
+| `"pickle"` (default) | Anything picklable | `pickle.dumps(value)` |
+| `"scientific"` | Anything picklable | Pickle, with large numpy / pandas buffers stored once as [chunks](#chunked-codecs). Requires `pip install kvgit[scientific]`. |
+| `"bytes"` | `bytes` only (`TypeError` otherwise, at commit) | The bytes as they are; nothing is ever decoded |
+| `(encoder, decoder)` | Whatever the pair handles | `encoder(value)` |
+
+A pair is detected by signature: a one-argument `encoder(value) -> bytes` / `decoder(bytes) -> value`, or a chunk-aware `encoder(value, sink)` / `decoder(bytes, reader)` pair as returned by `kvgit.codecs.compose(...)`. The check is "second positional parameter has no default", so `pickle.dumps` (whose `protocol` has a default) is one-argument.
+
+### Codecs and trust
+
+Pickle is what makes a worktree a dict of anything. But unpickling can execute code, so anyone who can write a pickle-codec store — a shared Postgres table, a disk directory — can run code in every process that reads it, `"scientific"` included. For a store more than one party can write, use `codec="bytes"`: kvgit then never decodes anything, and the embedder encodes its values itself, choosing where, if anywhere, untrusted pickles are loaded — in a sandbox, say, rather than the host process.
+
+The codec is fixed per store in practice. Nothing records it in the store, and values written under one read back as that codec's bytes under another — `snapshot.raw` reads them under any — so switching an existing store means rewriting its values.
 
 ---
 
 ## Tags
 
-A tag is an immutable name for a commit, available on both `Staged` and `VersionedKV`.
+A tag is an immutable name for a commit.
 
 ```python
-s.tag("v1")                                # names the current commit
-s.tag("v1", at=some_hash, info={"by": "ann"})
-s.tags()                                   # {"v1": "a1b2c3..."}
-s.tag_info("v1")                           # TagInfo(name=..., commit=..., dangling=False)
-s.checkout(tag="v1")["config"]             # read the tagged state
-s.peek("config", tag="v1")                 # one key, without a handle
-s.delete_tag("v1")
+repo.create_tag("v1", wt.head)
+repo.create_tag("v1-reviewed", wt.head, info={"by": "ann"})
+repo.tags()                          # {"v1": "a1b2c3...", "v1-reviewed": "a1b2c3..."}
+repo.tag_info("v1-reviewed")         # TagInfo(name=..., commit=..., info={"by": "ann"}, ...)
+repo.snapshot(tag="v1")["config"]    # read the tagged state
+repo.delete_tag("v1")
 ```
 
-**Tags never move.** Creating one over an existing name raises `ValueError`; pointing a name somewhere else is `delete_tag` then `tag`, so the move is visible in the calling code. Tags and branches are separate namespaces — `release` can be both, and the two are unrelated.
+**Tags never move.** Creating one over an existing name raises `TagExistsError`; pointing a name somewhere else is `delete_tag` then `create_tag`, so the move is visible in the calling code. Tags and branches are separate namespaces — `release` can be both, and the two are unrelated.
 
-**Names** follow branch names, which are unvalidated: any non-empty string, `/` included, so embedders can namespace their own (`pub/v1`). The single exclusion is `%`, since tag keys are built by `%`-formatting a template. `info` must be JSON-serializable, like commit info.
+**Names** follow branch names: any non-empty string, `/` included, so embedders can namespace their own (`pub/v1`). The single exclusion is `%`, since tag keys are built by `%`-formatting a template. `info` must be JSON-serializable, like commit info.
 
-**A tag is a garbage collection root**, and it is one by construction: a tag is stored as a *branch head* under the reserved name `refs/tags/<name>`, hidden from the branch API. [`clean_orphans`](#orphan-cleanup) and `deep_clean` walk every branch head, so a tag's commit — and everything it descends from — stays alive with no tag-specific rule anywhere in the sweep. Tagging a commit and then deleting every ordinary branch that reached it leaves the commit alive until the tag goes. `delete_tag` removes the reserved head, its `__branch_head_prev__` backup and the `__tag_info__` record, then runs the orphan sweep, matching `delete_branch`.
+**A tag is a garbage collection root**, and it is one by construction: a tag is stored as a *branch head* under the reserved name `refs/tags/<name>`, hidden from the branch API. Every sweep walks every branch head, so a tag's commit — and everything it descends from — stays alive with no tag-specific rule anywhere in the sweep. Tagging a commit and then deleting every branch that reached it leaves the commit alive until the tag goes. `delete_tag` removes the reserved head, its `__branch_head_prev__` backup and the `__tag_info__` record; the next `gc()` takes what only the tag kept alive.
 
-A tag whose commit is not in the store (`dangling=True`) marks **nothing** — it is a head that does not resolve, and the sweep already treats those as roots pointing nowhere. That is damage rather than an ordinary state: a tag cannot be created for a commit that does not exist.
+A tag whose commit is not in the store (`dangling=True`) marks **nothing** — it is a head that does not resolve, and the sweep already treats those as roots pointing nowhere. That is damage rather than an ordinary state: a tag cannot be created for a commit that does not exist, and `snapshot(tag=...)` / `log(tag=...)` on one raise `UnknownCommitError`.
 
-Tags do not get the prev-HEAD recovery tiers a branch gets. kvgit never writes a backup for a tag, because it never moves one; `checkout(tag=...)` and `peek(..., tag=...)` read the reserved head key and nothing else.
+Tags do not get the prev-HEAD recovery tiers a branch gets. kvgit never writes a backup for a tag, because it never moves one; reading through a tag reads the reserved head key and nothing else.
 
-**`checkout(tag=...)` is not a read-only mode.** The handle comes back on the caller's branch, so a commit made from it goes through the ordinary HEAD CAS: it fast-forwards if the branch has not moved since the tag, and merges or raises `MergeConflict` if it has.
+To work from a tagged commit, branch from it: `repo.create_branch("hotfix", at=repo.tags()["v1"])`.
 
 **One race, and it is narrow.** Tagging a commit that is *already* an orphan older than `min_age` can lose to a sweep running concurrently, which was free to collect that commit before the tag existed. In practice callers tag a commit they are holding — a head, or something a head descends from — and a commit a branch reaches is never a sweep candidate.
 
 ### Compatibility across kvgit versions
 
-Storing a tag as a reserved branch head, rather than as a key kind of its own, is what makes tags safe in a store that other kvgit versions also open — **no storage version change ships with tags**, and a tagged store still opens under versions that predate them.
+Storing a tag as a reserved branch head, rather than as a key kind of its own, is what makes tags safe in a store that other kvgit versions also open — **no storage version change shipped with tags**, and a tagged store still opens under versions that predate them.
 
 The reason is that a version stamp cannot protect anything from code that already shipped. kvgit 0.3.4's anchor-free `delete_branches` opens a backend directly and sweeps without consulting the stamp at all, so a new key kind holding tag pointers would have been invisible to it and every tag-only commit would have been collected. Reachability, in every version, is "walk the branch heads" — so a tag that *is* a branch head is honoured by all of them, including ones written before tags existed.
 
-What an older version sees is a branch named `refs/tags/<name>`. It will list it among the branches, and it can delete that branch by name or switch to it and commit — deleting or moving the tag. Both are deliberate acts naming a path that says what it is. Current code refuses reserved names everywhere in the branch API (`create_branch`, `switch_branch`, `delete_branch`, `peek(branch=...)`, and the `branch=` constructor argument) and hides them from `list_branches()` / `VersionedKV.branches(store)`.
+What an older version sees is a branch named `refs/tags/<name>`. It will list it among the branches, and it can delete that branch by name or switch to it and commit — deleting or moving the tag. Both are deliberate acts naming a path that says what it is. Current code refuses reserved names everywhere in the branch API (`worktree`, `create_branch`, `delete_branch`, `head`, `repair_head`, and `branch=` in `snapshot` / `log` / `merge`) and hides them from `branches()`.
 
-The `__tag_info__<name>` record is a separate key kind, and nothing collects it: every sweep, this version's and older ones', deletes only commit metadata keyed by commit hash, orphan-owned blobs and HAMT nodes, and — in `deep_clean` — the `kvgit:keyset:` and `kvgit:chunk:` namespaces.
+The `__tag_info__<name>` record is a separate key kind, and nothing collects it: every sweep, this version's and older ones', deletes only commit metadata keyed by commit hash, orphan-owned blobs and HAMT nodes, and — in a deep sweep — the `kvgit:keyset:` and `kvgit:chunk:` namespaces.
 
-Storage version checks remain where they are (`clean_orphans`, `deep_clean`, and both anchor-free admin paths refuse a store stamped above what they can read, before removing anything). They are what locks older kvgit out of a [v4 store](#storage-versions); they are not what protects tags.
+Storage version checks are what lock older kvgit out of a [v4 store](#storage-versions): `Repo` refuses a store stamped above what it reads when it is opened, and `gc()` checks again before removing anything. They are not what protects tags.
 
 ---
 
@@ -354,11 +394,11 @@ inner.namespace  # "myns/sub"
 
 ### Merge functions
 
-Register merge functions on the underlying store with the full prefixed key:
+Register merge rules on the underlying worktree (or repo) with the full prefixed key:
 
 ```python
-s.set_merge_fn("myns/counter", fn)
-s.set_merge_prefix("myns/", fn)  # the whole namespace
+wt.set_merge_fn("myns/counter", fn)
+wt.set_merge_prefix("myns/", fn)  # the whole namespace
 ```
 
 ---
@@ -367,31 +407,31 @@ s.set_merge_prefix("myns/", fn)  # the whole namespace
 
 ### MergeResult
 
-Frozen dataclass returned by `commit()`. Truthy when merge succeeded.
+Frozen dataclass returned by `commit()`, `merge()`, `apply()`, `cherry_pick()` and `revert()`. Truthy when the call succeeded.
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `merged` | `bool` | Whether the commit succeeded |
 | `commit` | `str \| None` | New commit hash |
-| `strategy` | `str` | `"no_op"`, `"fast_forward"`, or `"three_way"` |
+| `strategy` | `str` | `"no_op"`, `"fast_forward"`, `"three_way"`, or `"apply"` (a change applied as a single-parent commit) |
 | `auto_merged_keys` | `tuple[str, ...]` | Keys resolved by merge functions |
 | `carried_keys` | `tuple[str, ...]` | Keys carried forward from the other side |
 
 ### TagInfo
 
-Frozen dataclass returned by `tag_info()`.
+Frozen dataclass returned by `Repo.tag_info()`.
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `name` | `str` | The tag name |
 | `commit` | `str` | Commit the tag names |
 | `time` | `float \| None` | When the tag was created. `None` if the tag's info record is missing. |
-| `info` | `dict \| None` | Caller metadata passed to `tag()`, if any |
+| `info` | `dict \| None` | Caller metadata passed to `create_tag()`, if any |
 | `dangling` | `bool` | Whether the tagged commit is absent from the store — damage, not an ordinary state |
 
 ### DiffResult
 
-Frozen dataclass returned by `diff()`.
+Frozen dataclass returned by `Repo.diff()`.
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -401,7 +441,7 @@ Frozen dataclass returned by `diff()`.
 
 ### MergeFn
 
-User-level merge function type (decoded values, whatever you stored), used by `Staged`:
+Merge function type, over decoded values — whatever you stored:
 
 ```python
 MergeFn = Callable[[Any | None, Any, Any], Any]
@@ -410,7 +450,7 @@ MergeFn = Callable[[Any | None, Any, Any], Any]
 
 ### BytesMergeFn
 
-Bytes-level merge function type, used by `VersionedKV`:
+Bytes-level merge function type. Under `codec="bytes"` the decoded values *are* bytes, so these fit as they are:
 
 ```python
 BytesMergeFn = Callable[
@@ -462,18 +502,18 @@ That difference is the point of the `MergeChoice` form: a merge function cannot 
 ```python
 # The conversation on this branch is never overwritten by a merge, and a
 # merged-in branch's new __agno__/runs/<id> keys do not come along.
-s.set_merge_prefix("__agno__/", MergeChoice.OURS)
+wt.set_merge_prefix("__agno__/", MergeChoice.OURS)
 ```
 
 ---
 
 ## Built-in merge functions
 
-They come at two levels, and the level decides where a function fits. `VersionedKV` stores raw `bytes` and hands a merge function bytes. `Staged` decodes both sides first, so a function registered there receives your values as you stored them — a `str` key arrives as `str`, not as UTF-8 bytes.
+They come at two levels, and the level decides where a function fits. A worktree decodes every side before calling a merge function, so it receives your values as you stored them — a `str` key arrives as `str`, not as UTF-8 bytes. The bytes-level functions read their arguments as bytes, so they fit keys whose values are `bytes`, which under `codec="bytes"` is every key.
 
 ### Value-level, from `kvgit.content_types`
 
-Factories, for use with `Staged`.
+Factories, for values of any type.
 
 #### `counter() -> MergeFn`
 
@@ -487,11 +527,11 @@ Always returns `theirs` (the HEAD value), re-encoded as the merged value. `kvgit
 
 Marker merge for keys holding `str` or `bytes`: disjoint line changes merge cleanly, overlapping ones come back with git-style `<<<<<<<` markers under the given labels, which may not contain line breaks. `str` sides are encoded as UTF-8 for the merge and the result comes back as `str` when any side was `str`; a key whose values are `bytes` merges as bytes. With `strict=True` a conflict raises `CantMark` instead of marking, so the merge aborts rather than landing hunks. A value that is neither, and anything unmarkable — non-UTF-8 bytes, NUL bytes, inputs over the 1 MiB cap — raises `CantMark`, which the merge machinery files as an ordinary conflict.
 
-This is the one to register on a `Staged` for text. `kvgit.merges.text` below is the same merge over raw bytes.
+This is the one to register for text. `kvgit.merges.text` below is the same merge over raw bytes.
 
 ### Bytes-level, from `kvgit.merges`
 
-For `VersionedKV`. Two of them also work through `Staged`, and the difference is worth stating exactly: `ours` and `theirs` never look at the values they are handed, so nothing about them depends on the level; `text` and `make_text_merge` do read their arguments as bytes, so through a `Staged` they fit only keys whose stored values are already `bytes`. Registered on a key holding `str`, `text` receives a `str` and raises, and the key is filed as a `MergeConflict` — use `text_merge()` above instead.
+The difference is worth stating exactly: `ours` and `theirs` never look at the values they are handed, so they fit any key; `text` and `make_text_merge` do read their arguments as bytes, so they fit only keys whose values are `bytes`. Registered on a key holding `str`, `text` receives a `str` and raises, and the key is filed as a `MergeConflict` — use `text_merge()` above instead.
 
 #### `text(old, ours, theirs) -> bytes`
 
@@ -509,19 +549,32 @@ Take their side, on the same terms.
 
 ## Errors
 
+Every error kvgit raises about the state of a store derives from `KvgitError`, so one `except KvgitError` catches them all. None subclasses `ValueError`: argument validation — a bad name, two refs where one is expected, an unknown `on_conflict` — raises `ValueError`, and that is a bug in the call rather than a state to handle.
+
+| Error | Raised when |
+|-------|-------------|
+| `ConcurrencyError` | A commit keeps losing the race to publish (below) |
+| `MergeConflict` | A merge leaves keys no rule resolves (below) |
+| `UnknownBranchError` | A branch does not exist — `worktree`, `head`, `delete_branch`, `snapshot(branch=)`, a commit to a deleted branch |
+| `UnknownTagError` | A tag does not exist — `delete_tag`, `snapshot(tag=)`, `log(tag=)` |
+| `UnknownCommitError` | A commit is not in the store — `get_commit`, `create_branch(at=)`, `create_tag`, `reset`, `diff`, a dangling tag |
+| `BranchExistsError` | `create_branch` over a taken name |
+| `TagExistsError` | `create_tag` over a taken name |
+| `CorruptHeadError` | A branch HEAD is damaged and nothing recovers it; see [HEAD Recovery](#head-recovery) |
+| `StorageVersionError` | The store is stamped with a layout this code does not read; see [Storage versions](#storage-versions) |
+| `GcBusy` | `gc(wait=False)` found another sweep holding an unexpired lease |
+
+All are importable from `kvgit` (and `kvgit.errors`).
+
 ### ConcurrencyError
 
-Raised when a CAS operation fails during `commit()` and the failure is not mergeable. A single lost fast-forward race is retried once through the three-way merge path instead of raising, so this surfaces only when the merge itself can't resolve — no common ancestor, a second lost race — while a true conflict raises `MergeConflict` in `raise` mode (or abandons the branch untouched in `abandon` mode). Another writer updated HEAD between when this instance last read it and when the commit was attempted.
-
-### UnknownBranchError
-
-Raised when opening with `create=False` (or switching to) a branch that does not exist. A subclass of `ValueError`.
+Raised when a commit cannot publish and the failure is not mergeable. A lost race is retried through the three-way merge path instead of raising, so this surfaces only when that cannot resolve — no common ancestor, a second lost race — while a true conflict raises `MergeConflict` in `raise` mode (or abandons, leaving the branch untouched, in `abandon` mode). `refresh()` moves the worktree to the branch tip.
 
 ### MergeConflict
 
-Raised when a three-way merge encounters keys changed by both sides with no merge function to resolve them.
+Raised when a three-way merge encounters keys changed by both sides with no merge function to resolve them. Nothing is written.
 
-Both sides writing the *same* bytes to a key is not a conflict, and needs no merge function: each side stores its own copy under its own commit, so the pointers differ, but the merge compares the bytes and carries the key through. A key one side removed and the other modified stays a conflict.
+Both sides writing the *same* bytes to a key is not a conflict, and needs no merge function: the merge compares the bytes and carries the key through. A key one side removed and the other modified stays a conflict.
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
@@ -530,13 +583,13 @@ Both sides writing the *same* bytes to a key is not a conflict, and needs no mer
 
 ### GcBusy
 
-Raised by `deep_clean()` when another sweep holds an unexpired lease on the store. Nothing is swept and the holder's lease is left alone. Retry later; the lease carries an expiry, so a holder that dies without releasing it blocks nothing past that point. See [Orphan Cleanup](#orphan-cleanup).
+Raised by `gc(wait=False)` when another sweep holds an unexpired lease on the store. Nothing is swept and the holder's lease is left alone. Retry later; the lease carries an expiry, so a holder that dies without releasing it blocks nothing past that point. See [Orphan Cleanup](#orphan-cleanup).
 
 ---
 
 ## Chunked codecs
 
-`kvgit.codecs` is an opt-in layer that externalizes large sub-values (numpy buffers, pandas DataFrames, ...) as content-addressed chunks. Equal buffers are stored once across keys, commits, and branches. Pass the resulting `(encoder, decoder)` pair to `Staged` (or `kvgit.store(...)`) to enable.
+`kvgit.codecs` is an opt-in layer that externalizes large sub-values (numpy buffers, pandas DataFrames, ...) as content-addressed chunks. Equal buffers are stored once across keys, commits, and branches. `codec="scientific"` enables the numpy / pandas codec; pass a `compose(...)` pair as the codec to tune or extend it.
 
 Install with `pip install kvgit[numpy]` or `kvgit[scientific]`.
 
@@ -548,7 +601,7 @@ Build the encoder/decoder pair from a list of codecs. Codecs are tried in order 
 from kvgit.codecs import compose
 from kvgit.codecs.numpy import NumpyCodec
 
-encoder, decoder = compose(NumpyCodec())
+repo = Repo(backend, codec=compose(NumpyCodec()))
 ```
 
 Order matters when codecs claim overlapping types. Put the more specific codec first.
@@ -560,10 +613,10 @@ One-liner shortcut: compose the numpy codec (which transparently handles pandas 
 ```python
 from kvgit.codecs import scientific
 
-encoder, decoder = scientific()
+codec = scientific()
 ```
 
-The same shortcut is exposed on the factory as `kvgit.store(codecs="scientific")` -- prefer that when you don't need to tune codec parameters.
+The same shortcut is `codec="scientific"` -- prefer that when you don't need to tune codec parameters.
 
 ### `NumpyCodec(min_bytes=1024)`
 
@@ -637,133 +690,84 @@ v4 changes how *new* objects are keyed; nothing already stored is rewritten. Eve
 * **Equal bytes are one blob**, across keys, commits and branches, and the two sides of a merge agree about a key exactly when they point at the same blob. Keys that both sides changed to equal bytes still merge cleanly when one side's blob predates v4.
 * **A commit hash names one root.** Because the time is part of the hash, two writers making the same change mint two commits rather than one hash over two different keysets, and every key under `__commit_*__<hash>` is written once and never rewritten.
 
-A stamp locks older code out, deliberately: an older sweep deletes by rules that are wrong for content it did not write. Every handle and sweep refuses a store stamped above what it reads, before writing anything. kvgit releases whose admin paths predate that check refuse to open such a store, and their sweeps fail on the first v4 entry they decode.
+A stamp locks older code out, deliberately: an older sweep deletes by rules that are wrong for content it did not write. `Repo` and `gc()` refuse a store stamped above what they read with `StorageVersionError`, before writing anything. kvgit releases whose admin paths predate that check refuse to open such a store, and their sweeps fail on the first v4 entry they decode.
 
 ### Limitations
 
-* **Merge results are not chunked.** When `Staged`'s wrapped merge function re-encodes a merged value, it always falls back to plain `pickle.dumps` (the bytes-level merge protocol has no place to land chunks). Subsequent commits that overwrite the merged key go through the chunked path normally. In single-writer use cases (e.g., one agent per branch), merges are rare and this rarely matters.
+* **Merge results are not chunked.** A value a merge function produces is encoded with plain `pickle.dumps` under a chunked codec (the bytes-level merge protocol has no place to land chunks). Subsequent commits that overwrite the merged key go through the chunked path normally. In single-writer use cases (e.g., one agent per branch), merges are rare and this rarely matters.
 * **Decode allocates per key.** The codec is a storage-layer optimization — every read materializes a fresh, writable array (one memcpy, same cost shape as plain `pickle.loads`). It saves disk and quota; it doesn't reduce in-process RAM after read.
-* **Chunk dedup is a disk/storage optimization, not an in-memory one.** While values are sitting in the staging buffer, they're still distinct Python objects. Dedup happens at encode time.
+* **Chunk dedup is a disk/storage optimization, not an in-memory one.** While values are pending in a worktree, they're still distinct Python objects. Dedup happens at encode time.
 
 ---
 
-## Versioned protocol
-
-The `Versioned` protocol defines the shared interface implemented by all versioned backends. Most users interact with it through `Staged`, but it's useful for type annotations and custom backends.
-
-```python
-from kvgit import Versioned
-```
-
-See `kvgit/versioned/protocol.py` for the full protocol definition.
-
----
-
-## VersionedKV
-
-KV-backed implementation of `Versioned`. Operates on raw `bytes`. Most users should use `Staged` instead.
-
-```python
-from kvgit import VersionedKV
-
-v = VersionedKV()                                       # in-memory
-v = VersionedKV(store, branch="dev")                    # shared store
-v = VersionedKV(store, commit_hash="a1b2c3...")         # resume
-```
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `store` | `KVStore \| None` | `None` | Backend. Creates `Memory()` if None. |
-| `commit_hash` | `str \| None` | `None` | Resume from this commit. Reads HEAD if None. |
-| `branch` | `str` | `"main"` | Branch name. |
-| `create` | `bool` | `True` | Mint the branch with an initial commit when missing. `False` raises `UnknownBranchError` instead. |
-| `recover_from_corrupt_head` | `CorruptHeadRecoverer \| None` | `None` | Last-resort HEAD recovery, applied to every resolve this handle makes. `None` means a HEAD that is corrupt with no usable backup is unrecoverable. See [HEAD Recovery](#head-recovery). |
-
-All methods from the `Versioned` protocol are implemented. Additional:
-
-| Method / Attribute | Description |
-|--------------------|-------------|
-| `store` | Direct access to the underlying `KVStore` |
-| `branches(store)` | Static method: list branch names for a store. Excludes the reserved `refs/tags/` names that hold [tags](#tags). |
-| `exists(store, name)` | Static method: whether a branch has a HEAD entry. Never writes. |
-| `branch_exists(name)` | Whether a branch exists in this handle's store. |
-| `tag(name, *, at=None, info=None)` | Name a commit permanently — see [Tags](#tags). Also `tags()`, `tag_info(name)`, `delete_tag(name)`. Module-level `kvgit.versioned.kv.tags(store)` and `tag_info(store, name)` do the same without a handle. |
-| `clean_orphans(min_age=3600)` | Remove orphaned commits unreachable from any branch HEAD, with the blobs, nodes and chunks only they held. Returns count of cleaned orphans. Only deletes commits older than `min_age` seconds; safe beside concurrent writers at any `min_age`. Runs under the store's GC lease, waiting for another sweep's. See below. |
-| `deep_clean(min_age=3600, *, lease_ttl=600.0)` | `clean_orphans` plus a full scan of the `kvgit:blob:`, `kvgit:keyset:` and `kvgit:chunk:` namespaces, for content no commit references. Raises [`GcBusy`](#gcbusy) if another sweep holds the lease, and `ValueError` (writing nothing at all) for a store stamped too high. See below. |
-| `repair_head()` | Persist a recovered HEAD for this branch. Reads recover a damaged HEAD in memory without writing it back; this is the explicit call that makes the recovery durable. Returns the commit HEAD now names, or `None` if nothing was recoverable. See [HEAD Recovery](#head-recovery). |
-
-### HEAD Recovery
+## HEAD Recovery
 
 A branch HEAD lives in one key, `__branch_head__<branch>`, and a backup of the value it held before its current one lives in `__branch_head_prev__<branch>`. If HEAD is unreadable — truncated bytes, a hash whose commit metadata is gone — head resolution tries the backup, and if that does not resolve either, reports `None`: the branch is unrecoverable.
 
 There is a third tier below the backup, and it is **off by default**. When HEAD is unresolvable *and* the backup is missing or equally broken, the information needed is no longer in the store, so nothing kvgit can do is correct — only lucky. `recover_from_corrupt_head` is the seam for a caller who decides a guess beats losing the branch:
 
 ```python
-from kvgit.versioned.kv import recover_by_commit_scan
+from kvgit import recover_by_commit_scan
 
-v = VersionedKV(store, recover_from_corrupt_head=recover_by_commit_scan)
+repo = Repo(backend, recover_from_corrupt_head=recover_by_commit_scan)
 ```
 
-The recoverer is `(store, branch) -> str | None`, fired only when HEAD is present and both tiers above have failed. It applies to every resolve the handle makes — opening, `latest_head`, `refresh`, `switch_branch`, `peek`, `repair_head` — and is inherited by handles from `checkout()` and `create_branch()`. The module-level `repair_head(store, branch, recover_from_corrupt_head=...)` takes the same argument.
+The recoverer is `(store, branch) -> str | None`, fired only when HEAD is present and both tiers above have failed. It applies to every resolve the repo makes — `worktree()`, `head()`, `snapshot(branch=)`, `log(branch=)`, a worktree's `refresh()` and commits, `repair_head()`. Without one, those raise `CorruptHeadError` for a branch nothing recovers.
 
 `recover_by_commit_scan` is the implementation kvgit used to run by default, kept and exported. It scans every `__commit_root__` and returns the newest tip not claimed by a healthy branch. Know what you are buying:
 
-* **It can serve another branch's deleted data.** "Unclaimed" is its only signal for whose commit a commit is, and a deleted branch's commits are unclaimed until `clean_orphans()` collects them. Delete a branch, damage an unrelated branch's HEAD, lose its backup, and the survivor resolves onto the deleted branch's tip.
+* **It can serve another branch's deleted data.** "Unclaimed" is its only signal for whose commit a commit is, and a deleted branch's commits are unclaimed until `gc()` collects them. Delete a branch, damage an unrelated branch's HEAD, lose its backup, and the survivor resolves onto the deleted branch's tip.
 * **It is O(store)**, per unresolved read, until `repair_head()` runs.
 
 It is a reasonable trade on a single-branch store, or one where branches are never deleted — neither hazard is in play there.
 
-`clean_orphans()` and `deep_clean()` never use a recoverer, even one your handle carries. GC must not decide reachability from a guess: a wrong answer marks the wrong commits live, so real garbage survives and another branch's ancestry gets pinned into this one's mark set. The sweep marks only from branches whose HEAD actually resolves.
+`gc()` never uses a recoverer, even one the repo carries. GC must not decide reachability from a guess: a wrong answer marks the wrong commits live, so real garbage survives and another branch's ancestry gets pinned into this one's mark set. The sweep marks only from branches whose HEAD actually resolves.
 
 Two further rules govern this.
 
-**Reads never write.** Resolving a damaged branch on a read path — opening a handle, `peek`, `switch_branch`, `refresh`, the mark phase of a sweep — recovers in memory and leaves the store exactly as it found it. A read-only consumer can therefore read a damaged store, two concurrent readers cannot race each other repairing the same branch to different answers, and the damage stays visible instead of being quietly papered over. The cost is that the fallback runs on each read until someone repairs it: the backup tier is a couple of extra `get` calls and is flat in store size, and an injected recoverer costs whatever it costs.
+**Reads never write.** Resolving a damaged branch on a read path — opening a worktree, `head`, `snapshot`, `refresh`, the mark phase of a sweep — recovers in memory and leaves the store exactly as it found it. A read-only consumer can therefore read a damaged store, two concurrent readers cannot race each other repairing the same branch to different answers, and the damage stays visible instead of being quietly papered over. The cost is that the fallback runs on each read until someone repairs it: the backup tier is a couple of extra `get` calls and is flat in store size, and an injected recoverer costs whatever it costs.
 
 Two things persist a recovery:
 
-* `repair_head()` — the explicit maintenance call, and the one to reach for.
+* `repo.repair_head(name)` — the explicit maintenance call, and the one to reach for. It returns the commit HEAD now names, or `None` if nothing was recoverable.
 * A successful write. A CAS against a damaged HEAD always fails, which would leave the branch permanently unwritable, so a writer that finds HEAD unresolvable replaces it with the recovered commit and retries once. The replacement is itself a CAS against the exact damaged bytes, so two writers racing it cannot both win, and a HEAD that merely *moved* — an ordinary lost race — is never touched.
 
 ```python
-v = VersionedKV(store, branch="main")
-v.repair_head()                                  # or:
-kvgit.versioned.kv.repair_head(store, "main")    # no handle needed
+repo.repair_head("main")
 ```
 
 **The backup is exactly the previous HEAD.** `__branch_head_prev__` is written in the same atomic `cas_many` that moves HEAD, conditioned on HEAD holding the value being backed up. So the backup always names the commit HEAD held immediately before its current one — never a losing writer's stale value, never a commit that was never HEAD — and a crash cannot leave one moved without the other. Deleting a branch removes both keys in one call, so a backup cannot outlive its branch either. (Stores written by older kvgit, which wrote the two separately, can still hold a backup older than one commit back, or one with no HEAD; resolution never serves a backup whose HEAD is absent.)
 
-### Orphan Cleanup
+## Orphan Cleanup
 
-When branches are deleted, the commits they referenced may become unreachable ("orphaned"). `delete_branch()` automatically calls `clean_orphans()` after removing the branch HEAD. The default `min_age=3600` (1 hour) decides which unreachable commits are old enough to delete; orphans from deleted branches are cleaned up by subsequent `clean_orphans()` calls once they age past it.
+When branches or tags are deleted, the commits they referenced may become unreachable ("orphaned"). Nothing is swept as part of a delete: `repo.gc()` is its own step. The default `min_age=3600` (1 hour) decides which unreachable commits are old enough to delete; younger orphans are taken by a later `gc()` once they age past it.
 
 Reachability is decided by walking live branch heads. [Tags](#tags) need no special case: a tag is a branch head under a reserved name, so it keeps its commit's whole ancestry alive by being walked with everything else.
 
-`clean_orphans()` finds everything it deletes by walking the keyset of each orphan commit it is removing, and deletes the orphan's commit metadata and whatever in its keyset — blobs, HAMT nodes, chunks — nothing live shares. "Live" is every commit the mark phase saw: reachable from a branch head or tag, in flight (below), or an orphan younger than `min_age`. Content is keyed by what it holds, so an orphan's blob may be the very key a live commit uses; what makes deleting it safe is that the sweep runs under the [GC lease](#the-gc-lease), which no commit batch can land beside, so the mark phase has seen every commit that could point at it.
+`gc()` finds everything it deletes by walking the keyset of each orphan commit it is removing, and deletes the orphan's commit metadata and whatever in its keyset — blobs, HAMT nodes, chunks — nothing live shares. "Live" is every commit the mark phase saw: reachable from a branch head or tag, in flight (below), or an orphan younger than `min_age`. Content is keyed by what it holds, so an orphan's blob may be the very key a live commit uses; what makes deleting it safe is that the sweep runs under the [GC lease](#the-gc-lease), which no commit batch can land beside, so the mark phase has seen every commit that could point at it.
 
 `min_age` is policy alone — how long abandoned work lingers before it is taken — and any value is safe beside concurrent writers, `0` included.
 
 ```python
-v = VersionedKV(store)
-cleaned = v.clean_orphans()            # default: only orphans older than 1 hour
-cleaned = v.clean_orphans(min_age=0)   # delete unreachable commits immediately
+removed = repo.gc()            # default: only orphans older than 1 hour
+removed = repo.gc(min_age=0)   # delete unreachable commits immediately
 ```
 
-#### A lost CAS leaves garbage, and that is the safe outcome
+### A lost CAS leaves garbage, and that is the safe outcome
 
 A commit writes its blobs, HAMT nodes, chunks and metadata *before* it publishes the HEAD that makes it reachable. A writer that loses the race to publish leaves its commit behind — kept as one side of the merge it retries through, or, if it gives up, withdrawn from flight and left as an ordinary orphan. Nothing deletes it inline: its content is shared by key with whatever else holds the same bytes, so only a sweep, which sees every live commit, can tell what is safe to take.
 
-#### `deep_clean()` — reclaiming commit-less artifacts
+### `deep=True` — reclaiming commit-less artifacts
 
-`deep_clean()` does everything `clean_orphans()` does and then scans the whole `kvgit:blob:`, `kvgit:keyset:` and `kvgit:chunk:` namespaces, deleting anything not reachable from a live commit. That scan reaches what no orphan keyset points at — leftovers from crashes and interrupted writes, and from stores swept by an earlier kvgit. Run it as an occasional maintenance pass; `clean_orphans()` is the routine one.
+`gc(deep=True)` does everything a routine sweep does and then scans the whole `kvgit:blob:`, `kvgit:keyset:` and `kvgit:chunk:` namespaces, deleting anything not reachable from a live commit. That scan reaches what no orphan keyset points at — leftovers from crashes and interrupted writes, and from stores swept by an earlier kvgit. Run it as an occasional maintenance pass; the routine sweep is the everyday one.
 
 ```python
-v = VersionedKV(store)
-v.deep_clean()   # or kvgit.versioned.kv.deep_clean(store)
+repo.gc(deep=True)
 ```
 
-`deep_clean()` raises [`GcBusy`](#gcbusy) if another sweep holds the lease; `clean_orphans()`, which runs inside `delete_branch()`, waits for it instead.
+Either kind waits for another sweep's lease by default; `wait=False` raises [`GcBusy`](#gcbusy) instead.
 
-##### The GC lease
+### The GC lease
 
 A sweep deletes whatever its mark phase did not see, so it is only correct if no commit it should have seen can appear while it runs. Every sweep establishes that itself rather than asking the caller to promise it.
 
@@ -772,7 +776,7 @@ The lease lives in one reserved key, `__gc_lease__`, holding `{"owner": <opaque 
 | Step | What happens |
 |------|--------------|
 | Version check | Refuse a store stamped above the layout this code reads, *before* touching the lease key, so such a store comes out of the call with nothing written to it. |
-| Acquire | CAS the lease key. `deep_clean()` raises [`GcBusy`](#gcbusy) on a live lease held by someone else; `clean_orphans()` waits it out. |
+| Acquire | CAS the lease key. On a live lease held by someone else, wait it out — or, with `wait=False`, raise [`GcBusy`](#gcbusy). |
 | Sweep | Mark from in-flight markers, then branch heads, then young orphans; delete the rest. |
 | Release | In a `finally`: CAS our own bytes to an expired record carrying our owner id. A failed release means the lease was already reclaimed by someone else, and theirs is left alone. |
 
@@ -780,20 +784,20 @@ Writers hold up their end inside the store's own atomicity. Every path that writ
 
 | Path | What it writes |
 |------|----------------|
-| `commit()` fast-forward and merge batches | Nodes, blobs, chunks, commit metadata, in-flight marker |
-| `commit()` / `merge()` HEAD advance | `__branch_head__<branch>`, its backup, and the in-flight markers' removal |
+| `commit()` fast-forward and merge batches (and those of `merge()` / `apply()`) | Nodes, blobs, chunks, commit metadata, in-flight marker |
+| the HEAD advance that publishes one | `__branch_head__<branch>`, its backup, and the in-flight markers' removal |
 | `create_branch(name, at=...)` | `__branch_head__<name>` |
-| `reset_to(commit)` | `__branch_head__<branch>` and its backup |
-| `tag(name, at=...)` | `__branch_head__refs/tags/<name>` and `__tag_info__<name>` |
+| `Worktree.reset(commit)` | `__branch_head__<branch>` and its backup |
+| `create_tag(name, commit)` | `__branch_head__refs/tags/<name>` and `__tag_info__<name>` |
 | corrupt-HEAD repair (`repair_head()`, and the retry inside a losing publish) | `__branch_head__<branch>` |
 
-Every acquisition writes a fresh owner id and release writes an expired record rather than deleting the key, so bytes a writer read before a sweep can never match again: a sweep that starts after the read makes the write fail, and the writer waits and tries again. The head writes check their target commit exists and write the head against the same lease record, so `create_branch(at=...)`, `reset_to` and `tag` aimed at a commit a concurrent sweep collects report it gone rather than installing a head that names nothing.
+Every acquisition writes a fresh owner id and release writes an expired record rather than deleting the key, so bytes a writer read before a sweep can never match again: a sweep that starts after the read makes the write fail, and the writer waits and tries again. The head writes check their target commit exists and write the head against the same lease record, so `create_branch(at=...)`, `reset` and `create_tag` aimed at a commit a concurrent sweep collects report it gone rather than installing a head that names nothing.
 
 `lease_ttl` (default 600 seconds) bounds what a crashed holder costs: writers wait out a lease's remaining term and no longer. A sweep that outlives its own lease is **not** extended silently — it finishes, logs a warning at `kvgit.orphans` naming the overrun, and during that window writers are free to write. Set `lease_ttl` above the longest sweep this store has taken.
 
 The price is that writers wait while a sweep runs, including the mark phase, which walks every live commit's keyset once; on a large store, schedule sweeps for quiet moments.
 
-##### Commits between their write batch and their HEAD advance
+### Commits between their write batch and their HEAD advance
 
 A commit lands in two steps: the batch that writes its nodes, blobs, chunks and metadata, and — later — the write that publishes it as a branch HEAD, or the three-way merge that folds it into one. In between it is fully written and unreachable from every head.
 
@@ -872,12 +876,12 @@ By default the store has no practical size cap. Pass `size_limit` (in bytes) to 
 `KVStore` in one PostgreSQL table, for a store shared by processes on several machines. Requires `pip install kvgit[postgres]` (psycopg 3 and psycopg-pool) and PostgreSQL 11 or later.
 
 ```python
-from kvgit import Staged, VersionedKV
+from kvgit import Repo
 from kvgit.kv.postgres import Postgres
 
 backend = Postgres("postgresql://app@db.internal/kvgit")        # table "kvgit"
 backend = Postgres("dbname=kvgit", table="sessions", max_size=16)
-s = Staged(VersionedKV(backend))
+repo = Repo(backend)
 ```
 
 | Parameter | Default | Description |
@@ -939,6 +943,6 @@ Tier failures that look operational (`OSError`, network errors, a Pyodide `JsExc
 
 ### Cache tiers serve only immutable, content-derived keys
 
-A key starting with `__` names a value that changes under a fixed key — a branch head, its `__branch_head_prev__` backup, the `__kvgit_version__` stamp, the `__gc_lease__` record. Cached, those let a process keep serving state another process has already replaced: the handle takes a `ConcurrencyError` on commit, calls `refresh()`, and reads the same stale head back out of L1, forever. So they are read from the authoritative tier alone.
+A key starting with `__` names a value that changes under a fixed key — a branch head, its `__branch_head_prev__` backup, the `__kvgit_version__` stamp, the `__gc_lease__` record. Cached, those let a process keep serving state another process has already replaced: the worktree takes a `ConcurrencyError` on commit, calls `refresh()`, and reads the same stale head back out of L1, forever. So they are read from the authoritative tier alone.
 
 Everything else is keyed by its own content — `kvgit:blob:<hash>`, `kvgit:keyset:<hash>`, `kvgit:chunk:<hash>`, and `<commit>:<key>` blobs from before v4 — so the same key always holds the same bytes and a hit at any tier is the right answer. Those are what the cache tiers are for, and they are the bulk of the reads. Commit metadata (`__commit_root__`, `__parent_commit__`, `__commit_time__`, `__info__`) is immutable too, but it is small and `__`-prefixed, so it rides the same read-through rule rather than earning an exception.

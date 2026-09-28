@@ -5,134 +5,164 @@
 ```python
 import kvgit
 
-s = kvgit.store()
+wt = kvgit.store()
 ```
 
-That's it. You have a versioned key-value store backed by in-memory storage. For persistence, pass a backend:
+That's it: a `Worktree` on branch `main` of an in-memory `Repo`. For persistence, pass a backend:
 
 ```python
-s = kvgit.store(kind="disk", path="/tmp/mydb")       # SQLite-backed via diskcache
-s = kvgit.store(kind="indexeddb", db_name="myapp")    # browser-persistent via IndexedDB
+wt = kvgit.store(kind="disk", path="/tmp/mydb")       # SQLite-backed via diskcache
+wt = kvgit.store(kind="indexeddb", db_name="myapp")    # browser-persistent via IndexedDB
 ```
 
 `kind="disk"` requires `pip install kvgit[disk]`. `kind="indexeddb"` is available in Pyodide (browser) environments but has portability and durability tradeoffs — see [Browser persistence in Pyodide](pyodide.md) for the full picture and the recommended cross-browser alternative.
 
-For a store shared by processes on several machines, construct the PostgreSQL backend (`pip install kvgit[postgres]`) and wrap it yourself:
+`kvgit.store()` is sugar. It builds a `Repo` over the backend and opens (or creates) one branch. Build the `Repo` yourself for any other backend, or to set repo-wide options:
 
 ```python
-from kvgit import Staged, VersionedKV
+from kvgit import Repo
 from kvgit.kv.postgres import Postgres
 
-s = Staged(VersionedKV(Postgres("postgresql://app@db.internal/kvgit")))
+repo = Repo(Postgres("postgresql://app@db.internal/kvgit"))
+wt = repo.worktree("main", create=True)
 ```
 
-Any number of processes may commit to the same store, and garbage collection runs beside them — see [Postgres](api.md#postgres) in the API reference.
+The PostgreSQL backend (`pip install kvgit[postgres]`) suits a store shared by processes on several machines. Any number of processes may commit to the same store, and garbage collection runs beside them — see [Postgres](api.md#postgres) in the API reference.
+
+Three objects make up the API:
+
+* **`Repo`** owns the backend and everything store-wide: branches, tags, history, snapshots, garbage collection. It is safe to share across threads.
+* **`Worktree`** is one branch checked out for work — a dict whose writes stay pending until `commit()`. It belongs to one thread at a time.
+* **`Snapshot`** is a read-only dict pinned to one commit.
 
 ---
 
 ## Basic reads and writes
 
-A store is a `MutableMapping[str, Any]`. Values are pickle-serialized by default.
+A worktree is a `MutableMapping[str, Any]`. Values are pickle-serialized by default (see [Codecs and trust](#codecs-and-trust)).
 
 ```python
-s["user"] = "alice"
-s["score"] = 42
-s["tags"] = ["admin", "active"]
+wt = kvgit.store()
+wt["user"] = "alice"
+wt["score"] = 42
+wt["tags"] = ["admin", "active"]
 
-print(s["user"])     # "alice"
-print(s.get("nope")) # None
-print(len(s))        # 3
-print(list(s.keys()))# ["user", "score", "tags"]
+print(wt["user"])      # "alice"
+print(wt.get("nope"))  # None
+print(len(wt))         # 3
+print(sorted(wt))      # ["score", "tags", "user"]
 
-del s["tags"]
+del wt["tags"]
 ```
 
-Nothing is persisted until you commit:
+Nothing is persisted until you commit. There is no index to stage into: every change is pending until then, and `status()` lists them:
 
 ```python
-s.commit()
+wt.status()  # Status(updated=frozenset({'user', 'score'}), removed=frozenset())
+wt.commit()
+wt.status()  # falsy: nothing pending
 ```
 
 ---
 
 ## Commits and rollback
 
-Every `commit()` creates an immutable snapshot.
+Every `commit()` creates an immutable snapshot, and `wt.head` names the commit the worktree is on.
 
 ```python
-s["x"] = 1
-s.commit()
+wt["x"] = 1
+wt.commit()
 
-first = s.current_commit
+first = wt.head
 
-s["x"] = 2
-s.commit()
+wt["x"] = 2
+wt.commit()
 
-print(s["x"])  # 2
+print(wt["x"])  # 2
 
-s.reset_to(first)
-print(s["x"])  # 1
+wt.reset(first)  # move the branch back (git reset --hard)
+print(wt["x"])   # 1
 ```
 
-Discard uncommitted changes with `reset()`:
+Drop pending changes with `discard()`:
 
 ```python
-s["x"] = 999
-s.reset()
-print(s["x"])  # back to last committed value
+wt["x"] = 999
+wt.discard()
+print(wt["x"])  # 1: back to the last committed value
 ```
 
-Attach metadata to commits and retrieve it later:
+Attach metadata to commits and read it back from the repo:
 
 ```python
-s["x"] = 10
-s.commit(info={"author": "alice", "message": "bump x"})
+repo = wt.repo
+wt["x"] = 10
+wt.commit(info={"author": "alice", "message": "bump x"})
 
-s.versioned.commit_info()  # {"author": "alice", "message": "bump x"}
+repo.get_commit(wt.head).info  # {"author": "alice", "message": "bump x"}
 ```
 
-Commit only specific keys — the rest stay staged:
+Commit only specific keys — the rest stay pending:
 
 ```python
-s["a"] = 1
-s["b"] = 2
-s.commit(keys={"a"}, info={"message": "just a"})
-# "a" is committed; "b" remains staged for a future commit
+wt["a"] = 1
+wt["b"] = 2
+wt.commit(keys={"a"}, info={"message": "just a"})
+wt.status().updated  # frozenset({"b"}): still pending
+wt.discard()
 ```
 
 ---
 
 ## Branching
 
-Branches are cheap. Each branch has its own HEAD and commits independently.
+Branches are cheap. A branch is created on the repo, and a worktree checks one out:
 
 ```python
-s = kvgit.store()
-s["shared"] = "hello"
-s.commit()
+wt = kvgit.store()
+repo = wt.repo
+wt["shared"] = "hello"
+wt.commit()
 
-dev = s.create_branch("dev")
+repo.create_branch("dev", at=wt.head)
+dev = repo.worktree("dev")
 dev["feature"] = True
 dev.commit()
 
-print("feature" in s)    # False (main is unchanged)
+print("feature" in wt)   # False (main is unchanged)
 print("feature" in dev)  # True
 
-# Switch in-place
-s.switch_branch("dev")
-print(s["feature"])       # True
-
-# List and delete branches
-s.list_branches()         # ["dev", "main"]
-s.switch_branch("main")
-s.delete_branch("dev")
+repo.branches()          # ["dev", "main"]
+repo.delete_branch("dev")
 ```
 
-Fork from a specific commit with `at`:
+A worktree stays on its branch for its whole life; to work on another branch, open another worktree. Without `at`, a branch starts at the empty root commit:
 
 ```python
-clean = s.create_branch("clean", at=s.initial_commit)
-print(len(clean))  # 0 (forked from empty root)
+repo.create_branch("clean")
+print(len(repo.worktree("clean")))  # 0
+```
+
+---
+
+## Reading other branches and commits
+
+A snapshot reads any branch, tag or commit without a worktree, and stays pinned to the commit it resolved:
+
+```python
+wt = kvgit.store()
+repo = wt.repo
+wt["config"] = "v1"
+wt.commit()
+
+repo.create_branch("dev", at=wt.head)
+dev = repo.worktree("dev")
+dev["config"] = "v2"
+dev.commit()
+
+repo.snapshot(branch="dev")["config"]  # "v2"
+wt["config"]                           # "v1" (still on main)
+repo.snapshot(commit=wt.head)["config"]  # "v1"
 ```
 
 ---
@@ -142,72 +172,107 @@ print(len(clean))  # 0 (forked from empty root)
 A tag is an immutable name for a commit. Unlike a branch head, it never moves:
 
 ```python
-s = kvgit.store()
-s["config"] = "v1"
-s.commit()
+wt = kvgit.store()
+repo = wt.repo
+wt["config"] = "v1"
+wt.commit()
 
-s.tag("release-1", info={"by": "ann"})   # names the current commit
+repo.create_tag("release-1", wt.head, info={"by": "ann"})
 
-s["config"] = "v2"
-s.commit()
+wt["config"] = "v2"
+wt.commit()
 
-s["config"]                              # "v2" (the branch moved on)
-s.peek("config", tag="release-1")        # "v1" (the tag did not)
+wt["config"]                                # "v2" (the branch moved on)
+repo.snapshot(tag="release-1")["config"]    # "v1" (the tag did not)
 
-old = s.checkout(tag="release-1")        # a handle at the tagged commit
-old["config"]                            # "v1"
-
-s.tags()                                 # {"release-1": "a1b2c3..."}
-s.delete_tag("release-1")
+repo.tags()                                 # {"release-1": "a1b2c3..."}
+repo.tag_info("release-1").info             # {"by": "ann"}
+repo.delete_tag("release-1")
 ```
 
-Tagging again under the same name raises -- moving a tag is `delete_tag` then `tag`, spelled out. Tags and branches are separate namespaces, so the same name can be both.
+Creating a tag under a name already taken raises `TagExistsError` — moving a tag is `delete_tag` then `create_tag`, spelled out. Tags and branches are separate namespaces, so the same name can be both.
 
-A tag is also a garbage collection root: the tagged commit and everything it descends from survive [cleanup](#cleaning-up-unreachable-commits) for as long as the tag exists, even after every ordinary branch that reached them is gone. That is what makes a tag a safe place to leave a release, an experiment worth keeping, or a checkpoint an agent may want to come back to.
+A tag is also a garbage collection root: the tagged commit and everything it descends from survive [garbage collection](#garbage-collection) for as long as the tag exists, even after every branch that reached them is gone. That is what makes a tag a safe place to leave a release, an experiment worth keeping, or a checkpoint an agent may want to come back to.
 
-`checkout(tag=...)` is not a read-only mode. The handle sits on your current branch, so committing from it advances the branch if nothing else has moved it, and merges (or raises) if something has.
+To work from a tagged commit, branch from it: `repo.create_branch("hotfix", at=repo.tags()["release-1"])`.
 
-Under the hood a tag is a branch head under the reserved name `refs/tags/<name>`, hidden from `list_branches()` and refused by the branch API. That is deliberate: reachability is decided by walking branch heads in *every* kvgit version, so a tagged commit is kept alive even by versions written before tags existed. No storage version change ships with tags. See [Compatibility across kvgit versions](api.md#compatibility-across-kvgit-versions).
+Under the hood a tag is a branch head under the reserved name `refs/tags/<name>`, hidden from `branches()` and refused by the branch API. That is deliberate: reachability is decided by walking branch heads in *every* kvgit version, so a tagged commit is kept alive even by versions written before tags existed. See [Compatibility across kvgit versions](api.md#compatibility-across-kvgit-versions).
 
 ---
 
-## Merging
+## Concurrent commits merge
 
-When you commit on a branch that's behind HEAD (because another branch or writer committed first), kvgit performs a three-way merge automatically.
+Several worktrees may hold the same branch — in one process or many. When a commit finds the branch has moved since the worktree's `head`, kvgit performs a three-way merge automatically:
 
 ```python
-s = kvgit.store()
-s["a"] = 1
-s["b"] = 1
-s.commit()
+wt = kvgit.store()
+repo = wt.repo
+wt["a"] = 1
+wt["b"] = 1
+wt.commit()
 
-# Fork two branches from the same point
-b1 = s.create_branch("b1")
-b2 = s.create_branch("b2")
+w1 = repo.worktree("main")
+w2 = repo.worktree("main")
 
-b1["a"] = 2         # b1 changes "a"
-b1.commit()
+w1["a"] = 2         # w1 changes "a"
+w1.commit()
 
-b2["b"] = 2          # b2 changes "b"
-b2.commit()          # auto-merges: takes b1's "a" and b2's "b"
+w2["b"] = 2         # w2 changes "b"
+w2.commit()         # auto-merges: keeps w1's "a" and adds w2's "b"
 
-print(b2["a"])       # 2 (from b1)
-print(b2["b"])       # 2 (from b2)
+print(w2["a"])      # 2 (from w1)
+print(w2["b"])      # 2 (from w2)
 ```
 
-If both sides change the same key differently, you get a `MergeConflict`:
+If both sides change the same key differently, you get a `MergeConflict`, and nothing is written:
 
 ```python
 from kvgit import MergeConflict
 
-b1["x"] = "from_b1"
-b1.commit()
+w1["x"] = "from_w1"
+w1.commit()
 
-b2["x"] = "from_b2"
+w2["x"] = "from_w2"
 try:
-    b2.commit()
+    w2.commit()
 except MergeConflict as e:
     print(e.conflicting_keys)  # {"x"}
+w2.refresh()  # drop the pending change and move to the branch tip
+```
+
+---
+
+## Merging branches
+
+`merge()` brings another branch, tag or commit into the worktree's branch with a two-parent merge commit. It refuses while changes are pending.
+
+```python
+wt = kvgit.store()
+repo = wt.repo
+wt["a"] = 1
+wt.commit()
+
+repo.create_branch("feature", at=wt.head)
+feature = repo.worktree("feature")
+feature["b"] = 2
+feature.commit()
+
+wt["c"] = 3
+wt.commit()
+
+wt.merge(branch="feature")
+print(wt["b"], wt["c"])  # 2 3
+```
+
+`cherry_pick(c)` applies the change one commit made, `revert(c)` undoes it, and `apply(base, target)` applies the change between any two commits — each as an ordinary single-parent commit on the worktree's branch:
+
+```python
+feature["d"] = 4
+feature.commit()
+wt.cherry_pick(feature.head)  # just that commit's change
+print(wt["d"])                # 4
+wt.revert(wt.head)            # and undo it again
+print(wt.get("d"))            # None
 ```
 
 ---
@@ -219,23 +284,24 @@ Register a merge function to resolve conflicts automatically.
 ```python
 from kvgit import counter, last_writer_wins
 
-s = kvgit.store()
-s["hits"] = 100
-s.commit()
+wt = kvgit.store()
+repo = wt.repo
+wt["hits"] = 100
+wt.commit()
 
-b1 = s.create_branch("b1")
-b2 = s.create_branch("b2")
+w1 = repo.worktree("main")
+w2 = repo.worktree("main")
 
 # counter() merges as: ours + theirs - old
-b2.set_merge_fn("hits", counter())
+w2.set_merge_fn("hits", counter())
 
-b1["hits"] = 115     # +15
-b1.commit()
+w1["hits"] = 115     # +15
+w1.commit()
 
-b2["hits"] = 120     # +20
-b2.commit()
+w2["hits"] = 120     # +20
+w2.commit()
 
-print(b2["hits"])    # 135 (115 + 120 - 100)
+print(w2["hits"])    # 135 (115 + 120 - 100)
 ```
 
 `last_writer_wins()` always takes the HEAD value, and `text_merge()`
@@ -245,7 +311,7 @@ overlapping ones come back with git-style `<<<<<<<` markers:
 ```python
 from kvgit import text_merge
 
-s.set_merge_fn("notes", text_merge())
+wt.set_merge_fn("notes", text_merge())
 ```
 
 Custom merge functions work too:
@@ -256,7 +322,7 @@ def merge_lists(old, ours, theirs):
     base = set(old or [])
     return sorted(base | set(ours or []) | set(theirs or []))
 
-s.set_merge_fn("tags", merge_lists)
+wt.set_merge_fn("tags", merge_lists)
 ```
 
 A merge function receives `(old_value, our_value, their_value)` and returns the merged value. Any argument can be `None` (key absent on that side).
@@ -267,8 +333,8 @@ know in advance:
 ```python
 from kvgit import MergeChoice
 
-s.set_merge_prefix("counts/", counter())        # every key under counts/
-s.set_merge_prefix("notes/", MergeChoice.OURS)  # this branch owns notes/
+wt.set_merge_prefix("counts/", counter())        # every key under counts/
+wt.set_merge_prefix("notes/", MergeChoice.OURS)  # this branch owns notes/
 ```
 
 Registering a `MergeChoice` rather than a function is a policy, not a
@@ -280,46 +346,37 @@ keeps one the other side removed. A merge function -- including
 Set a default fallback for any key without a registered function:
 
 ```python
-s.set_default_merge(last_writer_wins())
+wt.set_default_merge(last_writer_wins())
 ```
 
 A contested key takes the most specific registration that applies: its
 exact key, else the longest matching prefix, else the default.
 
----
-
-## Peeking across branches
-
-Read a key from another branch without switching:
+Rules registered on a worktree apply to it alone. For rules every worktree should share, set them once on the repo; a worktree's registrations layer over the repo's, and a call's `merge_fns=` / `merge_prefixes=` / `default_merge=` over both:
 
 ```python
-s = kvgit.store()
-s["config"] = "v1"
-s.commit()
+from kvgit import Repo
+from kvgit.kv.memory import Memory
 
-dev = s.create_branch("dev")
-dev["config"] = "v2"
-dev.commit()
-
-s.peek("config", branch="dev")  # "v2"
-s["config"]                      # "v1" (still on main)
+shared_rules = Repo(Memory(), merge_prefixes={"counts/": counter()})
 ```
 
 ---
 
 ## History and diffs
 
-Walk the commit chain:
+Walk the commit chain, newest first:
 
 ```python
-for commit_hash in s.history():
-    print(commit_hash)
+history = list(repo.log(branch="main", limit=10))
+for c in history:
+    print(c.hash, c.time, c.info)
 ```
 
-Compare two commits:
+`log` follows every parent of a merge commit; `first_parent=True` follows only the branch's own line. Compare two commits:
 
 ```python
-d = s.versioned.diff(old_hash, new_hash)
+d = repo.diff(history[-1].hash, history[0].hash)  # oldest to newest
 print(d.added)     # frozenset of added keys
 print(d.removed)   # frozenset of removed keys
 print(d.modified)  # frozenset of modified keys
@@ -334,18 +391,18 @@ print(d.modified)  # frozenset of modified keys
 ```python
 from kvgit import Namespaced
 
-s = kvgit.store()
-agent = Namespaced(s, "agent")
-config = Namespaced(s, "config")
+wt = kvgit.store()
+agent = Namespaced(wt, "agent")
+config = Namespaced(wt, "config")
 
 agent["state"] = "running"
 config["timeout"] = 30
 
 agent["state"]         # "running"
 config.get("state")    # None (isolated)
-s.get("agent/state")   # "running" (prefixed in base store)
+wt.get("agent/state")  # "running" (prefixed in the worktree)
 
-s.commit()             # one commit covers all namespaces
+wt.commit()            # one commit covers all namespaces
 ```
 
 Nesting works:
@@ -353,34 +410,29 @@ Nesting works:
 ```python
 worker = Namespaced(agent, "worker")
 worker["task"] = "fetch"
-s.get("agent/worker/task")  # "fetch"
+wt.get("agent/worker/task")  # "fetch"
 ```
 
 ---
 
-## Cleaning up unreachable commits
+## Garbage collection
 
-Committing creates history. When a branch is deleted, the commits it referenced may become unreachable -- no branch HEAD and no [tag](#tags) can walk to them anymore -- but they still occupy storage along with any blobs and keyset nodes they uniquely owned. kvgit reclaims this with reachability-based garbage collection via `clean_orphans()`. This is not LRU eviction: nothing is ever removed just because it's old or infrequently accessed. Only truly unreachable commits are swept.
+Committing creates history. When a branch is deleted, the commits it referenced may become unreachable -- no branch HEAD and no [tag](#tags) can walk to them anymore -- but they still occupy storage along with any blobs, keyset nodes and chunks they uniquely owned. `repo.gc()` reclaims them. This is reachability-based collection, not LRU eviction: nothing is ever removed just because it's old or infrequently accessed.
 
-`delete_branch()` calls `clean_orphans()` automatically, so in the common case you don't need to think about it:
+Deleting a branch does not sweep; collection is its own step, run when it suits you:
 
 ```python
-s = kvgit.store(kind="disk", path="/tmp/mydb")
-worker = s.create_branch("experiment")
+wt = kvgit.store(kind="disk", path="/tmp/mydb")
+repo = wt.repo
+repo.create_branch("experiment", at=wt.head)
 # ... work on the branch ...
-s.delete_branch("experiment")   # calls clean_orphans() for you
+repo.delete_branch("experiment")
+
+repo.gc()           # default: skip orphans younger than 1 hour
+repo.gc(min_age=0)  # sweep unreachable commits immediately
 ```
 
-For periodic background cleanup -- or after a batch of deletions -- call it directly via the underlying `Versioned`:
-
-```python
-s.versioned.clean_orphans()           # default: skip commits younger than 1 hour
-s.versioned.clean_orphans(min_age=0)  # sweep unreachable commits immediately
-```
-
-`clean_orphans()` is safe to run while other writers are committing, at any `min_age` -- `0` included. It takes the orphans' commit metadata and the blobs, keyset nodes and chunks that nothing live shares. `min_age` is purely your policy on how long abandoned work lingers before it is taken.
-
-Cleanup is safe for shared commit histories -- blobs, keyset nodes, and chunks referenced by any reachable commit are never deleted.
+For a long-lived store, run `gc()` periodically — from a scheduled job for a shared Postgres store, or at a quiet moment in an embedding process for a local one. It is safe to run while other writers are committing, at any `min_age` -- `0` included. `min_age` is purely your policy on how long abandoned work lingers before it is taken. Content referenced by any live commit is never deleted.
 
 ### How a sweep runs beside writers
 
@@ -389,23 +441,21 @@ Blobs, keyset nodes and chunks are keyed by what they hold, so an orphan's blob 
 * Every sweep takes a lease under the reserved key `__gc_lease__`, and every commit batch is written with a `cas_many` that expects the lease record its writer read. No batch lands while a sweep runs; a writer that tries waits, and lands after.
 * Every batch carries an `__inflight__` marker for its commit, removed by the write that publishes it. A sweep marks from those markers as well as from branch heads, so a commit written but not yet published is live, not garbage.
 
-Writers do wait while a sweep runs, so on a large store, sweep at quiet moments. `clean_orphans()` waits for another sweep's lease rather than failing.
-
-### `deep_clean()` -- the maintenance pass
-
-`deep_clean()` does everything `clean_orphans()` does, then scans the `kvgit:blob:`, `kvgit:keyset:` and `kvgit:chunk:` namespaces directly for content *no* commit references -- left behind by a crash or an interrupted write, or by a store swept by an earlier kvgit -- since those have no orphan to be found through. Run it occasionally.
-
-```python
-s.versioned.deep_clean()                 # takes the lease, sweeps, releases
-```
-
-If another sweep already holds the lease, the call raises `kvgit.GcBusy` rather than sweeping beside it. Retry later.
+Writers do wait while a sweep runs, so on a large store, sweep at quiet moments. By default `gc()` waits for another sweep's lease; `wait=False` raises `kvgit.GcBusy` instead:
 
 ```python
 try:
-    s.versioned.deep_clean()
+    repo.gc(wait=False)
 except kvgit.GcBusy:
     pass   # someone else is already sweeping
+```
+
+### `deep=True` -- the maintenance pass
+
+`gc(deep=True)` does everything a routine sweep does, then scans the `kvgit:blob:`, `kvgit:keyset:` and `kvgit:chunk:` namespaces directly for content *no* commit references -- left behind by a crash or an interrupted write, or by a store swept by an earlier kvgit -- since those have no orphan to be found through. Run it occasionally.
+
+```python
+repo.gc(deep=True)
 ```
 
 `lease_ttl` (default 600 seconds) bounds the damage from a sweep that crashes holding the lease: writers wait out its remaining term and no longer. Raise it above the longest sweep this store has taken -- an overrun is not extended silently, it logs a warning and leaves writers free during the overrun.
@@ -418,14 +468,14 @@ See [Orphan Cleanup in the API reference](api.md#orphan-cleanup) for details.
 
 ## Recovering a damaged HEAD
 
-If a branch's HEAD key is unreadable, kvgit falls back to a backup of the previous HEAD. Reads use that fallback but never write it back: opening a handle on a damaged store gets you the recovered state without mutating anything, which is what a read-only consumer needs and what keeps two readers from racing each other.
+If a branch's HEAD key is unreadable, kvgit falls back to a backup of the previous HEAD. Reads use that fallback but never write it back: opening a worktree on a damaged store gets you the recovered state without mutating anything, which is what a read-only consumer needs and what keeps two readers from racing each other.
 
-If the backup is gone too, the branch is reported unrecoverable — `None` from head resolution, and a `ValueError` from opening a handle on it. At that point the store no longer holds the answer, so any recovery is a guess. You can opt into one:
+If the backup is gone too, the branch is unrecoverable, and opening a worktree on it raises `CorruptHeadError`. At that point the store no longer holds the answer, so any recovery is a guess. You can opt into one for the whole repo:
 
 ```python
-from kvgit.versioned.kv import recover_by_commit_scan
+from kvgit import recover_by_commit_scan
 
-v = VersionedKV(store, recover_from_corrupt_head=recover_by_commit_scan)
+repo = Repo(backend, recover_from_corrupt_head=recover_by_commit_scan)
 ```
 
 `recover_by_commit_scan` is what kvgit ran by default through v0.3.3: the newest commit no healthy branch claims. It is a heuristic, and on a store where branches get deleted it can hand one branch another branch's deleted data — a deleted branch's commits are unclaimed until GC collects them. Fine on a single-branch store; think twice elsewhere. See [HEAD Recovery in the API reference](api.md#head-recovery).
@@ -433,7 +483,7 @@ v = VersionedKV(store, recover_from_corrupt_head=recover_by_commit_scan)
 Making the recovery durable is a separate, explicit step:
 
 ```python
-s.versioned.repair_head()   # writes the recovered commit back to HEAD
+repo.repair_head("main")   # writes the recovered commit back to HEAD
 ```
 
 Writes heal it on their own, since a CAS against a damaged HEAD would otherwise fail forever. So in practice a damaged branch that anyone still commits to fixes itself, and `repair_head()` is for the read-only case and for maintenance.
@@ -442,18 +492,42 @@ See [HEAD Recovery in the API reference](api.md#head-recovery) for the full cont
 
 ---
 
-## Custom serialization
+## Codecs and trust
 
-The default encoder/decoder is pickle. Switch to JSON for human-readable storage:
+A repo's codec turns values into stored bytes, and is set when the repo is opened:
+
+| `codec=` | Values | Stored as |
+|---|---|---|
+| `"pickle"` (default) | anything picklable | `pickle.dumps(value)` |
+| `"scientific"` | anything picklable | pickle, with large numpy / pandas buffers stored once as [chunks](#storing-scientific-data-efficiently-chunked-codecs) |
+| `"bytes"` | `bytes` only | the bytes themselves; kvgit never decodes anything |
+| `(encoder, decoder)` | whatever your pair handles | `encoder(value)` |
+
+Pickle is what makes a worktree a dict of anything. But unpickling can execute code, so anyone who can write a pickle-codec store -- a shared Postgres table, a disk directory -- can run code in every process that reads it. For a store more than one party can write, use `codec="bytes"` and encode values yourself, choosing where (if anywhere) untrusted pickles are loaded:
 
 ```python
 import json
 
-s = kvgit.store(
-    encoder=lambda v: json.dumps(v).encode(),
-    decoder=lambda b: json.loads(b),
-)
+wt = kvgit.store(codec="bytes")
+wt["config"] = json.dumps({"retries": 3}).encode()
+wt.commit()
+json.loads(wt["config"])  # {"retries": 3}
 ```
+
+A pair of your own works the same way — JSON throughout, say:
+
+```python
+as_json = kvgit.store(codec=(lambda v: json.dumps(v).encode(), json.loads))
+```
+
+Whatever the codec, a snapshot's `.raw` view reads the stored bytes without decoding them:
+
+```python
+snap = wt.repo.snapshot(commit=wt.head)
+snap.raw["config"]  # b'{"retries": 3}'
+```
+
+The codec is fixed per store in practice: values written under one read back as that codec's bytes under another, so switching an existing store means rewriting its values. Merge functions see decoded values, and a merged value is encoded with the repo's codec.
 
 ---
 
@@ -467,26 +541,26 @@ The `kvgit.codecs` package solves this by externalizing large numpy buffers as c
 import numpy as np
 import kvgit
 
-s = kvgit.store(codecs="scientific")  # numpy + pandas
+wt = kvgit.store(codec="scientific")  # numpy + pandas
 
 big = np.arange(1_000_000, dtype="float64")  # ~8 MB
 
-s["full"]  = big
-s["head"]  = big[:100_000]
-s["tail"]  = big[-100_000:]
-s["copy"]  = np.arange(1_000_000, dtype="float64")  # different ndarray, same content
-s.commit()
+wt["full"]  = big
+wt["head"]  = big[:100_000]
+wt["tail"]  = big[-100_000:]
+wt["copy"]  = np.arange(1_000_000, dtype="float64")  # different ndarray, same content
+wt.commit()
 # Storage cost: ~8 MB, not ~32 MB. All four keys reference one chunk.
 ```
 
-The `codecs="scientific"` shortcut is equivalent to building the encoder/decoder pair by hand — useful when you want to tune codec parameters:
+The `codec="scientific"` shortcut is equivalent to building the encoder/decoder pair by hand — useful when you want to tune codec parameters:
 
 ```python
 from kvgit.codecs import compose
 from kvgit.codecs.numpy import NumpyCodec
 
-encoder, decoder = compose(NumpyCodec(min_bytes=4096))  # higher threshold
-s = kvgit.store(encoder=encoder, decoder=decoder)
+codec = compose(NumpyCodec(min_bytes=4096))  # higher threshold
+wt = kvgit.store(codec=codec)
 ```
 
 Pandas DataFrames work without a separate codec -- their underlying block ndarrays are visible to the numpy codec during pickling:
@@ -495,10 +569,10 @@ Pandas DataFrames work without a separate codec -- their underlying block ndarra
 import pandas as pd
 
 df = pd.DataFrame({"x": np.arange(100_000), "y": np.random.normal(size=100_000)})
-s["df"]    = df
-s["head"]  = df.iloc[:1000]      # row-slice view
-s["tail"]  = df.iloc[-1000:]
-s.commit()
+wt["df"]    = df
+wt["head"]  = df.iloc[:1000]      # row-slice view
+wt["tail"]  = df.iloc[-1000:]
+wt.commit()
 # Block buffers shared across all three.
 ```
 
@@ -507,11 +581,8 @@ s.commit()
 Current kvgit reads every older store in place; see [Storage versions](api.md#storage-versions). Chunked codecs need no migration either -- a store takes chunked writes as it is. To reclaim disk from arrays an older store pickled once per key, import its values into a fresh chunked store -- the dedup happens during the copy:
 
 ```python
-old = kvgit.store(kind="disk", path="/old/v2/store")        # plain pickle, v2
-new = kvgit.store(
-    kind="disk", path="/new/v3/store",
-    encoder=encoder, decoder=decoder,
-)
+old = kvgit.store(kind="disk", path="/old/store")  # plain pickle
+new = kvgit.store(kind="disk", path="/new/store", codec=codec)
 for k in old.keys():
     new[k] = old[k]
 new.commit()
@@ -551,32 +622,32 @@ class MyCodec:
     def materialize(self, token, reader):
         return MyBigThing(label=token["label"], payload=reader.get(token["ref"]))
 
-encoder, decoder = compose(MyCodec(), NumpyCodec())  # order = priority
+codec = compose(MyCodec(), NumpyCodec())  # order = priority; pass as codec=
 ```
 
 See [the API reference](api.md#chunked-codecs) for the full protocol and the storage layout.
 
 ### Reclaiming chunk space
 
-One thing to plan for: chunks are the only object kvgit stores under a bare content hash, and routine garbage collection deliberately does not delete them. Deleting a branch reclaims its commits, blobs and keyset nodes, but its unique buffers stay on disk until you run `deep_clean()`. See [Cleaning up unreachable commits](#cleaning-up-unreachable-commits).
+Chunks are collected like all other content: `repo.gc()` takes an orphan's chunks that nothing live references. `gc(deep=True)` also reaches chunks left behind by a crash, or by a store swept by an earlier kvgit. See [Garbage collection](#garbage-collection).
 
 ---
 
 ## Concurrency
 
-Multiple writers sharing the same backend coordinate via optimistic concurrency (compare-and-swap). If a CAS fails during commit, kvgit retries with a three-way merge. If the merge itself can't resolve, you get a `ConcurrencyError`:
+Multiple writers sharing the same backend coordinate via optimistic concurrency (compare-and-swap). If a CAS fails during commit, kvgit retries with a three-way merge (see [Concurrent commits merge](#concurrent-commits-merge)). If it keeps losing the race, you get a `ConcurrencyError`:
 
 ```python
 from kvgit import ConcurrencyError
 
 try:
-    s.commit()
+    wt.commit()
 except ConcurrencyError:
-    s.refresh()  # reload from HEAD
+    wt.refresh()  # move to the branch tip, dropping pending changes
     # re-apply changes and retry
 ```
 
-The `Disk` backend is safe across multiple processes (backed by SQLite file locking).
+The `Disk` backend is safe across multiple processes (backed by SQLite file locking), and `Postgres` across machines. Share one `Repo` between threads; give each thread its own worktree.
 
 ---
 
@@ -585,11 +656,11 @@ The `Disk` backend is safe across multiple processes (backed by SQLite file lock
 `commit()` returns a `MergeResult` with details about what happened:
 
 ```python
-result = s.commit()
+result = wt.commit()
 
 result.merged            # True if commit succeeded
 result.commit            # new commit hash
-result.strategy          # "no_op", "fast_forward", or "three_way"
+result.strategy          # "no_op", "fast_forward", "three_way", or "apply"
 result.auto_merged_keys  # keys resolved by merge functions
 result.carried_keys      # keys carried from the other side
 ```
@@ -597,7 +668,7 @@ result.carried_keys      # keys carried from the other side
 Use `on_conflict="abandon"` to get a falsy result instead of an exception:
 
 ```python
-result = s.commit(on_conflict="abandon")
+result = wt.commit(on_conflict="abandon")
 if not result:
     print("commit failed, no exception raised")
 ```
