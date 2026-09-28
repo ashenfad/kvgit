@@ -527,3 +527,119 @@ def test_open_returns_a_worktree_of_a_repo():
     assert isinstance(wt.repo, Repo)
     other = fork(wt, "other")
     assert other.repo is wt.repo
+
+
+class TestReadsAHandleAlreadyHas:
+    """A commit and a snapshot read nothing twice: HEAD and the GC lease
+    in one round trip, and no commit root the handle already holds."""
+
+    class Recording(Memory):
+        def __init__(self):
+            super().__init__()
+            self.reads: list[tuple[str, ...]] = []
+
+        def get(self, key):
+            self.reads.append((key,))
+            return super().get(key)
+
+        def get_many(self, *args):
+            keys = tuple(self._normalize_keys(args))
+            self.reads.append(keys)
+            return super().get_many(*args)
+
+        def read(self, key):
+            return sum(key in batch for batch in self.reads)
+
+    def _repo(self):
+        store = self.Recording()
+        repo = Repo(store)
+        wt = repo.worktree("main", create=True)
+        for i in range(200):
+            wt[f"k{i}"] = i
+        wt.commit()
+        store.reads.clear()
+        return store, repo, wt
+
+    def test_a_commit_reads_head_and_lease_together_and_no_root(self):
+        from kvgit.versioned.kv import BRANCH_HEAD, COMMIT_ROOT, GC_LEASE_KEY
+
+        store, _, wt = self._repo()
+        parent = wt.head
+        wt["k1"] = "changed"
+        wt.commit()
+
+        head = BRANCH_HEAD % "main"
+        assert (head, GC_LEASE_KEY) in store.reads
+        assert store.read(head) == 1
+        assert store.read(GC_LEASE_KEY) == 1
+        assert store.read(COMMIT_ROOT % parent) == 0
+
+    def test_back_to_back_commits_stay_that_cheap(self):
+        from kvgit.versioned.kv import COMMIT_ROOT
+
+        store, _, wt = self._repo()
+        for n in range(3):
+            parent = wt.head
+            store.reads.clear()
+            wt["k1"] = n
+            wt.commit()
+            assert store.read(COMMIT_ROOT % parent) == 0
+
+    def test_a_head_another_writer_moved_is_checked_as_before(self):
+        from kvgit.versioned.kv import COMMIT_ROOT
+
+        store, repo, wt = self._repo()
+        other = repo.worktree("main")
+        other["k2"] = "theirs"
+        other.commit()
+        store.reads.clear()
+
+        wt["k1"] = "ours"
+        wt.commit()  # merges past the move
+
+        assert store.read(COMMIT_ROOT % other.head) >= 1
+        assert repo.snapshot(branch="main").get_many("k1", "k2") == {
+            "k1": "ours",
+            "k2": "theirs",
+        }
+
+    def test_a_lease_that_changed_after_the_head_read_is_read_again(self):
+        """The lease rides along with HEAD, some time before the batch
+        lands. A sweep that has come and gone in between leaves a
+        different record: the landing write expecting the old one fails,
+        and the commit reads the lease again and lands."""
+        from kvgit.encoding import dumps
+        from kvgit.versioned.kv import GC_LEASE_KEY
+
+        store, repo, wt = self._repo()
+        real = store.get_many
+
+        def get_many_then_sweep(*args):
+            found = real(*args)
+            if GC_LEASE_KEY in tuple(store._normalize_keys(args)):
+                store.set(GC_LEASE_KEY, dumps({"owner": "sweep", "expires": 0}))
+            return found
+
+        store.get_many = get_many_then_sweep
+        wt["k1"] = "after a sweep"
+        wt.commit()
+        del store.get_many
+
+        assert repo.snapshot(branch="main")["k1"] == "after a sweep"
+
+    def test_a_snapshot_reads_its_root_once(self):
+        from kvgit.versioned.kv import COMMIT_ROOT
+
+        store, repo, wt = self._repo()
+        for snap in (
+            lambda: repo.snapshot(commit=wt.head),
+            lambda: repo.snapshot(branch="main"),
+        ):
+            store.reads.clear()
+            assert snap()["k7"] == 7
+            assert store.read(COMMIT_ROOT % wt.head) == 1
+
+    def test_a_snapshot_of_a_missing_commit_still_refuses_at_once(self):
+        _, repo, _ = self._repo()
+        with pytest.raises(UnknownCommitError):
+            repo.snapshot(commit="0" * 40)

@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **A commit makes 6 round trips to the backend instead of 9.**
+  - It reads the branch head and the GC lease in one `get_many`. Before, the lease was a read of its own just before the landing write.
+  - It no longer re-reads anything the handle already holds. A head that names a commit the handle loaded or wrote is known to exist without reading that commit's root. The parent's root comes from memory rather than the store, since a commit's root never changes.
+  - A lease record that changes between the head read and the landing (a sweep came and went) makes the landing write fail. The commit then reads the lease again and lands, as it would have before.
+- **`repo.snapshot()` reads a commit's root once instead of twice.** Resolving the ref already reads the root to check that the commit exists. The snapshot now keeps it instead of fetching it again when first read. A missing commit still raises `UnknownCommitError` from `snapshot()` itself.
+
 ## [0.4.1] - 2026-09-27
 
 ### Changed
