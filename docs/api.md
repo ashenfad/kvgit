@@ -114,7 +114,7 @@ See [Tags](#tags) for the semantics.
 | `get_commit(commit)` | `Commit` | One commit's record. `UnknownCommitError` if missing. |
 | `log(*, commit=None, branch=None, tag=None, limit=None, first_parent=False)` | `Iterator[Commit]` | Commits reachable from the one starting point named, newest first. Follows every parent of a merge; `first_parent=True` follows only the line made on the branch itself. |
 | `diff(a, b)` | `DiffResult` | Keys added, removed and modified going from commit `a` to `b` |
-| `merge_base(a, b)` | `str \| None` | Lowest common ancestor, or `None` if the two share no history. Criss-cross ties go to the smallest hash. |
+| `merge_base(a, b)` | `str \| None` | Lowest common ancestor, or `None` if the two share no history. Criss-cross ties go to the smallest hash. `UnknownCommitError` if either is not in the store. |
 | `snapshot(*, commit=None, branch=None, tag=None)` | `Snapshot` | Read-only view of the commit the ref resolves to now |
 
 History ends at the empty root commit every branch starts from (`ROOT_COMMIT`, the same hash in every store).
@@ -224,7 +224,7 @@ Apply the change from commit `base` to commit `target` onto this branch, as an o
 | Method | Description |
 |--------|-------------|
 | `discard()` | Drop pending changes (`git restore .`) |
-| `reset(commit)` | Move the branch to `commit` and drop pending changes (`git reset --hard`). `UnknownCommitError` if not in the store. |
+| `reset(commit)` | Move the branch to `commit` and drop pending changes (`git reset --hard`). `UnknownCommitError` if not in the store; `UnknownBranchError` if the branch was deleted, which it does not recreate. |
 | `refresh()` | Move to the branch's current tip, dropping pending changes. `UnknownBranchError` if the branch was deleted. |
 
 ### Merge rules
@@ -555,9 +555,9 @@ Every error kvgit raises about the state of a store derives from `KvgitError`, s
 |-------|-------------|
 | `ConcurrencyError` | A commit keeps losing the race to publish (below) |
 | `MergeConflict` | A merge leaves keys no rule resolves (below) |
-| `UnknownBranchError` | A branch does not exist — `worktree`, `head`, `delete_branch`, `snapshot(branch=)`, a commit to a deleted branch |
+| `UnknownBranchError` | A branch does not exist — `worktree`, `head`, `delete_branch`, `snapshot(branch=)`, a commit, `reset` or `refresh` on a deleted branch |
 | `UnknownTagError` | A tag does not exist — `delete_tag`, `snapshot(tag=)`, `log(tag=)` |
-| `UnknownCommitError` | A commit is not in the store — `get_commit`, `create_branch(at=)`, `create_tag`, `reset`, `diff`, a dangling tag |
+| `UnknownCommitError` | A commit is not in the store — `get_commit`, `create_branch(at=)`, `create_tag`, `reset`, `diff`, `merge_base`, a dangling tag |
 | `BranchExistsError` | `create_branch` over a taken name |
 | `TagExistsError` | `create_tag` over a taken name |
 | `CorruptHeadError` | A branch HEAD is damaged and nothing recovers it; see [HEAD Recovery](#head-recovery) |

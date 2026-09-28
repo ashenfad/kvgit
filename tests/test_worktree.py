@@ -18,7 +18,7 @@ from kvgit import (
     text_merge,
 )
 from kvgit.kv.memory import Memory
-from kvgit.versioned.kv import ROOT_COMMIT
+from kvgit.versioned.kv import BRANCH_HEAD, BRANCH_HEAD_PREV, ROOT_COMMIT
 
 
 class TestReads:
@@ -254,6 +254,36 @@ class TestDiscardResetRefresh:
         wt.repo.delete_branch("dev")
         with pytest.raises(UnknownBranchError):
             dev.refresh()
+
+    def test_reset_of_a_deleted_branch_raises_and_does_not_recreate_it(self):
+        wt = worktree()
+        dev = fork(wt, "dev")
+        wt.repo.delete_branch("dev")
+        with pytest.raises(UnknownBranchError):
+            dev.reset(wt.head)
+        assert not wt.repo.has_branch("dev")
+
+    def test_a_delete_landing_mid_reset_is_not_undone(self):
+        """The delete lands between reset's read of HEAD and its write."""
+
+        class DeleteFirst(Memory):
+            armed = False
+
+            def cas_many(self, expected, writes, removes=()):
+                if self.armed and BRANCH_HEAD % "dev" in writes:
+                    self.armed = False
+                    self.remove_many(BRANCH_HEAD % "dev", BRANCH_HEAD_PREV % "dev")
+                return super().cas_many(expected, writes, removes)
+
+        store = DeleteFirst()
+        wt = worktree(store)
+        wt["k"] = 1
+        wt.commit()
+        dev = fork(wt, "dev")
+        store.armed = True
+        with pytest.raises(UnknownBranchError):
+            dev.reset(ROOT_COMMIT)
+        assert not wt.repo.has_branch("dev")
 
 
 class TestSharedBranch:
