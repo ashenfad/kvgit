@@ -80,6 +80,21 @@ store written by 0.3.x opens as it is.
 
 ### Added
 
+- **`merge()` fast-forwards**, as git does, when the worktree's branch has
+  not moved since the fork: HEAD moves to theirs and no commit is written.
+  `fast_forward=False` writes the merge commit anyway. Merging something
+  the branch already contains is a `no_op` instead of an empty merge
+  commit.
+- **The common-ancestor search costs a few reads, not the history.**
+  Each new commit stores its parents' generations
+  (`__parent_gens__<commit>`), and the search visits commits highest
+  generation first, one batched read per generation, stopping once the
+  ancestor is found. A lost commit race over a 3,000-commit history went
+  from 3,099 reads (86 ms on local Postgres) to 2 for the search; history
+  written before generations falls back to the full walk.
+- **Merges read keysets in batches**, one `get_many` per HAMT level rather
+  than one read per node, and read each commit's keyset once. The same
+  lost race (50 keys) dropped from 98 reads to 19.
 - **PostgreSQL backend** (`kvgit.kv.postgres.Postgres`, `pip install
   kvgit[postgres]`). One table with a `text COLLATE "C"` key, so
   `keys(prefix)` is an index range scan. `cas_many` is one transaction

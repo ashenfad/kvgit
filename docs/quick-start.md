@@ -244,7 +244,7 @@ w2.refresh()  # drop the pending change and move to the branch tip
 
 ## Merging branches
 
-`merge()` brings another branch, tag or commit into the worktree's branch with a two-parent merge commit. It refuses while changes are pending.
+`merge()` brings another branch, tag or commit into the worktree's branch with a two-parent merge commit. It refuses while changes are pending. When the worktree's branch has not moved since the two forked, it fast-forwards instead, as git does — the branch simply moves to theirs — and `fast_forward=False` writes a merge commit regardless. Merging something the branch already contains is a no-op.
 
 ```python
 wt = kvgit.store()
