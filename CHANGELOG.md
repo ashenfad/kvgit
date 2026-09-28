@@ -7,6 +7,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — a new public API (breaking)
+
+kvgit's embedding API is rebuilt around three objects, named after git
+where the semantics match (#41). There are no deprecated aliases; the
+table below maps every removed name. Stores are unaffected: the storage
+layout, the `KVStore` protocol and every backend are unchanged, and a
+store written by 0.3.x opens as it is.
+
+- **`Repo(backend, *, codec=, merge_fns=, merge_prefixes=,
+  default_merge=, recover_from_corrupt_head=)`** owns the backend and
+  everything store-wide: `worktree(name, create=)`, `create_branch`,
+  `delete_branch`, `branches`, `has_branch`, `head`, `create_tag`,
+  `delete_tag`, `tags`, `tag_info`, `get_commit`, `log`, `diff`,
+  `merge_base`, `snapshot`, `gc`, `repair_head`. Merge rules and HEAD
+  recovery set here apply to every worktree it opens.
+- **`Worktree`** replaces `Staged`: a `MutableMapping` bound to one
+  branch for its whole life, with `head`, `status()`, `commit`,
+  `merge(commit=|branch=|tag=)`, `cherry_pick`, `revert`, `apply`,
+  `discard`, `reset(commit)` and `refresh`.
+- **`Snapshot`**: a read-only `Mapping` pinned to one commit, from
+  `repo.snapshot(commit=|branch=|tag=)`. `snapshot.raw` reads the stored
+  bytes, whatever the codec.
+- **`Commit`** records (`hash`, `parents`, `time`, `info`, `root`) from
+  `get_commit` and `log`.
+- **Codecs are named**: `codec="pickle"` (default), `"scientific"`,
+  `"bytes"` (values are bytes, never decoded), or an `(encoder, decoder)`
+  pair. The docs now spell out that unpickling a store others can write
+  runs their code, and recommend `"bytes"` for such stores.
+- **`cherry_pick`, `revert` and `apply(base, target)`** replay one change
+  as an ordinary single-parent commit (`MergeResult.strategy == "apply"`).
+- **Typed errors under `KvgitError`**: `UnknownCommitError`,
+  `UnknownTagError`, `BranchExistsError`, `TagExistsError`,
+  `CorruptHeadError` and `StorageVersionError` join `ConcurrencyError`,
+  `MergeConflict`, `UnknownBranchError` and `GcBusy`. None subclasses
+  `ValueError` any more; `ValueError` is left for invalid arguments.
+- **Deleting a branch or tag no longer sweeps.** Collection is
+  `repo.gc()`, run when it suits the deployment. Any branch can be
+  deleted, the last one included.
+- **A merged value is encoded with the repo's codec** (a merge function
+  under `codec="bytes"` returns bytes, stored as they are); chunked codecs
+  still store merge results as plain pickle.
+- `kvgit.store(kind=, *, path=, db_name=, branch=, codec=)` returns a
+  `Worktree` and always opens or creates its branch.
+- `recover_by_commit_scan`, `CorruptHeadRecoverer` and `ROOT_COMMIT` are
+  exported from `kvgit`.
+
+| 0.3 | 0.4 |
+|---|---|
+| `Staged` | `Worktree` |
+| `Staged.reset()` | `Worktree.discard()` |
+| `reset_to(c)` | `Worktree.reset(c)` |
+| `has_changes`, `is_staged(k)` | `status()` |
+| `current_commit` / `base_commit` | `head` |
+| `current_branch` | `branch` |
+| `initial_commit` | removed (always `ROOT_COMMIT`) |
+| `last_merge_result` | removed (returned by the call) |
+| `create_branch`, `delete_branch`, `list_branches`, `branch_exists` on a handle | `Repo.create_branch` / `delete_branch` / `branches` / `has_branch` |
+| `switch_branch`, `checkout(commit)`, `checkout(branch=)` | `repo.worktree(name)` or `repo.snapshot(...)` |
+| `checkout(tag=)`, `peek(key, branch=, tag=)` | `repo.snapshot(tag=...)[key]` |
+| `tag(name, at=, info=)` | `Repo.create_tag(name, commit, info=)` |
+| `tags`, `tag_info`, `delete_tag` on a handle | on `Repo` |
+| `history(c, all_parents=)` | `Repo.log(commit=..., first_parent=)`, yielding `Commit` |
+| `commit_info(c)`, `parents(c)` | `Repo.get_commit(c).info` / `.parents` |
+| `diff`, `merge_base` on `.versioned` | on `Repo` |
+| `merge(their_head)`, `merge_heads` | `Worktree.merge(commit=...)` / `branch=` / `tag=` |
+| `clean_orphans(min_age)`, `deep_clean(...)` | `Repo.gc(min_age=, deep=)` |
+| `repair_head` (method and module function) | `Repo.repair_head(name)` |
+| `kvgit.delete_branches(...)`, `kvgit.delete_tags(...)` | `Repo(backend).delete_branch` / `delete_tag`, then `gc()` |
+| `store(..., create=, encoder=, decoder=, codecs=)` | `store(..., codec=)` |
+| `Versioned` protocol, `VersionedKV`, `.versioned` | removed from the public API |
+
 ### Added
 
 - **PostgreSQL backend** (`kvgit.kv.postgres.Postgres`, `pip install

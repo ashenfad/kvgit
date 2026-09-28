@@ -18,7 +18,7 @@ Running kvgit inside [Pyodide](https://pyodide.org/) — for example, an in-brow
 
 ## Why this is harder than it looks
 
-Pyodide bridges synchronous Python to a fundamentally async browser environment. kvgit's `Staged.commit()` is synchronous, but every browser persistence API is asynchronous under the hood. Closing that gap is the recurring source of complexity in everything below.
+Pyodide bridges synchronous Python to a fundamentally async browser environment. kvgit's `Worktree.commit()` is synchronous, but every browser persistence API is asynchronous under the hood. Closing that gap is the recurring source of complexity in everything below.
 
 There are two ways to close it:
 
@@ -33,9 +33,9 @@ The built-in `IndexedDB` backend talks to IndexedDB's async API directly and bri
 
 ```python
 import kvgit
-s = kvgit.store(kind="indexeddb", db_name="myapp")
-s["key"] = "value"
-s.commit()  # durable on return — no host-side flush needed
+wt = kvgit.store(kind="indexeddb", db_name="myapp")
+wt["key"] = "value"
+wt.commit()  # durable on return — no host-side flush needed
 ```
 
 **Use this when:**
@@ -81,9 +81,9 @@ await pyodide.mountNativeFS("/persist", persistDir);
 
 ```python
 import kvgit
-s = kvgit.store(kind="disk", path="/persist/mydb")
-s["key"] = "value"
-s.commit()  # writes hit the in-memory mirror; see flush requirement below
+wt = kvgit.store(kind="disk", path="/persist/mydb")
+wt["key"] = "value"
+wt.commit()  # writes hit the in-memory mirror; see flush requirement below
 ```
 
 ### The flush requirement (this is the important part)
@@ -98,7 +98,7 @@ const syncfs = () => new Promise((resolve, reject) => {
 });
 ```
 
-This isn't a kvgit limitation: `Staged.commit()` is synchronous, `syncfs` is asynchronous, and there's no way to truly await durability from synchronous Python without JSPI (the very thing this approach exists to avoid). The flush has to live in the JS host, where async actually works.
+This isn't a kvgit limitation: `Worktree.commit()` is synchronous, `syncfs` is asynchronous, and there's no way to truly await durability from synchronous Python without JSPI (the very thing this approach exists to avoid). The flush has to live in the JS host, where async actually works.
 
 A robust pattern combines two flush triggers:
 
