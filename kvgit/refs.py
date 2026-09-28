@@ -41,7 +41,7 @@ class Branches(Mapping[str, str]):
         """The branch's head, recording its root in ``roots`` when given
         (see :meth:`Repo._resolve_ref`)."""
         _kv._reject_reserved_branch(name)
-        store = self._repo.store
+        store = self._repo._store
         commit = _kv._resolve_head(
             store, name, recover_from_corrupt_head=self._repo._recover, roots=roots
         )
@@ -52,13 +52,13 @@ class Branches(Mapping[str, str]):
         raise UnknownBranchError(f"Branch '{name}' does not exist")
 
     def __contains__(self, name: object) -> bool:
-        return isinstance(name, str) and VersionedKV.exists(self._repo.store, name)
+        return isinstance(name, str) and VersionedKV.exists(self._repo._store, name)
 
     def __iter__(self) -> Iterator[str]:
-        return iter(VersionedKV.branches(self._repo.store))
+        return iter(VersionedKV.branches(self._repo._store))
 
     def __len__(self) -> int:
-        return len(VersionedKV.branches(self._repo.store))
+        return len(VersionedKV.branches(self._repo._store))
 
     def create(self, name: str, at: str | None = None) -> str:
         """Create branch ``name`` at commit ``at`` (default: the empty root
@@ -69,7 +69,7 @@ class Branches(Mapping[str, str]):
             UnknownCommitError: if ``at`` is not in the store.
         """
         target = at or ROOT_COMMIT
-        _kv.create_branch(self._repo.store, name, target)
+        _kv.create_branch(self._repo._store, name, target)
         return target
 
     def delete(self, name: str) -> None:
@@ -80,7 +80,7 @@ class Branches(Mapping[str, str]):
         Raises:
             UnknownBranchError: if there is no such branch.
         """
-        _kv.delete_branch(self._repo.store, name)
+        _kv.delete_branch(self._repo._store, name)
 
 
 class Tags(Mapping[str, str]):
@@ -100,7 +100,7 @@ class Tags(Mapping[str, str]):
         return f"Tags({list(self)!r})"
 
     def __getitem__(self, name: str) -> str:
-        commit = _kv._resolve_tag(self._repo.store, name)
+        commit = _kv._resolve_tag(self._repo._store, name)
         if commit is None:
             raise UnknownTagError(f"Tag '{name}' does not exist")
         return commit
@@ -108,14 +108,14 @@ class Tags(Mapping[str, str]):
     def __contains__(self, name: object) -> bool:
         return (
             isinstance(name, str)
-            and _kv._resolve_tag(self._repo.store, name) is not None
+            and _kv._resolve_tag(self._repo._store, name) is not None
         )
 
     def __iter__(self) -> Iterator[str]:
-        return iter(_kv.tags(self._repo.store))
+        return iter(_kv.tags(self._repo._store))
 
     def __len__(self) -> int:
-        return len(_kv.tags(self._repo.store))
+        return len(_kv.tags(self._repo._store))
 
     def items(self) -> ItemsView[str, str]:
         """Every tag and its commit: a live view, like the mapping, that
@@ -130,7 +130,7 @@ class Tags(Mapping[str, str]):
             TagExistsError: if the name is taken.
             UnknownCommitError: if ``commit`` is not in the store.
         """
-        _kv.create_tag(self._repo.store, name, commit, info)
+        _kv.create_tag(self._repo._store, name, commit, info)
 
     def delete(self, name: str) -> None:
         """Delete a tag. A commit it alone kept alive becomes collectable
@@ -139,7 +139,7 @@ class Tags(Mapping[str, str]):
         Raises:
             UnknownTagError: if there is no such tag.
         """
-        _kv.delete_tag(self._repo.store, name)
+        _kv.delete_tag(self._repo._store, name)
 
     def info(self, name: str) -> TagInfo:
         """A tag's commit, creation time, info, and whether its commit is
@@ -148,7 +148,7 @@ class Tags(Mapping[str, str]):
         Raises:
             UnknownTagError: if there is no such tag.
         """
-        found = _kv.tag_info(self._repo.store, name)
+        found = _kv.tag_info(self._repo._store, name)
         if found is None:
             raise UnknownTagError(f"Tag '{name}' does not exist")
         return found

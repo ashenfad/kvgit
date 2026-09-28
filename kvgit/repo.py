@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ._codec import Codec, CodecSpec
+from .cache import DEFAULT_CACHE_BYTES, CachedStore, ContentCache
 from .content_types import MergeFn
 from .encoding import loads, safe_loads
 from .errors import (
@@ -69,6 +70,11 @@ class Repo:
         default_merge: The merge rule for keys no other rule covers.
         recover_from_corrupt_head: Last-resort recovery for a HEAD that is
             damaged and has no usable backup; see the API reference.
+        cache_bytes: Memory for tree nodes and commit records read from
+            the store, which never change once written (32 MB by
+            default; ``0`` turns the cache off). A sweep by any process
+            empties it before this one builds on what the sweep removed;
+            see :class:`~kvgit.cache.ContentCache`.
 
     Raises:
         StorageVersionError: if the store is stamped with a layout this
@@ -84,9 +90,20 @@ class Repo:
         merge_prefixes: dict[str, MergeRule] | None = None,
         default_merge: MergeRule | None = None,
         recover_from_corrupt_head: CorruptHeadRecoverer | None = None,
+        cache_bytes: int = DEFAULT_CACHE_BYTES,
     ) -> None:
         _kv._check_storage_version(backend)
-        self._store = backend
+        self._backend = backend
+        self.cache: ContentCache | None = (
+            ContentCache(cache_bytes) if cache_bytes > 0 else None
+        )
+        """What this repository remembers of its store, with its hit and
+        miss counts; ``None`` with ``cache_bytes=0``."""
+        # Everything the repository reads goes through the cache; the
+        # backend itself stays what ``store`` hands out.
+        self._store: KVStore = (
+            CachedStore(backend, self.cache) if self.cache is not None else backend
+        )
         self._codec = Codec(codec, backend)
         self._merge_fns = dict(merge_fns or {})
         self._merge_prefixes = dict(merge_prefixes or {})
@@ -100,16 +117,22 @@ class Repo:
         ``delete`` and ``info``."""
 
     def __repr__(self) -> str:
-        return f"Repo({type(self._store).__name__})"
+        return f"Repo({type(self._backend).__name__})"
 
     @property
     def store(self) -> KVStore:
-        """The backend."""
-        return self._store
+        """The backend.
+
+        Reads made straight through it bypass the repository's cache,
+        and so do removals: a key deleted here, rather than by
+        :meth:`gc`, may still be answered from memory until the next
+        sweep.
+        """
+        return self._backend
 
     def close(self) -> None:
         """Close the backend, if it has anything to close."""
-        close = getattr(self._store, "close", None)
+        close = getattr(self._backend, "close", None)
         if callable(close):
             close()
 
@@ -339,11 +362,11 @@ class Snapshot(Mapping[str, Any]):
         if self._keyset is None:
             root = self._root
             if root is None:
-                root_raw = self._repo.store.get(COMMIT_ROOT % self.commit)
+                root_raw = self._repo._store.get(COMMIT_ROOT % self.commit)
                 if root_raw is None:
                     raise UnknownCommitError(f"Commit '{self.commit}' does not exist")
                 root = loads(root_raw)
-            self._keyset = Keyset(self._repo.store, root=root)
+            self._keyset = Keyset(self._repo._store, root=root)
         return self._keyset
 
     def _index(self) -> dict[str, str]:
@@ -381,7 +404,7 @@ class Snapshot(Mapping[str, Any]):
             wanted.setdefault(pointer, []).append(key)
         if not wanted:
             return {}
-        found = self._repo.store.get_many(wanted.keys())
+        found = self._repo._store.get_many(wanted.keys())
         return {key: raw for pointer, raw in found.items() for key in wanted[pointer]}
 
     def __getitem__(self, key: str) -> Any:
