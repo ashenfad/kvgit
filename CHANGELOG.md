@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **A snapshot reads just the keys it is asked for.** `snap[key]`,
+  `snap.get()`, `snap.get_many()`, `key in snap` and the same reads on
+  `snap.raw` used to load the commit's whole keyset on first use, so
+  reading one key from each of many branches downloaded every one of
+  their keysets. They now look the keys up in the tree, one batched read
+  per tree level however many keys are asked for, and remember what they
+  found; the keyset is loaded whole only when something iterates the
+  snapshot or takes its `len()`. Reading one record from each of 31
+  branches of 5,000 keys went from 31 MB read to 0.12 MB.
+
+### Added
+
+- **`Hamt.get_many(keys)` and `Keyset.get_many(keys)`**: look up many keys
+  in one batched read per tree level.
+
 ## [0.4.0] - 2026-09-27
 
 ### Changed — a new public API (breaking)
