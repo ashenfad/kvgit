@@ -124,7 +124,7 @@ repo = wt.repo
 wt["shared"] = "hello"
 wt.commit()
 
-repo.create_branch("dev", at=wt.head)
+repo.branches.create("dev", at=wt.head)
 dev = repo.worktree("dev")
 dev["feature"] = True
 dev.commit()
@@ -132,14 +132,14 @@ dev.commit()
 print("feature" in wt)   # False (main is unchanged)
 print("feature" in dev)  # True
 
-repo.branches()          # ["dev", "main"]
-repo.delete_branch("dev")
+list(repo.branches)      # ["dev", "main"]
+repo.branches.delete("dev")
 ```
 
 A worktree stays on its branch for its whole life; to work on another branch, open another worktree. Without `at`, a branch starts at the empty root commit:
 
 ```python
-repo.create_branch("clean")
+repo.branches.create("clean")
 print(len(repo.worktree("clean")))  # 0
 ```
 
@@ -155,7 +155,7 @@ repo = wt.repo
 wt["config"] = "v1"
 wt.commit()
 
-repo.create_branch("dev", at=wt.head)
+repo.branches.create("dev", at=wt.head)
 dev = repo.worktree("dev")
 dev["config"] = "v2"
 dev.commit()
@@ -177,7 +177,7 @@ repo = wt.repo
 wt["config"] = "v1"
 wt.commit()
 
-repo.create_tag("release-1", wt.head, info={"by": "ann"})
+repo.tags.create("release-1", wt.head, info={"by": "ann"})
 
 wt["config"] = "v2"
 wt.commit()
@@ -185,18 +185,18 @@ wt.commit()
 wt["config"]                                # "v2" (the branch moved on)
 repo.snapshot(tag="release-1")["config"]    # "v1" (the tag did not)
 
-repo.tags()                                 # {"release-1": "a1b2c3..."}
-repo.tag_info("release-1").info             # {"by": "ann"}
-repo.delete_tag("release-1")
+dict(repo.tags)                             # {"release-1": "a1b2c3..."}
+repo.tags.info("release-1").info            # {"by": "ann"}
+repo.tags.delete("release-1")
 ```
 
-Creating a tag under a name already taken raises `TagExistsError` — moving a tag is `delete_tag` then `create_tag`, spelled out. Tags and branches are separate namespaces, so the same name can be both.
+Creating a tag under a name already taken raises `TagExistsError` — moving a tag is `repo.tags.delete` then `repo.tags.create`, spelled out. Tags and branches are separate namespaces, so the same name can be both.
 
 A tag is also a garbage collection root: the tagged commit and everything it descends from survive [garbage collection](#garbage-collection) for as long as the tag exists, even after every branch that reached them is gone. That is what makes a tag a safe place to leave a release, an experiment worth keeping, or a checkpoint an agent may want to come back to.
 
-To work from a tagged commit, branch from it: `repo.create_branch("hotfix", at=repo.tags()["release-1"])`.
+To work from a tagged commit, branch from it: `repo.branches.create("hotfix", at=repo.tags["release-1"])`.
 
-Under the hood a tag is a branch head under the reserved name `refs/tags/<name>`, hidden from `branches()` and refused by the branch API. That is deliberate: reachability is decided by walking branch heads in *every* kvgit version, so a tagged commit is kept alive even by versions written before tags existed. See [Compatibility across kvgit versions](api.md#compatibility-across-kvgit-versions).
+Under the hood a tag is a branch head under the reserved name `refs/tags/<name>`, hidden from `repo.branches` and refused by the branch API. That is deliberate: reachability is decided by walking branch heads in *every* kvgit version, so a tagged commit is kept alive even by versions written before tags existed. See [Compatibility across kvgit versions](api.md#compatibility-across-kvgit-versions).
 
 ---
 
@@ -252,7 +252,7 @@ repo = wt.repo
 wt["a"] = 1
 wt.commit()
 
-repo.create_branch("feature", at=wt.head)
+repo.branches.create("feature", at=wt.head)
 feature = repo.worktree("feature")
 feature["b"] = 2
 feature.commit()
@@ -424,9 +424,9 @@ Deleting a branch does not sweep; collection is its own step, run when it suits 
 ```python
 wt = kvgit.open("disk", path="/tmp/mydb")
 repo = wt.repo
-repo.create_branch("experiment", at=wt.head)
+repo.branches.create("experiment", at=wt.head)
 # ... work on the branch ...
-repo.delete_branch("experiment")
+repo.branches.delete("experiment")
 
 repo.gc()           # default: skip orphans younger than 1 hour
 repo.gc(min_age=0)  # sweep unreachable commits immediately

@@ -37,7 +37,7 @@ main["score"] = 0
 main.commit()
 
 # Branch and diverge
-repo.create_branch("dev", at=main.head)
+repo.branches.create("dev", at=main.head)
 dev = repo.worktree("dev")
 dev["score"] = 999
 dev.commit()
@@ -46,12 +46,14 @@ print(main["score"])  # 0   (main unchanged)
 print(dev["score"])   # 999 (dev branch)
 
 # Tag a commit by name -- immutable, and safe from garbage collection
-repo.create_tag("v1", main.head)
+repo.tags.create("v1", main.head)
 print(repo.snapshot(tag="v1")["score"])  # 0
 ```
 
 A `Repo` owns the backend and everything store-wide: branches, tags,
-history, snapshots, garbage collection. A `Worktree` is one branch
+history, snapshots, garbage collection. `repo.branches` and `repo.tags`
+are live mappings of name to commit, with `create` and `delete`, shaped
+like pygit2's `repo.branches`. A `Worktree` is one branch
 checked out for work -- a dict whose writes stay pending until
 `commit()`. A `Snapshot` is a read-only dict pinned to one commit.
 
@@ -80,8 +82,9 @@ with Repo(Disk("/tmp/kvgit-demo")) as on_disk:
 | `git reset --hard c` | `wt.reset(c)` |
 | `git merge x` | `wt.merge(branch="x")` |
 | `git cherry-pick c` / `git revert c` | `wt.cherry_pick(c)` / `wt.revert(c)` |
-| `git branch [-D] x` | `repo.create_branch("x")` / `repo.delete_branch("x")` |
-| `git tag [-d] v1` | `repo.create_tag("v1", c)` / `repo.delete_tag("v1")` |
+| `git branch`, `git tag` (list) | `list(repo.branches)`, `dict(repo.tags)` |
+| `git branch [-D] x` | `repo.branches.create("x")` / `repo.branches.delete("x")` |
+| `git tag [-d] v1` | `repo.tags.create("v1", c)` / `repo.tags.delete("v1")` |
 | `git log`, `git show c`, `git diff a b`, `git merge-base a b` | `repo.log(...)`, `repo.get_commit(c)`, `repo.diff(a, b)`, `repo.merge_base(a, b)` |
 | `git show v1:path` | `repo.snapshot(tag="v1")[key]` |
 | `git gc [--prune=now]` | `repo.gc([min_age=0])` |
@@ -121,7 +124,7 @@ from kvgit import text_merge
 main["notes"] = "alpha\nbeta\n"
 main.commit()
 
-repo.create_branch("edits", at=main.head)
+repo.branches.create("edits", at=main.head)
 edits = repo.worktree("edits")
 edits["notes"] = "alpha\nBETA\n"
 edits.commit()

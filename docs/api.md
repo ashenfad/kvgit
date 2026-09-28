@@ -16,7 +16,7 @@ with Repo(Disk("/tmp/db")) as repo:
     wt = repo.worktree("main", create=True)
     wt["k"] = "v"
     wt.commit(info={"msg": "first"})
-    repo.create_tag("v1", wt.head)
+    repo.tags.create("v1", wt.head)
     repo.snapshot(tag="v1")["k"]  # "v"
 ```
 
@@ -88,30 +88,56 @@ None of these settings is written to the store: they belong to the process that 
 
 A `Repo` is a context manager; `close()` closes the backend.
 
-### Branches
+### Branches — `repo.branches`
 
-| Method | Returns | Description |
+`repo.branches` is every branch, as a `Mapping[str, str]` of name to the commit it points at, shaped like pygit2's `repo.branches`. It is a live view: each read goes to the store, so it sees branches other processes create, move and delete.
+
+```python
+list(repo.branches)                      # ["dev", "main"]: sorted, never tags
+"dev" in repo.branches                   # True; never writes
+repo.branches["dev"]                     # "a1b2c3...": the tip
+repo.branches.get("nope")                # None
+repo.branches.create("fix", at=commit)   # or positionally: create("fix", commit)
+repo.branches.delete("fix")
+```
+
+| Member | Returns | Description |
+|--------|---------|-------------|
+| `branches[name]` | `str` | The commit a branch points at. `UnknownBranchError` (a `KeyError`) if missing; `CorruptHeadError` if its HEAD is damaged beyond recovery — from `get()` too, since damage is not absence. |
+| `name in branches`, `iter`, `len`, `get`, `keys`, `items`, `values` | | The `Mapping` protocol; iteration is by name, sorted |
+| `create(name, at=None)` | `str` | Create a branch at commit `at` (default: the empty root commit); returns that commit. `BranchExistsError` if taken, `UnknownCommitError` if `at` is not in the store. |
+| `delete(name)` | `None` | Delete any branch, including the last one and one with open worktrees. Removes its HEAD and HEAD backup; its commits become collectable at the next [`gc()`](#garbage-collection). `UnknownBranchError` if missing. |
+
+Moving a branch is a worktree's job: `Worktree.reset(commit)`, or a commit or merge.
+
+| `Repo` method | Returns | Description |
 |--------|---------|-------------|
 | `worktree(name, *, create=False)` | `Worktree` | Check out a branch. Raises `UnknownBranchError` if missing — unless `create=True`, which creates it at the empty root commit first. `CorruptHeadError` if its HEAD is damaged beyond recovery. |
-| `create_branch(name, *, at=None)` | `str` | Create a branch at commit `at` (default: the empty root commit); returns that commit. `BranchExistsError` if taken, `UnknownCommitError` if `at` is not in the store. |
-| `delete_branch(name)` | `None` | Delete any branch, including the last one and one with open worktrees. Removes its HEAD and HEAD backup; its commits become collectable at the next [`gc()`](#garbage-collection). `UnknownBranchError` if missing. |
-| `branches()` | `list[str]` | Every branch name, sorted. Tags are not included. |
-| `has_branch(name)` | `bool` | Whether a branch exists. Never writes. |
-| `head(name)` | `str` | The commit a branch points at. `UnknownBranchError`, `CorruptHeadError`. |
 | `repair_head(name)` | `str \| None` | Persist a recovered HEAD; see [HEAD Recovery](#head-recovery). |
 
 Branch names are any non-empty string without `%`, `/` included, except the reserved `refs/tags/` prefix, which every branch method refuses with `ValueError`.
 
 A worktree on a deleted branch still reads from its `head`; its next `commit()` raises `UnknownBranchError`.
 
-### Tags
+### Tags — `repo.tags`
 
-| Method | Returns | Description |
+`repo.tags` is every tag, as a live `Mapping[str, str]` of name to the commit it names, with the same shape as `repo.branches`.
+
+```python
+repo.tags.create("v1", commit, info={"by": "ann"})
+dict(repo.tags)                          # {"v1": "a1b2c3..."}
+repo.tags["v1"]                          # "a1b2c3..."
+repo.tags.info("v1")                     # TagInfo(name=..., commit=..., info={"by": "ann"}, ...)
+repo.tags.delete("v1")
+```
+
+| Member | Returns | Description |
 |--------|---------|-------------|
-| `create_tag(name, commit, *, info=None)` | `None` | Name a commit permanently. `TagExistsError` if taken, `UnknownCommitError` if the commit is not in the store. `info` must be JSON-serializable. |
-| `delete_tag(name)` | `None` | Remove a tag. A commit only it kept alive becomes collectable at the next `gc()`. `UnknownTagError` if missing. |
-| `tags()` | `dict[str, str]` | Every tag, name → commit |
-| `tag_info(name)` | `TagInfo \| None` | Details for one tag, or `None` |
+| `tags[name]` | `str` | The commit a tag names — even if that commit is no longer in the store (`info(name).dangling`). `UnknownTagError` (a `KeyError`) if missing. |
+| `name in tags`, `iter`, `len`, `get`, `keys`, `items`, `values` | | The `Mapping` protocol; iteration is by name, sorted, and `items()` reads every tag in one pass |
+| `create(name, commit, *, info=None)` | `None` | Name a commit permanently. `TagExistsError` if taken, `UnknownCommitError` if the commit is not in the store. `info` must be JSON-serializable. |
+| `delete(name)` | `None` | Remove a tag. A commit only it kept alive becomes collectable at the next `gc()`. `UnknownTagError` if missing. |
+| `info(name)` | `TagInfo` | Details for one tag. `UnknownTagError` if missing. |
 
 See [Tags](#tags) for the semantics.
 
@@ -174,7 +200,7 @@ Get one from `repo.worktree(name)` or `kvgit.open()`.
 |----------|------|-------------|
 | `repo` | `Repo` | The repository |
 | `branch` | `str` | The branch this worktree holds |
-| `head` | `str` | The commit this worktree is based on. The branch tip may have moved since: `repo.head(wt.branch)`. |
+| `head` | `str` | The commit this worktree is based on. The branch tip may have moved since: `repo.branches[wt.branch]`. |
 
 ### Committing
 
@@ -328,25 +354,25 @@ The codec is fixed per store in practice. Nothing records it in the store, and v
 A tag is an immutable name for a commit.
 
 ```python
-repo.create_tag("v1", wt.head)
-repo.create_tag("v1-reviewed", wt.head, info={"by": "ann"})
-repo.tags()                          # {"v1": "a1b2c3...", "v1-reviewed": "a1b2c3..."}
-repo.tag_info("v1-reviewed")         # TagInfo(name=..., commit=..., info={"by": "ann"}, ...)
+repo.tags.create("v1", wt.head)
+repo.tags.create("v1-reviewed", wt.head, info={"by": "ann"})
+dict(repo.tags)                          # {"v1": "a1b2c3...", "v1-reviewed": "a1b2c3..."}
+repo.tags.info("v1-reviewed")         # TagInfo(name=..., commit=..., info={"by": "ann"}, ...)
 repo.snapshot(tag="v1")["config"]    # read the tagged state
-repo.delete_tag("v1")
+repo.tags.delete("v1")
 ```
 
-**Tags never move.** Creating one over an existing name raises `TagExistsError`; pointing a name somewhere else is `delete_tag` then `create_tag`, so the move is visible in the calling code. Tags and branches are separate namespaces — `release` can be both, and the two are unrelated.
+**Tags never move.** Creating one over an existing name raises `TagExistsError`; pointing a name somewhere else is `tags.delete` then `tags.create`, so the move is visible in the calling code. Tags and branches are separate namespaces — `release` can be both, and the two are unrelated.
 
 **Names** follow branch names: any non-empty string, `/` included, so embedders can namespace their own (`pub/v1`). The single exclusion is `%`, since tag keys are built by `%`-formatting a template. `info` must be JSON-serializable, like commit info.
 
-**A tag is a garbage collection root**, and it is one by construction: a tag is stored as a *branch head* under the reserved name `refs/tags/<name>`, hidden from the branch API. Every sweep walks every branch head, so a tag's commit — and everything it descends from — stays alive with no tag-specific rule anywhere in the sweep. Tagging a commit and then deleting every branch that reached it leaves the commit alive until the tag goes. `delete_tag` removes the reserved head, its `__branch_head_prev__` backup and the `__tag_info__` record; the next `gc()` takes what only the tag kept alive.
+**A tag is a garbage collection root**, and it is one by construction: a tag is stored as a *branch head* under the reserved name `refs/tags/<name>`, hidden from the branch API. Every sweep walks every branch head, so a tag's commit — and everything it descends from — stays alive with no tag-specific rule anywhere in the sweep. Tagging a commit and then deleting every branch that reached it leaves the commit alive until the tag goes. `tags.delete` removes the reserved head, its `__branch_head_prev__` backup and the `__tag_info__` record; the next `gc()` takes what only the tag kept alive.
 
 A tag whose commit is not in the store (`dangling=True`) marks **nothing** — it is a head that does not resolve, and the sweep already treats those as roots pointing nowhere. That is damage rather than an ordinary state: a tag cannot be created for a commit that does not exist, and `snapshot(tag=...)` / `log(tag=...)` on one raise `UnknownCommitError`.
 
 Tags do not get the prev-HEAD recovery tiers a branch gets. kvgit never writes a backup for a tag, because it never moves one; reading through a tag reads the reserved head key and nothing else.
 
-To work from a tagged commit, branch from it: `repo.create_branch("hotfix", at=repo.tags()["v1"])`.
+To work from a tagged commit, branch from it: `repo.branches.create("hotfix", at=dict(repo.tags)["v1"])`.
 
 **One race, and it is narrow.** Tagging a commit that is *already* an orphan older than `min_age` can lose to a sweep running concurrently, which was free to collect that commit before the tag existed. In practice callers tag a commit they are holding — a head, or something a head descends from — and a commit a branch reaches is never a sweep candidate.
 
@@ -356,7 +382,7 @@ Storing a tag as a reserved branch head, rather than as a key kind of its own, i
 
 The reason is that a version stamp cannot protect anything from code that already shipped. kvgit 0.3.4's anchor-free `delete_branches` opens a backend directly and sweeps without consulting the stamp at all, so a new key kind holding tag pointers would have been invisible to it and every tag-only commit would have been collected. Reachability, in every version, is "walk the branch heads" — so a tag that *is* a branch head is honoured by all of them, including ones written before tags existed.
 
-What an older version sees is a branch named `refs/tags/<name>`. It will list it among the branches, and it can delete that branch by name or switch to it and commit — deleting or moving the tag. Both are deliberate acts naming a path that says what it is. Current code refuses reserved names everywhere in the branch API (`worktree`, `create_branch`, `delete_branch`, `head`, `repair_head`, and `branch=` in `snapshot` / `log` / `merge`) and hides them from `branches()`.
+What an older version sees is a branch named `refs/tags/<name>`. It will list it among the branches, and it can delete that branch by name or switch to it and commit — deleting or moving the tag. Both are deliberate acts naming a path that says what it is. Current code refuses reserved names everywhere in the branch API (`worktree`, `branches.create`, `branches.delete`, `branches[name]`, `repair_head`, and `branch=` in `snapshot` / `log` / `merge`) and hides them from `repo.branches`.
 
 The `__tag_info__<name>` record is a separate key kind, and nothing collects it: every sweep, this version's and older ones', deletes only commit metadata keyed by commit hash, orphan-owned blobs and HAMT nodes, and — in a deep sweep — the `kvgit:keyset:` and `kvgit:chunk:` namespaces.
 
@@ -438,14 +464,14 @@ Both are empty for a commit with no other side (`fast_forward` on `commit()`) an
 
 ### TagInfo
 
-Frozen dataclass returned by `Repo.tag_info()`.
+Frozen dataclass returned by `repo.tags.info()`.
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `name` | `str` | The tag name |
 | `commit` | `str` | Commit the tag names |
 | `time` | `float \| None` | When the tag was created. `None` if the tag's info record is missing. |
-| `info` | `dict \| None` | Caller metadata passed to `create_tag()`, if any |
+| `info` | `dict \| None` | Caller metadata passed to `tags.create()`, if any |
 | `dangling` | `bool` | Whether the tagged commit is absent from the store — damage, not an ordinary state |
 
 ### DiffResult
@@ -574,11 +600,11 @@ Every error kvgit raises about the state of a store derives from `KvgitError`, s
 |-------|-------------|
 | `ConcurrencyError` | A commit keeps losing the race to publish (below) |
 | `MergeConflict` | A merge leaves keys no rule resolves (below) |
-| `UnknownBranchError` | A branch does not exist — `worktree`, `head`, `delete_branch`, `snapshot(branch=)`, a commit, `reset` or `refresh` on a deleted branch |
-| `UnknownTagError` | A tag does not exist — `delete_tag`, `snapshot(tag=)`, `log(tag=)` |
-| `UnknownCommitError` | A commit is not in the store — `get_commit`, `create_branch(at=)`, `create_tag`, `reset`, `diff`, `merge_base`, a dangling tag |
-| `BranchExistsError` | `create_branch` over a taken name |
-| `TagExistsError` | `create_tag` over a taken name |
+| `UnknownBranchError` | A branch does not exist — `worktree`, `branches[name]`, `branches.delete`, `snapshot(branch=)`, a commit, `reset` or `refresh` on a deleted branch |
+| `UnknownTagError` | A tag does not exist — `tags[name]`, `tags.delete`, `tags.info`, `snapshot(tag=)`, `log(tag=)` |
+| `UnknownCommitError` | A commit is not in the store — `get_commit`, `branches.create(at=)`, `tags.create`, `reset`, `diff`, `merge_base`, a dangling tag |
+| `BranchExistsError` | `branches.create` over a taken name |
+| `TagExistsError` | `tags.create` over a taken name |
 | `CorruptHeadError` | A branch HEAD is damaged and nothing recovers it; see [HEAD Recovery](#head-recovery) |
 | `StorageVersionError` | The store is stamped with a layout this code does not read; see [Storage versions](#storage-versions) |
 | `GcBusy` | `gc(wait=False)` found another sweep holding an unexpired lease |
@@ -813,12 +839,12 @@ Writers hold up their end inside the store's own atomicity. Every path that writ
 |------|----------------|
 | `commit()` fast-forward and merge batches (and those of `merge()` / `apply()`) | Nodes, blobs, chunks, commit metadata, in-flight marker |
 | the HEAD advance that publishes one | `__branch_head__<branch>`, its backup, and the in-flight markers' removal |
-| `create_branch(name, at=...)` | `__branch_head__<name>` |
+| `branches.create(name, at=...)` | `__branch_head__<name>` |
 | `Worktree.reset(commit)` | `__branch_head__<branch>` and its backup |
-| `create_tag(name, commit)` | `__branch_head__refs/tags/<name>` and `__tag_info__<name>` |
+| `tags.create(name, commit)` | `__branch_head__refs/tags/<name>` and `__tag_info__<name>` |
 | corrupt-HEAD repair (`repair_head()`, and the retry inside a losing publish) | `__branch_head__<branch>` |
 
-Every acquisition writes a fresh owner id and release writes an expired record rather than deleting the key, so bytes a writer read before a sweep can never match again: a sweep that starts after the read makes the write fail, and the writer waits and tries again. The head writes check their target commit exists and write the head against the same lease record, so `create_branch(at=...)`, `reset` and `create_tag` aimed at a commit a concurrent sweep collects report it gone rather than installing a head that names nothing.
+Every acquisition writes a fresh owner id and release writes an expired record rather than deleting the key, so bytes a writer read before a sweep can never match again: a sweep that starts after the read makes the write fail, and the writer waits and tries again. The head writes check their target commit exists and write the head against the same lease record, so `branches.create(at=...)`, `reset` and `tags.create` aimed at a commit a concurrent sweep collects report it gone rather than installing a head that names nothing.
 
 `lease_ttl` (default 600 seconds) bounds what a crashed holder costs: writers wait out a lease's remaining term and no longer. A sweep that outlives its own lease is **not** extended silently — it finishes, logs a warning at `kvgit.orphans` naming the overrun, and during that window writers are free to write. Set `lease_ttl` above the longest sweep this store has taken.
 
