@@ -456,11 +456,14 @@ def recover_by_commit_scan(store: KVStore, branch: str) -> str | None:
     ``__commit_time__``). A :data:`CorruptHeadRecoverer`, so it is
     passed in rather than reached for::
 
-        from kvgit.versioned.kv import recover_by_commit_scan
+        import kvgit
 
-        v = VersionedKV(store, recover_from_corrupt_head=recover_by_commit_scan)
+        repo = kvgit.Repo(
+            backend, recover_from_corrupt_head=kvgit.recover_by_commit_scan
+        )
 
-    kvgit's default through v0.3.3, and **not** the default any more.
+    Off unless passed in: without a recoverer, a branch whose HEAD and
+    backup are both unusable is unrecoverable rather than guessed at.
     The name says what it does rather than what it is for, because what
     it is for is the part that cannot be guaranteed: this is a heuristic
     over a store that has already lost the answer.
@@ -470,7 +473,7 @@ def recover_by_commit_scan(store: KVStore, branch: str) -> str | None:
     **It can serve another branch's deleted data.** "Not claimed by a
     healthy branch" is the only signal it has for whose commit a commit
     is, and a deleted branch's commits are unclaimed by definition until
-    :func:`clean_orphans` collects them. Delete a branch, damage an
+    garbage collection (``Repo.gc``) takes them. Delete a branch, damage an
     unrelated branch's HEAD, lose its backup, and this returns the
     deleted branch's tip — grafting onto the survivor a lineage it never
     had, behind a ``logger.warning``. No race, no concurrency, no
@@ -478,7 +481,7 @@ def recover_by_commit_scan(store: KVStore, branch: str) -> str | None:
 
     **It is O(store).** Every ``__commit_root__`` and every branch
     ancestry, walked per unresolved read until someone calls
-    :func:`repair_head`.
+    ``Repo.repair_head``.
 
     It is worth it when losing the branch outright is worse than
     recovering it to a plausible commit — a single-branch store, or one
@@ -1591,8 +1594,8 @@ class VersionedKV(VersionedBase):
     HEAD resolution, for a HEAD that is present, unusable, and has no
     usable backup. Unset by default, which makes such a branch
     unrecoverable rather than guessed at; pass
-    :func:`recover_by_commit_scan` to restore kvgit's pre-0.3.4
-    behaviour. See :data:`CorruptHeadRecoverer`.
+    :func:`recover_by_commit_scan` to guess from a scan of every commit
+    instead. See :data:`CorruptHeadRecoverer`.
     """
 
     def __init__(
