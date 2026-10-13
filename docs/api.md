@@ -110,7 +110,7 @@ repo.branches.delete("fix")
 | `branches[name]` | `str` | The commit a branch points at. `UnknownBranchError` (a `KeyError`) if missing; `CorruptHeadError` if its HEAD is damaged beyond recovery — from `get()` too, since damage is not absence. |
 | `name in branches`, `iter`, `len`, `get`, `keys`, `items`, `values` | | The `Mapping` protocol; iteration is by name, sorted |
 | `create(name, at=None)` | `str` | Create a branch at commit `at` (default: the empty root commit); returns that commit. `BranchExistsError` if taken, `UnknownCommitError` if `at` is not in the store. |
-| `delete(name)` | `None` | Delete any branch, including the last one and one with open worktrees. Removes its HEAD and HEAD backup; its commits become collectable at the next [`gc()`](#garbage-collection). `UnknownBranchError` if missing. |
+| `delete(name)` | `None` | Delete any branch, including the last one and one with open worktrees. Removes its HEAD and HEAD backup; its commits become collectable at the next [`gc()`](#garbage-collection). `UnknownBranchError` if missing; `ConcurrencyError`, with nothing removed, if the branch moved or was recreated between the read and the removal. |
 
 Moving a branch is a worktree's job: `Worktree.reset(commit)`, or a commit or merge.
 
@@ -119,7 +119,7 @@ Moving a branch is a worktree's job: `Worktree.reset(commit)`, or a commit or me
 | `worktree(name, *, create=False)` | `Worktree` | Check out a branch. Raises `UnknownBranchError` if missing — unless `create=True`, which creates it at the empty root commit first. `CorruptHeadError` if its HEAD is damaged beyond recovery. |
 | `repair_head(name)` | `str \| None` | Persist a recovered HEAD; see [HEAD Recovery](#head-recovery). |
 
-Branch names are any non-empty string without `%`, `/` included, except the reserved `refs/tags/` prefix, which every branch method refuses with `ValueError`.
+Branch names are any non-empty string without `%`, `/` included, except the reserved `refs/tags/` prefix. Every branch method refuses the empty name and reserved names with `ValueError`.
 
 A worktree on a deleted branch still reads from its `head`; its next `commit()` raises `UnknownBranchError`.
 
@@ -140,7 +140,7 @@ repo.tags.delete("v1")
 | `tags[name]` | `str` | The commit a tag names — even if that commit is no longer in the store (`info(name).dangling`). `UnknownTagError` (a `KeyError`) if missing. |
 | `name in tags`, `iter`, `len`, `get`, `keys`, `items`, `values` | | The `Mapping` protocol; iteration is by name, sorted, and `items()` reads every tag in one pass |
 | `create(name, commit, *, info=None)` | `None` | Name a commit permanently. `TagExistsError` if taken, `UnknownCommitError` if the commit is not in the store. `info` must be JSON-serializable. |
-| `delete(name)` | `None` | Remove a tag. A commit only it kept alive becomes collectable at the next `gc()`. `UnknownTagError` if missing. |
+| `delete(name)` | `None` | Remove a tag. A commit only it kept alive becomes collectable at the next `gc()`. `UnknownTagError` if missing; `ConcurrencyError`, with nothing removed, if the tag was recreated between the read and the removal. |
 | `info(name)` | `TagInfo` | Details for one tag. `UnknownTagError` if missing. |
 
 See [Tags](#tags) for the semantics.
@@ -614,7 +614,7 @@ Every error kvgit raises about the state of a store derives from `KvgitError`, s
 
 | Error | Raised when |
 |-------|-------------|
-| `ConcurrencyError` | A commit keeps losing the race to publish (below) |
+| `ConcurrencyError` | A commit keeps losing the race to publish (below), or `branches.delete` / `tags.delete` found the head changed under it |
 | `MergeConflict` | A merge leaves keys no rule resolves (below) |
 | `UnknownBranchError` | A branch does not exist — `worktree`, `branches[name]`, `branches.delete`, `snapshot(branch=)`, a commit, `reset` or `refresh` on a deleted branch |
 | `UnknownTagError` | A tag does not exist — `tags[name]`, `tags.delete`, `tags.info`, `snapshot(tag=)`, `log(tag=)` |

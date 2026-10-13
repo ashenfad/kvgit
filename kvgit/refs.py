@@ -77,8 +77,16 @@ class Branches(Mapping[str, str]):
         ``gc``; worktrees still holding it read from their heads and raise
         :class:`UnknownBranchError` on commit.
 
+        The removal is conditional on the head this call read: if another
+        writer moves the branch, or deletes and recreates it, in between,
+        nothing is removed and the call raises rather than retrying, so a
+        newer head is never deleted on the strength of an older one.
+
         Raises:
             UnknownBranchError: if there is no such branch.
+            ConcurrencyError: if the branch changed while being deleted.
+            ValueError: if ``name`` is empty or in the reserved tag
+                namespace.
         """
         _kv.delete_branch(self._repo._store, name)
 
@@ -136,8 +144,13 @@ class Tags(Mapping[str, str]):
         """Delete a tag. A commit it alone kept alive becomes collectable
         at the next ``gc``.
 
+        The removal is conditional on the head this call read: a tag
+        deleted and made again by another writer in between keeps its
+        new commit and info, and the call raises rather than retrying.
+
         Raises:
             UnknownTagError: if there is no such tag.
+            ConcurrencyError: if the tag changed while being deleted.
         """
         _kv.delete_tag(self._repo._store, name)
 

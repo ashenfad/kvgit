@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **An empty branch name is refused.** It used to create a branch under the bare head key that took commits but never appeared in `repo.branches`; every branch method now raises `ValueError` for it, as for a reserved name.
+- **A stale branch or tag delete no longer removes a newer head.** `branches.delete` and `tags.delete` remove only if the head still holds the bytes they read, and otherwise raise `ConcurrencyError` with nothing removed (#72).
+
 ## [0.4.2] - 2026-09-28
 
 ### Added
