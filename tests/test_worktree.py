@@ -549,6 +549,35 @@ class TestApply:
         assert stale.head == base
         assert wt.repo.branches["main"] == tip
 
+    def test_a_no_op_checks_the_branch_has_not_moved(self):
+        """The stale worktree already holds the picked change, but another
+        writer has since reverted it on the branch: "nothing to do" holds
+        for the worktree, not for the branch."""
+        wt, picked = self._history()
+        wt.cherry_pick(picked)
+        stale = wt.repo.worktree("main")
+        wt.revert(picked)
+        reverted = wt.head
+
+        with pytest.raises(ConcurrencyError):
+            stale.cherry_pick(picked)
+        result = stale.cherry_pick(picked, on_conflict="abandon")
+        assert not result.merged and result.strategy == "no_op"
+        assert wt.repo.branches["main"] == reverted
+        assert wt.repo.snapshot(branch="main")["b"] == 1
+
+        stale.refresh()
+        assert stale.cherry_pick(picked).strategy == "apply"
+        assert wt.repo.snapshot(branch="main")["b"] == 2
+
+    def test_a_no_op_on_a_deleted_branch_raises(self):
+        wt, picked = self._history()
+        wt.cherry_pick(picked)
+        wt.repo.branches.delete("main")
+        with pytest.raises(UnknownBranchError):
+            wt.cherry_pick(picked)
+        assert "main" not in wt.repo.branches
+
 
 class TestMergeRules:
     def test_repo_defaults_apply_to_every_worktree(self):

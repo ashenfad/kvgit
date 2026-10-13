@@ -364,18 +364,19 @@ class Worktree(MutableMapping[str, Any]):
         ancestor: what ``target`` changed relative to ``base`` lands on
         this worktree's head as one ordinary commit, and changes made
         here since are kept. A change already present commits nothing
-        (strategy ``"no_op"``). :meth:`cherry_pick` and :meth:`revert`
-        are the common cases.
+        (strategy ``"no_op"``), provided the branch is still at this
+        worktree's head. :meth:`cherry_pick` and :meth:`revert` are the
+        common cases.
 
         Raises:
             ValueError: with pending changes — commit or discard first.
             UnknownCommitError: ``base`` or ``target`` is not in the store.
             MergeConflict: keys both changed that no rule resolves.
-            ConcurrencyError: the branch moved during the apply.
+            ConcurrencyError: the branch moved during the apply, or since
+                this worktree's head when the change is already present.
+            UnknownBranchError: the branch was deleted.
         """
         self._require_clean("apply a change")
-        self._repo.get_commit(base)
-        self._repo.get_commit(target)
         result = self._engine.apply_change(
             base,
             target,

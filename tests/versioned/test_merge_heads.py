@@ -3,7 +3,7 @@
 import pytest
 from support import fork, worktree
 
-from kvgit import MergeConflict
+from kvgit import MergeConflict, UnknownCommitError
 from kvgit.kv.memory import Memory
 from kvgit.merges import CantMark, text
 from kvgit.versioned.kv import VersionedKV as Versioned
@@ -119,6 +119,33 @@ class TestMergeHeads:
         with pytest.raises(MergeConflict) as exc_info:
             main.merge_heads(worker.current_commit, default_merge=text)
         assert isinstance(exc_info.value.merge_errors["doc"], CantMark)
+
+
+class TestEngineChecksItsCommits:
+    """A commit missing from the store reads as an empty tree, so the
+    engine refuses one up front rather than applying a change "to empty"
+    (removing every key) or reporting no common ancestor."""
+
+    def test_unknown_commits_are_refused_and_nothing_is_published(self):
+        store = Memory()
+        engine = Versioned(store)
+        engine.commit({"k": b"1"})
+        known = engine.current_commit
+        missing = "f" * 40
+        before = dict(store.items())
+
+        for attempt in (
+            lambda: engine.apply_change(known, missing),
+            lambda: engine.apply_change(missing, known),
+            lambda: engine.merge_heads(missing),
+            lambda: engine.apply_change(known, missing, on_conflict="abandon"),
+            lambda: engine.merge_heads(missing, on_conflict="abandon"),
+        ):
+            with pytest.raises(UnknownCommitError, match=missing):
+                attempt()
+        assert engine.latest_head == known
+        assert engine.get("k") == b"1"
+        assert dict(store.items()) == before
 
 
 class TestWorktreeMerge:
