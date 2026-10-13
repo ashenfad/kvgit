@@ -80,7 +80,10 @@ class Branches(Mapping[str, str]):
         The removal is conditional on the head this call read: if another
         writer moves the branch, or deletes and recreates it, in between,
         nothing is removed and the call raises rather than retrying, so a
-        newer head is never deleted on the strength of an older one.
+        newer head is never deleted on the strength of an older one. A
+        branch made again at the same commit is indistinguishable from
+        the one read, and is deleted, as with git's
+        ``update-ref -d <ref> <old-oid>``.
 
         Raises:
             UnknownBranchError: if there is no such branch.
@@ -144,9 +147,10 @@ class Tags(Mapping[str, str]):
         """Delete a tag. A commit it alone kept alive becomes collectable
         at the next ``gc``.
 
-        The removal is conditional on the head this call read: a tag
-        deleted and made again by another writer in between keeps its
-        new commit and info, and the call raises rather than retrying.
+        The removal is conditional on the head and info record this call
+        read: a tag deleted and made again by another writer in between,
+        even at the same commit, keeps its new commit and info, and the
+        call raises rather than retrying.
 
         Raises:
             UnknownTagError: if there is no such tag.
