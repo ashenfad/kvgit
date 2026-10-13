@@ -468,6 +468,37 @@ class TestInFlightMarkers:
             second.commit({"k": b"theirs"})
         assert list(store.keys("__inflight__")) == []
 
+    def test_a_withdrawal_leaves_a_marker_another_writer_rewrote(self):
+        """Another writer producing the same commit overwrites its marker
+        key with a marker of its own. An abandoned attempt withdrawing
+        afterwards must leave that marker: it is the other writer's
+        protection until it publishes."""
+        theirs = dumps(time.time() + 1234.5)
+        rewritten: list[str] = []
+
+        class RewriteBeforeWithdrawal(Memory):
+            def cas_many(self, expected, writes, removes=()):
+                removes = list(removes)
+                marker = next(
+                    (k for k in removes if k.startswith("__inflight__")), None
+                )
+                if marker is not None and not writes and not rewritten:
+                    self.set(marker, theirs)
+                    rewritten.append(marker)
+                return super().cas_many(expected, writes, removes)
+
+        store = RewriteBeforeWithdrawal()
+        worktree(store).commit()
+        first = VersionedKV(store)
+        second = VersionedKV(store)
+        first.commit({"k": b"ours"})
+        result = second.commit({"k": b"theirs"}, on_conflict="abandon")
+
+        assert not result.merged
+        assert rewritten, "the withdrawal never ran"
+        assert list(store.keys("__inflight__")) == rewritten
+        assert store.get(rewritten[0]) == theirs
+
     def test_a_lapsed_marker_releases_its_commit(self):
         """A writer that died before publishing leaves a marker that
         protects its commit only until it lapses; the next sweep then

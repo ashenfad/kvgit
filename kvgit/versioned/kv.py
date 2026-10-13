@@ -1867,14 +1867,19 @@ class VersionedKV(VersionedBase):
         """Restore in-memory state after a failed commit attempt.
 
         The attempt's commits are abandoned, so their in-flight markers
-        are withdrawn and they become ordinary orphans. Best effort: a
+        are withdrawn and they become ordinary orphans. Each marker goes
+        only if it still holds the bytes this handle wrote: another
+        writer that produced the same commit (same parents, content,
+        info and time) overwrote the key with its own marker, and that
+        writer's protection must stay until it publishes. Best effort: a
         marker left behind lapses after :data:`IN_FLIGHT_TTL`.
         """
         self._current_commit, self._commit_keys, self._meta = saved
         if self._in_flight:
-            markers = [IN_FLIGHT_KEY % commit for commit in self._in_flight]
-            self._in_flight = {}
-            self.store.remove_many(markers)
+            in_flight, self._in_flight = self._in_flight, {}
+            for commit, marker in in_flight.items():
+                key = IN_FLIGHT_KEY % commit
+                self.store.cas_many({key: marker}, {}, (key,))
 
     def _land_batch(self, commit: str, diffs: dict[str, bytes]) -> None:
         """Write a commit's batch, marked in flight, while no sweep runs.
@@ -2197,6 +2202,12 @@ class VersionedKV(VersionedBase):
     def _load_parents(self, commit_hash: str) -> tuple[str, ...]:
         """Load the parent tuple for a commit."""
         return load_parents(self.store, commit_hash)
+
+    def _missing_commits(self, commits: Iterable[str]) -> set[str]:
+        """Which of ``commits`` have no root in the store, in one read."""
+        keys = {commit: COMMIT_ROOT % commit for commit in commits}
+        found = self.store.get_many(list(keys.values()))
+        return {commit for commit, key in keys.items() if key not in found}
 
     def _find_lca(self, commit_a: str, commit_b: str) -> str | None:
         """Lowest common ancestor of two commits; see :func:`merge_base`."""

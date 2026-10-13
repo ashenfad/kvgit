@@ -3,7 +3,12 @@
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 
-from ..errors import ConcurrencyError, MergeConflict, UnknownBranchError
+from ..errors import (
+    ConcurrencyError,
+    MergeConflict,
+    UnknownBranchError,
+    UnknownCommitError,
+)
 from .helpers import changes_as_diff, walk_history
 from .merge import Change, MergeResolution, resolve_merge
 from .protocol import DiffResult, MergePolicy, MergeResult, PostCheck
@@ -372,16 +377,9 @@ class VersionedBase(ABC):
             raise
 
         if base is not None and not resolution:
-            # The change is already in our state, or changes nothing.
-            result = MergeResult(
-                merged=True,
-                commit=self._current_commit,
-                strategy="no_op",
-                auto_merged_keys=(),
-                carried_keys=(),
-            )
-            self.last_merge_result = result
-            return result
+            # The change is already in our state, or changes nothing: an
+            # answer that holds only while our state is the branch's.
+            return self._live_no_op(self._current_commit, on_conflict)
 
         if parents is None:
             # Concurrent-write default: keep following the moved HEAD, as
@@ -442,7 +440,8 @@ class VersionedBase(ABC):
         CAS-guarded on our own head (a race raises ``ConcurrencyError``
         and changes nothing). No common ancestor raises
         ``ConcurrencyError`` likewise without changing anything; retrying
-        cannot help that case, unlike a race.
+        cannot help that case, unlike a race. A ``their_head`` not in the
+        store raises ``UnknownCommitError`` before anything else is read.
 
         A head our history already contains merges as a no-op, provided
         the branch is still at our head. When ours
@@ -459,36 +458,13 @@ class VersionedBase(ABC):
             raise ValueError(
                 f"on_conflict must be 'raise' or 'abandon', got {on_conflict!r}"
             )
+        # Read as empty, an unknown head would surface as a misleading
+        # "no common ancestor".
+        self._require_commits(their_head)
         our_head = self._current_commit
         lca = self._find_lca(our_head, their_head)
         if lca == their_head:
-            # Nothing is written, so no publish guards this answer the way
-            # the other outcomes' CAS on our head does: check the branch
-            # is still where this handle left it.
-            live = self.latest_head
-            if live is None:
-                raise UnknownBranchError(f"Branch '{self._branch}' has no HEAD")
-            if live != our_head:
-                if on_conflict == "abandon":
-                    result = MergeResult(
-                        merged=False,
-                        commit=None,
-                        strategy="no_op",
-                        auto_merged_keys=(),
-                        carried_keys=(),
-                    )
-                    self.last_merge_result = result
-                    return result
-                raise ConcurrencyError("HEAD changed during merge. Refresh and retry.")
-            result = MergeResult(
-                merged=True,
-                commit=our_head,
-                strategy="no_op",
-                auto_merged_keys=(),
-                carried_keys=(),
-            )
-            self.last_merge_result = result
-            return result
+            return self._live_no_op(our_head, on_conflict)
         if lca == our_head and fast_forward:
             return self._fast_forward(their_head, on_conflict=on_conflict)
         return self._three_way_merge(
@@ -526,11 +502,28 @@ class VersionedBase(ABC):
         commit, CAS-guarded on our head — a cherry-pick is
         ``apply_change(parent, commit)`` and a revert
         ``apply_change(commit, parent)``.
+
+        A change already present commits nothing (``no_op``), provided the
+        branch is still at our head: if it moved, the answer may no longer
+        hold, and this raises ``ConcurrencyError`` (or abandons, with
+        ``on_conflict='abandon'``) as a lost publish would.
+
+        Raises:
+            UnknownCommitError: if ``base`` or ``target`` is not in the
+                store, checked before anything else is read.
+            UnknownBranchError: if the branch was deleted.
+            ConcurrencyError: if the branch moved during the apply, or
+                away from our head when the change is already present.
+            MergeConflict: if keys conflict and no merge function
+                resolves them.
         """
         if on_conflict not in ("raise", "abandon"):
             raise ValueError(
                 f"on_conflict must be 'raise' or 'abandon', got {on_conflict!r}"
             )
+        # A missing commit would read as an empty tree, and applying the
+        # change to or from empty removes or adds every key.
+        self._require_commits(base, target)
         our_head = self._current_commit
         return self._three_way_merge(
             target,
@@ -546,6 +539,47 @@ class VersionedBase(ABC):
             base=base,
             strategy="apply",
         )
+
+    def _live_no_op(self, our_head: str, on_conflict: str) -> MergeResult:
+        """A merge or apply that changes nothing, at ``our_head``.
+
+        Nothing is written, so no publish guards this answer the way the
+        other outcomes' CAS on our head does: it holds only if the branch
+        is still where this handle left it. A branch that moved raises
+        ``ConcurrencyError``, or abandons under ``on_conflict='abandon'``.
+        """
+        live = self.latest_head
+        if live is None:
+            raise UnknownBranchError(f"Branch '{self._branch}' has no HEAD")
+        if live != our_head:
+            if on_conflict == "abandon":
+                result = MergeResult(
+                    merged=False,
+                    commit=None,
+                    strategy="no_op",
+                    auto_merged_keys=(),
+                    carried_keys=(),
+                )
+                self.last_merge_result = result
+                return result
+            raise ConcurrencyError("HEAD changed during merge. Refresh and retry.")
+        result = MergeResult(
+            merged=True,
+            commit=our_head,
+            strategy="no_op",
+            auto_merged_keys=(),
+            carried_keys=(),
+        )
+        self.last_merge_result = result
+        return result
+
+    def _require_commits(self, *commits: str) -> None:
+        """Raise ``UnknownCommitError`` for the first of ``commits`` that is
+        not in the store."""
+        missing = self._missing_commits(commits)
+        for commit in commits:
+            if commit in missing:
+                raise UnknownCommitError(f"Commit '{commit}' does not exist")
 
     # -- Abstract methods (implemented by subclasses) --
 
@@ -610,6 +644,10 @@ class VersionedBase(ABC):
     @abstractmethod
     def _load_parents(self, commit_hash: str) -> tuple[str, ...]:
         """Load the parent tuple for a commit."""
+
+    @abstractmethod
+    def _missing_commits(self, commits: Iterable[str]) -> set[str]:
+        """Which of ``commits`` are not in the store."""
 
     @abstractmethod
     def _find_lca(self, commit_a: str, commit_b: str) -> str | None:

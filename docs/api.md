@@ -268,7 +268,7 @@ Finding the common ancestor costs a few batched reads however long the history: 
 
 #### `apply(base, target, **options) -> MergeResult`
 
-Apply the change from commit `base` to commit `target` onto this branch, as an ordinary single-parent commit. `base` stands in for the common ancestor in a three-way merge between this branch's head and `target`, so keys the change did not touch are left as they are. A change already present is a no-op.
+Apply the change from commit `base` to commit `target` onto this branch, as an ordinary single-parent commit. `base` stands in for the common ancestor in a three-way merge between this branch's head and `target`, so keys the change did not touch are left as they are. A change already present is a no-op (`strategy="no_op"`, nothing written), provided the branch is still at the worktree's `head`: `ConcurrencyError` (or a falsy result under `"abandon"`) if it moved, `UnknownBranchError` if it was deleted. `UnknownCommitError` if `base` or `target` is not in the store.
 
 #### `cherry_pick(commit, **options) -> MergeResult`
 
@@ -618,7 +618,7 @@ Every error kvgit raises about the state of a store derives from `KvgitError`, s
 | `MergeConflict` | A merge leaves keys no rule resolves (below) |
 | `UnknownBranchError` | A branch does not exist — `worktree`, `branches[name]`, `branches.delete`, `snapshot(branch=)`, a commit, `reset` or `refresh` on a deleted branch |
 | `UnknownTagError` | A tag does not exist — `tags[name]`, `tags.delete`, `tags.info`, `snapshot(tag=)`, `log(tag=)` |
-| `UnknownCommitError` | A commit is not in the store — `get_commit`, `branches.create(at=)`, `tags.create`, `reset`, `diff`, `merge_base`, a dangling tag |
+| `UnknownCommitError` | A commit is not in the store — `get_commit`, `branches.create(at=)`, `tags.create`, `reset`, `merge`, `apply`, `diff`, `merge_base`, a dangling tag |
 | `BranchExistsError` | `branches.create` over a taken name |
 | `TagExistsError` | `tags.create` over a taken name |
 | `CorruptHeadError` | A branch HEAD is damaged and nothing recovers it; see [HEAD Recovery](#head-recovery) |
@@ -872,7 +872,7 @@ A commit lands in two steps: the batch that writes its nodes, blobs, chunks and 
 
 So the batch also writes an in-flight marker, `__inflight__<commit>`, holding the time its protection lapses (`IN_FLIGHT_TTL`, 600 seconds), and the publishing write removes it in the same atomic step that moves HEAD. A sweep reads the markers *before* the branch heads: a commit published after its marker was read is under a head read later, and one published before has no marker to miss. So a commit in flight is marked live whatever `min_age` says, and a sweep never deletes a commit whose writer is about to publish it — or whose writer is still reading it back, as the merge path does.
 
-A writer that abandons its attempt withdraws its markers; one that dies leaves them, and they lapse, after which the next sweep takes the commit like any other orphan. The publishing write also expects the lease record — the one its latest batch landed against, so the common case costs no extra read — which keeps a publish from landing between a sweep's scans and its removals. And it expects each marker to hold the bytes its writer wrote, so a writer that took longer than `IN_FLIGHT_TTL` to publish — whose marker lapsed and may have been reaped along with its commit — gets an error instead of a head over a commit that is gone.
+A writer that abandons its attempt withdraws its markers, each only if it still holds the bytes that writer wrote (another writer producing the identical commit rewrites the key, and its protection stays); one that dies leaves them, and they lapse, after which the next sweep takes the commit like any other orphan. The publishing write also expects the lease record — the one its latest batch landed against, so the common case costs no extra read — which keeps a publish from landing between a sweep's scans and its removals. And it expects each marker to hold the bytes its writer wrote, so a writer that took longer than `IN_FLIGHT_TTL` to publish — whose marker lapsed and may have been reaped along with its commit — gets an error instead of a head over a commit that is gone.
 
 **A writer that bypasses kvgit is still exposed**: a process editing the backend directly, or an older kvgit (which the storage version stamp locks out), can land writes a sweep never saw.
 
