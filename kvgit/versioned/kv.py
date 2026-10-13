@@ -706,13 +706,19 @@ def _tag_branch(name: str) -> str:
 
 
 def _reject_reserved_branch(name: str) -> None:
-    """Refuse a branch name inside the reserved tag namespace.
+    """Refuse the empty branch name, and names in the reserved tag namespace.
+
+    An empty name would write the bare head key: a branch that exists,
+    takes commits and roots a sweep, but that :meth:`VersionedKV.branches`
+    never lists.
 
     The branch API does not hand out names under ``refs/tags/``, because
     a branch there would be indistinguishable from a tag: it would show
     up in ``tags()``, and moving it would silently move the tag. Tags
     are created, listed and deleted through the tag API instead.
     """
+    if name == "":
+        raise ValueError("Branch name must be a non-empty string")
     if isinstance(name, str) and name.startswith(TAG_BRANCH_PREFIX):
         raise ValueError(
             f"Branch name {name!r} is reserved for tags "
@@ -967,16 +973,33 @@ def create_branch(store: KVStore, name: str, target: str) -> None:
 def delete_branch(store: KVStore, name: str) -> None:
     """Delete a branch: its head and its backup, in one removal.
 
-    Its commits become collectable at the next :func:`gc`.
+    Its commits become collectable at the next :func:`gc`. The removal
+    expects the exact head bytes this call read, so a branch that moved,
+    or was deleted and made again, in between is left alone and the call
+    raises. It is not retried: the decision to delete was made about the
+    head that was read, and a retry would delete a newer one. A caller
+    that wants the newer head gone too reads it again and deletes again.
+
+    A delete does not wait out a sweep. Removing a root from under one
+    only means the sweep keeps what that root reached until the next.
 
     Raises:
         UnknownBranchError: if there is no such branch.
+        ConcurrencyError: if the head changed between the read and the
+            removal; nothing was removed.
+        ValueError: if ``name`` is empty or in the reserved tag namespace.
     """
     _reject_reserved_branch(name)
     branch_key = BRANCH_HEAD % name
-    if store.get(branch_key) is None:
+    current = store.get(branch_key)
+    if current is None:
         raise UnknownBranchError(f"Branch '{name}' does not exist")
-    store.remove_many([branch_key, BRANCH_HEAD_PREV % name])
+    if not store.cas_many(
+        {branch_key: current}, {}, (branch_key, BRANCH_HEAD_PREV % name)
+    ):
+        raise ConcurrencyError(
+            f"Branch '{name}' changed while being deleted; nothing was removed"
+        )
 
 
 def create_tag(
@@ -1032,16 +1055,28 @@ def delete_tag(store: KVStore, name: str) -> None:
     let head resolution serve the deleted tag's commit under a later
     branch of the same reserved name.
 
+    The removal expects the exact head bytes this call read, so a tag
+    deleted and made again in between keeps its new head and record, and
+    the call raises. It is not retried, since a retry would delete the
+    newer tag. Nor does it wait out a sweep: removing a root from under
+    one only means the sweep keeps what that root reached until the next.
+
     Raises:
         UnknownTagError: if there is no such tag.
+        ConcurrencyError: if the tag's head changed between the read and
+            the removal; nothing was removed.
+        ValueError: if ``name`` is not a valid tag name.
     """
     _validate_tag_name(name)
     head_key = BRANCH_HEAD % _tag_branch(name)
-    if store.get(head_key) is None:
+    current = store.get(head_key)
+    if current is None:
         raise UnknownTagError(f"Tag '{name}' does not exist")
-    store.remove_many(
-        [head_key, BRANCH_HEAD_PREV % _tag_branch(name), TAG_INFO_KEY % name]
-    )
+    removes = (head_key, BRANCH_HEAD_PREV % _tag_branch(name), TAG_INFO_KEY % name)
+    if not store.cas_many({head_key: current}, {}, removes):
+        raise ConcurrencyError(
+            f"Tag '{name}' changed while being deleted; nothing was removed"
+        )
 
 
 def commit_changes(
@@ -2227,7 +2262,15 @@ class VersionedKV(VersionedBase):
         )
 
     def delete_branch(self, name: str) -> None:
-        """Delete a branch and clean up orphaned commits."""
+        """Delete a branch and clean up orphaned commits.
+
+        Raises:
+            UnknownBranchError: if there is no such branch.
+            ConcurrencyError: if the branch's head changed while it was
+                being deleted; nothing was removed.
+            ValueError: if ``name`` is the current branch, empty, or in
+                the reserved tag namespace.
+        """
         _reject_reserved_branch(name)
         if name == self._branch:
             raise ValueError("Cannot delete the current branch")
@@ -2346,13 +2389,13 @@ class VersionedKV(VersionedBase):
         """Whether a branch exists — openable without creating.
 
         The same predicate :meth:`branches` lists by: the branch has a
-        HEAD entry. Reserved ``refs/tags/`` names are never branches,
-        so they read as missing here as they are excluded there. A
-        damaged HEAD still counts as existing; opening it raises either
-        way. Never writes, so checking cannot resurrect a deleted
-        branch.
+        HEAD entry. The empty name and reserved ``refs/tags/`` names are
+        never branches, so they read as missing here as they are
+        excluded there. A damaged HEAD still counts as existing; opening
+        it raises either way. Never writes, so checking cannot resurrect
+        a deleted branch.
         """
-        if not isinstance(name, str) or name.startswith(TAG_BRANCH_PREFIX):
+        if not isinstance(name, str) or not name or name.startswith(TAG_BRANCH_PREFIX):
             return False
         return store.get(BRANCH_HEAD % name) is not None
 
@@ -2438,6 +2481,11 @@ class VersionedKV(VersionedBase):
         committing — where leaving it behind would let head resolution
         serve the deleted tag's commit under a later branch of the same
         reserved name.
+
+        Raises:
+            UnknownTagError: if there is no such tag.
+            ConcurrencyError: if the tag's head changed while it was being
+                deleted; nothing was removed, and no sweep ran.
         """
         delete_tag(self.store, name)
         self.clean_orphans()

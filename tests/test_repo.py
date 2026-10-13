@@ -12,6 +12,7 @@ import kvgit
 from kvgit import (
     BranchExistsError,
     Commit,
+    ConcurrencyError,
     CorruptHeadError,
     GcBusy,
     KvgitError,
@@ -32,6 +33,7 @@ from kvgit.versioned.kv import (
     COMMIT_ROOT,
     ROOT_COMMIT,
     STORAGE_VERSION_KEY,
+    VersionedKV,
     _acquire_gc_lease,
 )
 
@@ -290,6 +292,123 @@ class TestTags:
                 attempt()
         assert reserved not in repo.branches
         assert dict(repo.tags) == {"v1": wt.head}
+
+
+class TestEmptyBranchName:
+    """An empty name would write the bare head key: a branch that takes
+    commits and roots a sweep, but that no listing shows."""
+
+    def test_every_branch_method_refuses_it(self):
+        repo, *_ = repo_with_history()
+        before = dict(repo.store.items())
+        for attempt in (
+            lambda: repo.worktree("", create=True),
+            lambda: repo.worktree(""),
+            lambda: repo.branches.create(""),
+            lambda: repo.branches.delete(""),
+            lambda: repo.branches[""],
+            lambda: repo.repair_head(""),
+            lambda: repo.snapshot(branch=""),
+            lambda: VersionedKV(repo.store, branch=""),
+        ):
+            with pytest.raises(ValueError, match="non-empty"):
+                attempt()
+        assert "" not in repo.branches
+        assert list(repo.branches) == ["dev", "main"]
+        assert dict(repo.store.items()) == before
+
+    def test_a_bare_head_key_is_not_a_branch(self):
+        """Written by older code, it still does not read as a branch."""
+        repo, wt, *_ = repo_with_history()
+        repo.store.set(BRANCH_HEAD % "", dumps(wt.head))
+        assert "" not in repo.branches
+        assert not VersionedKV.exists(repo.store, "")
+
+
+class DeleteRaceMemory(Memory):
+    """Runs a one-shot hook just before a ``cas_many`` that removes a
+    given key: the window between a delete's read and its removal."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.hooks: dict[str, object] = {}
+
+    def before_removing(self, key: str, hook) -> None:
+        self.hooks[key] = hook
+
+    def cas_many(self, expected, writes, removes=()):
+        removes = list(removes)
+        for key in removes:
+            hook = self.hooks.pop(key, None)
+            if hook is not None:
+                hook()  # type: ignore[operator]
+        return super().cas_many(expected, writes, removes)
+
+
+class TestStaleDeletes:
+    """A delete decides on the head it read. If another writer replaces
+    that head before the removal lands, the delete removes nothing and
+    raises; it does not retry, which would delete the newer head."""
+
+    def test_a_branch_made_again_in_the_meantime_survives(self):
+        store = DeleteRaceMemory()
+        wt = worktree(store)
+        repo = wt.repo
+        repo.branches.create("dev")
+        wt["k"] = "new history"
+        wt.commit()
+        newer = wt.head
+        seen: dict[str, bytes] = {}
+
+        def delete_and_recreate():
+            Repo(store).branches.delete("dev")
+            Repo(store).branches.create("dev", at=newer)
+            seen.update(store.items())
+
+        store.before_removing(BRANCH_HEAD % "dev", delete_and_recreate)
+        with pytest.raises(ConcurrencyError, match="nothing was removed"):
+            repo.branches.delete("dev")
+        assert repo.branches["dev"] == newer
+        assert dict(store.items()) == seen
+
+    def test_a_branch_that_moved_is_not_deleted(self):
+        store = DeleteRaceMemory()
+        wt = worktree(store)
+        dev = fork(wt, "dev")
+
+        def advance():
+            dev["k"] = "moved"
+            dev.commit()
+
+        store.before_removing(BRANCH_HEAD % "dev", advance)
+        with pytest.raises(ConcurrencyError):
+            wt.repo.branches.delete("dev")
+        assert wt.repo.branches["dev"] == dev.head
+        # Read again, the caller can delete the newer head deliberately.
+        wt.repo.branches.delete("dev")
+        assert "dev" not in wt.repo.branches
+
+    def test_a_tag_made_again_in_the_meantime_survives(self):
+        store = DeleteRaceMemory()
+        wt = worktree(store)
+        repo = wt.repo
+        wt["k"] = 1
+        wt.commit()
+        repo.tags.create("v1", ROOT_COMMIT)
+        seen: dict[str, bytes] = {}
+
+        def delete_and_recreate():
+            other = Repo(store)
+            other.tags.delete("v1")
+            other.tags.create("v1", wt.head, info={"note": "replacement"})
+            seen.update(store.items())
+
+        store.before_removing(BRANCH_HEAD % "refs/tags/v1", delete_and_recreate)
+        with pytest.raises(ConcurrencyError, match="nothing was removed"):
+            repo.tags.delete("v1")
+        assert repo.tags["v1"] == wt.head
+        assert repo.tags.info("v1").info == {"note": "replacement"}
+        assert dict(store.items()) == seen
 
 
 class TestCommits:
