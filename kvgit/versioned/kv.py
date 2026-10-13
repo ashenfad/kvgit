@@ -975,10 +975,17 @@ def delete_branch(store: KVStore, name: str) -> None:
 
     Its commits become collectable at the next :func:`gc`. The removal
     expects the exact head bytes this call read, so a branch that moved,
-    or was deleted and made again, in between is left alone and the call
-    raises. It is not retried: the decision to delete was made about the
-    head that was read, and a retry would delete a newer one. A caller
-    that wants the newer head gone too reads it again and deletes again.
+    or was deleted and made again elsewhere, in between is left alone and
+    the call raises. It is not retried: the decision to delete was made
+    about the head that was read, and a retry would delete a newer one. A
+    caller that wants the newer head gone too reads it again and deletes
+    again.
+
+    A head holds only the commit it names, so a branch deleted and made
+    again at the *same* commit is indistinguishable from the one read,
+    and the delete removes it, as git's ``update-ref -d <ref> <old-oid>``
+    would. The state removed is exactly the state the caller decided to
+    delete.
 
     A delete does not wait out a sweep. Removing a root from under one
     only means the sweep keeps what that root reached until the next.
@@ -1055,25 +1062,32 @@ def delete_tag(store: KVStore, name: str) -> None:
     let head resolution serve the deleted tag's commit under a later
     branch of the same reserved name.
 
-    The removal expects the exact head bytes this call read, so a tag
-    deleted and made again in between keeps its new head and record, and
-    the call raises. It is not retried, since a retry would delete the
-    newer tag. Nor does it wait out a sweep: removing a root from under
-    one only means the sweep keeps what that root reached until the next.
+    The removal expects the exact head and info-record bytes this call
+    read, so a tag deleted and made again in between keeps its new head
+    and record, and the call raises. That holds even for a tag made again
+    at the same commit: its record carries the time it landed, so the
+    record differs where the head does not. A tag with no record is
+    compared by its head alone. The call is not retried, since a retry
+    would delete the newer tag. Nor does it wait out a sweep: removing a
+    root from under one only means the sweep keeps what that root reached
+    until the next.
 
     Raises:
         UnknownTagError: if there is no such tag.
-        ConcurrencyError: if the tag's head changed between the read and
-            the removal; nothing was removed.
+        ConcurrencyError: if the tag's head or record changed between the
+            read and the removal; nothing was removed.
         ValueError: if ``name`` is not a valid tag name.
     """
     _validate_tag_name(name)
     head_key = BRANCH_HEAD % _tag_branch(name)
-    current = store.get(head_key)
+    record_key = TAG_INFO_KEY % name
+    found = store.get_many([head_key, record_key])
+    current = found.get(head_key)
     if current is None:
         raise UnknownTagError(f"Tag '{name}' does not exist")
-    removes = (head_key, BRANCH_HEAD_PREV % _tag_branch(name), TAG_INFO_KEY % name)
-    if not store.cas_many({head_key: current}, {}, removes):
+    expected = {head_key: current, record_key: found.get(record_key)}
+    removes = (head_key, BRANCH_HEAD_PREV % _tag_branch(name), record_key)
+    if not store.cas_many(expected, {}, removes):
         raise ConcurrencyError(
             f"Tag '{name}' changed while being deleted; nothing was removed"
         )

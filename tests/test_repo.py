@@ -33,6 +33,7 @@ from kvgit.versioned.kv import (
     COMMIT_ROOT,
     ROOT_COMMIT,
     STORAGE_VERSION_KEY,
+    TAG_INFO_KEY,
     VersionedKV,
     _acquire_gc_lease,
 )
@@ -409,6 +410,37 @@ class TestStaleDeletes:
         assert repo.tags["v1"] == wt.head
         assert repo.tags.info("v1").info == {"note": "replacement"}
         assert dict(store.items()) == seen
+
+    def test_a_tag_made_again_at_the_same_commit_survives(self):
+        """The head bytes match, but the replacement's info record (its
+        time and info) does not, and the stale delete must not take it."""
+        store = DeleteRaceMemory()
+        wt = worktree(store)
+        repo = wt.repo
+        wt["k"] = 1
+        wt.commit()
+        repo.tags.create("v1", wt.head, info={"note": "original"})
+        seen: dict[str, bytes] = {}
+
+        def delete_and_recreate():
+            other = Repo(store)
+            other.tags.delete("v1")
+            other.tags.create("v1", wt.head, info={"note": "replacement"})
+            seen.update(store.items())
+
+        store.before_removing(BRANCH_HEAD % "refs/tags/v1", delete_and_recreate)
+        with pytest.raises(ConcurrencyError, match="nothing was removed"):
+            repo.tags.delete("v1")
+        assert repo.tags["v1"] == wt.head
+        assert repo.tags.info("v1").info == {"note": "replacement"}
+        assert dict(store.items()) == seen
+
+    def test_a_tag_with_no_record_is_compared_by_its_head(self):
+        repo, wt, *_ = repo_with_history()
+        repo.tags.create("v1", wt.head)
+        repo.store.remove(TAG_INFO_KEY % "v1")
+        repo.tags.delete("v1")
+        assert "v1" not in repo.tags
 
 
 class TestCommits:

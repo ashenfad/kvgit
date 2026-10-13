@@ -110,7 +110,7 @@ repo.branches.delete("fix")
 | `branches[name]` | `str` | The commit a branch points at. `UnknownBranchError` (a `KeyError`) if missing; `CorruptHeadError` if its HEAD is damaged beyond recovery — from `get()` too, since damage is not absence. |
 | `name in branches`, `iter`, `len`, `get`, `keys`, `items`, `values` | | The `Mapping` protocol; iteration is by name, sorted |
 | `create(name, at=None)` | `str` | Create a branch at commit `at` (default: the empty root commit); returns that commit. `BranchExistsError` if taken, `UnknownCommitError` if `at` is not in the store. |
-| `delete(name)` | `None` | Delete any branch, including the last one and one with open worktrees. Removes its HEAD and HEAD backup; its commits become collectable at the next [`gc()`](#garbage-collection). `UnknownBranchError` if missing; `ConcurrencyError`, with nothing removed, if the branch moved or was recreated between the read and the removal. |
+| `delete(name)` | `None` | Delete any branch, including the last one and one with open worktrees. Removes its HEAD and HEAD backup; its commits become collectable at the next [`gc()`](#garbage-collection). `UnknownBranchError` if missing; `ConcurrencyError`, with nothing removed, if the branch moved or was recreated elsewhere between the read and the removal. A branch recreated at the same commit is indistinguishable and is deleted, as with git's `update-ref -d <ref> <old-oid>`. |
 
 Moving a branch is a worktree's job: `Worktree.reset(commit)`, or a commit or merge.
 
@@ -140,7 +140,7 @@ repo.tags.delete("v1")
 | `tags[name]` | `str` | The commit a tag names — even if that commit is no longer in the store (`info(name).dangling`). `UnknownTagError` (a `KeyError`) if missing. |
 | `name in tags`, `iter`, `len`, `get`, `keys`, `items`, `values` | | The `Mapping` protocol; iteration is by name, sorted, and `items()` reads every tag in one pass |
 | `create(name, commit, *, info=None)` | `None` | Name a commit permanently. `TagExistsError` if taken, `UnknownCommitError` if the commit is not in the store. `info` must be JSON-serializable. |
-| `delete(name)` | `None` | Remove a tag. A commit only it kept alive becomes collectable at the next `gc()`. `UnknownTagError` if missing; `ConcurrencyError`, with nothing removed, if the tag was recreated between the read and the removal. |
+| `delete(name)` | `None` | Remove a tag. A commit only it kept alive becomes collectable at the next `gc()`. `UnknownTagError` if missing; `ConcurrencyError`, with nothing removed, if the tag was recreated between the read and the removal, even at the same commit (its info record carries its creation time). |
 | `info(name)` | `TagInfo` | Details for one tag. `UnknownTagError` if missing. |
 
 See [Tags](#tags) for the semantics.

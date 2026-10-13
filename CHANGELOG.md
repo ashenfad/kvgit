@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **An empty branch name is refused.** It used to create a branch under the bare head key that took commits but never appeared in `repo.branches`; every branch method now raises `ValueError` for it, as for a reserved name.
-- **A stale branch or tag delete no longer removes a newer head.** `branches.delete` and `tags.delete` remove only if the head still holds the bytes they read, and otherwise raise `ConcurrencyError` with nothing removed (#72).
+- **A stale branch or tag delete no longer removes a newer head.** `branches.delete` and `tags.delete` remove only if the head (and a tag's info record) still holds the bytes they read, and otherwise raise `ConcurrencyError` with nothing removed (#72). A branch recreated at the same commit is indistinguishable from the one read and is still deleted, as with git's `update-ref -d`.
 
 ## [0.4.2] - 2026-09-28
 
