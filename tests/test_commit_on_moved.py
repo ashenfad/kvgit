@@ -105,6 +105,25 @@ def test_still_merges_by_default_and_commits_cleanly_after_a_refresh():
     assert repo.get_commit(landed.commit).parents == (tip,)
 
 
+def test_refuses_a_commit_with_nothing_to_write_when_the_branch_moved():
+    repo, _, _, a, b = two_writers()
+    # a clean worktree on the head the branch is about to leave
+    clean = repo.worktree("main")
+    first = a.commit().commit
+
+    with pytest.raises(BranchMovedError) as caught:
+        clean.commit(on_moved="raise")
+    assert caught.value.head == first
+    # pending changes, none of them selected
+    with pytest.raises(BranchMovedError):
+        b.commit(keys=set(), on_moved="raise")
+    assert b.status().updated == {"b"}
+    # by default, and on an unmoved branch, it is still a no-op
+    assert clean.commit().strategy == "no_op"
+    clean.refresh()
+    assert clean.commit(on_moved="raise").strategy == "no_op"
+
+
 def test_fast_forwards_when_the_branch_has_not_moved():
     repo, _, base, a, _ = two_writers()
     result = a.commit(on_moved="raise")

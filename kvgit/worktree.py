@@ -267,7 +267,8 @@ class Worktree(MutableMapping[str, Any]):
 
         Raises:
             BranchMovedError: with ``on_moved="raise"``, the branch moved
-                since this worktree's head; ``err.head`` is the tip found.
+                since this worktree's head, even with nothing to commit;
+                ``err.head`` is the tip found.
                 Nothing is written and the pending changes stay readable;
                 :meth:`refresh` then moves to the tip (dropping them) to
                 redo the work.

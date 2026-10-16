@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **`commit(on_moved="raise")` refuses to merge onto a moved branch.** A commit whose branch moved since the worktree's head raises the new `BranchMovedError` (a `ConcurrencyError` carrying the `head` it found), writes nothing and keeps the pending changes; the default, `"merge"`, is unchanged.
+- **`commit(on_moved="raise")` refuses to merge onto a moved branch.** A commit whose branch moved since the worktree's head raises the new `BranchMovedError` (a `ConcurrencyError` carrying the `head` it found), even with nothing to commit, writes nothing and keeps the pending changes; the default, `"merge"`, is unchanged.
 
 ### Fixed
 - **An empty branch name is refused.** It used to create a branch under the bare head key that took commits but never appeared in `repo.branches`; every branch method now raises `ValueError` for it, as for a reserved name.
