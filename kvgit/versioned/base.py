@@ -198,8 +198,16 @@ class VersionedBase(ABC):
         if on_moved not in ("merge", "raise"):
             raise ValueError(f"on_moved must be 'merge' or 'raise', got {on_moved!r}")
 
-        # No-op if no changes
+        # No-op if no changes. With on_moved="raise" a moved branch still
+        # raises, since the caller's base is out of date whether or not it
+        # had anything to write.
         if not updates and not removals and info is None:
+            if on_moved == "raise":
+                head = self.latest_head
+                if head is None:
+                    raise UnknownBranchError(f"Branch '{self._branch}' has no HEAD")
+                if head != self._base_commit:
+                    raise BranchMovedError(self._branch, self._base_commit, head)
             result = MergeResult(
                 merged=True,
                 commit=self._current_commit,

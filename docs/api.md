@@ -236,7 +236,7 @@ Encode pending changes and write them as one atomic commit. If the branch has mo
 
 Raises `MergeConflict` on a conflict in `"raise"` mode, `ConcurrencyError` if the commit keeps losing the race to publish, and `UnknownBranchError` if the branch was deleted.
 
-**Refusing to merge.** Where keys are not independent (pages of one database, say), a merge of two disjoint changes is a state neither writer made. With `on_moved="raise"` the commit lands only as a fast-forward from `head`, decided by the same compare-and-swap that publishes it. If the branch moved, before the commit or inside that swap, it raises `BranchMovedError`, a `ConcurrencyError` whose `head` is the tip it found, whatever `on_conflict` says. Nothing reachable is written and the pending changes stay; `refresh()` then moves to the tip (dropping them) to redo the work.
+**Refusing to merge.** Where keys are not independent (pages of one database, say), a merge of two disjoint changes is a state neither writer made. With `on_moved="raise"` the commit lands only as a fast-forward from `head`, decided by the same compare-and-swap that publishes it. If the branch moved, before the commit or inside that swap, it raises `BranchMovedError` (with nothing to commit too), a `ConcurrencyError` whose `head` is the tip it found, whatever `on_conflict` says. Nothing reachable is written and the pending changes stay; `refresh()` then moves to the tip (dropping them) to redo the work.
 
 ```python
 try:
