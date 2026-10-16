@@ -1,7 +1,10 @@
 """Shared commit/merge orchestration for versioned stores."""
 
+import functools
+import weakref
 from abc import ABC, abstractmethod
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Iterator, KeysView
+from typing import Any, TypeVar
 
 from ..errors import (
     BranchMovedError,
@@ -13,6 +16,54 @@ from ..errors import (
 from .helpers import changes_as_diff, walk_history
 from .merge import Change, MergeResolution, resolve_merge
 from .protocol import DiffResult, MergePolicy, MergeResult, PostCheck
+
+_F = TypeVar("_F", bound=Callable[..., Any])
+
+
+class _CommitKeys(KeysView):
+    """The keys of one commit, as ``VersionedBase.keys`` hands them out.
+
+    A commit changes the handle's key dict in place. While a view (or
+    an iteration over it) is alive, the handle changes a copy instead,
+    so the view keeps the keys it was taken at, as a view of a dict the
+    handle replaced would.
+    """
+
+    __slots__ = ("__weakref__", "_keys")
+
+    def __init__(self, keys: dict[str, str]) -> None:
+        super().__init__(keys)
+        self._keys = keys
+
+    def __iter__(self) -> Iterator[str]:
+        # A generator, so a running iteration keeps its view alive.
+        yield from self._keys
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}({list(self._keys)!r})"
+
+
+def _viewing(ref: "weakref.ref[_CommitKeys]", keys: dict[str, str]) -> bool:
+    """Whether the view ``ref`` names is alive and over ``keys``."""
+    view = ref()
+    return view is not None and view._keys is keys
+
+
+def _rolls_back(method: _F) -> _F:
+    """Wrap a state-changing call: one that raises partway rolls back
+    the attempt it opened, leaving the handle as it found it."""
+
+    @functools.wraps(method)
+    def wrapper(self: "VersionedBase", *args: Any, **kwargs: Any) -> Any:
+        try:
+            return method(self, *args, **kwargs)
+        except BaseException:
+            self._roll_back_attempt()
+            raise
+        finally:
+            self._end_attempt()
+
+    return wrapper  # type: ignore[return-value]
 
 
 class VersionedBase(ABC):
@@ -30,6 +81,8 @@ class VersionedBase(ABC):
         self._current_commit: str = commit_hash
         self._base_commit: str = commit_hash
         self._commit_keys: dict[str, str] = {}
+        # Views handed out by ``keys()``, by weak reference.
+        self._key_views: list[weakref.ref[_CommitKeys]] = []
         self._merge_fns: dict[str, MergePolicy] = {}
         self._merge_prefixes: dict[str, MergePolicy] = {}
         self._default_merge: MergePolicy | None = None
@@ -70,8 +123,30 @@ class VersionedBase(ABC):
     # -- Read operations --
 
     def keys(self) -> Iterable[str]:
-        """All keys in the current commit."""
-        return self._commit_keys.keys()
+        """All keys in the current commit.
+
+        The view keeps the keys it was taken at: a later commit doesn't
+        change it.
+        """
+        view = _CommitKeys(self._commit_keys)
+        self._key_views = [r for r in self._key_views if r() is not None]
+        self._key_views.append(weakref.ref(view))
+        return view
+
+    def _owned_keys(self) -> dict[str, str]:
+        """``_commit_keys``, ready to change in place.
+
+        A commit changes the dict rather than rebuilding it, so its cost
+        follows the size of the change. While a view from ``keys()`` is
+        alive, the change goes to a copy instead and the view keeps the
+        dict it was taken over.
+        """
+        keys = self._commit_keys
+        if self._key_views:
+            if any(_viewing(r, keys) for r in self._key_views):
+                keys = self._commit_keys = dict(keys)
+            self._key_views = []
+        return keys
 
     def __contains__(self, key: str) -> bool:
         return key in self._commit_keys
@@ -135,6 +210,7 @@ class VersionedBase(ABC):
 
     # -- Commit orchestration --
 
+    @_rolls_back
     def commit(
         self,
         updates: dict[str, bytes] | None = None,
@@ -460,6 +536,7 @@ class VersionedBase(ABC):
             "HEAD changed during three-way merge. Refresh and retry."
         )
 
+    @_rolls_back
     def merge_heads(
         self,
         their_head: str,
@@ -521,6 +598,7 @@ class VersionedBase(ABC):
             ancestor=(lca,),
         )
 
+    @_rolls_back
     def apply_change(
         self,
         base: str,
@@ -640,6 +718,13 @@ class VersionedBase(ABC):
     @abstractmethod
     def _restore_state(self, saved: tuple) -> None:
         """Restore in-memory state after a failed commit attempt."""
+
+    def _roll_back_attempt(self) -> None:  # noqa: B027 - optional hook
+        """Restore the state an attempt opened by ``_snapshot_state``
+        started from, if one is still open: the call running it raised."""
+
+    def _end_attempt(self) -> None:  # noqa: B027 - optional hook
+        """Forget the open attempt, if any: the call running it is over."""
 
     @abstractmethod
     def _create_commit(
