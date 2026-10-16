@@ -4,6 +4,7 @@ from ._open import open
 from .content_types import MergeFn, counter, last_writer_wins, text_merge
 from .errors import (
     BranchExistsError,
+    BranchMovedError,
     ConcurrencyError,
     CorruptHeadError,
     GcBusy,
@@ -40,6 +41,7 @@ from .worktree import Status, Worktree
 __all__ = [
     "ROOT_COMMIT",
     "BranchExistsError",
+    "BranchMovedError",
     "Branches",
     "CantMark",
     "Commit",

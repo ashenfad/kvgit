@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable
 
 from ..errors import (
+    BranchMovedError,
     ConcurrencyError,
     MergeConflict,
     UnknownBranchError,
@@ -140,6 +141,7 @@ class VersionedBase(ABC):
         removals: set[str] | None = None,
         *,
         on_conflict: str = "raise",
+        on_moved: str = "merge",
         merge_fns: dict[str, MergePolicy] | None = None,
         merge_prefixes: dict[str, MergePolicy] | None = None,
         default_merge: MergePolicy | None = None,
@@ -156,10 +158,20 @@ class VersionedBase(ABC):
         so a single well-behaved writer never sees ``ConcurrencyError``
         for a race it can merge past.
 
+        With ``on_moved="raise"`` a moved HEAD raises
+        :class:`BranchMovedError` instead of merging, whether it moved
+        before the commit started or inside the CAS window: the only
+        commit that can land is the fast-forward, published by the one
+        CAS that expects HEAD at the base. A commit that loses withdraws
+        its in-flight marker, leaving nothing reachable.
+
         Args:
             updates: Key-value pairs to add or update (bytes values).
             removals: Keys to remove.
             on_conflict: ``'raise'`` (default) or ``'abandon'`` for CAS failures.
+            on_moved: ``'merge'`` (default) three-way merges onto a HEAD
+                that moved since this handle's base; ``'raise'`` raises
+                :class:`BranchMovedError` and writes nothing.
             merge_fns: Per-key registrations (override instance-level).
                 A merge function, or a ``MergeChoice`` giving one side
                 every key it covers.
@@ -178,10 +190,14 @@ class VersionedBase(ABC):
             A ``MergeResult`` (truthy when committed, falsy if abandoned).
 
         Raises:
+            BranchMovedError: If ``on_moved='raise'`` and HEAD moved.
             ConcurrencyError: If ``on_conflict='raise'`` and CAS fails.
             MergeConflict: If keys conflict and no merge function
                 resolves them.
         """
+        if on_moved not in ("merge", "raise"):
+            raise ValueError(f"on_moved must be 'merge' or 'raise', got {on_moved!r}")
+
         # No-op if no changes
         if not updates and not removals and info is None:
             result = MergeResult(
@@ -201,6 +217,11 @@ class VersionedBase(ABC):
 
         current_head = self.latest_head
         ours_built = False
+
+        if on_moved == "raise" and current_head != self._base_commit:
+            if current_head is None:
+                raise UnknownBranchError(f"Branch '{self._branch}' has no HEAD")
+            raise BranchMovedError(self._branch, self._base_commit, current_head)
 
         if current_head == self._base_commit:
             # Fast-forward path
@@ -224,6 +245,17 @@ class VersionedBase(ABC):
                 )
                 self.last_merge_result = result
                 return result
+            if on_moved == "raise":
+                self._restore_state(saved)
+                head = self.latest_head
+                if head is None:
+                    raise UnknownBranchError(f"Branch '{self._branch}' has no HEAD")
+                if head != self._base_commit:
+                    raise BranchMovedError(self._branch, self._base_commit, head)
+                # HEAD reads as the base, yet the publish failed: it moved
+                # and came back, or the commit's in-flight marker lapsed
+                # and a sweep may have taken the commit.
+                raise ConcurrencyError("Commit could not be published. Retry.")
             # Lost the fast-forward race: another writer advanced HEAD
             # between our read and our CAS. Re-read HEAD and merge, the
             # way the base-behind-head case already does — in either
