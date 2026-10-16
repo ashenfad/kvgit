@@ -7,7 +7,12 @@ from dataclasses import dataclass
 from typing import Any
 
 from ._codec import Codec, CodecSpec
-from .cache import DEFAULT_CACHE_BYTES, CachedStore, ContentCache
+from .cache import (
+    DEFAULT_CACHE_BYTES,
+    DEFAULT_VALUE_CACHE_BYTES,
+    CachedStore,
+    ContentCache,
+)
 from .content_types import MergeFn
 from .encoding import loads, safe_loads
 from .errors import (
@@ -75,6 +80,11 @@ class Repo:
             default; ``0`` turns the cache off). A sweep by any process
             empties it before this one builds on what the sweep removed;
             see :class:`~kvgit.cache.ContentCache`.
+        value_cache_bytes: Memory for the decoded values each worktree
+            reads, held until its head moves (32 MB per worktree by
+            default; ``0`` holds none). A value costing more than a
+            quarter of it is never held; see
+            :class:`~kvgit.cache.ValueCache`.
 
     Raises:
         StorageVersionError: if the store is stamped with a layout this
@@ -91,8 +101,14 @@ class Repo:
         default_merge: MergeRule | None = None,
         recover_from_corrupt_head: CorruptHeadRecoverer | None = None,
         cache_bytes: int = DEFAULT_CACHE_BYTES,
+        value_cache_bytes: int = DEFAULT_VALUE_CACHE_BYTES,
     ) -> None:
         _kv._check_storage_version(backend)
+        if value_cache_bytes < 0:
+            raise ValueError(
+                f"value_cache_bytes must not be negative, got {value_cache_bytes}"
+            )
+        self._value_cache_bytes = value_cache_bytes
         self._backend = backend
         # 0 turns the cache off; anything else is a budget, and
         # ContentCache refuses one that is negative.

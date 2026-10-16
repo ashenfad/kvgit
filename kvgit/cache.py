@@ -19,6 +19,10 @@ commit exists — what ``snapshot(commit=)`` and a tag's ``dangling``
 ask — so it is always read, and whatever is reached through a root the
 store still holds is safe to answer from here. Absence is never cached
 either: a key missing now may be written by the next commit.
+
+A worktree keeps a second, separate memory: the decoded values it has
+read at its head (:class:`ValueCache`). That one holds blobs, so it is
+per worktree, emptied whenever the head moves, and bounded in bytes.
 """
 
 from __future__ import annotations
@@ -40,6 +44,9 @@ from .versioned.kv import (
 
 DEFAULT_CACHE_BYTES = 32 * 1024 * 1024
 """The default budget: tens of thousands of tree nodes."""
+
+DEFAULT_VALUE_CACHE_BYTES = 32 * 1024 * 1024
+"""The default budget for each worktree's decoded values."""
 
 _CACHEABLE_PREFIXES = (
     Keyset.DEFAULT_PREFIX,
@@ -281,3 +288,82 @@ class CachedStore(KVStore):
         if GC_LEASE_KEY in writes:
             # This process's own sweep taking or releasing the lease.
             self.cache.saw_lease(writes[GC_LEASE_KEY])
+
+
+class ValueCache:
+    """A worktree's decoded values of committed keys, least recently
+    used first out, bounded in bytes.
+
+    It holds only what the worktree's head already stores, so anything
+    it lets go is read again from the store; pending writes are kept by
+    the worktree itself and never pass through here. A value's cost is
+    the bytes it was decoded from (its blob, plus any chunks a chunked
+    codec read), and a value costing more than a quarter of the budget
+    is not held at all, so one large read cannot push out everything
+    else and the largest values, the ones a caller may want only a few
+    bytes of, are not kept alive by the cache. A budget of ``0`` holds
+    nothing.
+
+    Safe to use from several threads.
+    """
+
+    def __init__(self, max_bytes: int = DEFAULT_VALUE_CACHE_BYTES) -> None:
+        if max_bytes < 0:
+            raise ValueError(f"max_bytes must not be negative, got {max_bytes}")
+        self.max_bytes = max_bytes
+        self._entries: OrderedDict[str, tuple[Any, int]] = OrderedDict()
+        self._bytes = 0
+        self._lock = threading.Lock()
+
+    def __repr__(self) -> str:
+        return (
+            f"ValueCache({len(self._entries)} entries, "
+            f"{self._bytes}/{self.max_bytes} bytes)"
+        )
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._entries
+
+    @property
+    def size_bytes(self) -> int:
+        """What the values held now cost, by the budget's estimate."""
+        return self._bytes
+
+    @property
+    def max_value_bytes(self) -> int:
+        """The largest cost of a value that is held."""
+        return self.max_bytes // 4
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """The value held for ``key``, marked as just used; ``default``
+        if none is."""
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                return default
+            self._entries.move_to_end(key)
+            return entry[0]
+
+    def remember(self, key: str, value: Any, nbytes: int) -> None:
+        """Hold ``value``, decoded from ``nbytes`` bytes, evicting the
+        least recently used to fit."""
+        cost = nbytes + len(key) + _ENTRY_OVERHEAD
+        if cost > self.max_value_bytes:
+            return
+        with self._lock:
+            old = self._entries.pop(key, None)
+            if old is not None:
+                self._bytes -= old[1]
+            self._entries[key] = (value, cost)
+            self._bytes += cost
+            while self._bytes > self.max_bytes:
+                _, (_, evicted) = self._entries.popitem(last=False)
+                self._bytes -= evicted
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+            self._bytes = 0

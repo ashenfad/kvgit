@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A commit costs what it changes.** A handle updates its in-memory keyset in place instead of copying it, so a one-key commit on 100,000 keys takes 0.1 ms rather than 16.
 
 ### Fixed
+- **A worktree's read cache is bounded.** It holds the committed values it reads in a least-recently-used cache of `value_cache_bytes` (32 MB by default, values over a quarter of it never held), where it used to keep every one until the next commit (#78).
 - **An empty branch name is refused.** It used to create a branch under the bare head key that took commits but never appeared in `repo.branches`; every branch method now raises `ValueError` for it, as for a reserved name.
 - **A stale branch or tag delete no longer removes a newer head.** `branches.delete` and `tags.delete` remove only if the head (and a tag's info record) still holds the bytes they read, and otherwise raise `ConcurrencyError` with nothing removed (#72). A branch recreated at the same commit is indistinguishable from the one read and is still deleted, as with git's `update-ref -d`.
 - **An apply that changes nothing checks the live branch first.** `apply`, `cherry_pick` and `revert` reported `no_op` from a stale handle even when another writer had since undone the change; like a merge no-op, they now raise `ConcurrencyError` (or abandon) if the branch moved (#73).

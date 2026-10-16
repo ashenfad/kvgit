@@ -37,6 +37,7 @@ kvgit.open(
     branch="main",
     codec="pickle",
     cache_bytes=32 * 1024 * 1024,
+    value_cache_bytes=32 * 1024 * 1024,
 ) -> Worktree
 ```
 
@@ -48,6 +49,7 @@ kvgit.open(
 | `branch` | `str` | `"main"` | Branch to open; created at the empty root commit if missing |
 | `codec` | see [Codecs](#codecs) | `"pickle"` | How values become stored bytes |
 | `cache_bytes` | `int` | 32 MB | See [The cache](#the-cache) |
+| `value_cache_bytes` | `int` | 32 MB | See [The read cache](#the-read-cache) |
 
 The returned worktree's `repo` is the repository; close it with `wt.repo.close()`. For any other backend, or repo-wide options, construct a [`Repo`](#repo).
 
@@ -75,6 +77,7 @@ repo = Repo(
     default_merge=None,
     recover_from_corrupt_head=None,
     cache_bytes=32 * 1024 * 1024,
+    value_cache_bytes=32 * 1024 * 1024,
 )
 ```
 
@@ -87,6 +90,7 @@ repo = Repo(
 | `default_merge` | `MergeFn \| MergeChoice \| None` | `None` | The rule for keys no other rule covers |
 | `recover_from_corrupt_head` | `CorruptHeadRecoverer \| None` | `None` | Last-resort HEAD recovery; see [HEAD Recovery](#head-recovery) |
 | `cache_bytes` | `int` | 32 MB | Memory for what the store never rewrites; `0` turns it off. See [The cache](#the-cache) |
+| `value_cache_bytes` | `int` | 32 MB | Memory for the values each worktree reads; `0` holds none. See [The read cache](#the-read-cache) |
 
 None of these settings is written to the store: they belong to the process that opens it. Opening reads the store's version stamp once and raises [`StorageVersionError`](#errors) for a layout this code does not read; it never writes.
 
@@ -217,6 +221,17 @@ Get one from `repo.worktree(name)` or `kvgit.open()`.
 | `repo` | `Repo` | The repository |
 | `branch` | `str` | The branch this worktree holds |
 | `head` | `str` | The commit this worktree is based on. The branch tip may have moved since: `repo.branches[wt.branch]`. |
+| `cache` | `ValueCache` | The values read at `head` that this worktree remembers; see [The read cache](#the-read-cache) |
+
+### The read cache
+
+A worktree remembers the decoded values it reads at its head, so reading a key twice decodes it once. Each worktree has its own, separate from [the repository's cache](#the-cache).
+
+- **What it holds.** Only committed values, read at `head`. Pending writes are kept apart and never pass through it, so letting a value go never loses one: the next read decodes it from the store again.
+- **Its size.** `value_cache_bytes` bounds it, least recently used first out, 32 MB by default. A value costs the bytes it was decoded from, chunks included. A value costing more than a quarter of the budget is never held, so one large read doesn't push out everything else.
+- **When it empties.** Whenever the head moves (a commit, merge, apply, reset or refresh) and on `discard()`. `wt.cache.clear()` empties it without either.
+
+`wt.cache` has `size_bytes`, `max_bytes`, `len()` and `clear()`.
 
 ### Committing
 
