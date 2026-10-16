@@ -1658,6 +1658,11 @@ def _sweep(store: KVStore, min_age: float, *, deep: bool) -> int:
     return len(orphans)
 
 
+# A commit attempt: the commit it started from, and each changed key's
+# previous blob and meta (None where the key was absent).
+_Attempt = tuple[str, dict[str, tuple[str, MetaEntry] | None]]
+
+
 class VersionedKV(VersionedBase):
     """A commit log over a KV store.
 
@@ -1755,6 +1760,11 @@ class VersionedKV(VersionedBase):
         # The GC lease record read beside HEAD by the latest head read,
         # for the next batch to land against without reading it again.
         self._lease_hint: Any = _UNREAD
+
+        # The commit attempt in progress, if any: the commit it started
+        # from, and the entry each key it changed held before (None
+        # where the key was absent), to put back should it fail.
+        self._attempt: _Attempt | None = None
 
         # Materialize keyset + meta from the HAMT
         self._meta: dict[str, MetaEntry] = {}
@@ -1856,15 +1866,18 @@ class VersionedKV(VersionedBase):
     # -- Abstract method implementations --
 
     def _snapshot_state(self) -> tuple:
-        """Capture in-memory state before a commit attempt."""
-        return (
-            self._current_commit,
-            dict(self._commit_keys),
-            dict(self._meta),
-        )
+        """Open a commit attempt: from here the key maps record what
+        they change, so a failure can put it back."""
+        self._attempt = (self._current_commit, {})
+        return self._attempt
 
     def _restore_state(self, saved: tuple) -> None:
         """Restore in-memory state after a failed commit attempt.
+
+        Each key the attempt changed gets its old entry back, so this
+        costs what the attempt changed, not the size of the keyset.
+        Only the open attempt is undone: loading another commit closes
+        it, and that state is newer than anything the attempt saved.
 
         The attempt's commits are abandoned, so their in-flight markers
         are withdrawn and they become ordinary orphans. Each marker goes
@@ -1874,12 +1887,46 @@ class VersionedKV(VersionedBase):
         writer's protection must stay until it publishes. Best effort: a
         marker left behind lapses after :data:`IN_FLIGHT_TTL`.
         """
-        self._current_commit, self._commit_keys, self._meta = saved
+        if self._attempt is saved:
+            current_commit, undo = saved
+            keys = self._owned_keys()
+            for key, prev in undo.items():
+                if prev is None:
+                    keys.pop(key, None)
+                    self._meta.pop(key, None)
+                else:
+                    keys[key], self._meta[key] = prev
+            self._current_commit = current_commit
+            self._attempt = None
         if self._in_flight:
             in_flight, self._in_flight = self._in_flight, {}
             for commit, marker in in_flight.items():
                 key = IN_FLIGHT_KEY % commit
                 self.store.cas_many({key: marker}, {}, (key,))
+
+    def _roll_back_attempt(self) -> None:
+        if self._attempt is not None:
+            self._restore_state(self._attempt)
+
+    def _end_attempt(self) -> None:
+        self._attempt = None
+
+    def _set_entry(self, key: str, entry: tuple[str, MetaEntry] | None) -> None:
+        """Point ``key`` at a blob and its meta, or remove it (None), in
+        place. The open attempt records the entry the key held first, so
+        a failure can restore it. Called only once a commit's batch has
+        landed, never while the attempt can still fail before it."""
+        keys = self._owned_keys()
+        if self._attempt is not None:
+            undo = self._attempt[1]
+            if key not in undo:
+                blob = keys.get(key)
+                undo[key] = None if blob is None else (blob, self._meta[key])
+        if entry is None:
+            keys.pop(key, None)
+            self._meta.pop(key, None)
+        else:
+            keys[key], self._meta[key] = entry
 
     def _land_batch(self, commit: str, diffs: dict[str, bytes]) -> None:
         """Write a commit's batch, marked in flight, while no sweep runs.
@@ -1922,28 +1969,18 @@ class VersionedKV(VersionedBase):
         chunks = chunks or {}
         chunk_refs = chunk_refs or {}
 
-        # Build new in-memory dicts: carry forward, apply removals, apply updates
-        new_commit_keys: dict[str, str] = {}
-        new_meta: dict[str, MetaEntry] = {}
-
-        for key, versioned_key in self._commit_keys.items():
-            if key in removals:
-                continue
-            new_commit_keys[key] = versioned_key
-            if key in self._meta:
-                new_meta[key] = self._meta[key]
-
         # Every blob is written, even one whose key is already stored,
         # so the batch holds everything its commit needs whatever a sweep
         # took before it landed.
         diffs: dict[str, bytes] = {}
+        keyset_updates: dict[str, KeysetEntry] = {}
         for key, value in updates.items():
             pointer = blob_key(value)
             diffs[pointer] = value
-            new_commit_keys[key] = pointer
             refs = chunk_refs.get(key)
-            new_meta[key] = MetaEntry(
-                size=len(value), chunks=list(refs) if refs else None
+            keyset_updates[key] = KeysetEntry(
+                blob=pointer,
+                meta=MetaEntry(size=len(value), chunks=list(refs) if refs else None),
             )
 
         # Stage chunk writes under their content-addressed namespace.
@@ -1960,10 +1997,6 @@ class VersionedKV(VersionedBase):
         # sharing reuses unchanged subtrees from the parent commit.
         parent_root = self._root_of(self._current_commit)
         parent_ks = Keyset(self.store, root=parent_root)
-        keyset_updates = {
-            key: KeysetEntry(blob=new_commit_keys[key], meta=new_meta[key])
-            for key in updates
-        }
         new_ks, pending = parent_ks.updated(updates=keyset_updates, removals=removals)
         diffs.update(pending)
 
@@ -1986,10 +2019,13 @@ class VersionedKV(VersionedBase):
         self._land_batch(new_hash, diffs)
         self._remember_root(new_hash, new_ks.root)
 
-        # Update in-memory state
-        self._commit_keys = new_commit_keys
+        # Landed: change the key maps in place, removals first so an
+        # update to a removed key wins.
+        for key in removals:
+            self._set_entry(key, None)
+        for key, entry in keyset_updates.items():
+            self._set_entry(key, (entry.blob, entry.meta))
         self._current_commit = new_hash
-        self._meta = new_meta
         self._remember_generations({new_hash: 1 + max(parent_gens)})
 
         return new_hash
@@ -2058,15 +2094,6 @@ class VersionedKV(VersionedBase):
         )
         diffs.update(pending)
 
-        merged_keyset = dict(self._commit_keys)
-        merged_meta = dict(self._meta)
-        for key, entry in updates.items():
-            merged_keyset[key] = entry.blob
-            merged_meta[key] = entry.meta
-        for key in resolution.removals:
-            merged_keyset.pop(key, None)
-            merged_meta.pop(key, None)
-
         parent_gens = self._parent_generations(parents)
         created = time.time()
         merge_hash = commit_hash(parents, new_ks.root, created, info)
@@ -2081,10 +2108,12 @@ class VersionedKV(VersionedBase):
         self._land_batch(merge_hash, diffs)
         self._remember_root(merge_hash, new_ks.root)
 
-        # Update in-memory state
-        self._commit_keys = merged_keyset
+        # Landed: change the key maps in place.
+        for key, entry in updates.items():
+            self._set_entry(key, (entry.blob, entry.meta))
+        for key in resolution.removals:
+            self._set_entry(key, None)
         self._current_commit = merge_hash
-        self._meta = merged_meta
         self._remember_generations({merge_hash: 1 + max(parent_gens)})
 
         return merge_hash
@@ -2581,7 +2610,8 @@ class VersionedKV(VersionedBase):
 
     def _load_commit(self, commit_hash: str, *, update_base: bool) -> None:
         """Load a commit's state into memory."""
+        self._populate_state(commit_hash)
         self._current_commit = commit_hash
         if update_base:
             self._base_commit = commit_hash
-        self._populate_state(commit_hash)
+        self._attempt = None
