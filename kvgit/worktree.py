@@ -6,6 +6,7 @@ from collections.abc import Iterator, MutableMapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from .cache import ValueCache
 from .content_types import MergeFn
 from .errors import UnknownCommitError
 from .versioned.kv import ROOT_COMMIT, VersionedKV
@@ -15,6 +16,8 @@ if TYPE_CHECKING:
     from .repo import Repo
 
 MergeRule = MergeFn | MergeChoice
+
+_MISSING: Any = object()
 
 
 @dataclass(frozen=True)
@@ -40,6 +43,9 @@ class Worktree(MutableMapping[str, Any]):
     raises only when the two changed the same key in ways no merge rule
     resolves. ``commit(on_moved="raise")`` refuses to merge instead.
 
+    Values read at the head are remembered in :attr:`cache`, up to the
+    repository's ``value_cache_bytes``, until the head moves.
+
     Obtain one from :meth:`Repo.worktree`, or :func:`kvgit.open` for
     the one-line case.
     """
@@ -50,7 +56,9 @@ class Worktree(MutableMapping[str, Any]):
         self._codec = repo._codec
         self._updates: dict[str, Any] = {}
         self._removals: set[str] = set()
-        self._cache: dict[str, Any] = {}
+        # Decoded values of committed keys at the head. Pending writes
+        # live only in _updates, so evicting from here never loses one.
+        self._cache = ValueCache(repo._value_cache_bytes)
         self._merge_fns: dict[str, MergeRule] = {}
         self._merge_prefixes: dict[str, MergeRule] = {}
         self._default_merge: MergeRule | None = None
@@ -83,6 +91,16 @@ class Worktree(MutableMapping[str, Any]):
         """
         return self._engine.current_commit
 
+    @property
+    def cache(self) -> ValueCache:
+        """The values read at :attr:`head` that this worktree remembers.
+
+        Emptied whenever the head moves and by :meth:`discard`;
+        ``cache.clear()`` lets them go without either. Pending changes
+        are never held here.
+        """
+        return self._cache
+
     # -- Reads --
 
     def get(self, key: str, default: Any = None) -> Any:
@@ -91,13 +109,14 @@ class Worktree(MutableMapping[str, Any]):
             return default
         if key in self._updates:
             return self._updates[key]
-        if key in self._cache:
-            return self._cache[key]
+        value = self._cache.get(key, _MISSING)
+        if value is not _MISSING:
+            return value
         raw = self._engine.get(key)
         if raw is None:
             return default
-        value = self._codec.decode(raw)
-        self._cache[key] = value
+        value, nbytes = self._codec.decode_sized(raw)
+        self._cache.remember(key, value, nbytes)
         return value
 
     def get_many(self, *keys: str) -> dict[str, Any]:
@@ -109,14 +128,14 @@ class Worktree(MutableMapping[str, Any]):
                 continue
             if key in self._updates:
                 result[key] = self._updates[key]
-            elif key in self._cache:
-                result[key] = self._cache[key]
+            elif (value := self._cache.get(key, _MISSING)) is not _MISSING:
+                result[key] = value
             else:
                 fetch.append(key)
         if fetch:
             for key, raw in self._engine.get_many(*fetch).items():
-                value = self._codec.decode(raw)
-                self._cache[key] = value
+                value, nbytes = self._codec.decode_sized(raw)
+                self._cache.remember(key, value, nbytes)
                 result[key] = value
         return result
 

@@ -3,7 +3,7 @@
 from typing import Literal
 
 from ._codec import CodecSpec
-from .cache import DEFAULT_CACHE_BYTES
+from .cache import DEFAULT_CACHE_BYTES, DEFAULT_VALUE_CACHE_BYTES
 from .kv.base import KVStore
 from .kv.memory import Memory
 from .repo import Repo
@@ -41,6 +41,7 @@ def open(
     branch: str = "main",
     codec: CodecSpec = "pickle",
     cache_bytes: int = DEFAULT_CACHE_BYTES,
+    value_cache_bytes: int = DEFAULT_VALUE_CACHE_BYTES,
 ) -> Worktree:
     """Open (or create) a store, and a worktree on ``branch`` of it.
 
@@ -61,8 +62,14 @@ def open(
         codec: How values are stored; see :class:`Repo`.
         cache_bytes: Memory for what the store never changes; see
             :class:`Repo`.
+        value_cache_bytes: Memory for the values the worktree reads;
+            see :class:`Repo`.
     """
     backend = _make_backend(kind, path=path, db_name=db_name)
-    return Repo(backend, codec=codec, cache_bytes=cache_bytes).worktree(
-        branch, create=True
+    repo = Repo(
+        backend,
+        codec=codec,
+        cache_bytes=cache_bytes,
+        value_cache_bytes=value_cache_bytes,
     )
+    return repo.worktree(branch, create=True)

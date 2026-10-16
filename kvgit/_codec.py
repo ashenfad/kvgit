@@ -61,6 +61,27 @@ class _ChunkReader:
         return None
 
 
+class _CountingReader:
+    """A chunk reader that tallies the bytes of the chunks it returns."""
+
+    def __init__(self, reader: _ChunkReader) -> None:
+        self._reader = reader
+        self.nbytes = 0
+
+    def get(self, ref: str) -> bytes:
+        raw = self._reader.get(ref)
+        self.nbytes += len(raw)
+        return raw
+
+    def get_many(self, refs):
+        found = self._reader.get_many(refs)
+        self.nbytes += sum(len(v) for v in found.values())
+        return found
+
+    def prefetch(self, refs) -> None:
+        self._reader.prefetch(refs)
+
+
 def _is_chunk_aware(fn) -> bool:
     """Whether an encoder/decoder takes a required sink/reader argument.
 
@@ -147,6 +168,14 @@ class Codec:
         if self.decoder_chunked:
             return self.decoder(raw, self._reader)
         return self.decoder(raw)
+
+    def decode_sized(self, raw: bytes) -> tuple[Any, int]:
+        """A value, and the bytes it was decoded from: its blob plus any
+        chunks a chunked decoder read, which the value usually keeps."""
+        if self.decoder_chunked:
+            reader = _CountingReader(self._reader)  # type: ignore[arg-type]
+            return self.decoder(raw, reader), len(raw) + reader.nbytes
+        return self.decoder(raw), len(raw)
 
     def encode_merged(self, value: Any) -> bytes:
         """Encode a value a merge function produced.
