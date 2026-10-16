@@ -195,7 +195,7 @@ A repository remembers what its store never rewrites: tree nodes, and each commi
 
 ## Worktree
 
-A branch checked out for work: a `MutableMapping[str, Any]` bound to one branch for its whole life. Writes are pending until `commit()` — there is no separate index to stage into. Several worktrees may hold the same branch, in one process or many; a commit that finds the branch moved merges automatically.
+A branch checked out for work: a `MutableMapping[str, Any]` bound to one branch for its whole life. Writes are pending until `commit()` — there is no separate index to stage into. Several worktrees may hold the same branch, in one process or many; a commit that finds the branch moved merges automatically, unless it passes `on_moved="raise"`.
 
 Get one from `repo.worktree(name)` or `kvgit.open()`.
 
@@ -220,7 +220,7 @@ Get one from `repo.worktree(name)` or `kvgit.open()`.
 
 ### Committing
 
-#### `commit(*, keys=None, info=None, on_conflict="raise", merge_fns=None, merge_prefixes=None, default_merge=None) -> MergeResult`
+#### `commit(*, keys=None, info=None, on_conflict="raise", on_moved="merge", merge_fns=None, merge_prefixes=None, default_merge=None) -> MergeResult`
 
 Encode pending changes and write them as one atomic commit. If the branch has moved past `head`, a three-way merge is performed.
 
@@ -229,11 +229,21 @@ Encode pending changes and write them as one atomic commit. If the branch has mo
 | `keys` | `set[str] \| None` | `None` | Commit only these pending keys; the rest stay pending. Keys with nothing pending are ignored. |
 | `info` | `dict \| None` | `None` | Metadata attached to the commit (JSON-serializable) |
 | `on_conflict` | `str` | `"raise"` | `"raise"` or `"abandon"` (a falsy result, nothing written) |
+| `on_moved` | `str` | `"merge"` | What a commit does when the branch moved past `head`: `"merge"` three-way merges onto the tip; `"raise"` raises `BranchMovedError` |
 | `merge_fns` | `dict[str, MergeFn \| MergeChoice] \| None` | `None` | Per-key rules for this call |
 | `merge_prefixes` | `dict[str, MergeFn \| MergeChoice] \| None` | `None` | Rules by key prefix for this call |
 | `default_merge` | `MergeFn \| MergeChoice \| None` | `None` | Fallback rule for this call |
 
 Raises `MergeConflict` on a conflict in `"raise"` mode, `ConcurrencyError` if the commit keeps losing the race to publish, and `UnknownBranchError` if the branch was deleted.
+
+**Refusing to merge.** Where keys are not independent (pages of one database, say), a merge of two disjoint changes is a state neither writer made. With `on_moved="raise"` the commit lands only as a fast-forward from `head`, decided by the same compare-and-swap that publishes it. If the branch moved, before the commit or inside that swap, it raises `BranchMovedError`, a `ConcurrencyError` whose `head` is the tip it found, whatever `on_conflict` says. Nothing reachable is written and the pending changes stay; `refresh()` then moves to the tip (dropping them) to redo the work.
+
+```python
+try:
+    wt.commit(on_moved="raise")
+except kvgit.BranchMovedError as err:
+    wt.refresh()  # now at err.head; redo the work and retry
+```
 
 ```python
 wt["a"] = b"alpha"
@@ -610,11 +620,12 @@ Take their side, on the same terms.
 
 ## Errors
 
-Every error kvgit raises about the state of a store derives from `KvgitError`, so one `except KvgitError` catches them all. None subclasses `ValueError`: argument validation — a bad name, two refs where one is expected, an unknown `on_conflict` — raises `ValueError`, and that is a bug in the call rather than a state to handle.
+Every error kvgit raises about the state of a store derives from `KvgitError`, so one `except KvgitError` catches them all. None subclasses `ValueError`: argument validation — a bad name, two refs where one is expected, an unknown `on_conflict` or `on_moved` — raises `ValueError`, and that is a bug in the call rather than a state to handle.
 
 | Error | Raised when |
 |-------|-------------|
 | `ConcurrencyError` | A commit keeps losing the race to publish (below), or `branches.delete` / `tags.delete` found the head changed under it |
+| `BranchMovedError` | A `ConcurrencyError`: a `commit(on_moved="raise")` found the branch moved past the worktree's head. `branch`, `base` and `head` (the tip it found) are attributes |
 | `MergeConflict` | A merge leaves keys no rule resolves (below) |
 | `UnknownBranchError` | A branch does not exist — `worktree`, `branches[name]`, `branches.delete`, `snapshot(branch=)`, a commit, `reset` or `refresh` on a deleted branch |
 | `UnknownTagError` | A tag does not exist — `tags[name]`, `tags.delete`, `tags.info`, `snapshot(tag=)`, `log(tag=)` |
@@ -630,6 +641,8 @@ All are importable from `kvgit` (and `kvgit.errors`).
 ### ConcurrencyError
 
 Raised when a commit cannot publish and the failure is not mergeable. A lost race is retried through the three-way merge path instead of raising, so this surfaces only when that cannot resolve — no common ancestor, a second lost race — while a true conflict raises `MergeConflict` in `raise` mode (or abandons, leaving the branch untouched, in `abandon` mode). `refresh()` moves the worktree to the branch tip.
+
+A commit made with `on_moved="raise"` takes no merge path: any move of the branch, lost race included, raises the subclass `BranchMovedError` (see [Committing](#committing)).
 
 ### MergeConflict
 

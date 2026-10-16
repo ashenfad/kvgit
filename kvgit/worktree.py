@@ -38,7 +38,7 @@ class Worktree(MutableMapping[str, Any]):
     worktrees — in one process or many — may hold the same branch; a
     commit that loses the race to another merges automatically, and
     raises only when the two changed the same key in ways no merge rule
-    resolves.
+    resolves. ``commit(on_moved="raise")`` refuses to merge instead.
 
     Obtain one from :meth:`Repo.worktree`, or :func:`kvgit.open` for
     the one-line case.
@@ -245,6 +245,7 @@ class Worktree(MutableMapping[str, Any]):
         keys: set[str] | None = None,
         info: dict | None = None,
         on_conflict: str = "raise",
+        on_moved: str = "merge",
         merge_fns: dict[str, MergeRule] | None = None,
         merge_prefixes: dict[str, MergeRule] | None = None,
         default_merge: MergeRule | None = None,
@@ -257,7 +258,19 @@ class Worktree(MutableMapping[str, Any]):
         the rest pending. ``on_conflict="abandon"`` returns a falsy result
         instead of raising :class:`MergeConflict`.
 
+        ``on_moved="raise"`` never merges: the commit lands only as a
+        fast-forward from this worktree's head, decided by the same
+        compare-and-swap that publishes it, and otherwise raises
+        :class:`BranchMovedError` whatever ``on_conflict`` says. For data
+        whose keys are not independent, where a merge of two disjoint
+        changes is a state neither writer made.
+
         Raises:
+            BranchMovedError: with ``on_moved="raise"``, the branch moved
+                since this worktree's head; ``err.head`` is the tip found.
+                Nothing is written and the pending changes stay readable;
+                :meth:`refresh` then moves to the tip (dropping them) to
+                redo the work.
             MergeConflict: keys both sides changed that no rule resolves.
             ConcurrencyError: the branch moved again mid-merge.
             UnknownBranchError: the branch was deleted.
@@ -274,6 +287,7 @@ class Worktree(MutableMapping[str, Any]):
             encoded or None,
             set(removals) or None,
             on_conflict=on_conflict,
+            on_moved=on_moved,
             info=info,
             chunks=(sink.chunks or None) if sink is not None else None,
             chunk_refs=(sink.refs_by_key or None) if sink is not None else None,

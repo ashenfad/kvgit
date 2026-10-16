@@ -18,6 +18,28 @@ class ConcurrencyError(KvgitError):
     """
 
 
+class BranchMovedError(ConcurrencyError):
+    """Raised by a commit made with ``on_moved="raise"`` that found its
+    branch moved: the branch's head is no longer the commit the handle
+    is based on. Nothing was published and pending changes are kept;
+    refresh and redo the work, or give up.
+
+    Attributes:
+        branch: The branch.
+        base: The commit the handle is based on, which the branch no
+            longer names.
+        head: The branch's head as the commit found it.
+    """
+
+    def __init__(self, branch: str, base: str, head: str) -> None:
+        self.branch = branch
+        self.base = base
+        self.head = head
+        super().__init__(
+            f"Branch '{branch}' moved from {base} to {head}; nothing was committed"
+        )
+
+
 class MergeConflict(KvgitError):
     """Raised when a three-way merge encounters unresolvable conflicts.
 

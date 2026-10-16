@@ -90,7 +90,9 @@ with Repo(Disk("/tmp/kvgit-demo")) as on_disk:
 | `git gc [--prune=now]` | `repo.gc([min_age=0])` |
 
 Where it differs: there is no index; several worktrees can hold one
-branch, and their commits race and merge rather than being refused; a
+branch, and their commits race and merge rather than being refused
+(`commit(on_moved="raise")` refuses instead, raising
+`BranchMovedError`, for data whose keys aren't independent); a
 conflicted merge raises `MergeConflict` and changes nothing (unless a
 merge function such as `text_merge` writes markers into the value);
 commit hashes are not git's, and there are no remotes.
