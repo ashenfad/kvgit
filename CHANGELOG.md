@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.3] - 2026-10-16
 
 ### Added
 - **`commit(on_moved="raise")` refuses to merge onto a moved branch.** A commit whose branch moved since the worktree's head raises the new `BranchMovedError` (a `ConcurrencyError` carrying the `head` it found), even with nothing to commit, writes nothing and keeps the pending changes; the default, `"merge"`, is unchanged.
