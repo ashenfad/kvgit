@@ -105,6 +105,10 @@ export interface KVStore {
  */
 export interface MetaEntry {
   readonly size: number
+  /** Seconds; set only on entries written before storage v4, and kept
+   *  so that an entry nobody touched re-encodes to the bytes it was
+   *  stored as. Never set on a new entry. */
+  readonly createdAt?: number
   readonly chunks?: readonly string[]
 }
 

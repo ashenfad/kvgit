@@ -175,6 +175,7 @@ export async function resolveMerge(opts: ResolveMergeOptions): Promise<MergeReso
 function sameEntry(a: KeysetEntry | null, b: KeysetEntry | null): boolean {
   if (a === null || b === null) return a === b
   if (a.blob !== b.blob || a.meta.size !== b.meta.size) return false
+  if (a.meta.createdAt !== b.meta.createdAt) return false
   const ca = a.meta.chunks ?? []
   const cb = b.meta.chunks ?? []
   return ca.length === cb.length && ca.every((c, i) => c === cb[i])
