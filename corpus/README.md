@@ -99,7 +99,9 @@ keys. A step without `expect` must succeed.
 | `snapshot` | `repo`, `as`, one of `branch`, `commit`, `tag` | |
 
 Each `open` is a separate repository over the one shared store, as two
-processes would be. Merge rules given to `open` are the repository's
+processes would be. `open` may also take `recover: "commit_scan"`, the
+last-resort recoverer for a branch whose HEAD and backup are both
+unusable, which guesses the head from a scan of every commit. Merge rules given to `open` are the repository's
 defaults; see below.
 
 **Reading and writing**
@@ -158,6 +160,7 @@ packages' defaults, and each of these also takes merge rules. A result expectati
 | `branch_create` | `repo`, `name`, `at` (default the root commit) | |
 | `branch_delete` | `repo`, `name` | |
 | `branches` | `repo` | name to tip commit |
+| `repair_head` | `repo`, `name` | the commit HEAD now names, or `null` |
 | `tag_create` | `repo`, `name`, `commit`, `info` | |
 | `tag_delete` | `repo`, `name` | |
 | `tags` | `repo` | name to commit |

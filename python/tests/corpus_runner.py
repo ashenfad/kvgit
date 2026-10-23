@@ -16,7 +16,14 @@ from typing import Any
 
 import pytest
 
-from kvgit import KvgitError, MergeChoice, Repo, Snapshot, Worktree
+from kvgit import (
+    KvgitError,
+    MergeChoice,
+    Repo,
+    Snapshot,
+    Worktree,
+    recover_by_commit_scan,
+)
 from kvgit.kv.memory import Memory
 from kvgit.merges import make_text_merge, text_merge_result
 from kvgit.versioned import kv as _kv
@@ -284,7 +291,14 @@ class Run:
             self.clock.now += step["advance"]
 
     def op_open(self, step: dict) -> None:
-        self.repos[step["as"]] = Repo(self.store, codec="bytes", **rules(step))
+        options: dict[str, Any] = {}
+        if "recover" in step:
+            if step["recover"] != "commit_scan":
+                raise ScenarioFailure(f"unknown recoverer {step['recover']!r}")
+            options["recover_from_corrupt_head"] = recover_by_commit_scan
+        self.repos[step["as"]] = Repo(
+            self.store, codec="bytes", **options, **rules(step)
+        )
 
     def op_worktree(self, step: dict) -> None:
         self.handles[step["as"]] = self.repo(step).worktree(
@@ -377,6 +391,9 @@ class Run:
 
     def op_branch_delete(self, step: dict) -> None:
         self.repo(step).branches.delete(step["name"])
+
+    def op_repair_head(self, step: dict) -> str | None:
+        return self.repo(step).repair_head(step["name"])
 
     def op_branches(self, step: dict) -> dict[str, str]:
         return dict(self.repo(step).branches)
