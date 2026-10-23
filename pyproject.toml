@@ -1,15 +1,16 @@
 [build-system]
-requires = ["setuptools>=68.0"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.13,<2"]
+build-backend = "maturin"
 
 [project]
 name = "kvgit"
-version = "0.4.3"
+dynamic = ["version"]
 description = "Versioned key-value store with git-like commit, branch, and merge semantics."
 authors = [{ name = "ashenfad" }]
 requires-python = ">=3.10"
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 keywords = ["versioning", "git", "key-value", "branching", "merge"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -22,7 +23,6 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Typing :: Typed",
 ]
@@ -59,8 +59,24 @@ dev = [
     "pandas>=2.0",
 ]
 
-[tool.setuptools.packages.find]
-include = ["kvgit*"]
+[tool.maturin]
+# The version comes from the Cargo workspace, so the wheel and the
+# extension inside it can't disagree.
+manifest-path = "crates/py/Cargo.toml"
+module-name = "kvgit._core"
+features = ["extension-module"]
+python-source = "python"
+
+[tool.uv]
+# uv reinstalls the project, rebuilding the extension, when any of these
+# change; by default it watches only pyproject.toml.
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "Cargo.toml" },
+    { file = "Cargo.lock" },
+    { file = "crates/**/*.rs" },
+    { file = "crates/**/Cargo.toml" },
+]
 
 [tool.mypy]
 warn_unused_configs = true
@@ -70,9 +86,11 @@ module = ["diskcache"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["python/tests"]
 
 [tool.ruff]
+# Where the first-party package lives, for import sorting.
+src = ["python"]
 # ruff 0.16 formats Python code blocks inside Markdown. This project's docs
 # align trailing comments by hand, so letting the formatter at them produces
 # churn unrelated to whatever change is being made, on any commit touching
@@ -147,13 +165,13 @@ combine-as-imports = true
 # importing optional deps (numpy, pandas) and the matching codec modules,
 # which forces module-level imports to follow the skip call. E402 is the
 # wrong rule here — the pattern is the official pytest idiom.
-"tests/codecs/*.py" = ["E402"]
+"python/tests/codecs/*.py" = ["E402"]
 # The Pyodide FS probes exist to prove that ordinary blocking Python
 # file I/O — exactly what diskcache issues — works over an IDBFS/OPFS
 # mount. ASYNC230 objects to `open()` inside an async def, but the
 # blocking call *is* the thing under test.
-"tests/kv/test_pyodide_fs.py" = ["ASYNC230"]
+"python/tests/kv/test_pyodide_fs.py" = ["ASYNC230"]
 # Crash-injection stress harness: it kills workers mid-write and then
 # pokes at whatever survived. Catching Exception at every probe is the
 # design, not an oversight.
-"tests/stress_kill.py" = ["BLE001"]
+"python/tests/stress_kill.py" = ["BLE001"]

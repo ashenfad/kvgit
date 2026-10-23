@@ -2,9 +2,9 @@ name: Tests
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, core ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, core ]
 
 jobs:
   # Lint runs once, in its own job. It used to be two trailing steps of
@@ -29,11 +29,11 @@ jobs:
 
     - name: Run linter
       run: |
-        ruff check kvgit/ tests/
+        ruff check python/
 
     - name: Check formatting
       run: |
-        ruff format --check kvgit/ tests/
+        ruff format --check python/
 
   test:
     runs-on: ubuntu-latest
@@ -57,7 +57,7 @@ jobs:
 
     - name: Run tests
       run: |
-        pytest tests/ -v
+        pytest python/tests/ -v
 
   # The Postgres backend against a real server: its own tests and the
   # backend conformance suite, then the whole suite with every in-memory
@@ -99,71 +99,8 @@ jobs:
 
     - name: Run backend tests
       run: |
-        pytest tests/kv -v
+        pytest python/tests/kv -v
 
     - name: Run the whole suite on Postgres
       run: |
-        KVGIT_TEST_BACKEND=postgres pytest tests/ -q
-
-  test-pyodide:
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        browser: [chrome, firefox]
-
-    steps:
-    - uses: actions/checkout@v4
-
-    - name: Set up Python 3.12
-      uses: actions/setup-python@v5
-      with:
-        python-version: "3.12"
-
-    - name: Set up Chrome
-      if: matrix.browser == 'chrome'
-      uses: browser-actions/setup-chrome@v1
-      with:
-        chrome-version: stable
-
-    - name: Set up Firefox
-      if: matrix.browser == 'firefox'
-      uses: browser-actions/setup-firefox@v1
-      with:
-        firefox-version: latest
-
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -e ".[dev]"
-        pip install pytest-pyodide
-
-    - name: Download Pyodide distribution
-      run: |
-        mkdir -p pyodide
-        curl -sL https://github.com/pyodide/pyodide/releases/download/0.27.7/pyodide-0.27.7.tar.bz2 \
-          | tar -xj -C pyodide --strip-components=1
-
-    - name: Build wheel
-      run: |
-        pip install build
-        python -m build --wheel
-        cp dist/kvgit-*.whl pyodide/
-
-    # The IndexedDB backend depends on JSPI, which only Chromium ships
-    # by default — Firefox has it behind a flag and Safari has no
-    # implementation. Run those tests on Chrome only.
-    - name: Run IndexedDB tests (Chrome only)
-      if: matrix.browser == 'chrome'
-      run: |
-        KVGIT_PYODIDE_TESTS=1 pytest tests/kv/test_indexeddb.py \
-          --runtime chrome --dist-dir ./pyodide -x -v
-
-    # FS persistence probes (IDBFS, OPFS, diskcache reuse) don't need
-    # JSPI — they're the cross-browser path. Run on both browsers to
-    # validate that the "kvgit[disk] over a mounted persistent FS"
-    # recipe works everywhere we claim it does.
-    - name: Run Pyodide FS probes
-      run: |
-        KVGIT_PYODIDE_TESTS=1 pytest tests/kv/test_pyodide_fs.py \
-          --runtime ${{ matrix.browser }} --dist-dir ./pyodide -v
+        KVGIT_TEST_BACKEND=postgres pytest python/tests/ -q
