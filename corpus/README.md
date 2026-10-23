@@ -69,6 +69,9 @@ Every run of a scenario writes the same bytes:
   `lease-<n>`, counting from 1.
 - **Values are bytes.** Repositories use the bytes codec in every
   implementation.
+- **Integral numbers are integers.** In `info`, a number with no
+  fractional part is an integer. Python keeps `1e16` a float, but a
+  JSON parser in TypeScript cannot tell it from `10000000000000000`.
 
 The runners arrange this through test hooks, not public API: Python
 replaces `time` and `_new_lease_owner` in `kvgit.versioned.kv`;
