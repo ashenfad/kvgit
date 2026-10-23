@@ -421,6 +421,9 @@ export class Run {
   }
 
   async op_open(step: Step): Promise<void> {
+    if (step.recover !== undefined) {
+      throw new ScenarioFailure(`no recoverer ${show(step.recover)} in this package`)
+    }
     this.repos.set(
       step.as as string,
       await Repo.open(this.store, { now: () => this.clock, ...rules(step) }),
@@ -541,6 +544,10 @@ export class Run {
 
   async op_branch_delete(step: Step): Promise<void> {
     await this.repo(step).branches.delete(step.name as string)
+  }
+
+  async op_repair_head(step: Step): Promise<string | null> {
+    return this.repo(step).repairHead(step.name as string)
   }
 
   async op_branches(step: Step): Promise<Map<string, string>> {
