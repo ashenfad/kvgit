@@ -1,2 +1,2 @@
 def version() -> str:
-    """The version of the extension, which is the version of the package."""
+    """The version of the core, which is the version of the package."""

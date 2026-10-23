@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/py"]
+members = ["crates/core", "crates/py", "crates/wasm"]
 
 [workspace.package]
 version = "0.4.3"
