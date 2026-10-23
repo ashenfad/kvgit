@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -151,6 +152,20 @@ class Run:
                 raise ScenarioFailure(f"{value} is used before it is bound")
             return self.vars[value]
         return value
+
+    def interpolate(self, text: str) -> str:
+        """``text`` with each bound variable in it replaced by its value,
+        which must be a string."""
+
+        def value(m: re.Match) -> str:
+            name = m.group(0)
+            if name not in self.vars:
+                raise ScenarioFailure(f"{name} is used before it is bound")
+            if not isinstance(self.vars[name], str):
+                raise ScenarioFailure(f"{name} is {self.vars[name]!r}, not a string")
+            return self.vars[name]
+
+        return re.sub(r"\$[A-Za-z_][A-Za-z0-9_]*", value, text)
 
     def match(self, what: str, expected: Any, actual: Any) -> None:
         if isinstance(expected, str) and expected.startswith("$"):
@@ -428,14 +443,16 @@ class Run:
 
     def op_gc(self, step: dict) -> int:
         return self.repo(step).gc(
-            min_age=step.get("min_age", 3600), deep=step.get("deep", False)
+            min_age=step.get("min_age", 3600),
+            deep=step.get("deep", False),
+            wait=step.get("wait", True),
         )
 
     def op_store_set(self, step: dict) -> None:
-        self.store.set(step["key"], decode_bytes(step["value"]))
+        self.store.set(self.interpolate(step["key"]), decode_bytes(step["value"]))
 
     def op_store_delete(self, step: dict) -> None:
-        self.store.remove(step["key"])
+        self.store.remove(self.interpolate(step["key"]))
 
 
 def load(path: Path) -> dict:
