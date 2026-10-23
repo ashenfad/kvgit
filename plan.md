@@ -68,9 +68,16 @@ The pure parts in Rust, behind both hosts.
 - Both hosts call the core for these; the hosts still run their own
   I/O loops around them.
 - Benchmarks before and after, in both hosts: open, one-key commit,
-  bulk commit, `keys()` over 100,000 keys, merge, GC.
+  bulk commit, merge, GC, over two shapes of store:
+  - kvsql's: a log of a few thousand commits on a tree of about a
+    hundred keys, with 8 MB snapshot chunks; writing a snapshot and
+    replaying the log;
+  - the world's: 100,000 files, listing, iteration and repeated reads.
+- Values stay out of the core from the first kernel PR: the hosts hash
+  blobs, and the benchmarks confirm no value is copied into wasm.
 - The worktree-model measurement: a root-plus-cache worktree against a
-  materialized one, for `keys()` and repeated reads.
+  materialized one on the world's shape, for `keys()`, listing and
+  repeated reads, starting from the numbers lazy mode recorded.
 - Wasm loading settled (URL or inline) and the gzipped size recorded.
 
 **Gate 1:** the wheels and the wasm build hold up in day-to-day use
