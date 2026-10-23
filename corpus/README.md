@@ -194,6 +194,26 @@ repository's back: damage, leftovers, other writers.
 A sweep or a commit that finds a live lease waits for it to end or
 expire; a sweep with `wait` false raises `GcBusy` instead.
 
+**Other devices and remotes**
+
+| op | fields | expect |
+|---|---|---|
+| `store` | `as` | |
+| `remote` | `as`, `id` | |
+| `push`, `pull`, `sync` | `remote`, `branch`, `store` | a sync result |
+| `delete_remote_branch` | `remote`, `branch`, `store`, `expected` | `status`, `remote_head` |
+| `remote_refs` | `remote` | branch to head |
+
+`store` makes another empty store, another device; `open`,
+`store_set` and `store_delete` take `store` to use it instead of the
+scenario's, and only the scenario's store is in `final`. `remote` is a
+reference remote over a store of its own, which replays every push and
+checks every hash. A sync result gives `status`, `branch`,
+`local_head`, `remote_head` (the remote head seen before it moved) and
+`transferred`; `sync` gives `status`, `pull` and `push` (a result, or
+`null` when it stopped after the pull). Only TypeScript runs these for
+now, so it records their `final`.
+
 **Interleavings**
 
 | op | fields | expect |
