@@ -3,8 +3,9 @@ name: Tests
 on:
   push:
     branches: [ main, core ]
+  # Every pull request, whatever its base: a PR in a stack targets the
+  # branch of the PR below it.
   pull_request:
-    branches: [ main, core ]
 
 jobs:
   # Lint runs once, in its own job. It used to be two trailing steps of
