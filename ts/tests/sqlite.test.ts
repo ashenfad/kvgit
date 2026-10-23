@@ -140,3 +140,17 @@ describe('Sqlite — end-to-end VersionedKV over Sqlite (file-backed)', () => {
     expect(await vk2.commitInfo()).toEqual({ author: 'a' })
   })
 })
+
+describe('Sqlite — prefix scans', () => {
+  it('reads a lone surrogate in a prefix as U+FFFD, as it binds', async () => {
+    const db = await Sqlite.open()
+    openHandles.push(db)
+    await db.setMany([
+      ['a�x', bytes('1')],
+      ['a￾', bytes('2')],
+    ])
+    const got: string[] = []
+    for await (const k of db.keys('a\uD800')) got.push(k)
+    expect(got).toEqual(['a�x'])
+  })
+})

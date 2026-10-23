@@ -6,8 +6,8 @@
  *
  * 1. **Handle `onblocked` explicitly.** When another connection holds
  *    the database open with an incompatible version, IDB fires
- *    `onblocked` instead of resolving. Without an explicit handler the
- *    open promise never settles. We reject with an actionable message.
+ *    `onblocked` and waits for it to close. We give it `blockedMs` to,
+ *    then reject with an actionable message.
  *
  * 2. **Attach IDB request handlers synchronously, before any `await`.**
  *    The browser's microtask queue can complete an IDB request between
@@ -29,13 +29,16 @@ import { bytesEqual, checkBatch } from './_batch'
 
 const DEFAULT_DB_NAME = 'kvgit'
 const DEFAULT_STORE_NAME = 'kv'
-const SCHEMA_VERSION = 1
 
 export interface IndexedDBOptions {
   /** IndexedDB database name. Each name is an independent persistent store. */
   dbName?: string
   /** Object store name within the database. */
   storeName?: string
+  /** How long adding the object store to an existing database waits
+   *  for other connections to it to close before rejecting. Default
+   *  5000 ms. */
+  blockedMs?: number
 }
 
 /**
@@ -45,6 +48,11 @@ export interface IndexedDBOptions {
  * underlying `IDBDatabase` is opened (and the object store created if
  * needed) before the instance is returned, so subsequent operations
  * can be synchronous up to the IDB boundary.
+ *
+ * Several stores can share a database under different `storeName`s.
+ * IndexedDB creates object stores only in a version upgrade, so opening
+ * a store the database lacks bumps its version; that upgrade waits for
+ * every other connection to the database to close.
  */
 export class IndexedDB implements KVStore {
   readonly #db: IDBDatabase
@@ -55,29 +63,38 @@ export class IndexedDB implements KVStore {
     this.#storeName = storeName
   }
 
+  /**
+   * Open `storeName` in database `dbName`, creating either as needed.
+   *
+   * The database opens at its current version (a new one at version 1,
+   * with the store). If it lacks the store, it is reopened one version
+   * up to create it; should another connection have upgraded it
+   * meanwhile, the open starts over at the version it now has. Rejects
+   * if an upgrade is blocked by a connection still open after
+   * `blockedMs`.
+   */
   static async open(opts: IndexedDBOptions = {}): Promise<IndexedDB> {
     const dbName = opts.dbName ?? DEFAULT_DB_NAME
     const storeName = opts.storeName ?? DEFAULT_STORE_NAME
+    const blockedMs = opts.blockedMs ?? 5000
 
-    const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const req = globalThis.indexedDB.open(dbName, SCHEMA_VERSION)
-      req.onupgradeneeded = () => {
-        const upgradedDb = req.result
-        if (!upgradedDb.objectStoreNames.contains(storeName)) {
-          upgradedDb.createObjectStore(storeName)
-        }
+    for (;;) {
+      const db = await openDatabase(dbName, undefined, storeName, blockedMs)
+      if (db.objectStoreNames.contains(storeName)) return new IndexedDB(db, storeName)
+      const version = db.version + 1
+      db.close()
+      let upgraded: IDBDatabase
+      try {
+        upgraded = await openDatabase(dbName, version, storeName, blockedMs)
+      } catch (e) {
+        // Another connection took the database past `version` first.
+        if ((e as { name?: unknown } | null)?.name === 'VersionError') continue
+        throw e
       }
-      req.onsuccess = () => resolve(req.result)
-      req.onerror = () => reject(req.error ?? new Error('IndexedDB open failed'))
-      req.onblocked = () =>
-        reject(
-          new Error(
-            `IndexedDB open of '${dbName}' is blocked. Close other tabs / windows holding the database open and reload, or restart the browser.`,
-          ),
-        )
-    })
-
-    return new IndexedDB(db, storeName)
+      if (upgraded.objectStoreNames.contains(storeName)) return new IndexedDB(upgraded, storeName)
+      // Another connection upgraded to `version` for a different store.
+      upgraded.close()
+    }
   }
 
   /** Close the underlying IDB connection. */
@@ -369,6 +386,56 @@ export class IndexedDB implements KVStore {
 }
 
 /**
+ * Open `dbName` at `version` (its current one if undefined), creating
+ * `storeName` in any upgrade the open runs.
+ *
+ * An upgrade waits for other connections to the database to close:
+ * IndexedDB fires `blocked` at once, even for one closing as its last
+ * transaction finishes, so the open rejects only if one is still open
+ * after `blockedMs`. Should the upgrade then go ahead after all, the
+ * connection it opens is closed at once.
+ */
+function openDatabase(
+  dbName: string,
+  version: number | undefined,
+  storeName: string,
+  blockedMs: number,
+): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let gaveUp = false
+    const req =
+      version === undefined
+        ? globalThis.indexedDB.open(dbName)
+        : globalThis.indexedDB.open(dbName, version)
+    req.onupgradeneeded = () => {
+      clearTimeout(timer)
+      const db = req.result
+      if (!db.objectStoreNames.contains(storeName)) db.createObjectStore(storeName)
+    }
+    req.onsuccess = () => {
+      clearTimeout(timer)
+      if (gaveUp) req.result.close()
+      else resolve(req.result)
+    }
+    req.onerror = () => {
+      clearTimeout(timer)
+      reject(req.error ?? new Error('IndexedDB open failed'))
+    }
+    req.onblocked = () => {
+      timer ??= setTimeout(() => {
+        gaveUp = true
+        reject(
+          new Error(
+            `IndexedDB open of '${dbName}' is blocked: another connection has kept it open for ${blockedMs} ms while object store '${storeName}' is added. Close other tabs / connections.`,
+          ),
+        )
+      }, blockedMs)
+    }
+  })
+}
+
+/**
  * The bytes in a buffer of their own size. A view into a larger buffer
  * (an encoder's scratch space, a `subarray`) is copied, since IDB would
  * store the whole buffer; a value that already fills its buffer goes
@@ -381,10 +448,18 @@ function ownBuffer(value: Uint8Array): Uint8Array {
 }
 
 /**
- * Build an `IDBKeyRange` covering all keys with the given prefix.
- * `'￿'` is the highest BMP code point — well beyond any sensible
- * suffix character.
+ * The `IDBKeyRange` of every key starting with `prefix`.
+ *
+ * IndexedDB compares strings by UTF-16 code units, so the least string
+ * greater than all of them is `prefix` with its last code unit bumped
+ * by one, after dropping trailing units already at 0xFFFF. The range
+ * runs up to that bound, exclusive; with no such unit (an empty
+ * prefix, or all 0xFFFF) nothing is greater, and it is open above.
  */
 function prefixRange(prefix: string): IDBKeyRange {
-  return IDBKeyRange.bound(prefix, `${prefix}￿`, false, false)
+  let end = prefix.length
+  while (end > 0 && prefix.charCodeAt(end - 1) === 0xffff) end--
+  if (end === 0) return IDBKeyRange.lowerBound(prefix)
+  const upper = prefix.slice(0, end - 1) + String.fromCharCode(prefix.charCodeAt(end - 1) + 1)
+  return IDBKeyRange.bound(prefix, upper, false, true)
 }

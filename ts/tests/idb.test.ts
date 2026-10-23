@@ -178,6 +178,55 @@ describe('IndexedDB — backend-specific', () => {
   })
 })
 
+describe('IndexedDB.open with several stores in one database', () => {
+  const text = (b: Uint8Array | null): string | null =>
+    b === null ? null : new TextDecoder().decode(b)
+
+  it('adds a store to a database that lacks it', async () => {
+    const dbName = uniqueDbName()
+    const a = await IndexedDB.open({ dbName })
+    await a.set('k', bytes('in kv'))
+    a.close()
+
+    const b = await IndexedDB.open({ dbName, storeName: 'other' })
+    openHandles.push(b)
+    await b.set('k', bytes('in other'))
+    const again = await IndexedDB.open({ dbName })
+    openHandles.push(again)
+    expect(text(await again.get('k'))).toBe('in kv')
+    expect(text(await b.get('k'))).toBe('in other')
+    await again.set('k2', bytes('2'))
+    expect(await b.get('k2')).toBeNull()
+  })
+
+  it('two opens of the same new store both get it', async () => {
+    const dbName = uniqueDbName()
+    const a = await IndexedDB.open({ dbName })
+    a.close()
+    const [b, c] = await Promise.all([
+      IndexedDB.open({ dbName, storeName: 'other' }),
+      IndexedDB.open({ dbName, storeName: 'other' }),
+    ])
+    openHandles.push(b, c)
+    await b.set('k', bytes('v'))
+    expect(text(await c.get('k'))).toBe('v')
+  })
+
+  it('rejects when a connection blocks adding the store past blockedMs', async () => {
+    const dbName = uniqueDbName()
+    const a = await IndexedDB.open({ dbName })
+    await expect(IndexedDB.open({ dbName, storeName: 'other', blockedMs: 100 })).rejects.toThrow(
+      /kept it open for 100 ms/,
+    )
+    a.close()
+
+    const b = await IndexedDB.open({ dbName, storeName: 'other' })
+    openHandles.push(b)
+    await b.set('k', bytes('v'))
+    expect(text(await b.get('k'))).toBe('v')
+  })
+})
+
 describe('IndexedDB.deleteDatabase', () => {
   it('waits for a connection that closes meanwhile, then deletes', async () => {
     const dbName = uniqueDbName()

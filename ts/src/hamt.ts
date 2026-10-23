@@ -1051,14 +1051,15 @@ export class Hamt {
       const aItems = aNode.items
       const bItems = bNode.items
       for (const [k, v] of Object.entries(aItems)) {
-        if (!(k in bItems)) {
+        const bv = itemOf(bItems, k)
+        if (bv === undefined) {
           removed.set(k, decodeValue(v))
-        } else if (bItems[k] !== v) {
-          modified.set(k, [decodeValue(v), decodeValue(bItems[k] as string)] as const)
+        } else if (bv !== v) {
+          modified.set(k, [decodeValue(v), decodeValue(bv)] as const)
         }
       }
       for (const [k, v] of Object.entries(bItems)) {
-        if (!(k in aItems)) added.set(k, decodeValue(v))
+        if (itemOf(aItems, k) === undefined) added.set(k, decodeValue(v))
       }
       return
     }

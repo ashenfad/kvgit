@@ -373,3 +373,44 @@ describe('mergeBase by generation', () => {
     await expect(main.merge({ branch: 'dev' })).rejects.toThrow(ConcurrencyError)
   })
 })
+
+describe('keys named like Object.prototype members', () => {
+  it('diff and merge add, remove and modify them like any key', async () => {
+    const { repo, main } = await setup()
+    main.set('constructor', 1)
+    main.set('toString', 1)
+    main.set('__proto__', 1)
+    const base = (await main.commit()).commit as string
+    await repo.branches.create('dev', base)
+    const dev = await repo.worktree('dev')
+    dev.set('constructor', 2)
+    await dev.delete('toString')
+    dev.set('hasOwnProperty', 1)
+    const devHead = (await dev.commit()).commit as string
+    main.set('__proto__', 2)
+    await main.commit()
+
+    expect(await repo.diff(base, devHead)).toEqual({
+      added: new Set(['hasOwnProperty']),
+      removed: new Set(['toString']),
+      modified: new Set(['constructor']),
+    })
+    expect(await repo.diff(devHead, base)).toEqual({
+      added: new Set(['toString']),
+      removed: new Set(['hasOwnProperty']),
+      modified: new Set(['constructor']),
+    })
+
+    const result = await main.merge({ branch: 'dev' })
+    expect(result.strategy).toBe('three_way')
+    const snap = await repo.snapshot({ branch: 'main' })
+    expect(new Map(await snap.getMany(await snap.keys()))).toEqual(
+      new Map<string, unknown>([
+        ['base', 0],
+        ['constructor', 2],
+        ['hasOwnProperty', 1],
+        ['__proto__', 2],
+      ]),
+    )
+  })
+})
