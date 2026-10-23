@@ -1,0 +1,85 @@
+{
+  "name": "@agex-ts/kvgit",
+  "version": "0.2.0",
+  "description": "Versioned key-value store with branches, commits, and three-way merges. The TypeScript port of Python's kvgit, its v4 format byte for byte.",
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "versioned",
+    "key-value",
+    "git",
+    "indexeddb",
+    "branches",
+    "merge",
+    "snapshot",
+    "typescript",
+    "browser"
+  ],
+  "author": "Adam Ashenfelter",
+  "license": "MIT",
+  "homepage": "https://github.com/ashenfad/agex-ts/tree/main/packages/kvgit-ts#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ashenfad/agex-ts.git",
+    "directory": "packages/kvgit-ts"
+  },
+  "bugs": "https://github.com/ashenfad/agex-ts/issues",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./backends/memory": {
+      "types": "./dist/backends/memory.d.ts",
+      "import": "./dist/backends/memory.js"
+    },
+    "./backends/idb": {
+      "types": "./dist/backends/idb.d.ts",
+      "import": "./dist/backends/idb.js"
+    },
+    "./backends/sqlite": {
+      "types": "./dist/backends/sqlite.d.ts",
+      "browser": "./dist/backends/sqlite.browser.js",
+      "import": "./dist/backends/sqlite.js"
+    },
+    "./github": {
+      "types": "./dist/github/index.d.ts",
+      "import": "./dist/github/index.js"
+    },
+    "./github/fake": {
+      "types": "./dist/github/fake.d.ts",
+      "import": "./dist/github/fake.js"
+    },
+    "./github/fake-server": {
+      "types": "./dist/github/fake-server.d.ts",
+      "import": "./dist/github/fake-server.js"
+    }
+  },
+  "files": ["dist", "README.md", "LICENSE"],
+  "scripts": {
+    "build": "tsup",
+    "prepare": "tsup",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:browser": "vitest run --config vitest.browser.config.ts",
+    "fake-github": "node scripts/fake-github.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@vitest/browser": "^2.1.9",
+    "fake-indexeddb": "^6.2.5",
+    "playwright": "^1.59.1",
+    "tsup": "^8.3.5",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  },
+  "dependencies": {
+    "cbor-x": "^1.6.6"
+  }
+}
