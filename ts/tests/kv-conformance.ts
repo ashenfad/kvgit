@@ -293,6 +293,82 @@ export function runConformance(name: string, makeStore: StoreFactory): void {
         for await (const k of s.keys('foo:')) got.add(k)
         expect(got).toEqual(new Set(['foo:a', 'foo:a:b']))
       })
+
+      it('keys(prefix) and items(prefix) include any character after the prefix', async () => {
+        // Backends order keys by UTF-8 bytes or by UTF-16 code units, so
+        // no single character bounds every key under a prefix: not
+        // U+FFFF, which characters outside the BMP sort above in UTF-8,
+        // and which may itself follow the prefix.
+        const s = await makeStore()
+        const under = [
+          'user:',
+          'user:a',
+          'user:\u{1F600}',
+          'user:\u{10FFFF}',
+          'user:\uFFFF',
+          'user:\uFFFFx',
+          'user:\u{10FFFF}\u{10FFFF}',
+        ]
+        await s.setMany(
+          [...under, 'user', 'user;', 'user;\u{1F600}', 'usera'].map((k) => [k, bytes(k)] as const),
+        )
+        const keys = new Set<string>()
+        for await (const k of s.keys('user:')) keys.add(k)
+        expect(keys).toEqual(new Set(under))
+        const items = new Map<string, Uint8Array>()
+        for await (const [k, v] of s.items('user:')) items.set(k, v)
+        expect(new Set(items.keys())).toEqual(new Set(under))
+        expect(bytesEqual(items.get('user:\u{1F600}') as Uint8Array, bytes('user:\u{1F600}'))).toBe(
+          true,
+        )
+      })
+
+      it('keys(prefix) handles a prefix ending in U+D7FF, U+FFFF or U+10FFFF', async () => {
+        const s = await makeStore()
+        await s.setMany(
+          [
+            'k\uD7FF',
+            'k\uD7FF\u{1F600}',
+            'k\uE000',
+            'k\uFFFF',
+            'k\uFFFFa',
+            'k\uFFFF\uFFFF',
+            'k\uFFFF\u{1F600}',
+            'k\u{10000}',
+            'k\u{10FFFF}',
+            'k\u{10FFFF}a',
+            'k\u{10FFFF}\u{10FFFF}',
+            'l',
+          ].map((k) => [k, bytes(k)] as const),
+        )
+        const collect = async (prefix: string): Promise<Set<string>> => {
+          const got = new Set<string>()
+          for await (const k of s.keys(prefix)) got.add(k)
+          return got
+        }
+        expect(await collect('k\uD7FF')).toEqual(new Set(['k\uD7FF', 'k\uD7FF\u{1F600}']))
+        expect(await collect('k\uFFFF')).toEqual(
+          new Set(['k\uFFFF', 'k\uFFFFa', 'k\uFFFF\uFFFF', 'k\uFFFF\u{1F600}']),
+        )
+        expect(await collect('k\u{10FFFF}')).toEqual(
+          new Set(['k\u{10FFFF}', 'k\u{10FFFF}a', 'k\u{10FFFF}\u{10FFFF}']),
+        )
+        expect(await collect('\u{10FFFF}')).toEqual(new Set())
+      })
+
+      it('keys(prefix) with a prefix of only U+FFFF or U+10FFFF, or none', async () => {
+        const s = await makeStore()
+        const all = ['', 'a', '\uFFFF', '\uFFFF\uFFFF', '\uFFFFz', '\u{10FFFF}', '\u{10FFFF}z']
+        await s.setMany(all.map((k) => [k, bytes(k)] as const))
+        const collect = async (prefix: string): Promise<Set<string>> => {
+          const got = new Set<string>()
+          for await (const k of s.keys(prefix)) got.add(k)
+          return got
+        }
+        expect(await collect('')).toEqual(new Set(all))
+        expect(await collect('\uFFFF')).toEqual(new Set(['\uFFFF', '\uFFFF\uFFFF', '\uFFFFz']))
+        expect(await collect('\u{10FFFF}')).toEqual(new Set(['\u{10FFFF}', '\u{10FFFF}z']))
+      })
     })
 
     describe('clear', () => {

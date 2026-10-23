@@ -219,6 +219,63 @@ describe('Hamt — diff', () => {
   })
 })
 
+describe('Hamt — diff of keys named like Object.prototype members', () => {
+  // Leaves parse to plain objects, whose inherited members (`toString`,
+  // `constructor`, ...) must not read as keys either side holds.
+  for (const bucketMax of [1, 32]) {
+    it(`reports them added, removed and modified (bucketMax ${bucketMax})`, async () => {
+      const store = new Memory()
+      const build = async (entries: Array<[string, string]>): Promise<Hamt> =>
+        (await Hamt.empty(store, { bucketMax })).persist({
+          updates: entries.map(([k, v]): [string, Uint8Array] => [k, bytes(v)]),
+        })
+      const a = await build([
+        ['constructor', '1'],
+        ['toString', '1'],
+        ['__proto__', '1'],
+        ['other', 'x'],
+      ])
+      const b = await build([
+        ['constructor', '2'],
+        ['hasOwnProperty', '1'],
+        ['__proto__', '2'],
+        ['other', 'x'],
+      ])
+      const summary = (d: Awaited<ReturnType<Hamt['diff']>>) => ({
+        added: [...d.added].map(([k, v]) => [k, text(v)]).sort(),
+        removed: [...d.removed].map(([k, v]) => [k, text(v)]).sort(),
+        modified: [...d.modified].map(([k, [o, n]]) => [k, text(o), text(n)]).sort(),
+      })
+      expect(summary(await a.diff(b))).toEqual({
+        added: [['hasOwnProperty', '1']],
+        removed: [['toString', '1']],
+        modified: [
+          ['__proto__', '1', '2'],
+          ['constructor', '1', '2'],
+        ],
+      })
+      expect(summary(await b.diff(a))).toEqual({
+        added: [['toString', '1']],
+        removed: [['hasOwnProperty', '1']],
+        modified: [
+          ['__proto__', '2', '1'],
+          ['constructor', '2', '1'],
+        ],
+      })
+      const plain = await build([['other', 'x']])
+      expect(summary(await plain.diff(a))).toEqual({
+        added: [
+          ['__proto__', '1'],
+          ['constructor', '1'],
+          ['toString', '1'],
+        ],
+        removed: [],
+        modified: [],
+      })
+    })
+  }
+})
+
 describe('Hamt — pending semantics', () => {
   it('updated() returns a Hamt with non-empty pending; flush() persists it', async () => {
     const store = new Memory()
