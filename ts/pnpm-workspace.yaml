@@ -1,0 +1,13 @@
+# Settings only: this directory is a single package, not a workspace.
+
+# Postinstall scripts pnpm 11+ requires explicit approval for.
+allowBuilds:
+  # Platform-specific native binaries, required for normal operation.
+  '@biomejs/biome': true
+  esbuild: true
+  # A transitive dep of @vitest/browser whose postinstall prints a
+  # one-time setup message and is otherwise inert.
+  msw: true
+  # cbor-x's optional native decoder. cbor-x falls back to its pure-JS
+  # path (the one browsers use), so nothing is compiled at install.
+  cbor-extract: false

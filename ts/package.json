@@ -18,17 +18,18 @@
   ],
   "author": "Adam Ashenfelter",
   "license": "MIT",
-  "homepage": "https://github.com/ashenfad/agex-ts/tree/main/packages/kvgit-ts#readme",
+  "homepage": "https://github.com/ashenfad/kvgit/tree/main/ts#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ashenfad/agex-ts.git",
-    "directory": "packages/kvgit-ts"
+    "url": "git+https://github.com/ashenfad/kvgit.git",
+    "directory": "ts"
   },
-  "bugs": "https://github.com/ashenfad/agex-ts/issues",
+  "bugs": "https://github.com/ashenfad/kvgit/issues",
   "type": "module",
   "engines": {
     "node": ">=22"
   },
+  "packageManager": "pnpm@11.0.4",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -68,9 +69,13 @@
     "test:watch": "vitest",
     "test:browser": "vitest run --config vitest.browser.config.ts",
     "fake-github": "node scripts/fake-github.mjs",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "check:dist": "node scripts/check-dist-shape.mjs"
   },
   "devDependencies": {
+    "@biomejs/biome": "^1.9.4",
     "@types/node": "^22.10.0",
     "@vitest/browser": "^2.1.9",
     "fake-indexeddb": "^6.2.5",
