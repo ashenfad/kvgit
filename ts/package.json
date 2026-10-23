@@ -72,7 +72,9 @@
     "typecheck": "tsc --noEmit",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
-    "check:dist": "node scripts/check-dist-shape.mjs"
+    "check:dist": "node scripts/check-dist-shape.mjs",
+    "build:wasm": "node scripts/build-wasm.mjs",
+    "test:wasm": "vitest run --config vitest.wasm.config.ts && vitest run --config vitest.wasm-browser.config.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",

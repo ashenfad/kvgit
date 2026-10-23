@@ -106,6 +106,25 @@ jobs:
       run: |
         KVGIT_TEST_BACKEND=postgres pytest python/tests/ -q
 
+  # The Rust workspace: formatting, lints and unit tests.
+  rust:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Rust
+      run: rustup component add rustfmt clippy
+
+    - name: Check formatting
+      run: cargo fmt --check
+
+    - name: Run clippy
+      run: cargo clippy --all-targets -- -D warnings
+
+    - name: Run tests
+      run: cargo test
+
   # The TypeScript package: lint, typecheck, build, the bundle-shape
   # check, then the Node suite (fake IndexedDB) and the browser suite
   # (real IndexedDB in Chromium).
@@ -151,3 +170,18 @@ jobs:
 
     - name: Test (Chromium)
       run: pnpm test:browser
+
+    # The wasm-bindgen CLI's version must equal the `wasm-bindgen`
+    # crate's, pinned in crates/wasm/Cargo.toml.
+    - name: Set up the wasm toolchain
+      run: rustup target add wasm32-unknown-unknown
+
+    - uses: taiki-e/install-action@v2
+      with:
+        tool: wasm-bindgen@0.2.129
+
+    - name: Build the core for wasm
+      run: pnpm build:wasm
+
+    - name: Test the core in Node and Chromium
+      run: pnpm test:wasm

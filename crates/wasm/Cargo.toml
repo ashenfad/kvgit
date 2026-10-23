@@ -1,0 +1,17 @@
+[package]
+name = "kvgit-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+kvgit-core = { path = "../core" }
+# Pinned exactly: the generated JS glue must match the wasm-bindgen CLI
+# that produced it, and CI installs the CLI at this version.
+wasm-bindgen = "=0.2.129"
