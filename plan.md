@@ -44,19 +44,28 @@ The parity baseline, run against the two implementations as they are.
   expected results, expected final store bytes. JSON, with bytes as
   base64.
 - A runner in each host, driving its public API.
+- Deterministic inputs. A scenario fixes the commit clock, the wall
+  clock (lease and in-flight expiries) and the lease owner, so final
+  store bytes compare exactly with nothing normalized. The runners set
+  them through test seams: TypeScript's `now` option and its lease
+  clock and owner, and patching `time.time` and the owner in Python.
+  Python's public `now` still arrives in C7.
 - Seed it: the v4 golden history, a v4 store carrying pre-v4 entries
   and blob pointers, the merge goldens, text-merge cases,
   merge-base and ancestry cases, conditional branch and tag deletes,
   `on_moved`, lost-race merges (two worktrees on one stale base), head
-  recovery, GC (orphans, tags, in-flight markers, `min_age`), the sync
-  wire walk and replay.
+  recovery, GC (orphans, tags, in-flight markers, `min_age`).
+- Sync scenarios (the wire walk and the checked replay) are written
+  now and run by the TypeScript host only; Python has no sync
+  primitives until C6.
 - Races that need a true interleaving (a sweep starting between a
   commit's batch and its publish) are written now and run first by the
   core in C4; the hosts run them where a pausable test store can stage
   them.
 
-**Exit:** both current implementations pass the whole corpus, and any
-scenario on which they disagreed is fixed on `main` first.
+**Exit:** both current implementations pass every scenario their API
+can run (all but sync for Python), and any scenario on which they
+disagreed is fixed on `main` first.
 
 ## C3. Kernel and toolchain (gate 1)
 
@@ -122,8 +131,9 @@ own engine code; both suites and the corpus pass.
 - Python gets the primitives; whether they are public in 0.5.0 is the
   open question in the design.
 
-**Exit:** the TypeScript sync suites pass, including the live GitHub
-test against the scratch repository.
+**Exit:** the TypeScript sync suites and the corpus's sync scenarios
+pass, the latter in both hosts, and the live GitHub test against the
+scratch repository passes.
 
 ## C7. Public surface
 
