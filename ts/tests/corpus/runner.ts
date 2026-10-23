@@ -8,6 +8,7 @@
  * writes the same bytes.
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
 import { join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -24,7 +25,12 @@ import {
   makeTextMerge,
   textMergeResult,
 } from '../../src/index'
-import { ROOT_COMMIT } from '../../src/versioned/layout'
+import {
+  BRANCH_HEAD,
+  IN_FLIGHT_KEY,
+  ROOT_COMMIT,
+  TAG_BRANCH_PREFIX,
+} from '../../src/versioned/layout'
 import { leaseEnv } from '../../src/versioned/lease'
 
 export const CORPUS = fileURLToPath(new URL('../../../corpus/scenarios', import.meta.url))
@@ -182,8 +188,54 @@ function show(value: unknown): string {
   return text(value)
 }
 
+type Outcome = { result: unknown } | { error: unknown }
+
+/** An operation started on its own, to be held at a protocol point. */
+interface Job {
+  readonly step: Step
+  readonly pause: 'batch' | 'publish'
+  paused: boolean
+  /** Resolves when the job reaches its pause point. */
+  readonly reached: Promise<void>
+  reach: () => void
+  /** Lets the held write go ahead. */
+  go: () => void
+  readonly gate: Promise<void>
+  outcome?: Promise<Outcome>
+}
+
+const jobContext = new AsyncLocalStorage<Job>()
+
+/** The protocol point a write is, by the keys it writes: the commit
+ *  batch lands an in-flight marker, the publish moves a branch head. */
+function point(writes: ReadonlyMap<string, Uint8Array>): 'batch' | 'publish' | null {
+  const keys = [...writes.keys()]
+  if (keys.some((k) => k.startsWith(IN_FLIGHT_KEY('')))) return 'batch'
+  const tagHead = BRANCH_HEAD(TAG_BRANCH_PREFIX)
+  if (keys.some((k) => k.startsWith(BRANCH_HEAD('')) && !k.startsWith(tagHead))) return 'publish'
+  return null
+}
+
+/** A memory store that holds a job's write at its pause point. */
+class PausableMemory extends Memory {
+  override async casMany(
+    expected: ReadonlyMap<string, Uint8Array | null>,
+    writes: ReadonlyMap<string, Uint8Array>,
+    removes: Iterable<string> = [],
+  ): Promise<boolean> {
+    const job = jobContext.getStore()
+    if (job !== undefined && !job.paused && point(writes) === job.pause) {
+      job.paused = true
+      job.reach()
+      await job.gate
+    }
+    return super.casMany(expected, writes, removes)
+  }
+}
+
 export class Run {
-  readonly store = new Memory()
+  readonly store = new PausableMemory()
+  readonly jobs = new Map<string, Job>()
   readonly repos = new Map<string, Repo<Uint8Array>>()
   readonly handles = new Map<string, Handle>()
   readonly vars = new Map<string, unknown>([['$root', ROOT_COMMIT]])
@@ -304,6 +356,11 @@ export class Run {
           throw e
         }
       }
+      if (this.jobs.size > 0) {
+        throw new ScenarioFailure(
+          `${this.name}: never resumed: ${[...this.jobs.keys()].join(', ')}`,
+        )
+      }
     } finally {
       Object.assign(leaseEnv, saved)
     }
@@ -324,10 +381,29 @@ export class Run {
   }
 
   async step(step: Step): Promise<void> {
+    if (step.op === 'resume') {
+      await this.op_resume(step)
+      return
+    }
+    this.judge(step, await this.perform(step))
+  }
+
+  /** Run a step's operation: its result, or the error it threw. */
+  async perform(step: Step): Promise<Outcome> {
     const handler = (this as unknown as Record<string, (s: Step) => Promise<unknown>>)[
       `op_${step.op}`
     ]
     if (typeof handler !== 'function') throw new ScenarioFailure(`unknown op '${step.op}'`)
+    try {
+      return { result: await handler.call(this, step) }
+    } catch (e) {
+      if (e instanceof ScenarioFailure) throw e
+      return { error: e }
+    }
+  }
+
+  /** Hold an operation's outcome to the step's `expect`. */
+  judge(step: Step, outcome: Outcome): void {
     const expect = step.expect
     if (
       expect !== null &&
@@ -335,25 +411,26 @@ export class Run {
       !Array.isArray(expect) &&
       'error' in expect
     ) {
-      try {
-        await handler.call(this, step)
-      } catch (e) {
-        if (e instanceof ScenarioFailure) throw e
-        const name = errorName(e)
-        if (name !== expect.error) {
-          throw new ScenarioFailure(
-            `expected ${expect.error}, threw ${name}: ${(e as Error).message}`,
-          )
-        }
-        if ('keys' in expect) {
-          this.matchSorted('conflicting keys', expect.keys, (e as { keys: Set<string> }).keys)
-        }
-        return
+      if (!('error' in outcome)) {
+        throw new ScenarioFailure(`expected ${expect.error}, but it succeeded`)
       }
-      throw new ScenarioFailure(`expected ${expect.error}, but it succeeded`)
+      const name = errorName(outcome.error)
+      if (name !== expect.error) {
+        throw new ScenarioFailure(
+          `expected ${expect.error}, threw ${name}: ${(outcome.error as Error).message}`,
+        )
+      }
+      if ('keys' in expect) {
+        this.matchSorted(
+          'conflicting keys',
+          expect.keys,
+          (outcome.error as { keys: Set<string> }).keys,
+        )
+      }
+      return
     }
-    const result = await handler.call(this, step)
-    if ('expect' in step) this.check(step.op, step.expect, result)
+    if ('error' in outcome) throw outcome.error
+    if ('expect' in step) this.check(step.op, step.expect, outcome.result)
   }
 
   check(op: string, expected: Json | undefined, actual: unknown): void {
@@ -438,6 +515,47 @@ export class Run {
   }
 
   // --- Ops ---
+
+  async op_start(step: Step): Promise<void> {
+    const pause = step.pause
+    if (pause !== 'batch' && pause !== 'publish') {
+      throw new ScenarioFailure(`unknown pause point ${show(pause)}`)
+    }
+    let reach = () => {}
+    let go = () => {}
+    const job: Job = {
+      step: step.step as Step,
+      pause,
+      paused: false,
+      reached: new Promise<void>((resolve) => {
+        reach = resolve
+      }),
+      reach: () => reach(),
+      gate: new Promise<void>((resolve) => {
+        go = resolve
+      }),
+      go: () => go(),
+    }
+    this.jobs.set(step.job as string, job)
+    const outcome = jobContext.run(job, () =>
+      this.perform(job.step).catch((e: unknown): Outcome => ({ error: e })),
+    )
+    job.outcome = outcome
+    const first = await Promise.race([job.reached.then(() => 'paused'), outcome.then(() => 'done')])
+    if (first !== 'paused') {
+      throw new ScenarioFailure(`job ${step.job} finished without reaching ${pause}`)
+    }
+  }
+
+  async op_resume(step: Step): Promise<void> {
+    const job = this.jobs.get(step.job as string)
+    if (job?.outcome === undefined) throw new ScenarioFailure(`no job ${step.job}`)
+    this.jobs.delete(step.job as string)
+    job.go()
+    const outcome = await job.outcome
+    if ('error' in outcome && outcome.error instanceof ScenarioFailure) throw outcome.error
+    this.judge({ ...job.step, ...('expect' in step && { expect: step.expect }) }, outcome)
+  }
 
   async op_clock(step: Step): Promise<void> {
     if ('set' in step) this.clock = step.set as number
