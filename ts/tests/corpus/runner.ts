@@ -196,6 +196,19 @@ export class Run {
     return value as T
   }
 
+  /** `text` with each bound variable in it replaced by its value,
+   *  which must be a string. */
+  interpolate(text: string): string {
+    return text.replace(/\$[A-Za-z_][A-Za-z0-9_]*/g, (name) => {
+      if (!this.vars.has(name)) throw new ScenarioFailure(`${name} is used before it is bound`)
+      const value = this.vars.get(name)
+      if (typeof value !== 'string') {
+        throw new ScenarioFailure(`${name} is ${show(value)}, not a string`)
+      }
+      return value
+    })
+  }
+
   match(what: string, expected: Json | Uint8Array | undefined, actual: unknown): void {
     let want: unknown = expected
     if (typeof expected === 'string' && expected.startsWith('$')) {
@@ -598,14 +611,15 @@ export class Run {
     return this.repo(step).gc({
       minAge: (step.min_age as number | undefined) ?? 3600,
       deep: (step.deep as boolean | undefined) ?? false,
+      wait: (step.wait as boolean | undefined) ?? true,
     })
   }
 
   async op_store_set(step: Step): Promise<void> {
-    await this.store.set(step.key as string, decodeBytes(step.value))
+    await this.store.set(this.interpolate(step.key as string), decodeBytes(step.value))
   }
 
   async op_store_delete(step: Step): Promise<void> {
-    await this.store.remove(step.key as string)
+    await this.store.remove(this.interpolate(step.key as string))
   }
 }

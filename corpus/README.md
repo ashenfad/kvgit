@@ -52,8 +52,11 @@ Actors, worktrees and snapshots are named by the step that makes them
 A string starting with `$` is a variable. In an `expect`, an unbound
 variable binds to the value found, and a bound one must equal it; in
 an argument, it must already be bound. `$root` is bound from the start
-to the root commit every branch begins at. Variables keep commit
-hashes out of hand-written steps: the `final` store pins them.
+to the root commit every branch begins at. In the `key` of
+`store_set` and `store_delete`, a variable anywhere in the string is
+replaced by its value, which must be a string (`"__inflight__$c1"`).
+Variables keep commit hashes out of hand-written steps: the `final`
+store pins them.
 
 ### Determinism
 
@@ -178,12 +181,15 @@ packages' defaults, and each of these also takes merge rules. A result expectati
 
 | op | fields | expect |
 |---|---|---|
-| `gc` | `repo`, `min_age` (default 3600), `deep` (default false) | commits removed |
+| `gc` | `repo`, `min_age` (default 3600), `deep` (default false), `wait` (default true) | commits removed |
 | `store_set` | `key`, `value` | |
 | `store_delete` | `key` | |
 
 `store_set` and `store_delete` write the store directly, behind every
 repository's back: damage, leftovers, other writers.
+
+A sweep or a commit that finds a live lease waits for it to end or
+expire; a sweep with `wait` false raises `GcBusy` instead.
 
 ## Recording
 
