@@ -16,8 +16,9 @@ from typing import Any
 
 import pytest
 
-from kvgit import Repo, Snapshot, Worktree
+from kvgit import KvgitError, MergeChoice, Repo, Snapshot, Worktree
 from kvgit.kv.memory import Memory
+from kvgit.merges import make_text_merge, text_merge_result
 from kvgit.versioned import kv as _kv
 
 CORPUS = Path(__file__).resolve().parents[2] / "corpus" / "scenarios"
@@ -72,7 +73,51 @@ def _pinned(clock: _Clock) -> Iterator[None]:
         yield
 
 
+# -- Merge rules --
+
+
+def _concat(old: bytes | None, ours: bytes | None, theirs: bytes | None) -> bytes:
+    return (theirs or b"") + b"+" + (ours or b"")
+
+
+def _fail(old: bytes | None, ours: bytes | None, theirs: bytes | None) -> bytes:
+    raise ValueError("this rule refuses every key")
+
+
+RULES: dict[str, Any] = {
+    "text": make_text_merge(),
+    "text_strict": make_text_merge(strict=True),
+    "ours": MergeChoice.OURS,
+    "theirs": MergeChoice.THEIRS,
+    "pick_ours": lambda old, ours, theirs: MergeChoice.OURS,
+    "pick_theirs": lambda old, ours, theirs: MergeChoice.THEIRS,
+    "concat": _concat,
+    "fail": _fail,
+}
+
+
+def rules(step: dict) -> dict[str, Any]:
+    """The merge rules a step names, as keyword arguments."""
+    out: dict[str, Any] = {}
+    if "merge_fns" in step:
+        out["merge_fns"] = {k: RULES[v] for k, v in step["merge_fns"].items()}
+    if "merge_prefixes" in step:
+        out["merge_prefixes"] = {k: RULES[v] for k, v in step["merge_prefixes"].items()}
+    if "default_merge" in step:
+        out["default_merge"] = RULES[step["default_merge"]]
+    return out
+
+
 # -- The run --
+
+
+def error_name(e: Exception) -> str:
+    """The name a scenario uses for an error: kvgit's own errors by class
+    name, and a caller's mistake (``ValueError``, ``TypeError``) as
+    ``invalid``."""
+    if isinstance(e, (ValueError, TypeError)) and not isinstance(e, KvgitError):
+        return "invalid"
+    return type(e).__name__
 
 
 class ScenarioFailure(AssertionError):
@@ -162,7 +207,7 @@ class Run:
             try:
                 handler(step)
             except Exception as e:
-                name = type(e).__name__
+                name = error_name(e)
                 if name != expect["error"]:
                     raise ScenarioFailure(
                         f"expected {expect['error']}, raised {name}: {e}"
@@ -178,11 +223,18 @@ class Run:
             self.check(op, step["expect"], result)
 
     def check(self, op: str, expected: Any, actual: Any) -> None:
-        if op in ("commit", "merge"):
+        if op in ("commit", "merge", "apply", "cherry_pick", "revert"):
             for field in expected:
                 value = getattr(actual, field)
                 if field in ("auto_merged_keys", "carried_keys"):
                     self.match_sorted(field, expected[field], value)
+                else:
+                    self.match(field, expected[field], value)
+        elif op == "text_merge":
+            for field in expected:
+                value = actual[field]
+                if field == "merged":
+                    self.match(field, decode_bytes(expected[field]), value)
                 else:
                     self.match(field, expected[field], value)
         elif op == "get":
@@ -232,7 +284,7 @@ class Run:
             self.clock.now += step["advance"]
 
     def op_open(self, step: dict) -> None:
-        self.repos[step["as"]] = Repo(self.store, codec="bytes")
+        self.repos[step["as"]] = Repo(self.store, codec="bytes", **rules(step))
 
     def op_worktree(self, step: dict) -> None:
         self.handles[step["as"]] = self.repo(step).worktree(
@@ -273,14 +325,49 @@ class Run:
                 options[field] = step[field]
         if "keys" in step:
             options["keys"] = set(step["keys"])
-        return self.wt(step).commit(**options)
+        return self.wt(step).commit(**options, **rules(step))
 
     def op_merge(self, step: dict) -> Any:
         options: dict[str, Any] = {}
         for field in ("info", "on_conflict", "fast_forward"):
             if field in step:
                 options[field] = step[field]
-        return self.wt(step).merge(**self.ref(step), **options)
+        return self.wt(step).merge(**self.ref(step), **options, **rules(step))
+
+    def _apply_options(self, step: dict) -> dict[str, Any]:
+        options: dict[str, Any] = {}
+        for field in ("info", "on_conflict"):
+            if field in step:
+                options[field] = step[field]
+        return {**options, **rules(step)}
+
+    def op_apply(self, step: dict) -> Any:
+        return self.wt(step).apply(
+            self.arg(step["base"]),
+            self.arg(step["target"]),
+            **self._apply_options(step),
+        )
+
+    def op_cherry_pick(self, step: dict) -> Any:
+        return self.wt(step).cherry_pick(
+            self.arg(step["commit"]), **self._apply_options(step)
+        )
+
+    def op_revert(self, step: dict) -> Any:
+        return self.wt(step).revert(
+            self.arg(step["commit"]), **self._apply_options(step)
+        )
+
+    def op_text_merge(self, step: dict) -> dict[str, Any]:
+        sides = [
+            None if step[side] is None else decode_bytes(step[side])
+            for side in ("old", "ours", "theirs")
+        ]
+        labels = {k: step[k] for k in ("ours_label", "theirs_label") if k in step}
+        if step.get("strict", False):
+            return {"merged": make_text_merge(strict=True, **labels)(*sides)}
+        merged, conflicted = text_merge_result(*sides, **labels)
+        return {"merged": merged, "conflicted": conflicted}
 
     def op_branch_create(self, step: dict) -> str:
         at = step.get("at")
