@@ -230,6 +230,10 @@ kvgit provides versioned agent memory in [agex](https://github.com/ashenfad/agex
 
 ## Development
 
+The package is in `python/` and its native extension in `crates/py`, so
+building it needs a Rust toolchain (`rustup`). uv rebuilds the extension
+when the Rust sources change.
+
 ```bash
 uv sync --extra dev
 uv run pytest
