@@ -12,7 +12,7 @@
  */
 
 import { Hamt, type HamtOptions, type NodeCache } from './hamt'
-import { pyDumpsBytes } from './pyjson'
+import { PyFloat, pyDumpsBytes } from './pyjson'
 import type { KVStore, KeysetDiff, KeysetEntry, MetaEntry } from './types'
 
 const _decoder = new TextDecoder()
@@ -25,6 +25,7 @@ const _decoder = new TextDecoder()
  */
 export function encodeEntry(entry: KeysetEntry): Uint8Array {
   const meta: Record<string, unknown> = { size: entry.meta.size }
+  if (entry.meta.createdAt !== undefined) meta.created_at = new PyFloat(entry.meta.createdAt)
   if (entry.meta.chunks !== undefined && entry.meta.chunks.length > 0) {
     meta.chunks = [...entry.meta.chunks]
   }
@@ -34,12 +35,13 @@ export function encodeEntry(entry: KeysetEntry): Uint8Array {
 export function decodeEntry(raw: Uint8Array): KeysetEntry {
   const [blob, meta] = JSON.parse(_decoder.decode(raw)) as [
     string,
-    { size: number; chunks?: string[] },
+    { size: number; created_at?: number; chunks?: string[] },
   ]
-  const out: MetaEntry =
-    meta.chunks !== undefined && meta.chunks.length > 0
-      ? { size: meta.size, chunks: meta.chunks }
-      : { size: meta.size }
+  const out: MetaEntry = {
+    size: meta.size,
+    ...(typeof meta.created_at === 'number' && { createdAt: meta.created_at }),
+    ...(meta.chunks !== undefined && meta.chunks.length > 0 && { chunks: meta.chunks }),
+  }
   return { blob, meta: out }
 }
 
