@@ -28,7 +28,7 @@ A `Map<string, T>` with git-like history. Every `commit()` creates a checkpoint;
 
 ## Design
 
-The canonical type contracts live in [`src/types.ts`](./src/types.ts). `@agex-ts/world` keeps each session as a branch of one repository; [the design history](../../docs/design.md) has why the format follows Python's.
+The canonical type contracts live in [`src/types.ts`](./src/types.ts). `@agex-ts/world` keeps each session as a branch of one repository; [the design history](https://github.com/ashenfad/agex-ts/blob/main/docs/design.md) has why the format follows Python's.
 
 ## Storage backends
 

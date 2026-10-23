@@ -105,3 +105,49 @@ jobs:
     - name: Run the whole suite on Postgres
       run: |
         KVGIT_TEST_BACKEND=postgres pytest python/tests/ -q
+
+  # The TypeScript package: lint, typecheck, build, the bundle-shape
+  # check, then the Node suite (fake IndexedDB) and the browser suite
+  # (real IndexedDB in Chromium).
+  test-ts:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ts
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: pnpm/action-setup@v4
+      with:
+        version: 11.0.4
+
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 24
+        cache: pnpm
+        cache-dependency-path: ts/pnpm-lock.yaml
+
+    - name: Install dependencies
+      run: pnpm install --frozen-lockfile
+
+    - name: Lint
+      run: pnpm lint
+
+    - name: Typecheck
+      run: pnpm typecheck
+
+    - name: Build
+      run: pnpm build
+
+    - name: Bundle-shape check
+      run: pnpm check:dist
+
+    - name: Test (Node)
+      run: pnpm test
+
+    - name: Install Playwright Chromium
+      run: pnpm exec playwright install chromium --with-deps
+
+    - name: Test (Chromium)
+      run: pnpm test:browser

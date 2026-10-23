@@ -1,6 +1,6 @@
 // Commit time against branch size: one-key commits on a branch holding
 // 1k, 10k and 100k keys, on the in-memory backend. Not part of the test
-// suite. Build first, then run from packages/kvgit-ts:
+// suite. Build first, then run from ts/:
 //
 //   pnpm run build && node scripts/bench-commit.mjs [sizes...]
 
