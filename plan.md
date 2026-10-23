@@ -44,7 +44,8 @@ The parity baseline, run against the two implementations as they are.
   expected results, expected final store bytes. JSON, with bytes as
   base64.
 - A runner in each host, driving its public API.
-- Seed it: the v4 golden history, the merge goldens, text-merge cases,
+- Seed it: the v4 golden history, a v4 store carrying pre-v4 entries
+  and blob pointers, the merge goldens, text-merge cases,
   merge-base and ancestry cases, conditional branch and tag deletes,
   `on_moved`, lost-race merges (two worktrees on one stale base), head
   recovery, GC (orphans, tags, in-flight markers, `min_age`), the sync
@@ -135,10 +136,10 @@ branch's packages, linked locally.
 
 ## C8. Migration and release
 
-- On `main`, before the merge: a 0.4.x with the store inventory, the
-  generations backfill, and (if the inventory says any store needs it)
-  the legacy rewrite.
-- Run the inventory on the stores worth keeping; migrate them.
+- On `main`, before the merge: a 0.4.x with the store inventory and
+  the backfill.
+- Run the inventory on the stores worth keeping, and the backfill where
+  it reports anything.
 - Publish workflows: wheels and sdist to PyPI, the npm package with its
   wasm, one version.
 - `core` merges to `main`; 0.5.0 releases both packages.

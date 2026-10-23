@@ -37,7 +37,9 @@ In:
 - A language-neutral scenario corpus that all three (core, Python
   host, TS host) run.
 - Dropping surface nobody should build on: `VersionedBase`, `Staged`,
-  `VersionedKV` as public API, and the pre-v4 read paths.
+  and `VersionedKV` as public API.
+- Dropping the fallbacks for history written before v4, once a
+  backfill has brought existing stores up to date.
 
 Out:
 
@@ -200,29 +202,29 @@ callers that want it deterministic.
 ## Storage
 
 The format is storage v4 as both implementations write it today, and
-the corpus pins it byte for byte. The core reads and writes only v4
-objects:
+the corpus pins it byte for byte.
 
-- blobs under `kvgit:blob:<sha256>`;
-- keyset entries holding only what follows from the blob (pointer,
-  size, chunk references);
-- commits that store their parents' generations.
+Moving a store to v4 only raised its stamp; nothing already written was
+rewritten, and untouched subtrees are carried forward as stored. A
+store stamped v4 can therefore still hold objects from before v4. The
+core treats them this way:
 
-It does not read:
-
-- stores stamped v2 or v3;
-- blob pointers of the form `<commit>:<key>`;
-- entries carrying `created_at`;
-- commits without stored generations (today a merge-base search that
-  meets one falls back to walking whole histories);
-- parent records stored as a bare string.
-
-A store stamped v4 may still hold all of these, carried forward from
-before v4. TypeScript's reader already drops `created_at` when it
-re-encodes an entry, so on such a store the two implementations would
-write different nodes for the same change; the core removes that
-divergence by refusing the store. The migration is described in
-"Migration" below.
+- **Blob pointers of the form `<commit>:<key>`** are read like any
+  other pointer: an entry names a key and the blob is that key's value.
+  There is no separate read path for them.
+- **Entries carrying `created_at`** are read and written back with it,
+  in its stored position, so an untouched subtree re-encodes to the
+  bytes it was stored as. The core never writes it on a new entry.
+  TypeScript's reader drops it today, which makes the two
+  implementations write different nodes for the same change on such a
+  store; the corpus covers it and the fix lands on `main` first.
+- **Commits without stored generations** are not read: there is no
+  whole-history walk for merge base. The backfill below writes their
+  generations first.
+- **Parent records stored as a bare string** are not read; the
+  backfill rewrites them as lists, which changes no hash.
+- **Stores stamped v2 or v3** are refused; the backfill raises the
+  stamp.
 
 Chunks stay: entries keep their chunk references, GC marks and sweeps
 chunks, and the scientific codec keeps writing them from Python.
@@ -318,23 +320,21 @@ a conflict, as now).
 
 ## Migration
 
-For stores the core will refuse, the last pure-Python release on `main`
-(a 0.4.x) ships the tooling:
+For stores the core would refuse, the last pure-Python release on
+`main` (a 0.4.x) ships the tooling:
 
-- **An inventory** that reports, per store, its stamp, and how many
-  commits lack generations, how many entries carry `created_at`, and
-  how many reachable blobs use commit-keyed pointers.
-- **A generations backfill.** Writing a commit's parents' generations
-  adds a key and changes no hash, so it is safe on a live store.
-- **A rewrite for legacy entries and blobs.** Rewriting an entry
-  changes the keyset root of every commit holding it, and so that
-  commit's hash and every descendant's. The rewrite maps old hashes to
-  new, moves branch heads and tags, and reports the map, so a caller
-  holding commit hashes elsewhere (nontainer's records) can follow it.
+- **An inventory** that reports, per store, its stamp, how many commits
+  lack generations, how many parent records are bare strings, and, for
+  information, how many entries carry `created_at` and how many
+  reachable blobs use commit-keyed pointers.
+- **A backfill** that writes each commit's parents' generations,
+  rewrites bare-string parent records as lists, and raises the stamp
+  to 4. None of these is part of a commit's hash, so no commit changes
+  name and commit hashes recorded elsewhere stay valid. It only adds
+  keys or rewrites records to an equal value, so it is safe on a live
+  store and safe to re-run.
 
-The inventory comes first: if no store worth keeping holds legacy
-entries, the rewrite is not written, and those stores are rebuilt from
-their branch tips instead.
+Entries and blobs are not rewritten: the core reads both as stored.
 
 ## Consumers
 
@@ -358,7 +358,10 @@ Made 2026-10-23:
 - The public APIs stay mostly as they are; changes are made where they
   pay and listed as breaking.
 - `VersionedBase`, `Staged` and `VersionedKV` leave the public API.
-- The pre-v4 read paths go.
+- The fallbacks for pre-v4 history go (the merge-base walk, bare-string
+  parents, v2 and v3 stamps), after a hash-preserving backfill. Pre-v4
+  entries and blob pointers stay readable as stored; nothing is
+  rewritten.
 - No Pyodide build of the Python package.
 
 ## Open questions
@@ -367,7 +370,6 @@ Made 2026-10-23:
   iteration-heavy worktrees. Settled by measurement in the toolchain
   spike.
 - **Wasm loading:** URL or inlined bytes, and the size budget.
-- **The legacy rewrite:** needed or not, by the inventory.
 - **Python sync API:** expose the wire walk and replay publicly in
   0.5.0, or keep them internal until a transport wants them.
 - **Python's Composite backend** caches mutable keys per tier and has
