@@ -113,6 +113,8 @@ Each host owns:
 
 - **Backends.** Python: Memory, Disk, Postgres, Composite, Namespaced.
   TypeScript: Memory, IndexedDB, SQLite.
+- **Values.** A blob's bytes, and hashing them to the blob's key (see
+  "Values" below).
 - **Codecs.** Python: pickle, scientific (chunked numpy and pandas),
   bytes. TypeScript: bytes, JSON, CBOR. The core sees only bytes and,
   for chunked values, the chunk references a codec reports.
@@ -143,7 +145,7 @@ while True:
         case Cas(expect, writes, drops): reply = store.cas_many(expect, writes, drops)
         case Wait(seconds):              sleep(seconds); reply = None
         case Merge(rule, key, old, ours, theirs):
-                                         reply = rules[rule](old, ours, theirs)
+                                         reply = merge(rule, old, ours, theirs)
         case Recover(branch):            reply = recoverer(store, branch)
         case Done(result):               return result
         case Failed(error):              raise host_error(error)
@@ -178,6 +180,27 @@ protocol readable as straight-line code, as it is in Python today,
 rather than as hand-written state tables. No threads and no runtime are
 involved, so it runs the same in wasm.
 
+## Values
+
+Values do not cross the boundary. The core deals in blob keys, sizes
+and chunk references; the host reads and writes the bytes.
+
+- **Writing.** The host encodes a value, hashes it (`hashlib` in
+  Python, WebCrypto in TypeScript) and hands the core the blob key and
+  size. When the core's batch names that blob, the host supplies the
+  bytes it is holding into the `Cas`.
+- **Reading.** The core resolves a key to its entry; the host fetches
+  the blob in its own batched read.
+- **Merging.** A `Merge` request names the three sides by blob key.
+  The host reads and decodes them, runs the rule, encodes and hashes
+  the result, and replies with its key and size. The built-in text
+  merge is the one place value bytes enter the core, and only for the
+  keys it merges.
+
+This matters for large values: kvsql stores its database snapshots as
+8 MB chunks, and copying each one into wasm memory and out again would
+cost more than the commit it belongs to.
+
 ## Worktree state
 
 A worktree today holds its whole keyset in memory: always in Python,
@@ -185,14 +208,25 @@ and in TypeScript unless opened `lazy`. TypeScript's lazy mode instead
 holds the keyset root and reads the tree on demand through a bounded
 node cache.
 
+Lazy mode was built for a design of the app database that stored one
+SQLite page per key: about 51,000 keys for a 200 MB database, 262,000
+for 1 GB. Its measurements (headless Chromium, IndexedDB) put an eager
+open at 0.56 s for 50,000 keys, 3.0 s for 262,000 and 50 s for a
+million, and a lazy open under a millisecond at every size. The
+database shipped instead as kvsql, a changeset log with snapshot
+chunks, whose trees hold about a hundred keys, and nothing uses lazy
+mode today. The large tree that remains is the world's, one key per
+file.
+
 Proposed: one model. A worktree is a root plus its pending changes;
 reads go through the repository's content cache, which already holds
 tree nodes. Opening costs one read whatever the keyset's size, and a
-commit rewrites only the paths it changes. Whether `keys()` and
-iteration stay fast enough without a materialized index is measured in
-the toolchain spike before this is settled; if not, a materialized
-index returns as a cache over the same model rather than as a second
-mode.
+commit rewrites only the paths it changes. Its known cost is that
+`keys()` walks the whole tree on every call. Whether `keys()`, listing
+and iteration over a world-sized tree stay fast enough without a
+materialized index is measured in the toolchain spike before this is
+settled; if not, a materialized index returns as a cache over the
+same model rather than as a second mode.
 
 Worktree state lives in the core, owned by the host object. TypeScript
 objects holding core state are freed by a `FinalizationRegistry`
