@@ -1,0 +1,117 @@
+{
+  "generator": "cbor2 5.6.5, scripts/golden-cbor.py",
+  "cases": [
+    {
+      "name": "small int",
+      "hex": "05",
+      "expect": {
+        "number": 5
+      }
+    },
+    {
+      "name": "negative int",
+      "hex": "30",
+      "expect": {
+        "number": -17
+      }
+    },
+    {
+      "name": "int past 32 bits",
+      "hex": "1b0000010000000000",
+      "expect": {
+        "bigint": "1099511627776"
+      }
+    },
+    {
+      "name": "int past 64 bits",
+      "hex": "c249400000000000000000",
+      "expect": {
+        "bigint": "1180591620717411303424"
+      }
+    },
+    {
+      "name": "float",
+      "hex": "fb3ff8000000000000",
+      "expect": {
+        "number": 1.5
+      }
+    },
+    {
+      "name": "string",
+      "hex": "6dc3a920c3bc6ec3af20f09f9880",
+      "expect": {
+        "string": "é ünï 😀"
+      }
+    },
+    {
+      "name": "bytes",
+      "hex": "43ff0001",
+      "expect": {
+        "bytes": "ff0001"
+      }
+    },
+    {
+      "name": "none",
+      "hex": "f6",
+      "expect": {
+        "null": true
+      }
+    },
+    {
+      "name": "bool",
+      "hex": "f5",
+      "expect": {
+        "boolean": true
+      }
+    },
+    {
+      "name": "list",
+      "hex": "83016374776ff6",
+      "expect": {
+        "array": [
+          {
+            "number": 1
+          },
+          {
+            "string": "two"
+          },
+          {
+            "null": true
+          }
+        ]
+      }
+    },
+    {
+      "name": "dict with string keys",
+      "hex": "a26161016162814178",
+      "expect": {
+        "object": {
+          "a": {
+            "number": 1
+          },
+          "b": {
+            "array": [
+              {
+                "bytes": "78"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "set",
+      "hex": "d90102820102",
+      "expect": {
+        "set": [
+          {
+            "number": 1
+          },
+          {
+            "number": 2
+          }
+        ]
+      }
+    }
+  ]
+}

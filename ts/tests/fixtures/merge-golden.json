@@ -1,0 +1,207 @@
+{
+  "clean_union": {
+    "inputs": ["YQpiCmMKZAo=", "YQpCCmMKZAo=", "YQpiCmMKRAo="],
+    "labels": {},
+    "merged": "YQpCCmMKRAo=",
+    "conflicted": false,
+    "strict_raised": false,
+    "strict_bytes": "YQpCCmMKRAo="
+  },
+  "identical": {
+    "inputs": ["c2FtZQo=", "c2FtZQo=", "c2FtZQo="],
+    "labels": {},
+    "merged": "c2FtZQo=",
+    "conflicted": false,
+    "strict_raised": false,
+    "strict_bytes": "c2FtZQo="
+  },
+  "overlap": {
+    "inputs": ["YQpiCmMKZAo=", "YQpYCmMKZAo=", "YQpZCmMKZAo="],
+    "labels": {},
+    "merged": "YQo8PDw8PDw8IG91cnMKWAo9PT09PT09ClkKPj4+Pj4+PiB0aGVpcnMKYwpkCg==",
+    "conflicted": true,
+    "strict_raised": true,
+    "strict_bytes": null
+  },
+  "insert_both_same": {
+    "inputs": ["YQpiCg==", "YQpYCmIK", "YQpYCmIK"],
+    "labels": {},
+    "merged": "YQpYCmIK",
+    "conflicted": false,
+    "strict_raised": false,
+    "strict_bytes": "YQpYCmIK"
+  },
+  "insert_both_diff": {
+    "inputs": ["YQpiCg==", "YQpYCmIK", "YQpZCmIK"],
+    "labels": {},
+    "merged": "YQo8PDw8PDw8IG91cnMKWAo9PT09PT09ClkKPj4+Pj4+PiB0aGVpcnMKYgo=",
+    "conflicted": true,
+    "strict_raised": true,
+    "strict_bytes": null
+  },
+  "insert_adjacent": {
+    "inputs": ["YQpiCg==", "YQpYCmIK", "YQpiClkK"],
+    "labels": {},
+    "merged": "YQpYCmIKWQo=",
+    "conflicted": false,
+    "strict_raised": false,
+    "strict_bytes": "YQpYCmIKWQo="
+  },
+  "delete_vs_same": {
+    "inputs": ["YQpiCg==", "YQo=", "YQo="],
+    "labels": {},
+    "merged": "YQo=",
+    "conflicted": false,
+    "strict_raised": false,
+    "strict_bytes": "YQo="
+  },
+  "delete_vs_modify": {
+    "inputs": ["YQpiCg==", null, "YQpCCg=="],
+    "labels": {},
+    "merged": "PDw8PDw8PCBvdXJzCj09PT09PT0KYQpCCj4+Pj4+Pj4gdGhlaXJzCg==",
+    "conflicted": true,
+    "strict_raised": true,
+    "strict_bytes": null
+  },
+  "modify_vs_delete": {
+    "inputs": ["YQpiCg==", "YQpCCg==", null],
+    "labels": {},
+    "merged": "PDw8PDw8PCBvdXJzCmEKQgo9PT09PT09Cj4+Pj4+Pj4gdGhlaXJzCg==",
+    "conflicted": true,
+    "strict_raised": true,
+    "strict_bytes": null
+  },
+  "add_added_same": {
+    "inputs": [null, "eAo=", "eAo="],
+    "labels": {},
+    "merged": "eAo=",
+    "conflicted": false,
+    "strict_raised": false,
+    "strict_bytes": "eAo="
+  },
+  "add_added_diff": {
+    "inputs": [null, "eAo=", "eQo="],
+    "labels": {},
+    "merged": "PDw8PDw8PCBvdXJzCngKPT09PT09PQp5Cj4+Pj4+Pj4gdGhlaXJzCg==",
+    "conflicted": true,
+    "strict_raised": true,
+    "strict_bytes": null
+  },
+  "empty_base_write": {
+    "inputs": ["", null, "bmV3Cg=="],
+    "labels": {},
+    "merged": "PDw8PDw8PCBvdXJzCj09PT09PT0KbmV3Cj4+Pj4+Pj4gdGhlaXJzCg==",
+    "conflicted": true,
+    "strict_raised": true,
+    "strict_bytes": null
+  },
+  "no_trailing_newline": {
+    "inputs": ["YQpi", "YQpC", "YQpi"],
+    "labels": {},
+    "merged": "YQpC",
+    "conflicted": false,
+    "strict_raised": false,
+    "strict_bytes": "YQpC"
+  },
+  "crlf": {
+    "inputs": ["YQ0KYg0K", "YQ0KQg0K", "YQ0KYg0K"],
+    "labels": {},
+    "merged": "YQ0KQg0K",
+    "conflicted": false,
+    "strict_raised": false,
+    "strict_bytes": "YQ0KQg0K"
+  },
+  "lone_cr": {
+    "inputs": ["YQ1iDQ==", "YQ1iDWMN", "YQ1iDQ=="],
+    "labels": {},
+    "merged": "YQ1iDWMN",
+    "conflicted": false,
+    "strict_raised": false,
+    "strict_bytes": "YQ1iDWMN"
+  },
+  "unicode_split": {
+    "inputs": ["YeKAqGIK", "YeKAqEIK", "YeKAqGIK"],
+    "labels": {},
+    "merged": "YeKAqEIK",
+    "conflicted": false,
+    "strict_raised": false,
+    "strict_bytes": "YeKAqEIK"
+  },
+  "marker_passthrough": {
+    "inputs": ["YQpiCg==", "PDw8PDw8PCBub3QgYSBodW5rCnNhbWUK", "YQpiCg=="],
+    "labels": {},
+    "merged": "PDw8PDw8PCBub3QgYSBodW5rCnNhbWUK",
+    "conflicted": false,
+    "strict_raised": false,
+    "strict_bytes": "PDw8PDw8PCBub3QgYSBodW5rCnNhbWUK"
+  },
+  "strict_conflict": {
+    "inputs": ["YQpiCg==", "YQpYCg==", "YQpZCg=="],
+    "labels": {},
+    "merged": "YQo8PDw8PDw8IG91cnMKWAo9PT09PT09ClkKPj4+Pj4+PiB0aGVpcnMK",
+    "conflicted": true,
+    "strict_raised": true,
+    "strict_bytes": null
+  },
+  "strict_clean": {
+    "inputs": ["YQpiCg==", "YQpCCg==", "YQpiCg=="],
+    "labels": {},
+    "merged": "YQpCCg==",
+    "conflicted": false,
+    "strict_raised": false,
+    "strict_bytes": "YQpCCg=="
+  },
+  "strict_marker_passthrough": {
+    "inputs": ["YQpiCg==", "PDw8PDw8PCBub3QgYSBodW5rCnNhbWUK", "YQpiCg=="],
+    "labels": {},
+    "merged": "PDw8PDw8PCBub3QgYSBodW5rCnNhbWUK",
+    "conflicted": false,
+    "strict_raised": false,
+    "strict_bytes": "PDw8PDw8PCBub3QgYSBodW5rCnNhbWUK"
+  },
+  "custom_labels": {
+    "inputs": ["YQpiCg==", "YQpYCg==", "YQpZCg=="],
+    "labels": {
+      "ours_label": "main",
+      "theirs_label": "dev"
+    },
+    "merged": "YQo8PDw8PDw8IG1haW4KWAo9PT09PT09ClkKPj4+Pj4+PiBkZXYK",
+    "conflicted": true,
+    "strict_raised": true,
+    "strict_bytes": null
+  },
+  "nul": {
+    "inputs": ["YQo=", "YQBi", "YQo="],
+    "labels": {},
+    "error": "CantMark"
+  },
+  "non_utf8": {
+    "inputs": ["YQo=", "/yBiaW5hcnk=", "YQo="],
+    "labels": {},
+    "error": "CantMark"
+  },
+  "cr_clean_union": {
+    "inputs": ["YQ1iDWMN", "YQ1CDWMN", "YQ1iDUMN"],
+    "labels": {},
+    "merged": "YQ1CDUMN",
+    "conflicted": false,
+    "strict_raised": false,
+    "strict_bytes": "YQ1CDUMN"
+  },
+  "cr_overlap_conflict": {
+    "inputs": ["YQ1iDWMN", "YQ1CDWMN", "YQ1YDWMN"],
+    "labels": {},
+    "merged": "YQ08PDw8PDw8IG91cnMKQg09PT09PT09ClgNPj4+Pj4+PiB0aGVpcnMKYw0=",
+    "conflicted": true,
+    "strict_raised": true,
+    "strict_bytes": null
+  },
+  "cr_custom_labels": {
+    "inputs": ["YQ1iDWMN", "YQ1CDWMN", "YQ1YDWMN"],
+    "labels": { "ours_label": "main", "theirs_label": "dev" },
+    "merged": "YQ08PDw8PDw8IG1haW4KQg09PT09PT09ClgNPj4+Pj4+PiBkZXYKYw0=",
+    "conflicted": true,
+    "strict_raised": true,
+    "strict_bytes": null
+  }
+}
