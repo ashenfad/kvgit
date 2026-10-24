@@ -159,16 +159,27 @@ export class ScenarioFailure extends Error {
 
 type Handle = Worktree<Uint8Array> | Snapshot<Uint8Array>
 
+/** JSON text for comparing and showing values; an integer past the
+ *  safe range, read as a `bigint`, is written as its digits. */
+function text(value: unknown): string {
+  return JSON.stringify(value, (_k, v) => (typeof v === 'bigint' ? `${v}n` : v))
+}
+
+/** Equal as JSON values, a `bigint` equal only to a `bigint`. */
 function same(a: unknown, b: unknown): boolean {
   if (a instanceof Uint8Array && b instanceof Uint8Array) {
     return a.length === b.length && a.every((x, i) => x === b[i])
   }
-  return JSON.stringify(a) === JSON.stringify(b)
+  const typed = (value: unknown): string =>
+    JSON.stringify(value, (_k, v) =>
+      typeof v === 'bigint' ? `n${v}` : typeof v === 'string' ? `s${v}` : v,
+    )
+  return typed(a) === typed(b)
 }
 
 function show(value: unknown): string {
   if (value instanceof Uint8Array) return JSON.stringify(encodeBytes(value))
-  return JSON.stringify(value)
+  return text(value)
 }
 
 export class Run {
