@@ -1,0 +1,42 @@
+{
+  "description": "A new branch, one commit of a text and a binary value, read back from the worktree, a second repository and a snapshot.",
+  "clock": 1700000000.25,
+  "steps": [
+    { "op": "open", "as": "alice" },
+    { "op": "worktree", "repo": "alice", "as": "w", "branch": "main", "create": true },
+    { "op": "head", "wt": "w", "expect": "$root" },
+    { "op": "set", "wt": "w", "key": "greeting", "value": "hello" },
+    { "op": "set", "wt": "w", "key": "blob", "value": {"b64": "AP+AAQ=="} },
+    { "op": "get", "from": "w", "key": "greeting", "expect": "hello" },
+    { "op": "commit", "wt": "w", "info": {"message": "first"}, "expect": {"merged": true, "strategy": "fast_forward", "commit": "$c1"} },
+    { "op": "head", "wt": "w", "expect": "$c1" },
+    { "op": "open", "as": "bob" },
+    { "op": "worktree", "repo": "bob", "as": "b", "branch": "main" },
+    { "op": "get", "from": "b", "key": "blob", "expect": {"b64": "AP+AAQ=="} },
+    { "op": "keys", "from": "b", "expect": ["blob", "greeting"] },
+    { "op": "snapshot", "repo": "bob", "as": "s", "commit": "$c1" },
+    { "op": "get", "from": "s", "key": "greeting", "expect": "hello" },
+    { "op": "get", "from": "s", "key": "missing", "expect": null },
+    { "op": "branches", "repo": "bob", "expect": {"main": "$c1"} },
+    { "op": "get_commit", "repo": "bob", "commit": "$c1", "expect": {"parents": ["$root"], "time": 1700000000.25, "info": {"message": "first"}} },
+    { "op": "log", "repo": "bob", "branch": "main", "expect": ["$c1", "$root"] }
+  ],
+  "final": {
+    "__branch_head__main": "\"70009cd814819ad11c9db61e1099d21341998c06\"",
+    "__branch_head_prev__main": "\"821bf06b4dcb406ea508a4a992eadc22f29850cd\"",
+    "__commit_root__70009cd814819ad11c9db61e1099d21341998c06": "\"9256dfc8671997e1348b01dd9386ea2088a8f655627a1955181b5ac34decd677\"",
+    "__commit_root__821bf06b4dcb406ea508a4a992eadc22f29850cd": "\"a01262f23a252767acf71bcd9d1ca8deca5fda1519228657ef7d44990698fd30\"",
+    "__commit_time__70009cd814819ad11c9db61e1099d21341998c06": "1700000000.25",
+    "__commit_time__821bf06b4dcb406ea508a4a992eadc22f29850cd": "1700000000.25",
+    "__info__70009cd814819ad11c9db61e1099d21341998c06": "{\"message\":\"first\"}",
+    "__kvgit_version__": "4",
+    "__parent_commit__70009cd814819ad11c9db61e1099d21341998c06": "[\"821bf06b4dcb406ea508a4a992eadc22f29850cd\"]",
+    "__parent_commit__821bf06b4dcb406ea508a4a992eadc22f29850cd": "[]",
+    "__parent_gens__70009cd814819ad11c9db61e1099d21341998c06": "[0]",
+    "kvgit:blob:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824": "hello",
+    "kvgit:blob:6509423fd9da5c225d2f8619ffae394b40f9f7686fee55a38c54b1424ac65f46": {
+      "b64": "AP+AAQ=="
+    },
+    "kvgit:keyset:9256dfc8671997e1348b01dd9386ea2088a8f655627a1955181b5ac34decd677": "{\"items\":{\"blob\":\"WyJrdmdpdDpibG9iOjY1MDk0MjNmZDlkYTVjMjI1ZDJmODYxOWZmYWUzOTRiNDBmOWY3Njg2ZmVlNTVhMzhjNTRiMTQyNGFjNjVmNDYiLHsic2l6ZSI6NH1d\",\"greeting\":\"WyJrdmdpdDpibG9iOjJjZjI0ZGJhNWZiMGEzMGUyNmU4M2IyYWM1YjllMjllMWIxNjFlNWMxZmE3NDI1ZTczMDQzMzYyOTM4Yjk4MjQiLHsic2l6ZSI6NX1d\"},\"kind\":\"leaf\"}"
+  }
+}
