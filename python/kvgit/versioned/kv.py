@@ -887,11 +887,15 @@ def _acquire_gc_lease(store: KVStore, lease_ttl: float) -> tuple[bytes, float, f
             f"expires in {expiry - now:.1f}s)"
         )
     expires = now + lease_ttl
-    owner = f"{os.getpid()}-{uuid.uuid4().hex[:12]}"
-    ours = dumps({"owner": owner, "expires": expires})
+    ours = dumps({"owner": _new_lease_owner(), "expires": expires})
     if not store.cas(GC_LEASE_KEY, ours, expected=raw):
         raise GcBusy("Another sweep took the GC lease first")
     return ours, now, expires
+
+
+def _new_lease_owner() -> str:
+    """A name for a lease this process takes, unique among sweepers."""
+    return f"{os.getpid()}-{uuid.uuid4().hex[:12]}"
 
 
 def _release_gc_lease(

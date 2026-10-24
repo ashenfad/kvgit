@@ -1,0 +1,26 @@
+{
+  "description": "A tag keeps a deleted branch's commit alive through gc; deleting the tag lets the next gc take it, and the root commit it descends from.",
+  "clock": 1700000200.75,
+  "steps": [
+    { "op": "open", "as": "r" },
+    { "op": "worktree", "repo": "r", "as": "w", "branch": "topic", "create": true },
+    { "op": "set", "wt": "w", "key": "k", "value": "v" },
+    { "op": "commit", "wt": "w", "expect": {"commit": "$t1"} },
+    { "op": "tag_create", "repo": "r", "name": "v1", "commit": "$t1", "info": {"note": "keep"} },
+    { "op": "tag_create", "repo": "r", "name": "v1", "commit": "$t1", "expect": {"error": "TagExistsError"} },
+    { "op": "tags", "repo": "r", "expect": {"v1": "$t1"} },
+    { "op": "branch_delete", "repo": "r", "name": "topic" },
+    { "op": "branch_delete", "repo": "r", "name": "topic", "expect": {"error": "UnknownBranchError"} },
+    { "op": "clock", "advance": 7200 },
+    { "op": "gc", "repo": "r", "expect": 0 },
+    { "op": "snapshot", "repo": "r", "as": "s", "tag": "v1" },
+    { "op": "get", "from": "s", "key": "k", "expect": "v" },
+    { "op": "tag_delete", "repo": "r", "name": "v1" },
+    { "op": "gc", "repo": "r", "expect": 2 },
+    { "op": "snapshot", "repo": "r", "as": "gone", "commit": "$t1", "expect": {"error": "UnknownCommitError"} }
+  ],
+  "final": {
+    "__gc_lease__": "{\"owner\":\"lease-2\",\"expires\":0}",
+    "__kvgit_version__": "4"
+  }
+}

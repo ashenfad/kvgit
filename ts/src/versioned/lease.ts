@@ -31,9 +31,23 @@ export const IN_FLIGHT_TTL = 600
 /** Seconds a writer sleeps between checks while a lease is live. */
 export const GC_WAIT_POLL = 0.05
 
-/** The clock leases and in-flight markers expire by: wall time, in
- *  seconds. */
-export const leaseClock = (): number => Date.now() / 1000
+/**
+ * Where leases and in-flight markers read the time (wall time, in
+ * seconds), how a writer waits out a live lease, and how a lease names
+ * its holder. Tests that need identical bytes from every run replace
+ * these.
+ *
+ * @internal
+ */
+export const leaseEnv = {
+  clock: (): number => Date.now() / 1000,
+  sleep: (seconds: number): Promise<void> =>
+    new Promise((resolve) => setTimeout(resolve, seconds * 1000)),
+  owner: (): string => `ts-${globalThis.crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`,
+}
+
+/** The clock leases and in-flight markers expire by. */
+export const leaseClock = (): number => leaseEnv.clock()
 
 /** A fresh in-flight marker: the time its protection lapses. */
 export function inFlightMarker(): Uint8Array {
@@ -57,9 +71,6 @@ export function leaseExpiry(raw: Uint8Array | null): number {
   return typeof expires === 'number' ? expires : 0
 }
 
-const sleep = (seconds: number): Promise<void> =>
-  new Promise((resolve) => setTimeout(resolve, seconds * 1000))
-
 /**
  * Wait until no live lease is held; return the lease record then
  * (absent, or the expired record the last sweep left). A write that
@@ -76,7 +87,7 @@ export async function waitForGc(store: KVStore): Promise<Uint8Array | null> {
   while (raw !== null) {
     const remaining = leaseExpiry(raw) - leaseClock()
     if (remaining <= 0) return raw
-    await sleep(Math.min(GC_WAIT_POLL, remaining))
+    await leaseEnv.sleep(Math.min(GC_WAIT_POLL, remaining))
     raw = await store.get(GC_LEASE_KEY)
   }
   return null
@@ -139,8 +150,7 @@ export async function acquireGcLease(store: KVStore, ttl: number): Promise<HeldL
     )
   }
   const expires = at + ttl
-  const owner = `ts-${globalThis.crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`
-  const bytes = leaseRecord(owner, new PyFloat(expires))
+  const bytes = leaseRecord(leaseEnv.owner(), new PyFloat(expires))
   if (!(await store.cas(GC_LEASE_KEY, bytes, raw))) {
     throw new GcBusy('Another sweep took the GC lease first')
   }
