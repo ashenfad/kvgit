@@ -1,0 +1,43 @@
+{
+  "description": "A commit held before its batch lands while another writer moves the branch: the batch still lands, the publish finds the branch moved, and the commit merges onto the new tip.",
+  "clock": 1700003200.75,
+  "steps": [
+    { "op": "open", "as": "alice" },
+    { "op": "open", "as": "bob" },
+    { "op": "worktree", "repo": "alice", "as": "a", "branch": "main", "create": true },
+    { "op": "worktree", "repo": "bob", "as": "b", "branch": "main" },
+    { "op": "set", "wt": "a", "key": "x", "value": "alice" },
+    { "op": "start", "job": "alice", "pause": "batch", "step": { "op": "commit", "wt": "a" } },
+    { "op": "set", "wt": "b", "key": "y", "value": "bob" },
+    { "op": "commit", "wt": "b", "expect": { "strategy": "fast_forward", "commit": "$b1" } },
+    { "op": "resume", "job": "alice", "expect": { "strategy": "three_way", "commit": "$m1", "carried_keys": ["y"] } },
+    { "op": "keys", "from": "b", "expect": ["y"] },
+    { "op": "refresh", "wt": "b" },
+    { "op": "keys", "from": "b", "expect": ["x", "y"] }
+  ],
+  "final": {
+    "__branch_head__main": "\"873fa9871676f2ddd025dcba54b0de997e8916f1\"",
+    "__branch_head_prev__main": "\"f9c931c4e2eb1ef6d11e0ac6b6c3a5568d3f0aff\"",
+    "__commit_root__71d32a24bbb73c9fb970bde99caa6ffc4d519636": "\"26e83fe03a0e40c9f023d0d62d85bcc8b4649fa66b11df38e534e532fd5e6e21\"",
+    "__commit_root__821bf06b4dcb406ea508a4a992eadc22f29850cd": "\"a01262f23a252767acf71bcd9d1ca8deca5fda1519228657ef7d44990698fd30\"",
+    "__commit_root__873fa9871676f2ddd025dcba54b0de997e8916f1": "\"e30de51bbc7599ed5da789102aba94687ccc2619f5172aeb6bac0010ccfea2d7\"",
+    "__commit_root__f9c931c4e2eb1ef6d11e0ac6b6c3a5568d3f0aff": "\"bf0221c61e05c2e1d6da842abbd4420b367ffe62678a122780ec39732d1e3c65\"",
+    "__commit_time__71d32a24bbb73c9fb970bde99caa6ffc4d519636": "1700003200.75",
+    "__commit_time__821bf06b4dcb406ea508a4a992eadc22f29850cd": "1700003200.75",
+    "__commit_time__873fa9871676f2ddd025dcba54b0de997e8916f1": "1700003200.75",
+    "__commit_time__f9c931c4e2eb1ef6d11e0ac6b6c3a5568d3f0aff": "1700003200.75",
+    "__kvgit_version__": "4",
+    "__parent_commit__71d32a24bbb73c9fb970bde99caa6ffc4d519636": "[\"821bf06b4dcb406ea508a4a992eadc22f29850cd\"]",
+    "__parent_commit__821bf06b4dcb406ea508a4a992eadc22f29850cd": "[]",
+    "__parent_commit__873fa9871676f2ddd025dcba54b0de997e8916f1": "[\"f9c931c4e2eb1ef6d11e0ac6b6c3a5568d3f0aff\",\"71d32a24bbb73c9fb970bde99caa6ffc4d519636\"]",
+    "__parent_commit__f9c931c4e2eb1ef6d11e0ac6b6c3a5568d3f0aff": "[\"821bf06b4dcb406ea508a4a992eadc22f29850cd\"]",
+    "__parent_gens__71d32a24bbb73c9fb970bde99caa6ffc4d519636": "[0]",
+    "__parent_gens__873fa9871676f2ddd025dcba54b0de997e8916f1": "[1,1]",
+    "__parent_gens__f9c931c4e2eb1ef6d11e0ac6b6c3a5568d3f0aff": "[0]",
+    "kvgit:blob:2bd806c97f0e00af1a1fc3328fa763a9269723c8db8fac4f93af71db186d6e90": "alice",
+    "kvgit:blob:81b637d8fcd2c6da6359e6963113a1170de795e4b725b84d1e0b4cfd9ec58ce9": "bob",
+    "kvgit:keyset:26e83fe03a0e40c9f023d0d62d85bcc8b4649fa66b11df38e534e532fd5e6e21": "{\"items\":{\"x\":\"WyJrdmdpdDpibG9iOjJiZDgwNmM5N2YwZTAwYWYxYTFmYzMzMjhmYTc2M2E5MjY5NzIzYzhkYjhmYWM0ZjkzYWY3MWRiMTg2ZDZlOTAiLHsic2l6ZSI6NX1d\"},\"kind\":\"leaf\"}",
+    "kvgit:keyset:bf0221c61e05c2e1d6da842abbd4420b367ffe62678a122780ec39732d1e3c65": "{\"items\":{\"y\":\"WyJrdmdpdDpibG9iOjgxYjYzN2Q4ZmNkMmM2ZGE2MzU5ZTY5NjMxMTNhMTE3MGRlNzk1ZTRiNzI1Yjg0ZDFlMGI0Y2ZkOWVjNThjZTkiLHsic2l6ZSI6M31d\"},\"kind\":\"leaf\"}",
+    "kvgit:keyset:e30de51bbc7599ed5da789102aba94687ccc2619f5172aeb6bac0010ccfea2d7": "{\"items\":{\"x\":\"WyJrdmdpdDpibG9iOjJiZDgwNmM5N2YwZTAwYWYxYTFmYzMzMjhmYTc2M2E5MjY5NzIzYzhkYjhmYWM0ZjkzYWY3MWRiMTg2ZDZlOTAiLHsic2l6ZSI6NX1d\",\"y\":\"WyJrdmdpdDpibG9iOjgxYjYzN2Q4ZmNkMmM2ZGE2MzU5ZTY5NjMxMTNhMTE3MGRlNzk1ZTRiNzI1Yjg0ZDFlMGI0Y2ZkOWVjNThjZTkiLHsic2l6ZSI6M31d\"},\"kind\":\"leaf\"}"
+  }
+}
