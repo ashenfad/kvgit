@@ -28,6 +28,19 @@ describe('encodeEntry / decodeEntry', () => {
     expect(enc.decode(chunked)).toBe('["x",{"size":1,"chunks":["c1","c2"]}]')
     expect(decodeEntry(chunked)).toEqual({ blob: 'x', meta: { size: 1, chunks: ['c1', 'c2'] } })
   })
+
+  it('re-encodes an entry written before storage v4 to its stored bytes', () => {
+    const stored = [
+      '["c1:k",{"size":26,"created_at":1790533742.0508668}]',
+      '["c1:k",{"size":2,"created_at":1790533742.0}]',
+      '["c1:k",{"size":2,"created_at":1790533742.5,"chunks":["c1","c2"]}]',
+    ]
+    for (const text of stored) {
+      const decoded = decodeEntry(new TextEncoder().encode(text))
+      expect(decoded.meta.createdAt).toBeTypeOf('number')
+      expect(enc.decode(encodeEntry(decoded))).toBe(text)
+    }
+  })
 })
 
 describe('Keyset — empty', () => {
