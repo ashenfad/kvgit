@@ -80,6 +80,8 @@ export class Sqlite implements KVStore {
   readonly #allItemsStmt: StatementSync
   readonly #prefixKeysStmt: StatementSync
   readonly #prefixItemsStmt: StatementSync
+  readonly #fromKeysStmt: StatementSync
+  readonly #fromItemsStmt: StatementSync
   readonly #clearStmt: StatementSync
   readonly #casUpdateStmt: StatementSync
   readonly #casInsertIfAbsentStmt: StatementSync
@@ -98,6 +100,8 @@ export class Sqlite implements KVStore {
     this.#allItemsStmt = db.prepare('SELECT key, value FROM kv')
     this.#prefixKeysStmt = db.prepare('SELECT key FROM kv WHERE key >= ? AND key < ?')
     this.#prefixItemsStmt = db.prepare('SELECT key, value FROM kv WHERE key >= ? AND key < ?')
+    this.#fromKeysStmt = db.prepare('SELECT key FROM kv WHERE key >= ?')
+    this.#fromItemsStmt = db.prepare('SELECT key, value FROM kv WHERE key >= ?')
     this.#clearStmt = db.prepare('DELETE FROM kv')
     this.#casUpdateStmt = db.prepare('UPDATE kv SET value = ? WHERE key = ? AND value = ?')
     this.#casInsertIfAbsentStmt = db.prepare('INSERT OR IGNORE INTO kv (key, value) VALUES (?, ?)')
@@ -224,21 +228,37 @@ export class Sqlite implements KVStore {
   // ---------- Iteration ----------
 
   async *keys(prefix?: string): AsyncIterable<string> {
-    const rows = (
-      prefix !== undefined
-        ? this.#prefixKeysStmt.all(prefix, prefixUpperBound(prefix))
-        : this.#allKeysStmt.all()
+    const rows = this.#scan(
+      prefix,
+      this.#allKeysStmt,
+      this.#fromKeysStmt,
+      this.#prefixKeysStmt,
     ) as Array<{ key: string }>
     for (const row of rows) yield row.key
   }
 
   async *items(prefix?: string): AsyncIterable<readonly [string, Uint8Array]> {
-    const rows = (
-      prefix !== undefined
-        ? this.#prefixItemsStmt.all(prefix, prefixUpperBound(prefix))
-        : this.#allItemsStmt.all()
+    const rows = this.#scan(
+      prefix,
+      this.#allItemsStmt,
+      this.#fromItemsStmt,
+      this.#prefixItemsStmt,
     ) as Array<{ key: string; value: Uint8Array }>
     for (const row of rows) yield [row.key, toFreshUint8Array(row.value)] as const
+  }
+
+  /** The rows under `prefix`: every row without one, rows from it
+   *  up when no string bounds its keys above, else the half-open
+   *  range up to that bound. */
+  #scan(
+    prefix: string | undefined,
+    all: StatementSync,
+    from: StatementSync,
+    range: StatementSync,
+  ): unknown[] {
+    if (prefix === undefined) return all.all()
+    const upper = prefixUpperBound(prefix)
+    return upper === null ? from.all(prefix) : range.all(prefix, upper)
   }
 
   async clear(): Promise<void> {
@@ -256,11 +276,27 @@ function toFreshUint8Array(v: Uint8Array): Uint8Array {
   return new Uint8Array(v)
 }
 
+const MAX_CODE_POINT = 0x10ffff
+
 /**
- * Compute the exclusive upper bound for a prefix range scan.
- * `'￿'` (highest BMP code point) is appended so the half-open
- * range `[prefix, upper)` covers every key starting with `prefix`.
+ * The least string greater than every string starting with `prefix`:
+ * the exclusive upper bound of a prefix scan, or null when nothing is
+ * greater and the scan is open above.
+ *
+ * SQLite's BINARY collation compares the UTF-8 bytes node:sqlite binds,
+ * which order as code points do, so the bound is `prefix` with its last
+ * code point bumped by one: carried leftwards past code points already
+ * at U+10FFFF, and stepped over the surrogates, which UTF-8 cannot
+ * hold. A lone surrogate binds as U+FFFD, so it counts as U+FFFD here.
  */
-function prefixUpperBound(prefix: string): string {
-  return `${prefix}￿`
+function prefixUpperBound(prefix: string): string | null {
+  const points = Array.from(prefix, (ch) => {
+    const cp = ch.codePointAt(0) as number
+    return cp >= 0xd800 && cp <= 0xdfff ? 0xfffd : cp
+  })
+  while (points.length > 0 && points[points.length - 1] === MAX_CODE_POINT) points.pop()
+  const last = points.pop()
+  if (last === undefined) return null
+  points.push(last + 1 === 0xd800 ? 0xe000 : last + 1)
+  return points.map((cp) => String.fromCodePoint(cp)).join('')
 }
