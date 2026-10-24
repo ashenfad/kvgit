@@ -1,0 +1,59 @@
+{
+  "description": "The line-based text merge: clean unions, overlaps marked as conflicts, deletes against edits, line endings, labels and inputs it refuses, each also in strict mode. Ported from the cross-language merge golden.",
+  "clock": 1700000300.0,
+  "steps": [
+    { "op": "text_merge", "old": "a\nb\nc\nd\n", "ours": "a\nB\nc\nd\n", "theirs": "a\nb\nc\nD\n", "expect": {"merged": "a\nB\nc\nD\n", "conflicted": false} },
+    { "op": "text_merge", "old": "a\nb\nc\nd\n", "ours": "a\nB\nc\nd\n", "theirs": "a\nb\nc\nD\n", "strict": true, "expect": {"merged": "a\nB\nc\nD\n"} },
+    { "op": "text_merge", "old": "same\n", "ours": "same\n", "theirs": "same\n", "expect": {"merged": "same\n", "conflicted": false} },
+    { "op": "text_merge", "old": "same\n", "ours": "same\n", "theirs": "same\n", "strict": true, "expect": {"merged": "same\n"} },
+    { "op": "text_merge", "old": "a\nb\nc\nd\n", "ours": "a\nX\nc\nd\n", "theirs": "a\nY\nc\nd\n", "expect": {"merged": "a\n<<<<<<< ours\nX\n=======\nY\n>>>>>>> theirs\nc\nd\n", "conflicted": true} },
+    { "op": "text_merge", "old": "a\nb\nc\nd\n", "ours": "a\nX\nc\nd\n", "theirs": "a\nY\nc\nd\n", "strict": true, "expect": {"error": "CantMark"} },
+    { "op": "text_merge", "old": "a\nb\n", "ours": "a\nX\nb\n", "theirs": "a\nX\nb\n", "expect": {"merged": "a\nX\nb\n", "conflicted": false} },
+    { "op": "text_merge", "old": "a\nb\n", "ours": "a\nX\nb\n", "theirs": "a\nX\nb\n", "strict": true, "expect": {"merged": "a\nX\nb\n"} },
+    { "op": "text_merge", "old": "a\nb\n", "ours": "a\nX\nb\n", "theirs": "a\nY\nb\n", "expect": {"merged": "a\n<<<<<<< ours\nX\n=======\nY\n>>>>>>> theirs\nb\n", "conflicted": true} },
+    { "op": "text_merge", "old": "a\nb\n", "ours": "a\nX\nb\n", "theirs": "a\nY\nb\n", "strict": true, "expect": {"error": "CantMark"} },
+    { "op": "text_merge", "old": "a\nb\n", "ours": "a\nX\nb\n", "theirs": "a\nb\nY\n", "expect": {"merged": "a\nX\nb\nY\n", "conflicted": false} },
+    { "op": "text_merge", "old": "a\nb\n", "ours": "a\nX\nb\n", "theirs": "a\nb\nY\n", "strict": true, "expect": {"merged": "a\nX\nb\nY\n"} },
+    { "op": "text_merge", "old": "a\nb\n", "ours": "a\n", "theirs": "a\n", "expect": {"merged": "a\n", "conflicted": false} },
+    { "op": "text_merge", "old": "a\nb\n", "ours": "a\n", "theirs": "a\n", "strict": true, "expect": {"merged": "a\n"} },
+    { "op": "text_merge", "old": "a\nb\n", "ours": null, "theirs": "a\nB\n", "expect": {"merged": "<<<<<<< ours\n=======\na\nB\n>>>>>>> theirs\n", "conflicted": true} },
+    { "op": "text_merge", "old": "a\nb\n", "ours": null, "theirs": "a\nB\n", "strict": true, "expect": {"error": "CantMark"} },
+    { "op": "text_merge", "old": "a\nb\n", "ours": "a\nB\n", "theirs": null, "expect": {"merged": "<<<<<<< ours\na\nB\n=======\n>>>>>>> theirs\n", "conflicted": true} },
+    { "op": "text_merge", "old": "a\nb\n", "ours": "a\nB\n", "theirs": null, "strict": true, "expect": {"error": "CantMark"} },
+    { "op": "text_merge", "old": null, "ours": "x\n", "theirs": "x\n", "expect": {"merged": "x\n", "conflicted": false} },
+    { "op": "text_merge", "old": null, "ours": "x\n", "theirs": "x\n", "strict": true, "expect": {"merged": "x\n"} },
+    { "op": "text_merge", "old": null, "ours": "x\n", "theirs": "y\n", "expect": {"merged": "<<<<<<< ours\nx\n=======\ny\n>>>>>>> theirs\n", "conflicted": true} },
+    { "op": "text_merge", "old": null, "ours": "x\n", "theirs": "y\n", "strict": true, "expect": {"error": "CantMark"} },
+    { "op": "text_merge", "old": "", "ours": null, "theirs": "new\n", "expect": {"merged": "<<<<<<< ours\n=======\nnew\n>>>>>>> theirs\n", "conflicted": true} },
+    { "op": "text_merge", "old": "", "ours": null, "theirs": "new\n", "strict": true, "expect": {"error": "CantMark"} },
+    { "op": "text_merge", "old": "a\nb", "ours": "a\nB", "theirs": "a\nb", "expect": {"merged": "a\nB", "conflicted": false} },
+    { "op": "text_merge", "old": "a\nb", "ours": "a\nB", "theirs": "a\nb", "strict": true, "expect": {"merged": "a\nB"} },
+    { "op": "text_merge", "old": "a\r\nb\r\n", "ours": "a\r\nB\r\n", "theirs": "a\r\nb\r\n", "expect": {"merged": "a\r\nB\r\n", "conflicted": false} },
+    { "op": "text_merge", "old": "a\r\nb\r\n", "ours": "a\r\nB\r\n", "theirs": "a\r\nb\r\n", "strict": true, "expect": {"merged": "a\r\nB\r\n"} },
+    { "op": "text_merge", "old": "a\rb\r", "ours": "a\rb\rc\r", "theirs": "a\rb\r", "expect": {"merged": "a\rb\rc\r", "conflicted": false} },
+    { "op": "text_merge", "old": "a\rb\r", "ours": "a\rb\rc\r", "theirs": "a\rb\r", "strict": true, "expect": {"merged": "a\rb\rc\r"} },
+    { "op": "text_merge", "old": "a b\n", "ours": "a B\n", "theirs": "a b\n", "expect": {"merged": "a B\n", "conflicted": false} },
+    { "op": "text_merge", "old": "a b\n", "ours": "a B\n", "theirs": "a b\n", "strict": true, "expect": {"merged": "a B\n"} },
+    { "op": "text_merge", "old": "a\nb\n", "ours": "<<<<<<< not a hunk\nsame\n", "theirs": "a\nb\n", "expect": {"merged": "<<<<<<< not a hunk\nsame\n", "conflicted": false} },
+    { "op": "text_merge", "old": "a\nb\n", "ours": "<<<<<<< not a hunk\nsame\n", "theirs": "a\nb\n", "strict": true, "expect": {"merged": "<<<<<<< not a hunk\nsame\n"} },
+    { "op": "text_merge", "old": "a\nb\n", "ours": "a\nX\n", "theirs": "a\nY\n", "expect": {"merged": "a\n<<<<<<< ours\nX\n=======\nY\n>>>>>>> theirs\n", "conflicted": true} },
+    { "op": "text_merge", "old": "a\nb\n", "ours": "a\nX\n", "theirs": "a\nY\n", "strict": true, "expect": {"error": "CantMark"} },
+    { "op": "text_merge", "old": "a\nb\n", "ours": "a\nB\n", "theirs": "a\nb\n", "expect": {"merged": "a\nB\n", "conflicted": false} },
+    { "op": "text_merge", "old": "a\nb\n", "ours": "a\nB\n", "theirs": "a\nb\n", "strict": true, "expect": {"merged": "a\nB\n"} },
+    { "op": "text_merge", "old": "a\nb\n", "ours": "<<<<<<< not a hunk\nsame\n", "theirs": "a\nb\n", "expect": {"merged": "<<<<<<< not a hunk\nsame\n", "conflicted": false} },
+    { "op": "text_merge", "old": "a\nb\n", "ours": "<<<<<<< not a hunk\nsame\n", "theirs": "a\nb\n", "strict": true, "expect": {"merged": "<<<<<<< not a hunk\nsame\n"} },
+    { "op": "text_merge", "old": "a\nb\n", "ours": "a\nX\n", "theirs": "a\nY\n", "ours_label": "main", "theirs_label": "dev", "expect": {"merged": "a\n<<<<<<< main\nX\n=======\nY\n>>>>>>> dev\n", "conflicted": true} },
+    { "op": "text_merge", "old": "a\nb\n", "ours": "a\nX\n", "theirs": "a\nY\n", "ours_label": "main", "theirs_label": "dev", "strict": true, "expect": {"error": "CantMark"} },
+    { "op": "text_merge", "old": "a\n", "ours": "a\u0000b", "theirs": "a\n", "expect": {"error": "CantMark"} },
+    { "op": "text_merge", "old": "a\n", "ours": "a\u0000b", "theirs": "a\n", "strict": true, "expect": {"error": "CantMark"} },
+    { "op": "text_merge", "old": "a\n", "ours": {"b64": "/yBiaW5hcnk="}, "theirs": "a\n", "expect": {"error": "CantMark"} },
+    { "op": "text_merge", "old": "a\n", "ours": {"b64": "/yBiaW5hcnk="}, "theirs": "a\n", "strict": true, "expect": {"error": "CantMark"} },
+    { "op": "text_merge", "old": "a\rb\rc\r", "ours": "a\rB\rc\r", "theirs": "a\rb\rC\r", "expect": {"merged": "a\rB\rC\r", "conflicted": false} },
+    { "op": "text_merge", "old": "a\rb\rc\r", "ours": "a\rB\rc\r", "theirs": "a\rb\rC\r", "strict": true, "expect": {"merged": "a\rB\rC\r"} },
+    { "op": "text_merge", "old": "a\rb\rc\r", "ours": "a\rB\rc\r", "theirs": "a\rX\rc\r", "expect": {"merged": "a\r<<<<<<< ours\nB\r=======\nX\r>>>>>>> theirs\nc\r", "conflicted": true} },
+    { "op": "text_merge", "old": "a\rb\rc\r", "ours": "a\rB\rc\r", "theirs": "a\rX\rc\r", "strict": true, "expect": {"error": "CantMark"} },
+    { "op": "text_merge", "old": "a\rb\rc\r", "ours": "a\rB\rc\r", "theirs": "a\rX\rc\r", "ours_label": "main", "theirs_label": "dev", "expect": {"merged": "a\r<<<<<<< main\nB\r=======\nX\r>>>>>>> dev\nc\r", "conflicted": true} },
+    { "op": "text_merge", "old": "a\rb\rc\r", "ours": "a\rB\rc\r", "theirs": "a\rX\rc\r", "ours_label": "main", "theirs_label": "dev", "strict": true, "expect": {"error": "CantMark"} }
+  ],
+  "final": {}
+}

@@ -14,11 +14,15 @@ import { fileURLToPath } from 'node:url'
 import { Memory } from '../../src/backends/memory'
 import {
   type CommitInfo,
+  MergeChoice,
   type MergeResult,
+  type MergeRule,
   type Ref,
   Repo,
   type Snapshot,
   Worktree,
+  makeTextMerge,
+  textMergeResult,
 } from '../../src/index'
 import { ROOT_COMMIT } from '../../src/versioned/layout'
 import { leaseEnv } from '../../src/versioned/lease'
@@ -92,7 +96,62 @@ export function encodeBytes(value: Uint8Array): Json {
   }
 }
 
+// --- Merge rules ---
+
+type Bytes = Uint8Array | null
+
+const RULES: Record<string, MergeRule<Uint8Array>> = {
+  text: makeTextMerge(),
+  text_strict: makeTextMerge({ strict: true }),
+  ours: MergeChoice.OURS,
+  theirs: MergeChoice.THEIRS,
+  pick_ours: () => MergeChoice.OURS,
+  pick_theirs: () => MergeChoice.THEIRS,
+  concat: (_old: Bytes, ours: Bytes, theirs: Bytes) => {
+    const a = theirs ?? new Uint8Array()
+    const b = ours ?? new Uint8Array()
+    const out = new Uint8Array(a.length + 1 + b.length)
+    out.set(a)
+    out[a.length] = 0x2b // '+'
+    out.set(b, a.length + 1)
+    return out
+  },
+  fail: () => {
+    throw new Error('this rule refuses every key')
+  },
+}
+
+function rule(name: Json | undefined): MergeRule<Uint8Array> {
+  const found = RULES[name as string]
+  if (found === undefined) throw new ScenarioFailure(`unknown merge rule ${show(name)}`)
+  return found
+}
+
+function ruleMap(rules: Json | undefined): ReadonlyMap<string, MergeRule<Uint8Array>> | undefined {
+  if (rules === undefined) return undefined
+  return new Map(Object.entries(rules as Record<string, Json>).map(([k, v]) => [k, rule(v)]))
+}
+
+/** The merge rules a step names, as options. */
+function rules(step: Step) {
+  const fns = ruleMap(step.merge_fns)
+  const prefixes = ruleMap(step.merge_prefixes)
+  return {
+    ...(fns !== undefined && { mergeFns: fns }),
+    ...(prefixes !== undefined && { mergePrefixes: prefixes }),
+    ...(step.default_merge !== undefined && { defaultMerge: rule(step.default_merge) }),
+  }
+}
+
 // --- The run ---
+
+/** The name a scenario uses for an error: kvgit's own errors by class
+ *  name, and a caller's mistake (a plain `Error`, `TypeError`,
+ *  `RangeError`) as `invalid`. */
+export function errorName(e: unknown): string {
+  const name = (e as Error).name
+  return ['Error', 'TypeError', 'RangeError'].includes(name) ? 'invalid' : name
+}
 
 export class ScenarioFailure extends Error {
   override readonly name = 'ScenarioFailure'
@@ -256,7 +315,7 @@ export class Run {
         await handler.call(this, step)
       } catch (e) {
         if (e instanceof ScenarioFailure) throw e
-        const name = (e as Error).name
+        const name = errorName(e)
         if (name !== expect.error) {
           throw new ScenarioFailure(
             `expected ${expect.error}, threw ${name}: ${(e as Error).message}`,
@@ -276,7 +335,10 @@ export class Run {
   check(op: string, expected: Json | undefined, actual: unknown): void {
     switch (op) {
       case 'commit':
-      case 'merge': {
+      case 'merge':
+      case 'apply':
+      case 'cherry_pick':
+      case 'revert': {
         const result = actual as MergeResult
         const fields: Record<string, unknown> = {
           merged: result.merged,
@@ -292,6 +354,14 @@ export class Run {
           } else {
             this.match(field, want, fields[field])
           }
+        }
+        return
+      }
+      case 'text_merge': {
+        const got = actual as { merged: Uint8Array; conflicted?: boolean }
+        for (const [field, want] of Object.entries(expected as Record<string, Json>)) {
+          if (field === 'merged') this.match(field, decodeBytes(want), got.merged)
+          else this.match(field, want, got[field as 'conflicted'])
         }
         return
       }
@@ -351,7 +421,10 @@ export class Run {
   }
 
   async op_open(step: Step): Promise<void> {
-    this.repos.set(step.as as string, await Repo.open(this.store, { now: () => this.clock }))
+    this.repos.set(
+      step.as as string,
+      await Repo.open(this.store, { now: () => this.clock, ...rules(step) }),
+    )
   }
 
   async op_worktree(step: Step): Promise<void> {
@@ -405,6 +478,7 @@ export class Run {
         onConflict: step.on_conflict as 'raise' | 'abandon',
       }),
       ...(step.keys !== undefined && { keys: step.keys as string[] }),
+      ...rules(step),
     })
   }
 
@@ -415,7 +489,49 @@ export class Run {
         onConflict: step.on_conflict as 'raise' | 'abandon',
       }),
       ...(step.fast_forward !== undefined && { fastForward: step.fast_forward as boolean }),
+      ...rules(step),
     })
+  }
+
+  applyOptions(step: Step) {
+    return {
+      ...(step.info !== undefined && { info: step.info as CommitInfo }),
+      ...(step.on_conflict !== undefined && {
+        onConflict: step.on_conflict as 'raise' | 'abandon',
+      }),
+      ...rules(step),
+    }
+  }
+
+  async op_apply(step: Step): Promise<MergeResult> {
+    return this.wt(step).apply(
+      this.arg<string>(step.base),
+      this.arg<string>(step.target),
+      this.applyOptions(step),
+    )
+  }
+
+  async op_cherry_pick(step: Step): Promise<MergeResult> {
+    return this.wt(step).cherryPick(this.arg<string>(step.commit), this.applyOptions(step))
+  }
+
+  async op_revert(step: Step): Promise<MergeResult> {
+    return this.wt(step).revert(this.arg<string>(step.commit), this.applyOptions(step))
+  }
+
+  async op_text_merge(step: Step): Promise<{ merged: Uint8Array; conflicted?: boolean }> {
+    const [old, ours, theirs] = (['old', 'ours', 'theirs'] as const).map((side) =>
+      step[side] === null ? null : decodeBytes(step[side]),
+    ) as [Bytes, Bytes, Bytes]
+    const labels = {
+      ...(step.ours_label !== undefined && { oursLabel: step.ours_label as string }),
+      ...(step.theirs_label !== undefined && { theirsLabel: step.theirs_label as string }),
+    }
+    if (step.strict === true) {
+      return { merged: makeTextMerge({ ...labels, strict: true })(old, ours, theirs) }
+    }
+    const [merged, conflicted] = textMergeResult(old, ours, theirs, labels)
+    return { merged, conflicted }
   }
 
   async op_branch_create(step: Step): Promise<string> {

@@ -78,8 +78,11 @@ Each step has an `op` and the fields below. Any step may carry an
 error, named as both packages name it (`BranchMovedError`,
 `MergeConflict`, `UnknownBranchError`, `UnknownCommitError`,
 `UnknownTagError`, `BranchExistsError`, `TagExistsError`,
-`ConcurrencyError`, `GcBusy`). A `MergeConflict` may also give
-`"keys"`, the conflicting keys. A step without `expect` must succeed.
+`ConcurrencyError`, `GcBusy`, `CantMark`). A caller's mistake, which
+each language reports in its own idiom (`ValueError` or `TypeError` in
+Python, a plain `Error`, `TypeError` or `RangeError` in TypeScript), is
+`invalid`. A `MergeConflict` may also give `"keys"`, the conflicting
+keys. A step without `expect` must succeed.
 
 **Time**
 
@@ -91,12 +94,13 @@ error, named as both packages name it (`BranchMovedError`,
 
 | op | fields | expect |
 |---|---|---|
-| `open` | `as` | |
+| `open` | `as`, merge rules | |
 | `worktree` | `repo`, `as`, `branch`, `create` (default false) | |
 | `snapshot` | `repo`, `as`, one of `branch`, `commit`, `tag` | |
 
 Each `open` is a separate repository over the one shared store, as two
-processes would be.
+processes would be. Merge rules given to `open` are the repository's
+defaults; see below.
 
 **Reading and writing**
 
@@ -117,11 +121,35 @@ processes would be.
 |---|---|---|
 | `commit` | `wt`, `info`, `on_moved`, `on_conflict`, `keys` | a result |
 | `merge` | `wt`, one of `branch`, `commit`, `tag`; `info`, `on_conflict`, `fast_forward` | a result |
+| `apply` | `wt`, `base`, `target`; `info`, `on_conflict` | a result |
+| `cherry_pick` | `wt`, `commit`; `info`, `on_conflict` | a result |
+| `revert` | `wt`, `commit`; `info`, `on_conflict` | a result |
 
-All fields but `wt` and the ref are optional and take the packages'
-defaults. A result expectation checks only the fields it gives:
+All fields but `wt` and the commits are optional and take the
+packages' defaults, and each of these also takes merge rules. A result expectation checks only the fields it gives:
 `merged`, `commit`, `strategy` (`no_op`, `fast_forward`, `three_way`,
 `apply`), `auto_merged_keys` and `carried_keys` (sorted lists).
+
+**Merge rules**
+
+`open`, `commit`, `merge`, `apply`, `cherry_pick` and `revert` take
+`merge_fns` (key to rule), `merge_prefixes` (prefix to rule) and
+`default_merge` (a rule). A rule is one of these names:
+
+| rule | |
+|---|---|
+| `text` | the line-based text merge, marking conflicts in the value |
+| `text_strict` | the text merge, refusing (a conflict) where it would mark one |
+| `ours`, `theirs` | a standing policy: that side's value for every key it covers that either side changed |
+| `pick_ours`, `pick_theirs` | a function answering that side for each contested key |
+| `concat` | a function: theirs, `+`, ours (a missing side as empty) |
+| `fail` | a function that raises for every key |
+
+| op | fields | expect |
+|---|---|---|
+| `text_merge` | `old`, `ours`, `theirs` (bytes or `null`); `ours_label`, `theirs_label`, `strict` | `merged`, and `conflicted` unless `strict` |
+
+`text_merge` calls the text merge directly, with no repository.
 
 **Refs**
 
