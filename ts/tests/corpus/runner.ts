@@ -15,14 +15,20 @@ import { fileURLToPath } from 'node:url'
 import { Memory } from '../../src/backends/memory'
 import {
   type CommitInfo,
+  MemoryRemote,
   MergeChoice,
   type MergeResult,
   type MergeRule,
   type Ref,
   Repo,
   type Snapshot,
+  type SyncResult,
   Worktree,
+  deleteRemoteBranch,
   makeTextMerge,
+  pullBranch,
+  pushBranch,
+  syncBranch,
   textMergeResult,
 } from '../../src/index'
 import {
@@ -149,6 +155,17 @@ function rules(step: Step) {
   }
 }
 
+/** A sync result as a scenario names its fields. */
+function syncResult(r: SyncResult): Json {
+  return {
+    status: r.status,
+    branch: r.branch,
+    local_head: r.localHead,
+    remote_head: r.remoteHead,
+    transferred: r.transferred,
+  }
+}
+
 // --- The run ---
 
 /** The name a scenario uses for an error: kvgit's own errors by class
@@ -235,6 +252,9 @@ class PausableMemory extends Memory {
 
 export class Run {
   readonly store = new PausableMemory()
+  /** Stores besides the scenario's: other devices. */
+  readonly stores = new Map<string, PausableMemory>()
+  readonly remotes = new Map<string, MemoryRemote>()
   readonly jobs = new Map<string, Job>()
   readonly repos = new Map<string, Repo<Uint8Array>>()
   readonly handles = new Map<string, Handle>()
@@ -291,6 +311,19 @@ export class Run {
     this.match(what, want, [...actual].sort())
   }
 
+  /** Each field `expected` gives, against `actual`, nested objects
+   *  field by field. */
+  matchFields(what: string, expected: Json | undefined, actual: Record<string, Json>): void {
+    for (const [field, want] of Object.entries(expected as Record<string, Json>)) {
+      const got = actual[field]
+      if (want !== null && typeof want === 'object' && !Array.isArray(want) && got !== null) {
+        this.matchFields(`${what}.${field}`, want, got as Record<string, Json>)
+      } else {
+        this.match(`${what}.${field}`, want, got)
+      }
+    }
+  }
+
   matchMap(what: string, expected: Json | undefined, actual: Map<string, string>): void {
     const want = expected as Record<string, Json>
     const names = [...actual.keys()].sort()
@@ -305,6 +338,19 @@ export class Run {
   }
 
   // Handles
+
+  storeOf(step: Step): Memory {
+    if (step.store === undefined) return this.store
+    const store = this.stores.get(step.store as string)
+    if (store === undefined) throw new ScenarioFailure(`no store ${step.store}`)
+    return store
+  }
+
+  remote(step: Step): MemoryRemote {
+    const remote = this.remotes.get(step.remote as string)
+    if (remote === undefined) throw new ScenarioFailure(`no remote ${step.remote}`)
+    return remote
+  }
 
   repo(step: Step): Repo<Uint8Array> {
     const repo = this.repos.get(step.repo as string)
@@ -481,8 +527,15 @@ export class Run {
         want.forEach((e, n) => this.match(`log[${n}]`, e, got[n]))
         return
       }
+      case 'push':
+      case 'pull':
+      case 'sync':
+      case 'delete_remote_branch':
+        this.matchFields(op, expected, actual as Record<string, Json>)
+        return
       case 'branches':
       case 'tags':
+      case 'remote_refs':
         this.matchMap(op, expected, actual as Map<string, string>)
         return
       case 'get_commit': {
@@ -568,7 +621,7 @@ export class Run {
     }
     this.repos.set(
       step.as as string,
-      await Repo.open(this.store, { now: () => this.clock, ...rules(step) }),
+      await Repo.open(this.storeOf(step), { now: () => this.clock, ...rules(step) }),
     )
   }
 
@@ -744,11 +797,57 @@ export class Run {
     })
   }
 
+  async op_store(step: Step): Promise<void> {
+    this.stores.set(step.as as string, new PausableMemory())
+  }
+
+  async op_remote(step: Step): Promise<void> {
+    this.remotes.set(
+      step.as as string,
+      new MemoryRemote(new Memory(), step.id === undefined ? {} : { id: step.id as string }),
+    )
+  }
+
+  async op_push(step: Step): Promise<Json> {
+    return syncResult(
+      await pushBranch(this.storeOf(step), this.remote(step), step.branch as string),
+    )
+  }
+
+  async op_pull(step: Step): Promise<Json> {
+    return syncResult(
+      await pullBranch(this.storeOf(step), this.remote(step), step.branch as string),
+    )
+  }
+
+  async op_sync(step: Step): Promise<Json> {
+    const outcome = await syncBranch(this.storeOf(step), this.remote(step), step.branch as string)
+    return {
+      status: outcome.status,
+      pull: syncResult(outcome.pull),
+      push: outcome.push === null ? null : syncResult(outcome.push),
+    }
+  }
+
+  async op_delete_remote_branch(step: Step): Promise<Json> {
+    const result = await deleteRemoteBranch(
+      this.storeOf(step),
+      this.remote(step),
+      step.branch as string,
+      step.expected === undefined ? {} : { expected: this.arg<string>(step.expected) },
+    )
+    return { status: result.status, remote_head: result.remoteHead }
+  }
+
+  async op_remote_refs(step: Step): Promise<Map<string, string>> {
+    return new Map((await this.remote(step).listRefs()).map((r) => [r.branch, r.head]))
+  }
+
   async op_store_set(step: Step): Promise<void> {
-    await this.store.set(this.interpolate(step.key as string), decodeBytes(step.value))
+    await this.storeOf(step).set(this.interpolate(step.key as string), decodeBytes(step.value))
   }
 
   async op_store_delete(step: Step): Promise<void> {
-    await this.store.remove(this.interpolate(step.key as string))
+    await this.storeOf(step).remove(this.interpolate(step.key as string))
   }
 }
