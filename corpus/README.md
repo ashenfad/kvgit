@@ -194,6 +194,23 @@ repository's back: damage, leftovers, other writers.
 A sweep or a commit that finds a live lease waits for it to end or
 expire; a sweep with `wait` false raises `GcBusy` instead.
 
+**Interleavings**
+
+| op | fields | expect |
+|---|---|---|
+| `start` | `job`, `pause` (`batch` or `publish`), `step` | |
+| `resume` | `job` | what `step` would expect |
+
+`start` runs `step` as a job of its own and holds it just before it
+writes at the `pause` point: `batch`, the write that lands a commit's
+content with its in-flight marker, or `publish`, the write that moves
+the branch head. The steps after it run while the job is held; `resume`
+lets the held write go ahead, waits for the job, and checks its outcome
+against `expect`. A job that finishes without reaching its pause point,
+or is never resumed, fails the scenario. The runners hold the write in a store wrapped
+around the scenario's store: Python runs the job on a thread,
+TypeScript as a promise it can tell apart by `AsyncLocalStorage`.
+
 ## Recording
 
 `final` comes from running the scenario. To record or refresh it:

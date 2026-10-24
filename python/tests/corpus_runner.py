@@ -10,7 +10,8 @@ from __future__ import annotations
 import base64
 import json
 import re
-from collections.abc import Iterator
+import threading
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -132,11 +133,54 @@ class ScenarioFailure(AssertionError):
     pass
 
 
+class _Job:
+    """An operation started on its own thread, to be held at a point."""
+
+    def __init__(self, step: dict, pause: str) -> None:
+        self.step = step
+        self.pause = pause
+        self.paused = threading.Event()
+        self.go = threading.Event()
+        self.done = threading.Event()
+        self.outcome: tuple[Any, BaseException | None] = (None, None)
+
+
+class PausableMemory(Memory):
+    """A memory store that holds a job's write at a protocol point: the
+    commit batch (the write landing an in-flight marker) or the publish
+    (the write moving a branch head)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.local = threading.local()
+
+    def cas_many(self, expected, writes, removes=()) -> bool:
+        job: _Job | None = getattr(self.local, "job", None)
+        if job is not None and not job.paused.is_set() and _point(writes) == job.pause:
+            job.paused.set()
+            job.go.wait()
+        return super().cas_many(expected, writes, removes)
+
+
+def _point(writes: Mapping[str, bytes]) -> str | None:
+    """The protocol point a write is, by the keys it writes."""
+    if any(k.startswith(_kv.IN_FLIGHT_KEY % "") for k in writes):
+        return "batch"
+    if any(
+        k.startswith(_kv.BRANCH_HEAD % "")
+        and not k.startswith(_kv.BRANCH_HEAD % _kv.TAG_BRANCH_PREFIX)
+        for k in writes
+    ):
+        return "publish"
+    return None
+
+
 class Run:
     def __init__(self, scenario: dict, path: Path) -> None:
         self.scenario = scenario
         self.path = path
-        self.store = Memory()
+        self.store = PausableMemory()
+        self.jobs: dict[str, _Job] = {}
         for key, value in (scenario.get("store") or {}).items():
             self.store.set(key, decode_bytes(value))
         self.clock = _Clock(scenario["clock"])
@@ -214,35 +258,54 @@ class Run:
                     raise ScenarioFailure(
                         f"{self.path.name} step {index} ({step['op']}): {e}"
                     ) from None
+            if self.jobs:
+                raise ScenarioFailure(
+                    f"{self.path.name}: never resumed: {', '.join(self.jobs)}"
+                )
         return {
             key: encode_bytes(value)
             for key, value in sorted(self.store.items(), key=lambda kv: kv[0])
         }
 
     def step(self, step: dict) -> None:
-        op = step["op"]
-        handler = getattr(self, "op_" + op, None)
+        if step["op"] == "resume":
+            self.op_resume(step)
+            return
+        self.judge(step, self.perform(step))
+
+    def perform(self, step: dict) -> tuple[Any, BaseException | None]:
+        """Run a step's operation; its result, or the error it raised."""
+        handler = getattr(self, "op_" + step["op"], None)
         if handler is None:
-            raise ScenarioFailure(f"unknown op {op!r}")
+            raise ScenarioFailure(f"unknown op {step['op']!r}")
+        try:
+            return handler(step), None
+        except ScenarioFailure:
+            raise
+        except Exception as e:  # noqa: BLE001 — the step's expect judges it
+            return None, e
+
+    def judge(self, step: dict, outcome: tuple[Any, BaseException | None]) -> None:
+        """Hold an operation's outcome to the step's ``expect``."""
+        result, error = outcome
         expect = step.get("expect")
         if isinstance(expect, dict) and "error" in expect:
-            try:
-                handler(step)
-            except Exception as e:
-                name = error_name(e)
-                if name != expect["error"]:
-                    raise ScenarioFailure(
-                        f"expected {expect['error']}, raised {name}: {e}"
-                    ) from e
-                if "keys" in expect:
-                    self.match_sorted(
-                        "conflicting keys", expect["keys"], e.conflicting_keys
-                    )
-                return
-            raise ScenarioFailure(f"expected {expect['error']}, but it succeeded")
-        result = handler(step)
+            if error is None:
+                raise ScenarioFailure(f"expected {expect['error']}, but it succeeded")
+            name = error_name(error)
+            if name != expect["error"]:
+                raise ScenarioFailure(
+                    f"expected {expect['error']}, raised {name}: {error}"
+                ) from error
+            if "keys" in expect:
+                self.match_sorted(
+                    "conflicting keys", expect["keys"], error.conflicting_keys
+                )
+            return
+        if error is not None:
+            raise error
         if "expect" in step:
-            self.check(op, step["expect"], result)
+            self.check(step["op"], step["expect"], result)
 
     def check(self, op: str, expected: Any, actual: Any) -> None:
         if op in ("commit", "merge", "apply", "cherry_pick", "revert"):
@@ -298,6 +361,42 @@ class Run:
             self.match(op, expected, actual)
 
     # -- Ops --
+
+    def op_start(self, step: dict) -> None:
+        if step["pause"] not in ("batch", "publish"):
+            raise ScenarioFailure(f"unknown pause point {step['pause']!r}")
+        job = _Job(step["step"], step["pause"])
+        self.jobs[step["job"]] = job
+
+        def run() -> None:
+            self.store.local.job = job
+            try:
+                job.outcome = self.perform(job.step)
+            except BaseException as e:  # noqa: BLE001 — handed to resume
+                job.outcome = (None, e)
+            finally:
+                job.done.set()
+
+        threading.Thread(target=run, daemon=True).start()
+        while not (job.paused.wait(0.01) or job.done.is_set()):
+            pass
+        if not job.paused.is_set():
+            raise ScenarioFailure(
+                f"job {step['job']} finished without reaching {job.pause}"
+            )
+
+    def op_resume(self, step: dict) -> None:
+        job = self.jobs.pop(step["job"])
+        job.go.set()
+        if not job.done.wait(10):
+            raise ScenarioFailure(f"job {step['job']} did not finish")
+        outcome = job.outcome
+        if isinstance(outcome[1], ScenarioFailure):
+            raise outcome[1]
+        self.judge(
+            {**job.step, **({"expect": step["expect"]} if "expect" in step else {})},
+            outcome,
+        )
 
     def op_clock(self, step: dict) -> None:
         if "set" in step:
