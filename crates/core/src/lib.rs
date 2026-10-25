@@ -3,13 +3,20 @@
 
 pub mod base64;
 pub mod commit;
+pub mod error;
 pub mod hash;
+pub mod head;
+pub mod history;
 pub mod json;
 pub mod keyset;
 pub mod layout;
+pub mod lease;
 pub mod machine;
+pub mod merge;
+pub mod store;
 pub mod text;
 pub mod tree;
+pub mod write;
 
 /// The version of the core, which is the version of both packages.
 pub fn version() -> &'static str {

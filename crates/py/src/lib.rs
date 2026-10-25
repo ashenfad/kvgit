@@ -491,6 +491,7 @@ mod _core {
                 Step::Request(Request::Get(keys)) => {
                     ("get", PyList::new(py, keys)?).into_pyobject(py)
                 }
+                Step::Request(other) => unreachable!("a tree only reads, not {other:?}"),
                 Step::Done(Err(e)) => Err(PyValueError::new_err(e.to_string())),
                 Step::Done(Ok(out)) => {
                     let result: Bound<'py, PyAny> = match out {
