@@ -30,6 +30,7 @@ fn every_batch_reaches_the_root_python_reached() {
         let shape = Shape {
             prefix: "t:".into(),
             bucket_max: *bucket_max as usize,
+            memo: None,
         };
         let Some(Value::Array(batches)) = r.get("batches") else {
             panic!("batches")

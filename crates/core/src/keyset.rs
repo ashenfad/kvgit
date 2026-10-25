@@ -17,6 +17,7 @@ pub fn shape() -> Shape {
     Shape {
         prefix: KEYSET_PREFIX.to_string(),
         bucket_max: 8,
+        memo: None,
     }
 }
 
