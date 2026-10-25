@@ -1,15 +1,20 @@
 //! The stores the corpus recorded (`corpus/scenarios/**`, each one's
 //! `final`), read back through the core: every commit made during a
-//! scenario rehashes to its name, and every keyset node hashes to its
-//! key and re-encodes to its bytes.
+//! scenario rehashes to its name, every keyset node hashes to its key
+//! and re-encodes to its bytes, and every commit's keyset reads back
+//! entry by entry and builds again, from nothing, to the same root.
 
 use kvgit_core::commit::commit_hash;
 use kvgit_core::hash::sha256_hex;
 use kvgit_core::json::{Value, dumps, loads};
+use kvgit_core::keyset::{Entry, shape};
 use kvgit_core::layout::{
-    COMMIT_ROOT_PREFIX, KEYSET_PREFIX, ROOT_COMMIT, commit_time, info_key, parent_commit,
+    COMMIT_ROOT_PREFIX, EMPTY_HASH, KEYSET_PREFIX, ROOT_COMMIT, commit_time, info_key,
+    parent_commit,
 };
-use std::collections::BTreeMap;
+use kvgit_core::machine::Machine;
+use kvgit_core::tree::{update, walk};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -115,4 +120,61 @@ fn every_keyset_node_hashes_to_its_key_and_reencodes() {
         }
     }
     assert!(checked > 50, "only {checked} nodes checked");
+}
+
+fn run<T: 'static>(store: &BTreeMap<String, String>, machine: Machine<T>) -> T {
+    machine.run(|keys| {
+        keys.iter()
+            .filter_map(|k| store.get(k).map(|v| (k.clone(), v.as_bytes().to_vec())))
+            .collect()
+    })
+}
+
+#[test]
+fn every_keyset_reads_back_and_builds_again_to_its_root() {
+    let mut checked = 0;
+    for (path, before, after) in corpus() {
+        let roots: HashSet<String> = after
+            .iter()
+            .filter(|(k, _)| k.starts_with(COMMIT_ROOT_PREFIX) && !before.contains_key(*k))
+            .map(|(_, v)| loads(v.as_bytes()).unwrap().as_str().unwrap().to_string())
+            .collect();
+        for root in roots {
+            let at = root.clone();
+            let (items, nodes) = run(
+                &after,
+                Machine::new(move |io| walk(io, shape(), at, |_| false)),
+            )
+            .unwrap();
+            if root != *EMPTY_HASH {
+                assert!(
+                    !nodes.is_empty(),
+                    "{}: {root} isn't in the store",
+                    path.display()
+                );
+            }
+            for (_, raw) in &items {
+                let entry = Entry::decode(raw).unwrap();
+                assert_eq!(entry.encode(), *raw, "{}", path.display());
+            }
+            let empty = BTreeMap::new();
+            let rebuilt = run(
+                &empty,
+                Machine::new(move |io| {
+                    update(
+                        io,
+                        shape(),
+                        EMPTY_HASH.clone(),
+                        items,
+                        vec![],
+                        HashMap::new(),
+                    )
+                }),
+            )
+            .unwrap();
+            assert_eq!(rebuilt.root, root, "{}", path.display());
+            checked += 1;
+        }
+    }
+    assert!(checked > 40, "only {checked} keysets checked");
 }
