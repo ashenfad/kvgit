@@ -63,8 +63,8 @@
   },
   "files": ["dist", "README.md", "LICENSE"],
   "scripts": {
-    "build": "tsup",
-    "prepare": "tsup",
+    "build": "node scripts/build-wasm.mjs && tsup",
+    "prepare": "node scripts/build-wasm.mjs && tsup",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:browser": "vitest run --config vitest.browser.config.ts",

@@ -31,6 +31,10 @@ const FORBIDDEN = [
   { pattern: /from\s+['"]node:worker_threads['"]/, label: "import from 'node:worker_threads'" },
   { pattern: /from\s+['"]worker_threads['"]/, label: "import from 'worker_threads'" },
   { pattern: /from\s+['"]node:sqlite['"]/, label: "import from 'node:sqlite'" },
+  {
+    pattern: /\.wasm['"]\s*,\s*import\.meta\.url/,
+    label: 'a .wasm file resolved against import.meta.url',
+  },
 ]
 
 // Files allowed to contain forbidden patterns, because a browser bundle

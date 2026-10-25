@@ -1,11 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import init, { version } from '../wasm/kvgit_wasm.js'
+import { core } from '../src/core'
 import { coreVersion } from './expected'
 
 describe('the core in a browser', () => {
   it('loads in the main thread', async () => {
-    await init()
-    expect(version()).toBe(coreVersion)
+    expect((await core()).version()).toBe(coreVersion)
   })
 
   it('loads in a module worker', async () => {

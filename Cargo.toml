@@ -8,3 +8,12 @@ edition = "2024"
 license = "MIT"
 repository = "https://github.com/ashenfad/kvgit"
 rust-version = "1.85"
+
+# The WebAssembly build: small, since it ships inside the npm package.
+[profile.wasm]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

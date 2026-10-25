@@ -125,9 +125,10 @@ jobs:
     - name: Run tests
       run: cargo test
 
-  # The TypeScript package: lint, typecheck, build, the bundle-shape
-  # check, then the Node suite (fake IndexedDB) and the browser suite
-  # (real IndexedDB in Chromium).
+  # The TypeScript package: lint, typecheck, build (the core's wasm
+  # first), the bundle-shape check, the Node suite (fake IndexedDB),
+  # the browser suite (real IndexedDB in Chromium) and the core's
+  # loading on its own.
   test-ts:
     runs-on: ubuntu-latest
     defaults:
@@ -147,6 +148,17 @@ jobs:
         cache: pnpm
         cache-dependency-path: ts/pnpm-lock.yaml
 
+    # The package carries the core's wasm, built before anything else;
+    # the wasm-bindgen CLI's version must equal the `wasm-bindgen`
+    # crate's, pinned in crates/wasm/Cargo.toml.
+    - name: Set up the wasm toolchain
+      run: rustup target add wasm32-unknown-unknown
+
+    - uses: taiki-e/install-action@v2
+      with:
+        tool: wasm-bindgen@0.2.129
+
+    # Installing runs `prepare`, which builds the wasm and dist/.
     - name: Install dependencies
       run: pnpm install --frozen-lockfile
 
@@ -170,18 +182,6 @@ jobs:
 
     - name: Test (Chromium)
       run: pnpm test:browser
-
-    # The wasm-bindgen CLI's version must equal the `wasm-bindgen`
-    # crate's, pinned in crates/wasm/Cargo.toml.
-    - name: Set up the wasm toolchain
-      run: rustup target add wasm32-unknown-unknown
-
-    - uses: taiki-e/install-action@v2
-      with:
-        tool: wasm-bindgen@0.2.129
-
-    - name: Build the core for wasm
-      run: pnpm build:wasm
 
     - name: Test the core in Node and Chromium
       run: pnpm test:wasm
