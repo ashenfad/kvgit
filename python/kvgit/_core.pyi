@@ -85,3 +85,31 @@ def text_merge(
 
 def check_text_labels(ours_label: str, theirs_label: str) -> None:
     """Raise ``ValueError`` if either label holds a line break."""
+
+class CommitOp:
+    """A commit in progress. ``resume`` returns the next request as a
+    tuple, to be answered by the next call, until it returns
+    ``("done", outcome, notes)``; see ``kvgit.versioned._drive``."""
+
+    def __init__(
+        self,
+        branch: str,
+        base: str,
+        current: str,
+        updates: list[tuple[str, KeysetEntry]],
+        removals: list[str],
+        chunks: list[str],
+        info: dict | None,
+        on_moved: str,
+        on_conflict: str,
+        merge_fns: dict[str, Any],
+        merge_prefixes: list[tuple[str, Any]],
+        default_merge: Any,
+        recover: bool,
+        stamped: bool,
+        roots: list[tuple[str, str]],
+        generations: list[tuple[str, int]],
+    ) -> None: ...
+    def resume(
+        self, wall: float, reply: Any = None, failed: bool = False
+    ) -> tuple[Any, ...]: ...
