@@ -218,15 +218,35 @@ chunks, whose trees hold about a hundred keys, and nothing uses lazy
 mode today. The large tree that remains is the world's, one key per
 file.
 
-Proposed: one model. A worktree is a root plus its pending changes;
-reads go through the repository's content cache, which already holds
-tree nodes. Opening costs one read whatever the keyset's size, and a
-commit rewrites only the paths it changes. Its known cost is that
-`keys()` walks the whole tree on every call. Whether `keys()`, listing
-and iteration over a world-sized tree stay fast enough without a
-materialized index is measured in the toolchain spike before this is
-settled; if not, a materialized index returns as a cache over the
-same model rather than as a second mode.
+One model: a worktree is a root plus its pending changes; reads go
+through the repository's content cache, which already holds tree
+nodes. Opening costs one read whatever the keyset's size, and a commit
+rewrites only the paths it changes.
+
+Walking the whole tree for every `keys()` call is too slow on the
+world's shape. Measured in TypeScript on 100,000 files, against a
+materialized worktree:
+
+| | materialized ms | root plus cache ms |
+|---|---|---|
+| open | 318.4 | 0.009 |
+| `keys()` | 42.8 | 251.4 |
+| one directory's listing | 45.5 | 250.1 |
+| reading every file | 521.8 | 1,034.2 |
+| 10,000 reads of 1,000 files | 314.6 | 102.0 |
+
+So a worktree also keeps a key index, as a cache over the same model:
+
+- The first `keys()`, listing or iteration builds it with one walk;
+  nothing builds it at open, so a worktree that never lists pays
+  nothing.
+- It holds the sorted keys and nothing else, and pending changes are
+  applied to it as they are made.
+- A commit carries it to the new root with the commit's own changes.
+  Moving the worktree to a root it did not write (a merge, a checkout,
+  a refresh) updates it by a structural diff of the two roots, which
+  reads only the subtrees that differ.
+- Reads never consult it; a lookup is a tree path through the cache.
 
 Worktree state lives in the core, owned by the host object. TypeScript
 objects holding core state are freed by a `FinalizationRegistry`
@@ -329,9 +349,9 @@ a conflict, as now).
 - **TypeScript:** wasm-bindgen, with the wasm shipped inside the npm
   package. It must load under Node 22 and in Vite builds, in the main
   thread and in workers. Initialization happens inside `Repo.open`,
-  which is already async, so callers see no new step. How the module is
-  loaded (a URL resolved against `import.meta.url`, or bytes inlined)
-  is settled by the spike, with the gzipped size recorded.
+  which is already async, so callers see no new step. The module's
+  bytes are inlined in the package as base64, so no bundler or server
+  has to resolve a `.wasm` URL; the release build is 97 KB gzipped.
 - **Versions:** both packages release together under one version
   number, starting at 0.5.0. `core` merges to `main` as that release.
 - **Changelog:** one `CHANGELOG.md` at the root, entries marked by
@@ -400,10 +420,6 @@ Made 2026-10-23:
 
 ## Open questions
 
-- **One worktree model,** or a materialized index kept for large
-  iteration-heavy worktrees. Settled by measurement in the toolchain
-  spike.
-- **Wasm loading:** URL or inlined bytes, and the size budget.
 - **Python sync API:** expose the wire walk and replay publicly in
   0.5.0, or keep them internal until a transport wants them.
 - **Python's Composite backend** caches mutable keys per tier and has

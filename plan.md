@@ -117,7 +117,8 @@ whether the C3 kernel alone is worth keeping.
 - Merge, fast-forward, `apply`, cherry-pick, revert, `post_check`.
 - Merge base, ancestry, log, diff, snapshots.
 - GC: the lease, mark and sweep, the deep scan.
-- The content cache, and the worktree model C3 chose.
+- The content cache, and the worktree model C3 chose: root plus
+  cache, with the key index built on the first listing.
 
 **Exit:** both hosts run entirely on the core; neither keeps any of its
 own engine code; both suites and the corpus pass.
