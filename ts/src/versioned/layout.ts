@@ -32,8 +32,9 @@
  * the same in the other.
  */
 
+import { core } from '../core'
 import { StorageVersionError } from '../errors'
-import { PyFloat, pyDumpsBytes, pyLoadsBytes } from '../pyjson'
+import { PyFloat, pyDumps, pyDumpsBytes, pyLoadsBytes } from '../pyjson'
 import type { KVStore } from '../types'
 
 export const STORAGE_VERSION = 4
@@ -196,11 +197,9 @@ export async function commitHash(
   created: number | PyFloat,
   info: unknown,
 ): Promise<string> {
-  const time = created instanceof PyFloat ? created : new PyFloat(created)
-  const payload = pyDumpsBytes(['kvgit/4', [...parents], root, time, info ?? null], {
-    sortKeys: true,
-  })
-  return (await sha256Hex(payload)).slice(0, COMMIT_HASH_LEN)
+  const time = created instanceof PyFloat ? created.value : created
+  const infoText = info === null || info === undefined ? undefined : pyDumps(info)
+  return (await core()).commitHash(JSON.stringify(parents), root, time, infoText)
 }
 
 /** A commit's generation is one more than its highest parent's, and 0

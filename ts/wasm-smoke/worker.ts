@@ -1,4 +1,3 @@
-import init, { version } from '../wasm/kvgit_wasm.js'
+import { core } from '../src/core'
 
-await init()
-postMessage(version())
+postMessage((await core()).version())

@@ -323,11 +323,12 @@ describe('Hamt — getMany', () => {
     const asked = ['k0', 'k57', 'k199', 'missing', 'k57', 'also-missing']
     store.batches = 0
     const found = await h.getMany(asked)
+    const batches = store.batches
     expect([...found.keys()].sort()).toEqual(['k0', 'k199', 'k57'])
     for (const [k, v] of found) expect(text(v)).toBe(text((await h.get(k)) as Uint8Array))
     // Bounded by the depth of the tree, not the number of keys.
-    expect(store.batches).toBeGreaterThan(1)
-    expect(store.batches).toBeLessThanOrEqual(4)
+    expect(batches).toBeGreaterThan(1)
+    expect(batches).toBeLessThanOrEqual(4)
   })
 
   it('reads an empty Hamt without touching the store', async () => {

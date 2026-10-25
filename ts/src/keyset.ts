@@ -11,7 +11,8 @@
  * `Keyset` just gives the API a kvgit-friendly shape.
  */
 
-import { Hamt, type HamtOptions, type NodeCache } from './hamt'
+import { core } from './core'
+import { EMPTY_HASH, Hamt, type HamtOptions, type NodeCache, type TreeOp, drive } from './hamt'
 import { PyFloat, pyDumpsBytes } from './pyjson'
 import type { KVStore, KeysetDiff, KeysetEntry, MetaEntry } from './types'
 
@@ -33,10 +34,13 @@ export function encodeEntry(entry: KeysetEntry): Uint8Array {
 }
 
 export function decodeEntry(raw: Uint8Array): KeysetEntry {
-  const [blob, meta] = JSON.parse(_decoder.decode(raw)) as [
-    string,
-    { size: number; created_at?: number; chunks?: string[] },
-  ]
+  return fromStored(JSON.parse(_decoder.decode(raw)) as StoredEntry)
+}
+
+/** An entry as stored, parsed. */
+type StoredEntry = [string, { size: number; created_at?: number; chunks?: string[] }]
+
+function fromStored([blob, meta]: StoredEntry): KeysetEntry {
   const out: MetaEntry = {
     size: meta.size,
     ...(typeof meta.created_at === 'number' && { createdAt: meta.created_at }),
@@ -111,16 +115,19 @@ export class Keyset {
   // ---------- Reads ----------
 
   async get(key: string): Promise<KeysetEntry | null> {
-    const raw = await this.#hamt.get(key)
-    return raw === null ? null : decodeEntry(raw)
+    return (await this.getMany([key])).get(key) ?? null
   }
 
   /** The entries of the keys that are present, one batched store read
    *  per tree level. */
   async getMany(keys: Iterable<string>): Promise<Map<string, KeysetEntry>> {
-    const out = new Map<string, KeysetEntry>()
-    for (const [k, raw] of await this.#hamt.getMany(keys)) out.set(k, decodeEntry(raw))
-    return out
+    const h = this.#hamt
+    const wanted = [...new Set(keys)]
+    if (wanted.length === 0 || h.root === EMPTY_HASH) return new Map()
+    return h.run(
+      (c, memo) => c.TreeOp.getMany(h.prefix, h.bucketMax, h.root, JSON.stringify(wanted), memo),
+      entryRows,
+    )
   }
 
   /** Shortcut: just the blob pointer, skipping a meta decode. */
@@ -133,22 +140,14 @@ export class Keyset {
     return this.#hamt.has(key)
   }
 
-  /**
-   * Iterate over all `(key, entry)` pairs lazily. One store read per
-   * visited HAMT node. See `materialize()` for a batched alternative.
-   */
+  /** Every `(key, entry)` pair, one batched store read per level. */
   async *items(): AsyncIterable<readonly [string, KeysetEntry]> {
-    for await (const [k, v] of this.#hamt.items()) {
-      yield [k, decodeEntry(v)] as const
-    }
+    yield* await this.materialize()
   }
 
   /** Walk the entire keyset using batched store reads. */
   async materialize(): Promise<Map<string, KeysetEntry>> {
-    const raw = await this.#hamt.materialize()
-    const out = new Map<string, KeysetEntry>()
-    for (const [k, v] of raw) out.set(k, decodeEntry(v))
-    return out
+    return (await this.walk())[0]
   }
 
   /**
@@ -159,10 +158,19 @@ export class Keyset {
    * `Hamt.walk` for `skipNodes` cumulative seen-set semantics.
    */
   async walk(skipNodes?: ReadonlySet<string>): Promise<[Map<string, KeysetEntry>, Set<string>]> {
-    const [raw, nodes] = await this.#hamt.walk(skipNodes)
-    const entries = new Map<string, KeysetEntry>()
-    for (const [k, v] of raw) entries.set(k, decodeEntry(v))
-    return [entries, nodes]
+    const h = this.#hamt
+    if (h.root === EMPTY_HASH || skipNodes?.has(h.root)) return [new Map(), new Set()]
+    const skip =
+      skipNodes === undefined
+        ? undefined
+        : skipNodes instanceof Set
+          ? skipNodes
+          : new Set(skipNodes)
+    return h.run(
+      (c, memo) =>
+        c.TreeOp.walk(h.prefix, h.bucketMax, h.root, skip as Set<string> | undefined, memo),
+      (op) => [entryRows(op), new Set(JSON.parse(op.resultNodes()) as string[])],
+    )
   }
 
   async *keys(): AsyncIterable<string> {
@@ -233,14 +241,25 @@ export class Keyset {
    * equality, so cost is proportional to the number of changed entries.
    */
   async diff(other: Keyset): Promise<KeysetDiff> {
-    const raw = await this.#hamt.diff(other.#hamt)
     const added = new Map<string, KeysetEntry>()
     const removed = new Map<string, KeysetEntry>()
     const modified = new Map<string, readonly [KeysetEntry, KeysetEntry]>()
-    for (const [k, v] of raw.added) added.set(k, decodeEntry(v))
-    for (const [k, v] of raw.removed) removed.set(k, decodeEntry(v))
-    for (const [k, [oldRaw, newRaw]] of raw.modified) {
-      modified.set(k, [decodeEntry(oldRaw), decodeEntry(newRaw)] as const)
+    const [a, b] = [this.#hamt, other.#hamt]
+    if (a.root === b.root) return { added, removed, modified }
+    const c = await core()
+    const op = c.TreeOp.diff(a.prefix, a.bucketMax, a.root, b.root, a.memo(c))
+    try {
+      await drive(op, (keys) => a.readEither(b, keys))
+      const d = JSON.parse(op.resultDiffEntries()) as {
+        added: Array<[string, StoredEntry]>
+        removed: Array<[string, StoredEntry]>
+        modified: Array<[string, StoredEntry, StoredEntry]>
+      }
+      for (const [k, e] of d.added) added.set(k, fromStored(e))
+      for (const [k, e] of d.removed) removed.set(k, fromStored(e))
+      for (const [k, x, y] of d.modified) modified.set(k, [fromStored(x), fromStored(y)] as const)
+    } finally {
+      op.free()
     }
     return { added, removed, modified }
   }
@@ -254,4 +273,13 @@ function hamtOpts(opts: KeysetOptions): HamtOptions {
     ...(opts.pending !== undefined && { pending: opts.pending }),
     ...(opts.cache !== undefined && { cache: opts.cache }),
   }
+}
+
+/** An operation's result rows, whose values are entries. */
+function entryRows(op: TreeOp): Map<string, KeysetEntry> {
+  const out = new Map<string, KeysetEntry>()
+  for (const [k, e] of JSON.parse(op.resultEntries()) as Array<[string, StoredEntry]>) {
+    out.set(k, fromStored(e))
+  }
+  return out
 }

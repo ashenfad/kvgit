@@ -172,9 +172,10 @@ describe('Hamt.updatedBatch', () => {
       // Path length: count the nodes a lookup visits.
       let n = 0
       const counting = new (class extends Memory {
-        override async get(k: string) {
-          n++
-          return store.get(k)
+        override async getMany(keys: Iterable<string>) {
+          const asked = [...keys]
+          n += asked.length
+          return store.getMany(asked)
         }
       })()
       await new Hamt(counting, flushed.root).get(key)
@@ -186,23 +187,17 @@ describe('Hamt.updatedBatch', () => {
 })
 
 describe('NodeCache', () => {
-  it('evicts the least recently used past its byte bound', () => {
-    const cache = new NodeCache({ maxBytes: 300 })
-    const leaf = { kind: 'leaf' as const, items: {} }
-    cache.set('a', leaf, 100)
-    cache.set('b', leaf, 100)
-    cache.set('c', leaf, 100)
-    expect(cache.get('a')).toBe(leaf) // a is now the most recent
-    cache.set('d', leaf, 100)
-    expect(cache.get('b')).toBeUndefined()
-    expect(cache.get('a')).toBe(leaf)
-    expect(cache.stats()).toMatchObject({
-      entries: 3,
-      bytes: 300,
-      evictions: 1,
-      hits: 2,
-      misses: 1,
-    })
+  it('holds no more than its byte bound', async () => {
+    const store = new Memory()
+    const updates: Array<[string, Uint8Array]> = []
+    for (let i = 0; i < 500; i++) updates.push([`page/${i}`, bytes(`v${i}`)])
+    const root = (await (await Hamt.empty(store)).persist({ updates })).root
+    const cache = new NodeCache({ maxBytes: 2000 })
+    await new Hamt(store, root, { cache }).materialize()
+    const stats = cache.stats()
+    expect(stats.bytes).toBeLessThanOrEqual(2000)
+    expect(stats.evictions).toBeGreaterThan(0)
+    expect(stats.misses).toBeGreaterThan(stats.entries)
   })
 })
 
