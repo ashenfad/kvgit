@@ -8,6 +8,7 @@ These pin the rollback on every failure path, and the stable view that
 import gc
 
 import pytest
+from support import fail_reads, race_publish
 
 from kvgit import ConcurrencyError, MergeConflict
 from kvgit.kv.memory import Memory
@@ -48,17 +49,7 @@ def _state(v: Versioned) -> dict:
 
 def _race_once(loser: Versioned, advance) -> None:
     """Make ``loser``'s next HEAD swap lose: run ``advance`` first."""
-    real_cas = loser._cas_head
-    raced = False
-
-    def cas(expected, new_head):
-        nonlocal raced
-        if not raced:
-            raced = True
-            advance()
-        return real_cas(expected, new_head)
-
-    loser._cas_head = cas
+    race_publish(loser.store, loser.current_branch, advance)
 
 
 def _setup():
@@ -97,18 +88,16 @@ class TestRollback:
         assert _state(v) == before
 
     def test_merge_publish_loses_a_second_race(self):
-        _, writer, v = _setup()
+        store, writer, v = _setup()
         before = _state(v)
-        real_cas = v._cas_head
         n = 0
 
-        def always_race(expected, new_head):
+        def always_race():
             nonlocal n
             writer.commit({f"other{n}": b"o"})
             n += 1
-            return real_cas(expected, new_head)
 
-        v._cas_head = always_race
+        race_publish(store, "main", always_race, times=None)
         with pytest.raises(ConcurrencyError):
             _change(v)
         assert _state(v) == before
@@ -122,15 +111,17 @@ class TestRollback:
         assert _state(v) == before
 
     def test_read_for_merge_after_lost_race_fails(self):
-        _, writer, v = _setup()
+        store, writer, v = _setup()
         before = _state(v)
-
-        def fail(*_):
-            raise RuntimeError("store read failed")
 
         def advance():
             writer.commit({"other": b"o1"})
-            v._find_lca = fail
+            # The merge's first read of history: the two heads' parents.
+            fail_reads(
+                store,
+                lambda keys: any(k.startswith("__parent_commit__") for k in keys),
+                RuntimeError("store read failed"),
+            )
 
         _race_once(v, advance)
         with pytest.raises(RuntimeError, match="store read failed"):

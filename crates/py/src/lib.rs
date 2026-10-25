@@ -4,11 +4,15 @@ use pyo3::prelude::*;
 
 #[pymodule]
 mod _core {
+    use kvgit_core::error::Error;
+    use kvgit_core::head::Note;
     use kvgit_core::json::Value;
     use kvgit_core::keyset::Entry;
-    use kvgit_core::machine::{Machine, Reply, Request, Step};
-    use kvgit_core::text::{self, TextError};
+    use kvgit_core::machine::{Cas, Machine, Reply, Request, Step, Write};
+    use kvgit_core::merge::{MergeAnswer, Rule, Rules};
+    use kvgit_core::text::{self, TextError, TextRule};
     use kvgit_core::tree::{self, Shape, TreeDiff, TreeError, Updated};
+    use kvgit_core::write::{self, CommitArgs, Committed, Done, OnConflict, OnMoved};
     use pyo3::exceptions::{PyTypeError, PyValueError};
     use pyo3::prelude::*;
     use pyo3::types::{
@@ -525,6 +529,334 @@ mod _core {
                             .into_any(),
                     };
                     ("done", result).into_pyobject(py)
+                }
+            }
+        }
+    }
+
+    /// A commit in progress, driven like a tree operation: `resume`
+    /// returns the next request as a tuple, to be answered by the next
+    /// call, until it returns `("done", outcome, notes)`.
+    ///
+    /// - `("get", keys)`: a dict of the stored values, absent ones left
+    ///   out.
+    /// - `("cas", expect, writes, removes)`: whether the batch landed.
+    ///   `expect` and `writes` are lists of `(key, bytes)`; an expected
+    ///   `None` means absent, and a write of `None` writes the bytes the
+    ///   host holds for that key.
+    /// - `("wait", seconds)`: `None`, once slept.
+    /// - `("merge", asks)`: one answer per `(rule, key, old, ours,
+    ///   theirs)`, each side a blob key or `None`: `("value", blob,
+    ///   size)`, `"ours"`, `"theirs"` or `("failed", reason)`.
+    /// - `("recover", branch)`: the recoverer's guess, or `None`.
+    /// - `("now",)`: the time to stamp a commit with.
+    ///
+    /// Every call passes wall time; `failed=True` answers a request the
+    /// host couldn't perform.
+    #[pyclass]
+    struct CommitOp {
+        machine: Option<Machine<Done<Committed>>>,
+        asked: Option<Request>,
+    }
+
+    // SAFETY: a machine is neither `Send` nor `Sync` only for the `Rc`s
+    // between it and its operation, and every clone of them lives inside
+    // this object: the commit's shape has no memo and its arguments hold
+    // none. Moved to another thread, the object takes them all along.
+    // Python reaches the machine only through `resume`, which takes the
+    // object mutably, so no two threads ever touch them at once.
+    unsafe impl Send for CommitOp {}
+    unsafe impl Sync for CommitOp {}
+
+    /// A merge rule as Python hands one over: `"ours"`, `"theirs"`, a
+    /// host function's number, or `("text", ours_label, theirs_label,
+    /// strict)`.
+    fn rule_of(obj: &Bound<'_, PyAny>) -> PyResult<Rule> {
+        if let Ok(n) = obj.extract::<u32>() {
+            return Ok(Rule::Host(n));
+        }
+        if let Ok(side) = obj.extract::<String>() {
+            return match side.as_str() {
+                "ours" => Ok(Rule::Ours),
+                "theirs" => Ok(Rule::Theirs),
+                other => Err(PyValueError::new_err(format!(
+                    "not a merge rule: {other:?}"
+                ))),
+            };
+        }
+        let (kind, ours_label, theirs_label, strict): (String, String, String, bool) =
+            obj.extract()?;
+        if kind != "text" {
+            return Err(PyValueError::new_err(format!("not a merge rule: {kind:?}")));
+        }
+        Ok(Rule::Text(TextRule {
+            ours_label,
+            theirs_label,
+            strict,
+        }))
+    }
+
+    fn reply_of(asked: &Request, reply: Option<&Bound<'_, PyAny>>) -> PyResult<Reply> {
+        if let Request::Wait(_) = asked {
+            return Ok(Reply::Waited);
+        }
+        let reply = reply.ok_or_else(|| PyValueError::new_err("a request needs a reply"))?;
+        Ok(match asked {
+            Request::Get(_) => Reply::Values(bytes_of(reply.cast::<PyDict>()?)?),
+            Request::Cas(_) => Reply::Landed(reply.extract()?),
+            Request::Wait(_) => unreachable!("answered above"),
+            Request::Recover(_) => Reply::Recovered(reply.extract()?),
+            Request::Now => Reply::Now(reply.extract()?),
+            Request::Merge(_) => {
+                let mut answers = Vec::new();
+                for answer in reply.try_iter()? {
+                    let answer = answer?;
+                    answers.push(if let Ok(side) = answer.extract::<String>() {
+                        match side.as_str() {
+                            "ours" => MergeAnswer::Ours,
+                            "theirs" => MergeAnswer::Theirs,
+                            other => {
+                                return Err(PyValueError::new_err(format!(
+                                    "not an answer: {other:?}"
+                                )));
+                            }
+                        }
+                    } else if let Ok((_, blob, size)) = answer.extract::<(String, String, u64)>() {
+                        MergeAnswer::Value { blob, size }
+                    } else {
+                        let (_, reason): (String, String) = answer.extract()?;
+                        MergeAnswer::Failed(reason)
+                    });
+                }
+                Reply::Merged(answers)
+            }
+        })
+    }
+
+    fn request_to_py<'py>(py: Python<'py>, request: &Request) -> PyResult<Bound<'py, PyTuple>> {
+        let bytes = |b: &Option<Vec<u8>>| b.as_ref().map(|b| PyBytes::new(py, b));
+        match request {
+            Request::Get(keys) => ("get", PyList::new(py, keys)?).into_pyobject(py),
+            Request::Cas(Cas {
+                expect,
+                writes,
+                removes,
+            }) => {
+                let expect = PyList::new(
+                    py,
+                    expect
+                        .iter()
+                        .map(|(k, v)| (k, bytes(v)))
+                        .collect::<Vec<_>>(),
+                )?;
+                let writes = PyList::new(
+                    py,
+                    writes
+                        .iter()
+                        .map(|(k, w)| match w {
+                            Write::Bytes(b) => (k, Some(PyBytes::new(py, b))),
+                            Write::Held => (k, None),
+                        })
+                        .collect::<Vec<_>>(),
+                )?;
+                ("cas", expect, writes, PyList::new(py, removes)?).into_pyobject(py)
+            }
+            Request::Wait(seconds) => ("wait", *seconds).into_pyobject(py),
+            Request::Merge(asks) => {
+                let asks = asks
+                    .iter()
+                    .map(|a| (a.rule, &a.key, &a.old, &a.ours, &a.theirs))
+                    .collect::<Vec<_>>();
+                ("merge", PyList::new(py, asks)?).into_pyobject(py)
+            }
+            Request::Recover(branch) => ("recover", branch).into_pyobject(py),
+            Request::Now => ("now",).into_pyobject(py),
+        }
+    }
+
+    fn note_to_py<'py>(py: Python<'py>, note: &Note) -> PyResult<Bound<'py, PyTuple>> {
+        match note {
+            Note::FromBackup { branch } => ("from_backup", branch, py.None()).into_pyobject(py),
+            Note::FromRecoverer { branch } => {
+                ("from_recoverer", branch, py.None()).into_pyobject(py)
+            }
+            Note::RecovererMissed { branch, answer } => {
+                ("recoverer_missed", branch, answer).into_pyobject(py)
+            }
+            Note::Healed { branch } => ("healed", branch, py.None()).into_pyobject(py),
+        }
+    }
+
+    /// An outcome as `("ok", fields)`, or `("error", kind, fields)`.
+    fn outcome_to_py<'py>(
+        py: Python<'py>,
+        result: &Result<Committed, Error>,
+    ) -> PyResult<Bound<'py, PyTuple>> {
+        let fields = PyDict::new(py);
+        match result {
+            Ok(c) => {
+                fields.set_item("merged", c.merged)?;
+                fields.set_item("commit", &c.commit)?;
+                fields.set_item("strategy", c.strategy.name())?;
+                fields.set_item("auto_merged_keys", PyTuple::new(py, &c.auto_merged)?)?;
+                fields.set_item("carried_keys", PyTuple::new(py, &c.carried)?)?;
+                let changes = PyList::empty(py);
+                for (key, entry) in &c.changes {
+                    let entry = match entry {
+                        Some(e) => entry_to_py(py, e)?.into_any(),
+                        None => py.None(),
+                    };
+                    changes.append((key, entry))?;
+                }
+                fields.set_item("changes", changes)?;
+                fields.set_item("roots", PyList::new(py, &c.roots)?)?;
+                fields.set_item("generations", PyList::new(py, &c.generations)?)?;
+                fields.set_item("stamped", c.stamped)?;
+                ("ok", fields).into_pyobject(py)
+            }
+            Err(e) => {
+                let kind = match e {
+                    Error::Host => "host",
+                    Error::BranchMoved { branch, base, head } => {
+                        fields.set_item("branch", branch)?;
+                        fields.set_item("base", base)?;
+                        fields.set_item("head", head)?;
+                        "branch_moved"
+                    }
+                    Error::UnknownBranch { branch } => {
+                        fields.set_item("branch", branch)?;
+                        "unknown_branch"
+                    }
+                    Error::Concurrency(_) => "concurrency",
+                    Error::MergeConflict { keys, failures } => {
+                        fields.set_item("keys", PyList::new(py, keys)?)?;
+                        fields.set_item(
+                            "failures",
+                            PyDict::from_sequence(&PyList::new(py, failures)?.into_any())?,
+                        )?;
+                        "merge_conflict"
+                    }
+                    Error::Malformed(_) => "malformed",
+                };
+                fields.set_item("message", e.to_string())?;
+                ("error", kind, fields).into_pyobject(py)
+            }
+        }
+    }
+
+    #[pymethods]
+    impl CommitOp {
+        #[new]
+        #[allow(clippy::too_many_arguments)]
+        #[pyo3(signature = (
+            branch, base, current, updates, removals, chunks, info, on_moved, on_conflict,
+            merge_fns, merge_prefixes, default_merge, recover, stamped, roots, generations,
+        ))]
+        fn new(
+            branch: String,
+            base: String,
+            current: String,
+            updates: Vec<(String, Bound<'_, PyAny>)>,
+            removals: Vec<String>,
+            chunks: Vec<String>,
+            info: Option<&Bound<'_, PyAny>>,
+            on_moved: &str,
+            on_conflict: &str,
+            merge_fns: &Bound<'_, PyDict>,
+            merge_prefixes: Vec<(String, Bound<'_, PyAny>)>,
+            default_merge: Option<&Bound<'_, PyAny>>,
+            recover: bool,
+            stamped: bool,
+            roots: Vec<(String, String)>,
+            generations: Vec<(String, u64)>,
+        ) -> PyResult<CommitOp> {
+            let updates = updates
+                .iter()
+                .map(|(k, e)| Ok((k.clone(), entry_from_py(e)?)))
+                .collect::<PyResult<_>>()?;
+            let mut keys = HashMap::new();
+            for (k, r) in merge_fns.iter() {
+                keys.insert(k.extract::<String>()?, rule_of(&r)?);
+            }
+            let rules = Rules {
+                keys,
+                prefixes: merge_prefixes
+                    .iter()
+                    .map(|(p, r)| Ok((p.clone(), rule_of(r)?)))
+                    .collect::<PyResult<_>>()?,
+                default: default_merge
+                    .filter(|d| !d.is_none())
+                    .map(rule_of)
+                    .transpose()?,
+            };
+            let args = CommitArgs {
+                branch,
+                base,
+                current,
+                shape: kvgit_core::keyset::shape(),
+                updates,
+                removals,
+                chunks,
+                info: info.filter(|v| !v.is_none()).map(to_value).transpose()?,
+                on_moved: if on_moved == "raise" {
+                    OnMoved::Raise
+                } else {
+                    OnMoved::Merge
+                },
+                on_conflict: if on_conflict == "abandon" {
+                    OnConflict::Abandon
+                } else {
+                    OnConflict::Raise
+                },
+                rules,
+                recover,
+                stamped,
+                roots,
+                generations,
+            };
+            Ok(CommitOp {
+                machine: Some(Machine::new(move |io| write::commit(io, args))),
+                asked: None,
+            })
+        }
+
+        #[pyo3(signature = (wall, reply=None, failed=false))]
+        fn resume<'py>(
+            &mut self,
+            py: Python<'py>,
+            wall: f64,
+            reply: Option<&Bound<'py, PyAny>>,
+            failed: bool,
+        ) -> PyResult<Bound<'py, PyTuple>> {
+            let reply = match (&self.asked, failed) {
+                (None, _) => None,
+                (Some(_), true) => Some(Reply::Failed),
+                (Some(asked), false) => Some(reply_of(asked, reply)?),
+            };
+            let machine = self
+                .machine
+                .as_mut()
+                .ok_or_else(|| PyValueError::new_err("the commit is done"))?;
+            match machine.resume_at(wall, reply) {
+                Step::Request(request) => {
+                    let out = request_to_py(py, &request);
+                    self.asked = Some(request);
+                    out
+                }
+                Step::Done(done) => {
+                    self.machine = None;
+                    self.asked = None;
+                    let notes = done
+                        .notes
+                        .iter()
+                        .map(|n| note_to_py(py, n))
+                        .collect::<PyResult<Vec<_>>>()?;
+                    (
+                        "done",
+                        outcome_to_py(py, &done.result)?,
+                        PyList::new(py, notes)?,
+                    )
+                        .into_pyobject(py)
                 }
             }
         }

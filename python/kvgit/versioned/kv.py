@@ -101,11 +101,12 @@ from ..errors import (
 from ..hamt import EMPTY_HASH
 from ..kv.base import KVStore
 from ..kv.memory import Memory
+from ._drive import drive
 from .base import VersionedBase
 from .helpers import walk_history
 from .keyset import Keyset, KeysetEntry, MetaEntry
 from .merge import Change, MergeResolution
-from .protocol import MergeResult, TagInfo
+from .protocol import MergeChoice, MergePolicy, MergeResult, TagInfo
 
 PARENT_COMMIT = "__parent_commit__%s"
 PARENT_GENS = "__parent_gens__%s"
@@ -1861,6 +1862,157 @@ class VersionedKV(VersionedBase):
 
         raw = self.store.get_many(keys_by_blob.keys())
         return {key: value for blob, value in raw.items() for key in keys_by_blob[blob]}
+
+    # -- Commit --
+
+    def commit(
+        self,
+        updates: dict[str, bytes] | None = None,
+        removals: set[str] | None = None,
+        *,
+        on_conflict: str = "raise",
+        on_moved: str = "merge",
+        merge_fns: dict[str, MergePolicy] | None = None,
+        merge_prefixes: dict[str, MergePolicy] | None = None,
+        default_merge: MergePolicy | None = None,
+        info: dict | None = None,
+        chunks: dict[str, bytes] | None = None,
+        chunk_refs: dict[str, list[str]] | None = None,
+    ) -> MergeResult:
+        """Commit changes and atomically advance HEAD.
+
+        Creates a new commit with the given changes and advances the
+        branch HEAD.  If HEAD has diverged, performs a three-way merge.
+        A HEAD move that lands inside the fast-forward CAS window is
+        retried once against the new HEAD through that same merge path,
+        so a single well-behaved writer never sees ``ConcurrencyError``
+        for a race it can merge past.
+
+        With ``on_moved="raise"`` a moved HEAD raises
+        :class:`BranchMovedError` instead of merging, whether it moved
+        before the commit started or inside the CAS window: the only
+        commit that can land is the fast-forward, published by the one
+        CAS that expects HEAD at the base. A commit that loses withdraws
+        its in-flight marker, leaving nothing reachable.
+
+        Args:
+            updates: Key-value pairs to add or update (bytes values).
+            removals: Keys to remove.
+            on_conflict: ``'raise'`` (default) or ``'abandon'`` for CAS failures.
+            on_moved: ``'merge'`` (default) three-way merges onto a HEAD
+                that moved since this handle's base; ``'raise'`` raises
+                :class:`BranchMovedError` and writes nothing.
+            merge_fns: Per-key registrations (override instance-level).
+                A merge function, or a ``MergeChoice`` giving one side
+                every key it covers.
+            merge_prefixes: Registrations by key prefix, layered over
+                the instance-level prefix registrations.
+            default_merge: Default merge function (override instance-level).
+            info: Optional metadata dict for the commit.
+            chunks: Optional content-addressed chunks to write under
+                ``kvgit:chunk:<hash>``. Keyed by chunk hash. Backends
+                that don't understand chunks ignore this argument.
+            chunk_refs: Optional per-key list of chunk hashes referenced
+                by that key's encoded blob. Stored on the keyset
+                ``MetaEntry.chunks`` so GC can trace reachability.
+
+        Returns:
+            A ``MergeResult`` (truthy when committed, falsy if abandoned).
+
+        Raises:
+            BranchMovedError: If ``on_moved='raise'`` and HEAD moved.
+            ConcurrencyError: If ``on_conflict='raise'`` and CAS fails.
+            MergeConflict: If keys conflict and no merge function
+                resolves them.
+        """
+        if on_moved not in ("merge", "raise"):
+            raise ValueError(f"on_moved must be 'merge' or 'raise', got {on_moved!r}")
+        if (updates or removals or info is not None) and on_conflict not in (
+            "raise",
+            "abandon",
+        ):
+            raise ValueError(
+                f"on_conflict must be 'raise' or 'abandon', got {on_conflict!r}"
+            )
+
+        # The bytes the commit writes stay here; the core names them by
+        # key. Every blob and chunk is written, even one already stored,
+        # so the batch holds everything its commit needs whatever a sweep
+        # took before it landed.
+        held: dict[str, bytes] = {}
+        entries = []
+        refs_by_key = chunk_refs or {}
+        for key, value in (updates or {}).items():
+            pointer = blob_key(value)
+            held[pointer] = value
+            refs = refs_by_key.get(key)
+            meta = MetaEntry(size=len(value), chunks=list(refs) if refs else None)
+            entries.append((key, KeysetEntry(blob=pointer, meta=meta)))
+        chunk_keys = []
+        for chunk_hash, chunk_bytes in (chunks or {}).items():
+            held[CHUNK_PREFIX + chunk_hash] = chunk_bytes
+            chunk_keys.append(CHUNK_PREFIX + chunk_hash)
+
+        hosted: list[MergePolicy] = []
+
+        def lower(policy: MergePolicy) -> str | int:
+            if isinstance(policy, MergeChoice):
+                return policy.value
+            hosted.append(policy)
+            return len(hosted) - 1
+
+        fns = {**self._merge_fns, **(merge_fns or {})}
+        prefixes = {**self._merge_prefixes, **(merge_prefixes or {})}
+        default = default_merge or self._default_merge
+        current = self._current_commit
+        root = self._roots.get(current)
+        generation = self._generations.get(current)
+        op = _core.CommitOp(
+            self._branch,
+            self._base_commit,
+            current,
+            entries,
+            sorted(removals or ()),
+            chunk_keys,
+            info,
+            on_moved,
+            on_conflict,
+            {k: lower(p) for k, p in fns.items()},
+            [(k, lower(p)) for k, p in prefixes.items()],
+            lower(default) if default is not None else None,
+            self._recover_from_corrupt_head is not None,
+            self._blob_version_stamped,
+            [] if root is None else [(current, root)],
+            [] if generation is None else [(current, generation)],
+        )
+        done = drive(
+            op,
+            self.store,
+            held=held,
+            merge_fns=hosted,
+            recoverer=self._recover_from_corrupt_head,
+            clock=time.time,
+            sleep=time.sleep,
+        )
+        result = MergeResult(
+            merged=done["merged"],
+            commit=done["commit"],
+            strategy=done["strategy"],
+            auto_merged_keys=done["auto_merged_keys"],
+            carried_keys=done["carried_keys"],
+        )
+        self.last_merge_result = result
+        if not result.merged or result.strategy == "no_op":
+            return result
+        # Landed: change the key maps in place, by what the commit changed.
+        for key, entry in done["changes"]:
+            self._set_entry(key, None if entry is None else (entry.blob, entry.meta))
+        for commit, commit_root in done["roots"]:
+            self._remember_root(commit, commit_root)
+        self._remember_generations(dict(done["generations"]))
+        self._blob_version_stamped = done["stamped"]
+        self._current_commit = self._base_commit = result.commit
+        return result
 
     # -- Abstract method implementations --
 

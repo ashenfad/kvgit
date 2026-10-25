@@ -1,6 +1,7 @@
 """Tests for the Versioned commit log."""
 
 import pytest
+from support import fail_reads, race_publish
 
 from kvgit import ConcurrencyError, MergeChoice, MergeConflict, MergeResult
 from kvgit.encoding import dumps
@@ -14,6 +15,7 @@ from kvgit.errors import (
 from kvgit.kv.memory import Memory
 from kvgit.versioned.kv import (
     BRANCH_HEAD,
+    GC_LEASE_KEY,
     VersionedKV as Versioned,
     _load_root,
     blob_key,
@@ -231,18 +233,8 @@ class TestVersionedCommit:
 
 
 def _race_once(loser, advance):
-    """Make ``loser``'s next CAS lose: advance HEAD first, then run it."""
-    real_cas = loser._cas_head
-    raced = False
-
-    def cas(expected, new_head):
-        nonlocal raced
-        if not raced:
-            raced = True
-            advance()
-        return real_cas(expected, new_head)
-
-    loser._cas_head = cas
+    """Make ``loser``'s next publish lose: advance HEAD first, then run it."""
+    race_publish(loser.store, loser.current_branch, advance)
 
 
 class TestFastForwardRace:
@@ -299,13 +291,7 @@ class TestFastForwardRace:
         v1 = Versioned(store)
         v1.commit({"base": b"0"})
         v2 = Versioned(store)
-        real_cas = v2._cas_head
-
-        def always_race(expected, new_head):
-            v1.commit({"other": b"1"})
-            return real_cas(expected, new_head)
-
-        v2._cas_head = always_race
+        race_publish(store, "main", lambda: v1.commit({"other": b"1"}), times=None)
         with pytest.raises(ConcurrencyError):
             v2.commit({"mine": b"2"})
 
@@ -327,7 +313,7 @@ class TestFastForwardRace:
         assert v2.get("mine") is None
         assert v2.get("base") == b"0"
 
-    def test_failing_head_reread_restores_state(self, monkeypatch):
+    def test_failing_head_reread_restores_state(self):
         """A retry whose HEAD re-read rejects restores the pre-commit
         snapshot too, and the handle stays usable afterwards."""
         store = Memory()
@@ -336,29 +322,23 @@ class TestFastForwardRace:
         base_head = v1.current_commit
         v2 = Versioned(store)
 
-        # Fail the third HEAD read: the loser's initial read and the
-        # winner's read inside the race succeed, so the fault lands
-        # exactly on the retry's re-read. (A store-level fault would
-        # fire earlier, inside the CAS's own heal check.)
-        real_fget = Versioned.latest_head.fget
-        reads = {"n": 0}
+        def advance():
+            v1.commit({"other": b"1"})
+            # A head read reads the head, the lease and the base's root
+            # together; the heal check before it reads them one by one.
+            fail_reads(
+                store,
+                lambda keys: BRANCH_HEAD % "main" in keys and GC_LEASE_KEY in keys,
+                RuntimeError("transient storage boom"),
+            )
 
-        @property
-        def flaky_head(self):
-            reads["n"] += 1
-            if reads["n"] > 2:
-                raise RuntimeError("transient storage boom")
-            return real_fget(self)
-
-        monkeypatch.setattr(Versioned, "latest_head", flaky_head)
-        _race_once(v2, lambda: v1.commit({"other": b"1"}))
+        _race_once(v2, advance)
         with pytest.raises(RuntimeError, match="transient storage boom"):
             v2.commit({"mine": b"2"})
 
         assert v2.current_commit == base_head
         assert v2.get("mine") is None
-        # The handle stays usable: reset the counter and commit cleanly.
-        reads["n"] = 0
+        # The handle stays usable.
         result = v2.commit({"mine": b"2"})
         assert result.merged
         assert v2.get("mine") == b"2"

@@ -26,7 +26,7 @@ import time
 import pytest
 from support import fork, worktree
 
-from kvgit import ConcurrencyError, GcBusy, MergeConflict, Repo, Worktree
+from kvgit import ConcurrencyError, GcBusy, MergeConflict
 from kvgit.encoding import dumps, loads
 from kvgit.errors import StorageVersionError, UnknownCommitError
 from kvgit.kv.memory import Memory
@@ -314,8 +314,9 @@ class TestLeaseArithmetic:
             sweeper.join(timeout=10)
 
 
-class PausedCommitKV(VersionedKV):
-    """VersionedKV that stops between its write batch and publishing it.
+class PausingMemory(Memory):
+    """A memory store that, once armed, holds the writer of the next
+    commit batch just after the batch lands.
 
     A commit lands in two steps: the batch that writes its nodes, blobs,
     chunks, metadata and in-flight marker, and — later — the write that
@@ -325,16 +326,24 @@ class PausedCommitKV(VersionedKV):
     event a test can schedule.
     """
 
-    def __init__(self, *args, reached, release, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self._reached = reached
-        self._release = release
+    def __init__(self) -> None:
+        super().__init__()
+        self._pause: tuple[threading.Event, threading.Event] | None = None
 
-    def _create_commit(self, *args, **kwargs):
-        commit_hash = super()._create_commit(*args, **kwargs)
-        self._reached.set()
-        assert self._release.wait(timeout=10), "test never released the writer"
-        return commit_hash
+    def pause_after_batch(
+        self, reached: threading.Event, release: threading.Event
+    ) -> None:
+        self._pause = (reached, release)
+
+    def cas_many(self, expected, writes, removes=()):
+        landed = super().cas_many(expected, writes, removes)
+        is_batch = any(k.startswith("__inflight__") for k in writes)
+        if landed and is_batch and self._pause is not None:
+            reached, release = self._pause
+            self._pause = None
+            reached.set()
+            assert release.wait(timeout=10), "test never released the writer"
+        return landed
 
 
 class TestCommitsBetweenWriteAndPublish:
@@ -345,7 +354,7 @@ class TestCommitsBetweenWriteAndPublish:
     """
 
     def test_an_unpublished_commit_survives_a_min_age_zero_sweep(self):
-        store = Memory()
+        store = PausingMemory()
         s = worktree(store, codec=(chunky_encoder, chunky_decoder))
         s["base"] = "base value"
         s.commit()
@@ -358,11 +367,9 @@ class TestCommitsBetweenWriteAndPublish:
         landed: dict[str, object] = {}
 
         def writer():
-            other = Worktree(
-                Repo(store, codec=(chunky_encoder, chunky_decoder)),
-                PausedCommitKV(store, reached=reached, release=release),
-            )
+            other = worktree(store, codec=(chunky_encoder, chunky_decoder))
             other["late"] = "written before the lease, published after"
+            store.pause_after_batch(reached, release)
             landed["commit"] = other.commit().commit
             landed["chunks"] = set(chunk_keys(store)) - before - {stray}
             landed["nodes"] = node_hashes(store, landed["commit"])
@@ -402,7 +409,7 @@ class TestCommitsBetweenWriteAndPublish:
         — and the merge cannot be built at all if the sweep took the
         commit it is supposed to fold.
         """
-        store = Memory()
+        store = PausingMemory()
         s = worktree(store)
         s["base"] = "base"
         s.commit()
@@ -410,9 +417,7 @@ class TestCommitsBetweenWriteAndPublish:
         reached, release = threading.Event(), threading.Event()
         # Opened before the other writer moves HEAD, so this handle's
         # base commit is stale by the time it commits — the merge path.
-        mine = Worktree(
-            Repo(store), PausedCommitKV(store, reached=reached, release=release)
-        )
+        mine = worktree(store)
         mine["ours"] = "merged in"
 
         theirs = worktree(store)
@@ -420,6 +425,7 @@ class TestCommitsBetweenWriteAndPublish:
         theirs.commit()
 
         result: dict[str, object] = {}
+        store.pause_after_batch(reached, release)
         writer_thread = threading.Thread(
             target=lambda: result.update(merge=mine.commit())
         )
@@ -519,29 +525,32 @@ class TestInFlightMarkers:
         assert store.get(marker) is None
 
 
-class LapsingCommitKV(VersionedKV):
-    """VersionedKV whose first commit's marker lapses and is swept before
-    it publishes — a writer that took longer than ``IN_FLIGHT_TTL``."""
+class LapsingMemory(Memory):
+    """A memory store whose first commit batch's marker lapses and is
+    swept as soon as it lands: a writer that took longer than
+    ``IN_FLIGHT_TTL`` to publish."""
 
-    lapsed = False
+    def __init__(self) -> None:
+        super().__init__()
+        self.lapsed = False
 
-    def _create_commit(self, *args, **kwargs):
-        commit_hash = super()._create_commit(*args, **kwargs)
-        if not LapsingCommitKV.lapsed:
-            LapsingCommitKV.lapsed = True
-            self.store.set(IN_FLIGHT_KEY % commit_hash, dumps(time.time() - 1))
-            clean_orphans(self.store, min_age=0)
-        return commit_hash
+    def cas_many(self, expected, writes, removes=()):
+        landed = super().cas_many(expected, writes, removes)
+        marker = next((k for k in writes if k.startswith("__inflight__")), None)
+        if landed and marker is not None and not self.lapsed:
+            self.lapsed = True
+            self.set(marker, dumps(time.time() - 1))
+            clean_orphans(self, min_age=0)
+        return landed
 
 
 class TestALapsedMarker:
     def test_a_writer_whose_marker_lapsed_fails_rather_than_dangling(self):
-        store = Memory()
+        store = LapsingMemory()
         worktree(store).commit()
         head_before = _resolve_head(store, "main")
 
-        LapsingCommitKV.lapsed = False
-        slow = LapsingCommitKV(store)
+        slow = VersionedKV(store)
         with pytest.raises((ConcurrencyError, MergeConflict, ValueError)):
             slow.commit({"k": b"too slow"})
 
