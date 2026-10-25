@@ -221,3 +221,30 @@ resolve. Built with `[profile.wasm]` (`opt-level = "z"`, LTO,
 `panic = "abort"`), it is 251,542 bytes, 97 KB gzipped, and about
 400 KB of the built package as base64.
 
+
+## The write protocol
+
+Recorded with the write-protocol stage's last PR: both packages commit
+through the core's protocol, each with a driver that performs the
+core's requests against its store (`bench/protocol/`). Each was run
+back to back with the kernel stage's build, and the ratios are to that
+run.
+
+**Python** commits cost what they did: `commit_one` 0.98×,
+`commit_1k` 1.01×, kvsql's appends 0.95× and its merge 1.09×, every
+other workload within a few percent either way.
+
+**TypeScript** commits in bulk cost what they did (`commit_1k` 0.97×,
+the world's merge 0.98×). A single small commit costs a hundredth of a
+millisecond or two more (`commit_one` 1.11×, kvsql's appends 1.12×),
+kvsql's snapshot 4 ms more (1.14×) and its merge 0.04 ms more (1.23×):
+a commit now makes one more round trip, for its time, and each request
+crosses the boundary as JSON.
+
+| | before | after |
+|---|---|---|
+| the wasm, bytes | 251,542 | 470,685 |
+| the wasm, gzipped | 97 KB | 164 KB |
+
+The core now carries the commit protocol, merge resolution, history
+and the text merge.

@@ -1,0 +1,85 @@
+{
+  "host": "python",
+  "runtime": "CPython 3.13.5",
+  "machine": "Apple M4, Darwin 25.5.0",
+  "quick": false,
+  "results": {
+    "world.bulk_import": {
+      "median_ms": 2000.799,
+      "n": 3,
+      "keys": 100000
+    },
+    "world.open": {
+      "median_ms": 228.883,
+      "n": 5
+    },
+    "world.keys_cold": {
+      "median_ms": 238.41,
+      "n": 5
+    },
+    "world.keys_warm": {
+      "median_ms": 3.308,
+      "n": 5
+    },
+    "world.list_dir": {
+      "median_ms": 6.769,
+      "n": 5
+    },
+    "world.read_all": {
+      "median_ms": 437.21,
+      "n": 2
+    },
+    "world.reads_10k": {
+      "median_ms": 236.498,
+      "n": 5
+    },
+    "world.commit_one": {
+      "median_ms": 0.064,
+      "n": 50,
+      "p90_ms": 0.074
+    },
+    "world.commit_1k": {
+      "median_ms": 28.826,
+      "n": 5
+    },
+    "world.merge": {
+      "median_ms": 8.216,
+      "n": 5
+    },
+    "world.gc": {
+      "median_ms": 543.846,
+      "n": 1,
+      "removed": 20
+    },
+    "kvsql.snapshot": {
+      "median_ms": 20.764,
+      "n": 1,
+      "chunks": 8,
+      "chunk_bytes": 8388608
+    },
+    "kvsql.append": {
+      "median_ms": 0.04,
+      "n": 3000,
+      "p90_ms": 0.046,
+      "total_ms": 124.0
+    },
+    "kvsql.open": {
+      "median_ms": 0.163,
+      "n": 5
+    },
+    "kvsql.replay": {
+      "median_ms": 77.606,
+      "n": 3,
+      "entries": 3000
+    },
+    "kvsql.merge": {
+      "median_ms": 0.141,
+      "n": 5
+    },
+    "kvsql.gc": {
+      "median_ms": 453.994,
+      "n": 1,
+      "removed": 3022
+    }
+  }
+}
