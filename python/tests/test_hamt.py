@@ -657,20 +657,16 @@ def test_materialize_uses_batched_reads():
     )
 
 
-def test_items_uses_per_node_reads():
-    """Sanity check the contrast: items() does one get per visited node."""
+def test_items_reads_a_level_at_a_time():
+    """items() reads the tree as materialize() does: a batch per level."""
     store = _CountingMemory()
     items = {f"k{i:04d}": f"v{i}".encode() for i in range(200)}
     h = Hamt(store, bucket_max=4).persist(items)
 
     store.reset_counts()
-    list(h.items())
-
-    # items() doesn't batch — it's many per-key gets, no get_many calls.
-    assert store.get_calls > 50, (
-        f"items() should issue many per-node get calls, got {store.get_calls}"
-    )
-    assert store.get_many_calls == 0
+    assert dict(h.items()) == items
+    assert store.get_calls == 0
+    assert 0 < store.get_many_calls <= 6
 
 
 def test_materialize_round_trip_through_store():
@@ -736,7 +732,7 @@ def test_walk_uses_batched_reads():
 
 
 def test_walk_is_one_pass_compared_to_separate_walks():
-    """walk() should make ~half the round-trips of items() + reachable_nodes()."""
+    """walk() makes half the round trips of items() + reachable_nodes()."""
     store = _CountingMemory()
     items = {f"k{i:04d}": f"v{i}".encode() for i in range(200)}
     h = Hamt(store, bucket_max=4).persist(items)
@@ -752,10 +748,9 @@ def test_walk_is_one_pass_compared_to_separate_walks():
     list(h.reachable_nodes())
     separate_calls = store.get_many_calls + store.get_calls
 
-    # walk() should be drastically cheaper
-    assert walk_calls * 10 < separate_calls, (
-        f"walk={walk_calls}, separate={separate_calls} — "
-        f"expected walk to be at least 10x cheaper"
+    # Each of those is a walk of its own.
+    assert walk_calls * 2 == separate_calls, (
+        f"walk={walk_calls}, separate={separate_calls}"
     )
 
 
@@ -952,8 +947,10 @@ def test_an_update_reads_by_level_not_by_key():
 
 def test_an_update_leaves_the_shared_view_untouched():
     h = Hamt(_store(), bucket_max=2).persist({f"k{i}": b"v" for i in range(50)})
+    root = h.root
     h.updated({"x": b"1"}, ["k1"])
-    assert h._fetched == {}
+    assert h.root == root
+    assert h.pending == {}
 
 
 @pytest.mark.parametrize("seed", range(20))
