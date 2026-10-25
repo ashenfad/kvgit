@@ -1,0 +1,109 @@
+{
+  "host": "ts",
+  "runtime": "Node 25.9.0",
+  "machine": "Apple M4, Darwin 25.5.0",
+  "quick": false,
+  "results": {
+    "world.bulk_import": {
+      "median_ms": 4928.08,
+      "n": 3,
+      "keys": 100000
+    },
+    "world.open": {
+      "median_ms": 294.276,
+      "n": 5
+    },
+    "world.keys_cold": {
+      "median_ms": 340.796,
+      "n": 5
+    },
+    "world.keys_warm": {
+      "median_ms": 37.521,
+      "n": 5
+    },
+    "world.list_dir": {
+      "median_ms": 39.826,
+      "n": 5
+    },
+    "world.read_all": {
+      "median_ms": 470.729,
+      "n": 2
+    },
+    "world.reads_10k": {
+      "median_ms": 289.986,
+      "n": 5
+    },
+    "world.lazy.open": {
+      "median_ms": 0.004,
+      "n": 5
+    },
+    "world.lazy.keys_cold": {
+      "median_ms": 236.736,
+      "n": 5
+    },
+    "world.lazy.keys_warm": {
+      "median_ms": 245.246,
+      "n": 5
+    },
+    "world.lazy.list_dir": {
+      "median_ms": 245.309,
+      "n": 5
+    },
+    "world.lazy.read_all": {
+      "median_ms": 988.327,
+      "n": 2
+    },
+    "world.lazy.reads_10k": {
+      "median_ms": 101.106,
+      "n": 5
+    },
+    "world.commit_one": {
+      "median_ms": 0.184,
+      "n": 50,
+      "p90_ms": 0.232
+    },
+    "world.commit_1k": {
+      "median_ms": 68.599,
+      "n": 5
+    },
+    "world.merge": {
+      "median_ms": 17.148,
+      "n": 5
+    },
+    "world.gc": {
+      "median_ms": 483.605,
+      "n": 1,
+      "removed": 20
+    },
+    "kvsql.snapshot": {
+      "median_ms": 33.723,
+      "n": 1,
+      "chunks": 8,
+      "chunk_bytes": 8388608
+    },
+    "kvsql.append": {
+      "median_ms": 0.1,
+      "n": 3000,
+      "p90_ms": 0.108,
+      "total_ms": 313.4
+    },
+    "kvsql.open": {
+      "median_ms": 0.231,
+      "n": 5
+    },
+    "kvsql.replay": {
+      "median_ms": 87.199,
+      "n": 3,
+      "entries": 3000
+    },
+    "kvsql.merge": {
+      "median_ms": 0.239,
+      "n": 5
+    },
+    "kvsql.gc": {
+      "median_ms": 91.24,
+      "n": 1,
+      "removed": 3022
+    }
+  }
+}
