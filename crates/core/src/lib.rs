@@ -1,6 +1,11 @@
 //! The kvgit core: everything that is bytes or protocol, shared by the
 //! Python and TypeScript packages.
 
+pub mod commit;
+pub mod hash;
+pub mod json;
+pub mod layout;
+
 /// The version of the core, which is the version of both packages.
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
