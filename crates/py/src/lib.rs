@@ -304,7 +304,11 @@ mod _core {
     }
 
     fn shape(prefix: String, bucket_max: usize) -> Shape {
-        Shape { prefix, bucket_max }
+        Shape {
+            prefix,
+            bucket_max,
+            memo: None,
+        }
     }
 
     fn bytes_of(d: &Bound<'_, PyDict>) -> PyResult<HashMap<String, Vec<u8>>> {

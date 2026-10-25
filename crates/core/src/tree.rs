@@ -21,19 +21,127 @@ use crate::hash::sha256_hex;
 use crate::json::{self, Value, write_string};
 use crate::layout::EMPTY_HASH;
 use crate::machine::Io;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
 /// Hex digits in a key's hash, and so the deepest a tree can go.
 const HASH_LEN: usize = 64;
 
-/// Where a tree's nodes are stored and how full a leaf may get.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Where a tree's nodes are stored, how full a leaf may get, and the
+/// memo stored nodes are read through, if any.
+#[derive(Clone, Debug)]
 pub struct Shape {
     /// The prefix of each node's store key, before its hash.
     pub prefix: String,
     /// The most entries a leaf holds before it splits.
     pub bucket_max: usize,
+    pub memo: Option<Memo>,
+}
+
+/// A [`NodeMemo`] the host shares between operations.
+pub type Memo = Rc<RefCell<NodeMemo>>;
+
+/// What a [`NodeMemo`] has done since its counts were last reset.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+    /// Nodes held now.
+    pub entries: usize,
+    /// Stored bytes of the nodes held now.
+    pub bytes: usize,
+}
+
+/// Stored nodes, parsed, by hash, bounded by their stored bytes and
+/// evicted least recently used first. A node never changes once stored,
+/// so nothing held goes stale; only nodes read from the store are held,
+/// never ones an operation made and the host has yet to write.
+#[derive(Debug)]
+pub struct NodeMemo {
+    max_bytes: usize,
+    held: HashMap<String, (Rc<Node>, usize, u64)>,
+    order: BTreeMap<u64, String>,
+    tick: u64,
+    stats: MemoStats,
+}
+
+impl NodeMemo {
+    pub fn new(max_bytes: usize) -> NodeMemo {
+        NodeMemo {
+            max_bytes,
+            held: HashMap::new(),
+            order: BTreeMap::new(),
+            tick: 0,
+            stats: MemoStats::default(),
+        }
+    }
+
+    /// The node, marked most recently used.
+    fn get(&mut self, hash: &str) -> Option<Rc<Node>> {
+        let Some((node, _, tick)) = self.held.get_mut(hash) else {
+            self.stats.misses += 1;
+            return None;
+        };
+        self.stats.hits += 1;
+        self.order.remove(tick);
+        self.tick += 1;
+        *tick = self.tick;
+        self.order.insert(self.tick, hash.to_string());
+        Some(node.clone())
+    }
+
+    fn put(&mut self, hash: &str, node: Rc<Node>, size: usize) {
+        if let Some((_, old_size, old_tick)) = self.held.remove(hash) {
+            self.order.remove(&old_tick);
+            self.stats.bytes -= old_size;
+        }
+        if size > self.max_bytes {
+            return;
+        }
+        self.tick += 1;
+        self.held.insert(hash.to_string(), (node, size, self.tick));
+        self.order.insert(self.tick, hash.to_string());
+        self.stats.bytes += size;
+        while self.stats.bytes > self.max_bytes {
+            let (_, oldest) = self.order.pop_first().expect("bytes held means nodes held");
+            let (_, size, _) = self.held.remove(&oldest).expect("ordered nodes are held");
+            self.stats.bytes -= size;
+            self.stats.evictions += 1;
+        }
+    }
+
+    /// Hold a stored node from its bytes, as if it had just been read.
+    pub fn hold(&mut self, hash: &str, raw: &[u8]) -> Result<(), TreeError> {
+        let node = Rc::new(Node::decode(raw, hash)?);
+        self.put(hash, node, raw.len());
+        Ok(())
+    }
+
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
+    pub fn stats(&self) -> MemoStats {
+        MemoStats {
+            entries: self.held.len(),
+            ..self.stats
+        }
+    }
+
+    pub fn reset_stats(&mut self) {
+        self.stats = MemoStats {
+            bytes: self.stats.bytes,
+            ..MemoStats::default()
+        };
+    }
+
+    pub fn clear(&mut self) {
+        self.held.clear();
+        self.order.clear();
+        self.stats.bytes = 0;
+    }
 }
 
 /// A node, with its entries and children in the order they are written.
@@ -209,6 +317,16 @@ impl Nodes {
                 wanted.push(hash.clone());
             }
         }
+        if let Some(memo) = &self.shape.memo {
+            let mut memo = memo.borrow_mut();
+            wanted.retain(|hash| match memo.get(hash) {
+                Some(node) => {
+                    self.read.insert(hash.clone(), Some(node));
+                    false
+                }
+                None => true,
+            });
+        }
         if wanted.is_empty() {
             return Ok(());
         }
@@ -219,7 +337,13 @@ impl Nodes {
         let mut got = self.io.get(keys.clone()).await;
         for (hash, key) in wanted.into_iter().zip(keys) {
             let node = match got.remove(&key) {
-                Some(raw) => Some(Rc::new(Node::decode(&raw, &hash)?)),
+                Some(raw) => {
+                    let node = Rc::new(Node::decode(&raw, &hash)?);
+                    if let Some(memo) = &self.shape.memo {
+                        memo.borrow_mut().put(&hash, node.clone(), raw.len());
+                    }
+                    Some(node)
+                }
                 None => None,
             };
             self.read.insert(hash, node);
@@ -338,8 +462,42 @@ pub async fn walk(
     root: String,
     skip: impl Fn(&str) -> bool,
 ) -> Result<(Vec<(String, Vec<u8>)>, Vec<String>), TreeError> {
-    let mut nodes = Nodes::new(io, shape, HashMap::new())?;
     let mut items = Vec::new();
+    let visited = walk_leaves(io, shape, root, skip, |k, v| {
+        items.push((k.to_string(), decode_value(k, v)?));
+        Ok(())
+    })
+    .await?;
+    Ok((items, visited))
+}
+
+/// Every key the tree at `root` holds, without its value.
+pub async fn keys(io: Io, shape: Shape, root: String) -> Result<Vec<String>, TreeError> {
+    let mut keys = Vec::new();
+    walk_leaves(
+        io,
+        shape,
+        root,
+        |_| false,
+        |k, _| {
+            keys.push(k.to_string());
+            Ok(())
+        },
+    )
+    .await?;
+    Ok(keys)
+}
+
+/// Walk the tree a level at a time, handing each leaf entry (key and
+/// encoded value) to `each`; the hashes of the nodes walked.
+async fn walk_leaves(
+    io: Io,
+    shape: Shape,
+    root: String,
+    skip: impl Fn(&str) -> bool,
+    mut each: impl FnMut(&str, &str) -> Result<(), TreeError>,
+) -> Result<Vec<String>, TreeError> {
+    let mut nodes = Nodes::new(io, shape, HashMap::new())?;
     let mut visited = Vec::new();
     let mut level = if root == EMPTY_HASH.as_str() || skip(&root) {
         vec![]
@@ -361,7 +519,7 @@ pub async fn walk(
             match node.as_ref() {
                 Node::Leaf(entries) => {
                     for (k, v) in entries {
-                        items.push((k.clone(), decode_value(k, v)?));
+                        each(k, v)?;
                     }
                 }
                 Node::Branch(children) => next.extend(children.values().cloned()),
@@ -369,7 +527,7 @@ pub async fn walk(
         }
         level = next;
     }
-    Ok((items, visited))
+    Ok(visited)
 }
 
 /// What changed between two trees.
@@ -816,6 +974,7 @@ mod tests {
         Shape {
             prefix: "t:".into(),
             bucket_max: 2,
+            memo: None,
         }
     }
 
@@ -1044,6 +1203,58 @@ mod tests {
             walk(io, shape(), "bad".into(), |_| false)
         }));
         assert!(matches!(out, Err(TreeError::Malformed { .. })));
+    }
+
+    #[test]
+    fn a_memo_holds_read_nodes_between_operations() {
+        let store = Store::default();
+        let all = keys(30);
+        let pairs: Vec<(&str, &str)> = all.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let root = store.update(&EMPTY_HASH, &pairs, &[]);
+        let memo: Memo = Rc::new(RefCell::new(NodeMemo::new(1 << 20)));
+        let walk_with = |memo: &Memo| {
+            let (root, shape) = (
+                root.clone(),
+                Shape {
+                    memo: Some(memo.clone()),
+                    ..shape()
+                },
+            );
+            store
+                .run(Machine::new(move |io| walk(io, shape, root, |_| false)))
+                .unwrap()
+        };
+        *store.reads.borrow_mut() = 0;
+        let (first, nodes) = walk_with(&memo);
+        assert!(*store.reads.borrow() > 0);
+        assert_eq!(memo.borrow().stats().entries, nodes.len());
+        *store.reads.borrow_mut() = 0;
+        let (second, _) = walk_with(&memo);
+        assert_eq!(*store.reads.borrow(), 0);
+        assert_eq!(first, second);
+        assert_eq!(memo.borrow().stats().hits as usize, nodes.len());
+    }
+
+    #[test]
+    fn a_memo_evicts_the_least_recently_used() {
+        let mut memo = NodeMemo::new(300);
+        let node = Rc::new(Node::empty());
+        memo.put("a", node.clone(), 100);
+        memo.put("b", node.clone(), 100);
+        memo.put("c", node.clone(), 100);
+        assert!(memo.get("a").is_some());
+        memo.put("d", node.clone(), 100);
+        assert!(memo.get("b").is_none());
+        assert!(memo.get("a").is_some());
+        memo.put("huge", node, 301);
+        assert!(memo.get("huge").is_none());
+        let stats = memo.stats();
+        assert_eq!((stats.entries, stats.bytes, stats.evictions), (3, 300, 1));
+        assert_eq!((stats.hits, stats.misses), (2, 2));
+        memo.reset_stats();
+        assert_eq!(memo.stats().bytes, 300);
+        memo.clear();
+        assert_eq!((memo.stats().entries, memo.stats().bytes), (0, 0));
     }
 
     #[test]
