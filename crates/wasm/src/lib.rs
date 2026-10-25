@@ -363,6 +363,7 @@ impl TreeOp {
         };
         match machine.resume(reply) {
             Step::Request(Request::Get(keys)) => Ok(Some(strings_json(&keys))),
+            Step::Request(other) => unreachable!("a tree only reads, not {other:?}"),
             Step::Done(result) => {
                 self.machine = None;
                 self.out = Some(result.map_err(to_js)?);

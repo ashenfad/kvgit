@@ -103,7 +103,11 @@ The sans-IO design proven on the hardest path.
   `on_moved="raise"`, rollback of a failed attempt.
 - Merge resolution and the text merge in the core, merge functions as
   host callbacks.
-- The interleaving scenarios from C2, run by the core.
+- The interleaving scenarios from C2, run by the core. The two that
+  need a sweep (`sweep-before-publish`, and `lost-at-publish`, which
+  ends with one) join when GC moves into the core in C5; until then
+  the core's own tests stage the sweep by taking and giving back the
+  lease between a commit's batch and its publish.
 
 **Gate 2:** the protocol reads as straight-line code, each host's
 driver stays small (on the order of a hundred lines), and the corpus

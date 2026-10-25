@@ -160,6 +160,8 @@ pub enum TreeError {
     Malformed { hash: String, why: String },
     /// A shape no tree can have: one whose leaves hold nothing.
     BadShape,
+    /// The host failed a read; it holds the reason.
+    Host,
 }
 
 impl std::fmt::Display for TreeError {
@@ -167,6 +169,7 @@ impl std::fmt::Display for TreeError {
         match self {
             TreeError::Malformed { hash, why } => write!(f, "malformed tree node {hash}: {why}"),
             TreeError::BadShape => write!(f, "bucket_max must be at least 1"),
+            TreeError::Host => write!(f, "the host failed a read"),
         }
     }
 }
@@ -334,7 +337,11 @@ impl Nodes {
             .iter()
             .map(|h| format!("{}{h}", self.shape.prefix))
             .collect();
-        let mut got = self.io.get(keys.clone()).await;
+        let mut got = self
+            .io
+            .get(keys.clone())
+            .await
+            .map_err(|_| TreeError::Host)?;
         for (hash, key) in wanted.into_iter().zip(keys) {
             let node = match got.remove(&key) {
                 Some(raw) => {
