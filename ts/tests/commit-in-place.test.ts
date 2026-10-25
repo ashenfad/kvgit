@@ -9,6 +9,7 @@ import { describe, expect, it } from 'vitest'
 import { Memory } from '../src/backends/memory'
 import { ConcurrencyError, MergeConflict, VersionedKV } from '../src/index'
 import { IN_FLIGHT_KEY } from '../src/versioned/layout'
+import { failReads, racePublish } from './races'
 
 const enc = new TextEncoder()
 const dec = new TextDecoder()
@@ -18,7 +19,6 @@ const text = (b: Uint8Array | null): string | null => (b === null ? null : dec.d
 interface Internals {
   commitKeys: Map<string, string>
   meta: Map<string, unknown>
-  casHead(expected: string, newHead: string): Promise<boolean>
 }
 const internals = (vk: VersionedKV): Internals => vk as unknown as Internals
 
@@ -66,16 +66,7 @@ class FailingMemory extends Memory {
 
 /** Make `loser`'s next HEAD swap lose: run `advance` first. */
 function raceOnce(loser: VersionedKV, advance: () => Promise<unknown>): void {
-  const i = internals(loser)
-  const realCas = i.casHead.bind(loser)
-  let raced = false
-  i.casHead = async (expected, newHead) => {
-    if (!raced) {
-      raced = true
-      await advance()
-    }
-    return realCas(expected, newHead)
-  }
+  racePublish(loser.store, loser.currentBranch, advance)
 }
 
 /** A branch with keys to update, keep and remove, and a second handle
@@ -122,15 +113,15 @@ describe('a failed commit attempt restores the key maps exactly', () => {
   })
 
   it('when the merge publish loses a second race', async () => {
-    const { writer, vk } = await setup()
+    const { store, writer, vk } = await setup()
     const before = stateOf(vk)
-    const i = internals(vk)
-    const realCas = i.casHead.bind(vk)
     let n = 0
-    i.casHead = async (expected, newHead) => {
-      await writer.commit({ updates: new Map([[`other${n++}`, bytes('o')]]) })
-      return realCas(expected, newHead)
-    }
+    racePublish(
+      store,
+      'main',
+      () => writer.commit({ updates: new Map([[`other${n++}`, bytes('o')]]) }),
+      null,
+    )
     await expect(vk.commit(change())).rejects.toThrow(ConcurrencyError)
     expect(stateOf(vk)).toEqual(before)
   })
@@ -144,13 +135,16 @@ describe('a failed commit attempt restores the key maps exactly', () => {
   })
 
   it('when reading for the merge after a lost race fails', async () => {
-    const { writer, vk } = await setup()
+    const { store, writer, vk } = await setup()
     const before = stateOf(vk)
     raceOnce(vk, async () => {
       await writer.commit({ updates: new Map([['other', bytes('o1')]]) })
-      ;(vk as unknown as { findLca(): Promise<never> }).findLca = async () => {
-        throw new Error('store read failed')
-      }
+      // The merge's first read of history: the two heads' parents.
+      failReads(
+        store,
+        (keys) => keys.some((k) => k.startsWith('__parent_commit__')),
+        new Error('store read failed'),
+      )
     })
     await expect(vk.commit(change())).rejects.toThrow('store read failed')
     expect(stateOf(vk)).toEqual(before)

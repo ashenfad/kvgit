@@ -20,6 +20,7 @@ import {
   jsonCodec,
 } from '../src/index'
 import { IN_FLIGHT_KEY, IN_FLIGHT_PREFIX } from '../src/versioned/layout'
+import { racePublish } from './races'
 
 const enc = new TextEncoder()
 const dec = new TextDecoder()
@@ -456,13 +457,13 @@ describe('lazy rollback', () => {
     const vk = await VersionedKV.open(store, { lazy: true })
     await writer.commit({ updates: new Map([['other', bytes('o0')]]) })
     const before = { commit: vk.currentCommit, base: vk.baseCommit }
-    const i = vk as unknown as { casHead(e: string, n: string): Promise<boolean> }
-    const realCas = i.casHead.bind(vk)
     let n = 0
-    i.casHead = async (expected, newHead) => {
-      await writer.commit({ updates: new Map([[`race${n++}`, bytes('r')]]) })
-      return realCas(expected, newHead)
-    }
+    racePublish(
+      store,
+      'main',
+      () => writer.commit({ updates: new Map([[`race${n++}`, bytes('r')]]) }),
+      null,
+    )
     await expect(vk.commit({ updates: new Map([['mine', bytes('m')]]) })).rejects.toThrow(
       ConcurrencyError,
     )

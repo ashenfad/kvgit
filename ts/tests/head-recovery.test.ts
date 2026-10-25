@@ -29,7 +29,7 @@
  * and after a fix.
  */
 
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { Memory } from '../src/backends/memory'
 import { ConcurrencyError, UnknownBranchError, VersionedKV, repairHead } from '../src/index'
 import type { CorruptHeadRecoverer } from '../src/index'
@@ -655,6 +655,28 @@ describe('an injected recoverer is checked, not trusted', () => {
       CORRUPT,
     )
     expect(repaired).toBeNull()
+  })
+
+  it('names a non-string answer when a commit rejects it', async () => {
+    // A commit from a handle opened before the damage resolves HEAD
+    // again as it publishes; the rejected answer is what tells the
+    // caller which recoverer misbehaved.
+    const store = new Memory()
+    const { mainTip } = await doublyDamaged(store, 'main')
+    const bogus = (async () => 12345) as unknown as CorruptHeadRecoverer
+    const vk = await VersionedKV.open(store, {
+      commitHash: mainTip,
+      recoverFromCorruptHead: bogus,
+    })
+
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      await vk.commit(one('a', '1')).catch(() => {})
+      const said = warn.mock.calls.map((args) => String(args[0]))
+      expect(said.some((m) => m.includes('recoverer returned "12345"'))).toBe(true)
+    } finally {
+      warn.mockRestore()
+    }
   })
 
   it('still honours a recoverer that names a real commit', async () => {

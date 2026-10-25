@@ -9,7 +9,8 @@ import {
 } from '../src/index'
 import { Keyset } from '../src/keyset'
 import { PyFloat } from '../src/pyjson'
-import { BRANCH_HEAD, COMMIT_ROOT, loads } from '../src/versioned/layout'
+import { BRANCH_HEAD, COMMIT_ROOT, GC_LEASE_KEY, loads } from '../src/versioned/layout'
+import { failReads, racePublish } from './races'
 
 const enc = new TextEncoder()
 const dec = new TextDecoder()
@@ -520,18 +521,7 @@ describe('VersionedKV — corrupt-HEAD recovery', () => {
 describe('VersionedKV — fast-forward race retry', () => {
   /** Make `loser`'s next CAS lose: advance HEAD first, then run it. */
   function raceOnce(loser: VersionedKV, advance: () => Promise<unknown>): void {
-    const patched = loser as unknown as {
-      casHead(expected: string, newHead: string): Promise<boolean>
-    }
-    const realCas = patched.casHead.bind(loser)
-    let raced = false
-    patched.casHead = async (expected: string, newHead: string) => {
-      if (!raced) {
-        raced = true
-        await advance()
-      }
-      return realCas(expected, newHead)
-    }
+    racePublish(loser.store, loser.currentBranch, advance)
   }
 
   const one = (key: string, value: string) => ({ updates: new Map([[key, bytes(value)]]) })
@@ -588,14 +578,7 @@ describe('VersionedKV — fast-forward race retry', () => {
     const v1 = await VersionedKV.open(store)
     await v1.commit(one('base', '0'))
     const v2 = await VersionedKV.open(store)
-    const patched = v2 as unknown as {
-      casHead(expected: string, newHead: string): Promise<boolean>
-    }
-    const realCas = patched.casHead.bind(v2)
-    patched.casHead = async (expected: string, newHead: string) => {
-      await v1.commit(one('other', '1'))
-      return realCas(expected, newHead)
-    }
+    racePublish(store, 'main', () => v1.commit(one('other', '1')), null)
     await expect(v2.commit(one('mine', '2'))).rejects.toThrow(ConcurrencyError)
   })
 
@@ -619,20 +602,21 @@ describe('VersionedKV — fast-forward race retry', () => {
     await v1.commit(one('base', '0'))
     const baseHead = v1.currentCommit
     const v2 = await VersionedKV.open(store)
-    const patchedHead = v2 as unknown as { latestHead(): Promise<string | null> }
-    const realHead = patchedHead.latestHead.bind(v2)
     raceOnce(v2, async () => {
       await v1.commit(one('other', '1'))
-      patchedHead.latestHead = async () => {
-        throw new Error('transient storage boom')
-      }
+      // A head read reads the head, the lease and the base's root
+      // together; the heal check before it reads them one by one.
+      failReads(
+        store,
+        (keys) => keys.includes(BRANCH_HEAD('main')) && keys.includes(GC_LEASE_KEY),
+        new Error('transient storage boom'),
+      )
     })
 
     await expect(v2.commit(one('mine', '2'))).rejects.toThrow('transient storage boom')
     expect(v2.currentCommit).toBe(baseHead)
     expect(await v2.get('mine')).toBeNull()
-    // The handle stays usable: restore the read and commit cleanly.
-    patchedHead.latestHead = realHead
+    // The handle stays usable.
     const result = await v2.commit(one('mine', '2'))
     expect(result.merged).toBe(true)
     expect(text((await v2.get('mine')) as Uint8Array)).toBe('2')
