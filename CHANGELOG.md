@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **Breaking (TypeScript): the text merge needs the core loaded.** `text`, `textMergeResult` and the functions `makeTextMerge` builds run the core's merge, which `Repo.open` loads; code that merges text before opening any repository awaits the new `loadCore()` first.
+- **Breaking (Python): commit info keys must be strings.** Other keys raise `TypeError`, since `json.dumps` writes them as strings and they wouldn't read back as the keys the commit hash covers.
+
 ## [0.4.3] - 2026-10-16
 
 ### Added

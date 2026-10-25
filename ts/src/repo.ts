@@ -11,6 +11,7 @@
  */
 
 import { type Codec, type CodecName, bytesCodec, resolveCodec } from './codec'
+import { core } from './core'
 import {
   BranchExistsError,
   CorruptHeadError,
@@ -150,7 +151,7 @@ export class Repo<V = Uint8Array> {
   ): Promise<Repo<V>>
   static open<V>(store: KVStore, opts: RepoOptions<V> & { codec: Codec<V> }): Promise<Repo<V>>
   static async open<V>(store: KVStore, opts: RepoOptions<V> = {}): Promise<Repo<V>> {
-    await checkStorageVersion(store)
+    await Promise.all([core(), checkStorageVersion(store)])
     return new Repo(store, opts)
   }
 
