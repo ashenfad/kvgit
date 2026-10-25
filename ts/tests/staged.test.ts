@@ -3,6 +3,7 @@ import { Memory } from '../src/backends/memory'
 import { Staged, type jsonDecoder, type jsonEncoder } from '../src/staged'
 import type { MergeFn, Versioned } from '../src/types'
 import { VersionedKV } from '../src/versioned/kv'
+import { racePublish } from './races'
 
 async function freshStaged(opts?: { encoder?: typeof jsonEncoder; decoder?: typeof jsonDecoder }) {
   const store = new Memory()
@@ -93,20 +94,10 @@ describe('Staged — commit', () => {
 })
 
 describe('Staged — commit race', () => {
-  /** Make `loser`'s next CAS lose: advance HEAD first, then run it. */
+  /** Make `loser`'s next publish lose: advance HEAD first, then run it. */
   function raceOnce(loser: Versioned, advance: () => Promise<unknown>): void {
-    const patched = loser as unknown as {
-      casHead(expected: string, newHead: string): Promise<boolean>
-    }
-    const realCas = patched.casHead.bind(loser)
-    let raced = false
-    patched.casHead = async (expected: string, newHead: string) => {
-      if (!raced) {
-        raced = true
-        await advance()
-      }
-      return realCas(expected, newHead)
-    }
+    const vk = loser as VersionedKV
+    racePublish(vk.store, vk.currentBranch, advance)
   }
 
   it('commit survives a fast-forward race without refresh', async () => {

@@ -25,6 +25,7 @@
  * rewriting a full snapshot per commit.
  */
 
+import { core } from '../core'
 import {
   BranchExistsError,
   ConcurrencyError,
@@ -33,20 +34,25 @@ import {
   UnknownBranchError,
   UnknownCommitError,
 } from '../errors'
-import { EMPTY_HASH, NodeCache } from '../hamt'
-import { Keyset } from '../keyset'
-import { PyFloat, compareCodePoints } from '../pyjson'
-import type {
-  CommitInfo,
-  ConflictDisposition,
-  KVStore,
-  KeysetEntry,
-  MergeResult,
-  MetaEntry,
-  Versioned,
+import { EMPTY_HASH, NodeCache, uncached } from '../hamt'
+import { Keyset, decodeEntry } from '../keyset'
+import { PyFloat, compareCodePoints, pyDumps, pyDumpsBytes } from '../pyjson'
+import {
+  type BytesMergeFn,
+  type CommitInfo,
+  type ConflictDisposition,
+  type KVStore,
+  type KeysetEntry,
+  MergeChoice,
+  type MergePolicy,
+  type MergeResult,
+  type MetaEntry,
+  type Versioned,
+  type VersionedCommitOptions,
 } from '../types'
 import { type CommitRecord, NoGenerations, generationOfRecord, loadRecords } from './ancestry'
-import { VersionedBase } from './base'
+import { VersionedBase, checkDisposition, checkMoved } from './base'
+import { type Committed, type StoredEntry, driveCommit } from './drive'
 import { type ParentLoader, walkHistory } from './helpers'
 import {
   BLOB_PREFIX,
@@ -1129,6 +1135,90 @@ export class VersionedKV extends VersionedBase {
     })
   }
 
+  /**
+   * One commit, run by the core: it reads the head, lands the batch,
+   * publishes it or merges onto a moved head, and reports the keyset it
+   * leaves as changes to this handle's. The handle changes only once a
+   * commit lands, so one that fails leaves it as it was.
+   */
+  protected async commitOnce(opts: VersionedCommitOptions): Promise<MergeResult> {
+    const onConflict = checkDisposition(opts.onConflict)
+    const onMoved = checkMoved(opts.onMoved)
+    // The bytes the commit writes stay here; the core names them by key.
+    const held = new Map<string, Uint8Array>()
+    const updates: Array<[string, string, number, null]> = []
+    for (const [key, value] of opts.updates ?? []) {
+      const blob = await blobKey(value)
+      held.set(blob, value)
+      updates.push([key, blob, value.length, null])
+    }
+    const hosted: BytesMergeFn[] = []
+    const lower = (policy: MergePolicy): string | number => {
+      if (policy === MergeChoice.OURS) return 'ours'
+      if (policy === MergeChoice.THEIRS) return 'theirs'
+      hosted.push(policy as BytesMergeFn)
+      return hosted.length - 1
+    }
+    const lowered = (rules: Map<string, MergePolicy>) =>
+      [...rules].map(([k, policy]) => [k, lower(policy)])
+    const defaultMerge = opts.defaultMerge ?? this.defaultMergeFn
+    const current = this.currentCommitHash
+    const generation = this.generations.get(current)
+    const args = {
+      branch: this.branch,
+      base: this.baseCommitHash,
+      current,
+      updates,
+      removals: [...(opts.removals ?? [])].sort(compareCodePoints),
+      chunks: [],
+      onMoved,
+      onConflict,
+      mergeFns: lowered(new Map([...this.mergeFns, ...(opts.mergeFns ?? [])])),
+      mergePrefixes: lowered(new Map([...this.mergePrefixes, ...(opts.mergePrefixes ?? [])])),
+      defaultMerge: defaultMerge === null ? null : lower(defaultMerge),
+      recover: this.recoverFromCorruptHead !== undefined,
+      // Opening checked the store is stamped v4, the only version read.
+      stamped: true,
+      roots: this.nodeCache === null ? [] : [[current, this.root]],
+      generations: generation === undefined ? [] : [[current, generation]],
+    }
+    const info = opts.info ?? null
+    const c = await core()
+    const memo = this.nodeCache === null ? uncached(c) : this.nodeCache.memo(c)
+    const op = new c.CommitOp(JSON.stringify(args), info === null ? undefined : pyDumps(info), memo)
+    let done: Committed
+    try {
+      done = await driveCommit(op, {
+        store: this.store,
+        held,
+        mergeFns: hosted,
+        recover: this.recoverFromCorruptHead,
+        now: this.now,
+      })
+    } finally {
+      op.free()
+    }
+    const result: MergeResult = {
+      merged: done.merged,
+      commit: done.commit,
+      strategy: done.strategy,
+      autoMergedKeys: done.autoMerged,
+      carriedKeys: done.carried,
+    }
+    if (!done.merged || done.strategy === 'no_op') return this.finish(result)
+    // Landed: change the key maps in place, by what the commit changed.
+    for (const [key, stored] of done.changes) {
+      this.setEntry(key, stored === null ? null : decodeStored(stored))
+    }
+    for (const [commit, gen] of done.generations) this.generations.set(commit, gen)
+    const commit = done.commit as string
+    if (this.nodeCache !== null) {
+      this.root = done.roots.find(([c]) => c === commit)?.[1] ?? this.root
+    }
+    this.currentCommitHash = this.baseCommitHash = commit
+    return this.finish(result)
+  }
+
   /** Open a commit attempt: from here the key maps record what they
    *  change, so a failure can put it back. */
   protected snapshotState(): Attempt {
@@ -1810,4 +1900,9 @@ async function populateState(
     meta.set(k, entry.meta)
   }
   return { commitKeys, meta }
+}
+
+/** An entry as the core reports it, stored form parsed. */
+function decodeStored(stored: StoredEntry): KeysetEntry {
+  return decodeEntry(pyDumpsBytes(stored))
 }

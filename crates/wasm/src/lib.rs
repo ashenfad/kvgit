@@ -13,6 +13,9 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 
+mod commit;
+pub use commit::CommitOp;
+
 /// The version of the core, which is the version of the package.
 #[wasm_bindgen]
 pub fn version() -> String {

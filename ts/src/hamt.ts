@@ -82,7 +82,8 @@ export class NodeCache {
 let noMemo: NodeMemo | null = null
 
 /** A memo with no room, for reads that shouldn't be cached. */
-function uncached(c: Core): NodeMemo {
+/** @internal A memo that holds nothing. */
+export function uncached(c: Core): NodeMemo {
   noMemo ??= new c.NodeMemo(0)
   return noMemo
 }

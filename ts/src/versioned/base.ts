@@ -238,102 +238,9 @@ export abstract class VersionedBase implements Versioned {
     return this.exclusive(() => this.commitOnce(opts))
   }
 
-  private async commitOnce(opts: VersionedCommitOptions): Promise<MergeResult> {
-    const updates = opts.updates ?? null
-    const removals = opts.removals ?? null
-    const onConflict = checkDisposition(opts.onConflict)
-    const onMoved = checkMoved(opts.onMoved)
-    const info = opts.info ?? null
-
-    // Nothing to do: report the current HEAD and write nothing. With
-    // `onMoved: 'raise'` a moved branch still throws, since the caller's
-    // base is out of date whether or not it had anything to write.
-    if (
-      (updates === null || updates.size === 0) &&
-      (removals === null || removals.size === 0) &&
-      info === null
-    ) {
-      if (onMoved === 'raise') {
-        const head = await this.latestHead()
-        if (head === null) throw new UnknownBranchError(this.branch)
-        if (head !== this.baseCommitHash) {
-          throw new BranchMovedError(this.branch, this.baseCommitHash, head)
-        }
-      }
-      return this.finish(noOp(this.currentCommitHash))
-    }
-
-    let currentHead = await this.latestHead()
-    let oursBuilt = false
-    let saved: unknown = null
-
-    if (onMoved === 'raise' && currentHead !== this.baseCommitHash) {
-      if (currentHead === null) throw new UnknownBranchError(this.branch)
-      throw new BranchMovedError(this.branch, this.baseCommitHash, currentHead)
-    }
-
-    // Fast-forward path: HEAD hasn't moved.
-    if (currentHead === this.baseCommitHash) {
-      saved = this.snapshotState()
-      await this.createCommit({
-        ...(updates !== null && { updates }),
-        ...(removals !== null && { removals }),
-        ...(info !== null && { info }),
-      })
-      if (await this.casHead(this.baseCommitHash, this.currentCommitHash)) {
-        this.baseCommitHash = this.currentCommitHash
-        return this.finish(landed(this.currentCommitHash, 'fast_forward', [], []))
-      }
-      if (onMoved === 'raise') {
-        this.restoreState(saved)
-        const head = await this.latestHead()
-        if (head === null) throw new UnknownBranchError(this.branch)
-        if (head !== this.baseCommitHash) {
-          throw new BranchMovedError(this.branch, this.baseCommitHash, head)
-        }
-        // HEAD reads as the base, yet the publish failed: it moved and
-        // came back, or the commit's in-flight marker lapsed and a sweep
-        // may have taken the commit.
-        throw new ConcurrencyError('Commit could not be published. Retry.')
-      }
-      // Lost the fast-forward race: another writer advanced HEAD between
-      // our read and our CAS. Re-read HEAD and merge, as when the base
-      // was already behind, so the caller never has to refresh (and drop
-      // pending work) just to replay a mergeable commit.
-      try {
-        currentHead = await this.latestHead()
-      } catch (e) {
-        // A failing re-read must not leave phantom state behind either.
-        this.restoreState(saved)
-        throw e
-      }
-      // Keep the commit just built as our side of the merge: a rebuild
-      // would mint a second commit for the same change (the hash covers
-      // the time) and orphan the first.
-      oursBuilt = true
-    }
-
-    // Three-way merge path: HEAD has moved.
-    if (currentHead === null) {
-      // A retry that finds its branch gone restores the pre-commit
-      // snapshot. A null first read built nothing to restore.
-      if (oursBuilt) this.restoreState(saved)
-      throw new UnknownBranchError(this.branch)
-    }
-    if (!oursBuilt) {
-      saved = this.snapshotState()
-      await this.createCommit({
-        ...(updates !== null && { updates }),
-        ...(removals !== null && { removals }),
-      })
-    }
-    return this.threeWayMerge(currentHead, {
-      onConflict,
-      rules: opts,
-      ...(info !== null && { info }),
-      savedState: saved,
-    })
-  }
+  /** One commit, run once every earlier state-changing call has
+   *  settled. */
+  protected abstract commitOnce(opts: VersionedCommitOptions): Promise<MergeResult>
 
   /**
    * Merge another head (usually another branch's) into this branch.
@@ -557,7 +464,7 @@ export abstract class VersionedBase implements Versioned {
     }
   }
 
-  private finish(result: MergeResult): MergeResult {
+  protected finish(result: MergeResult): MergeResult {
     this.lastMergeResult = result
     return result
   }
@@ -612,7 +519,7 @@ export abstract class VersionedBase implements Versioned {
   protected abstract hasCommit(commit: string): Promise<boolean>
 }
 
-function checkDisposition(value: ConflictDisposition | undefined): ConflictDisposition {
+export function checkDisposition(value: ConflictDisposition | undefined): ConflictDisposition {
   const onConflict = value ?? 'raise'
   if (onConflict !== 'raise' && onConflict !== 'abandon') {
     throw new TypeError(`onConflict must be 'raise' or 'abandon', got ${String(onConflict)}`)
@@ -620,7 +527,7 @@ function checkDisposition(value: ConflictDisposition | undefined): ConflictDispo
   return onConflict
 }
 
-function checkMoved(value: MovedDisposition | undefined): MovedDisposition {
+export function checkMoved(value: MovedDisposition | undefined): MovedDisposition {
   const onMoved = value ?? 'merge'
   if (onMoved !== 'merge' && onMoved !== 'raise') {
     throw new TypeError(`onMoved must be 'merge' or 'raise', got ${String(onMoved)}`)
@@ -628,15 +535,15 @@ function checkMoved(value: MovedDisposition | undefined): MovedDisposition {
   return onMoved
 }
 
-function noOp(commit: string): MergeResult {
+export function noOp(commit: string): MergeResult {
   return { merged: true, commit, strategy: 'no_op', autoMergedKeys: [], carriedKeys: [] }
 }
 
-function abandoned(strategy: MergeResult['strategy']): MergeResult {
+export function abandoned(strategy: MergeResult['strategy']): MergeResult {
   return { merged: false, commit: null, strategy, autoMergedKeys: [], carriedKeys: [] }
 }
 
-function landed(
+export function landed(
   commit: string,
   strategy: MergeResult['strategy'],
   autoMergedKeys: readonly string[],
