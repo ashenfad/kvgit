@@ -77,7 +77,6 @@ version raise on open and need to be rebuilt fresh.
 """
 
 import hashlib
-import json
 import logging
 import os
 import time
@@ -86,6 +85,7 @@ from collections import deque
 from collections.abc import Callable, Iterable
 from typing import Any
 
+from .. import _core
 from ..encoding import dumps, loads, safe_loads
 from ..errors import (
     BranchExistsError,
@@ -240,12 +240,7 @@ def commit_hash(
     blobs; making it at the same clock instant, they mint the very same
     commit, byte for byte.
     """
-    payload = json.dumps(
-        ["kvgit/4", list(parents), root, created, info],
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return hashlib.sha256(payload.encode()).hexdigest()[:40]
+    return _core.commit_hash(list(parents), root, created, info)
 
 
 logger = logging.getLogger("kvgit")

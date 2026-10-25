@@ -311,6 +311,21 @@ class TestHonestCommitHash:
             )
             assert recomputed == record.hash
 
+    def test_info_keys_must_be_strings(self):
+        """Stored info reads back with string keys, so a key of any
+        other type couldn't be checked against its hash."""
+        with pytest.raises(TypeError, match="keys must be str"):
+            commit_hash(("p",), "r", 1.5, {1: "a"})
+        with pytest.raises(TypeError, match="keys must be str"):
+            commit_hash(("p",), "r", 1.5, {"nested": {2: "b"}})
+
+    def test_info_nested_past_the_limit_is_refused(self):
+        info: list = []
+        for _ in range(300):
+            info = [info]
+        with pytest.raises(ValueError, match="nested too deeply"):
+            commit_hash(("p",), "r", 1.5, {"deep": info})
+
     def test_a_commit_rewrites_nothing_already_stored(self):
         """Every key a commit writes is new or holds the bytes it had, so
         everything but branch heads can be cached forever."""
