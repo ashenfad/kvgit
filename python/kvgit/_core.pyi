@@ -67,3 +67,21 @@ class TreeOp:
         entries: bool = False,
     ) -> TreeOp: ...
     def resume(self, reply: dict[str, bytes] | None = None) -> tuple[str, Any]: ...
+
+MAX_MARK_BYTES: int
+"""The most bytes, all sides together, the text merge will mark."""
+
+def text_merge(
+    old: bytes | None,
+    ours: bytes | None,
+    theirs: bytes | None,
+    ours_label: str,
+    theirs_label: str,
+    cant_mark: type[Exception],
+) -> tuple[bytes, bool]:
+    """The three-way text merge of a value's sides, and whether it marked
+    a conflict. Values that can't be marked raise ``cant_mark``; a label
+    holding a line break raises ``ValueError``."""
+
+def check_text_labels(ours_label: str, theirs_label: str) -> None:
+    """Raise ``ValueError`` if either label holds a line break."""

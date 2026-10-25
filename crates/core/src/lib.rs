@@ -8,6 +8,7 @@ pub mod json;
 pub mod keyset;
 pub mod layout;
 pub mod machine;
+pub mod text;
 pub mod tree;
 
 /// The version of the core, which is the version of both packages.

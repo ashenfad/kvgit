@@ -48,6 +48,56 @@ pub fn commit_hash(
     ))
 }
 
+/// What the text merge made of a value's sides.
+#[wasm_bindgen]
+pub struct TextMerged {
+    #[wasm_bindgen(getter_with_clone)]
+    pub merged: Vec<u8>,
+    pub conflicted: bool,
+    /// Why the values can't be marker-merged, when they can't; then
+    /// `merged` is empty.
+    #[wasm_bindgen(getter_with_clone)]
+    pub refused: Option<String>,
+}
+
+/// The three-way text merge of a value's sides, absent where the key
+/// is. A label holding a line break throws.
+#[wasm_bindgen(js_name = textMerge)]
+pub fn text_merge(
+    old: Option<Vec<u8>>,
+    ours: Option<Vec<u8>>,
+    theirs: Option<Vec<u8>>,
+    ours_label: &str,
+    theirs_label: &str,
+) -> Result<TextMerged, JsError> {
+    use kvgit_core::text::{self, TextError};
+    match text::text_merge(
+        old.as_deref(),
+        ours.as_deref(),
+        theirs.as_deref(),
+        ours_label,
+        theirs_label,
+    ) {
+        Ok((merged, conflicted)) => Ok(TextMerged {
+            merged,
+            conflicted,
+            refused: None,
+        }),
+        Err(TextError::CantMark(reason)) => Ok(TextMerged {
+            merged: Vec::new(),
+            conflicted: false,
+            refused: Some(reason),
+        }),
+        Err(e) => Err(to_js(e)),
+    }
+}
+
+/// The most bytes, all sides together, the text merge will mark.
+#[wasm_bindgen(js_name = maxMarkBytes)]
+pub fn max_mark_bytes() -> usize {
+    kvgit_core::text::MAX_MARK_BYTES
+}
+
 fn to_js(e: impl std::fmt::Display) -> JsError {
     JsError::new(&e.to_string())
 }

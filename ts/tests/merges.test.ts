@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs'
-import { describe, expect, it } from 'vitest'
+import { beforeAll, describe, expect, it } from 'vitest'
 import { Memory } from '../src/backends/memory'
+import { loadCore } from '../src/core'
 import {
   CantMark,
   MergeConflict,
@@ -13,6 +14,8 @@ import {
   textMergeResult,
 } from '../src/index'
 import { SequenceMatcher } from '../src/sequenceMatcher'
+
+beforeAll(loadCore)
 
 const enc = new TextEncoder()
 const dec = new TextDecoder()

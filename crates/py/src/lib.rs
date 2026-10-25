@@ -7,10 +7,13 @@ mod _core {
     use kvgit_core::json::Value;
     use kvgit_core::keyset::Entry;
     use kvgit_core::machine::{Machine, Reply, Request, Step};
+    use kvgit_core::text::{self, TextError};
     use kvgit_core::tree::{self, Shape, TreeDiff, TreeError, Updated};
     use pyo3::exceptions::{PyTypeError, PyValueError};
     use pyo3::prelude::*;
-    use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PySet, PyString, PyTuple};
+    use pyo3::types::{
+        PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PySet, PyString, PyTuple, PyType,
+    };
     use pyo3::{IntoPyObjectExt, PyTypeInfo};
     use std::collections::HashMap;
 
@@ -44,6 +47,36 @@ mod _core {
             info.as_ref(),
         ))
     }
+
+    /// The three-way text merge of a value's sides, and whether it
+    /// marked a conflict. Values that can't be marked raise `cant_mark`;
+    /// a label holding a line break raises `ValueError`.
+    #[pyfunction]
+    fn text_merge<'py>(
+        py: Python<'py>,
+        old: Option<&[u8]>,
+        ours: Option<&[u8]>,
+        theirs: Option<&[u8]>,
+        ours_label: &str,
+        theirs_label: &str,
+        cant_mark: &Bound<'py, PyType>,
+    ) -> PyResult<(Bound<'py, PyBytes>, bool)> {
+        match text::text_merge(old, ours, theirs, ours_label, theirs_label) {
+            Ok((merged, conflicted)) => Ok((PyBytes::new(py, &merged), conflicted)),
+            Err(TextError::CantMark(message)) => Err(PyErr::from_type(cant_mark.clone(), message)),
+            Err(e) => Err(PyValueError::new_err(e.to_string())),
+        }
+    }
+
+    /// Raise `ValueError` if either label holds a line break.
+    #[pyfunction]
+    fn check_text_labels(ours_label: &str, theirs_label: &str) -> PyResult<()> {
+        text::check_labels(ours_label, theirs_label)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    #[pymodule_export]
+    const MAX_MARK_BYTES: usize = text::MAX_MARK_BYTES;
 
     /// A Python value as JSON, as `json.dumps` would read it. Object
     /// keys must be strings: `json.dumps` writes others as strings, so
