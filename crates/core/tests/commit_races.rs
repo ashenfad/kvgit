@@ -115,6 +115,7 @@ impl Store {
             ),
             Request::Recover(_) => Reply::Recovered(None),
             Request::Emit(_) => Reply::Next,
+            Request::Check(_) => Reply::Refused(vec![]),
             Request::Now => Reply::Now(self.clock),
         }
     }

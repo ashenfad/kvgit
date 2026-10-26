@@ -12,7 +12,7 @@ use crate::layout::commit_root;
 use crate::machine::{Io, Machine};
 use crate::refs::{self, Ref};
 use crate::store::{dumps_str, loads_str};
-use crate::write::{self, CommitArgs, Committed, Done};
+use crate::write::{self, CommitArgs, Committed, Done, MergeArgs};
 use std::collections::HashMap;
 
 /// What an operation answers with.
@@ -90,6 +90,17 @@ pub fn call(name: &str, args: Value) -> Result<Op, Error> {
 pub fn commit(args: CommitArgs) -> Op {
     Machine::new(move |io| async move {
         let done = write::commit(io, args).await;
+        Done {
+            result: done.result.map(|c| Out::Committed(Box::new(c))),
+            notes: done.notes,
+        }
+    })
+}
+
+/// Start a merge or an apply.
+pub fn merge(args: MergeArgs) -> Op {
+    Machine::new(move |io| async move {
+        let done = write::merge(io, args).await;
         Done {
             result: done.result.map(|c| Out::Committed(Box::new(c))),
             notes: done.notes,

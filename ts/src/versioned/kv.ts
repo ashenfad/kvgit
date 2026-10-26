@@ -25,27 +25,24 @@
  * rewriting a full snapshot per commit.
  */
 
+import type { Op } from '../../wasm/kvgit_wasm.js'
 import { core } from '../core'
-import {
-  ConcurrencyError,
-  CorruptHeadError,
-  GcBusy,
-  UnknownBranchError,
-  UnknownCommitError,
-} from '../errors'
+import { CorruptHeadError, GcBusy, UnknownBranchError, UnknownCommitError } from '../errors'
 import { EMPTY_HASH, NodeCache, uncached } from '../hamt'
 import { Keyset, decodeEntry } from '../keyset'
 import { compareCodePoints, pyDumps, pyDumpsBytes } from '../pyjson'
 import {
   type BytesMergeFn,
   type CommitInfo,
-  type ConflictDisposition,
   type KVStore,
   type KeysetEntry,
   MergeChoice,
+  type MergeHeadsOptions,
   type MergePolicy,
   type MergeResult,
+  type MergeRuleOptions,
   type MetaEntry,
+  type PostCheck,
   type Versioned,
   type VersionedCommitOptions,
 } from '../types'
@@ -59,9 +56,7 @@ import {
   BRANCH_HEAD_PREV,
   COMMIT_ROOT,
   COMMIT_TIME,
-  GC_LEASE_KEY,
   INFO_KEY,
-  IN_FLIGHT_KEY,
   IN_FLIGHT_PREFIX,
   PARENT_COMMIT,
   PARENT_GENS,
@@ -69,8 +64,6 @@ import {
   assertStorageVersion,
   blobKey,
   checkStorageVersion,
-  commitHash,
-  commitRecords,
   dumps,
   generationOf,
   loads,
@@ -81,14 +74,12 @@ import {
   GC_LEASE_TTL,
   type HeldLease,
   acquireGcLease,
-  inFlightMarker,
   markerLive,
   releaseGcLease,
-  sameBytes,
   tryLand,
   waitForGc,
 } from './lease'
-import type { Change, MergeResolution } from './merge'
+import type { Change } from './merge'
 import { listBranches, rejectReservedBranch } from './refs'
 
 // ---------------------------------------------------------------------------
@@ -176,20 +167,6 @@ export async function headOf(
   const args = { branch: name, recover: recover !== undefined }
   const found = (await callCore('head_of', args, { store, recover, now: wallClock })) as Resolved
   return found.commit
-}
-
-/**
- * Atomically replace an unresolvable HEAD with `commit`.
- *
- * Returns true only when HEAD was damaged *and* this call is the one
- * that replaced it. A HEAD that resolves moved rather than broke, and
- * one already naming `commit` needs nothing; an absent HEAD is a
- * deleted branch, which healing must not bring back. The replacement
- * is a CAS against the exact damaged bytes, so two writers healing the
- * same branch cannot both win.
- */
-async function healHead(store: KVStore, branch: string, commit: string): Promise<boolean> {
-  return (await callCore('heal_head', { branch, commit }, { store, now: wallClock })) as boolean
 }
 
 /**
@@ -620,19 +597,6 @@ export async function loadParents(store: KVStore, commit: string): Promise<reado
 }
 
 /**
- * A commit attempt: the commit it started from, and the entry each key
- * it has changed held before (undefined where the key was absent), to
- * put back if it fails. Restoring costs what the attempt changed, not
- * the size of the keyset.
- */
-interface Attempt {
-  currentCommit: string
-  /** The keyset root it started from (lazy handles). */
-  root: string
-  undo: Map<string, { blob: string | undefined; meta: MetaEntry | undefined }>
-}
-
-/**
  * A commit log over a `KVStore`.
  *
  * Construct via the async `VersionedKV.open(store, opts?)` factory —
@@ -643,20 +607,11 @@ interface Attempt {
 export class VersionedKV extends VersionedBase {
   readonly store: KVStore
   private meta: Map<string, MetaEntry>
-  /** The commit attempt in progress, if any: what to undo should it
-   *  fail. */
-  private attempt: Attempt | null = null
   private readonly recoverFromCorruptHead: CorruptHeadRecoverer | undefined
   private readonly now: () => number
   /** Generations of commits this handle has written or read. A
    *  commit's generation never changes, so nothing here goes stale. */
   private readonly generations = new Map<string, number>()
-  /** Commits this handle has written and not yet published, with the
-   *  bytes of each one's in-flight marker. */
-  private inFlight = new Map<string, Uint8Array>()
-  /** The lease record this handle's latest batch landed against: a
-   *  publish expecting it can't land while a sweep runs. */
-  private leaseSeen: Uint8Array | null = null
   /** A lazy handle's node cache; null for a handle that holds its
    *  whole keyset in `commitKeys` and `meta`. */
   private readonly nodeCache: NodeCache | null
@@ -861,17 +816,7 @@ export class VersionedKV extends VersionedBase {
       updates.push([key, blob, value.length, null])
     }
     const hosted: BytesMergeFn[] = []
-    const lower = (policy: MergePolicy): string | number => {
-      if (policy === MergeChoice.OURS) return 'ours'
-      if (policy === MergeChoice.THEIRS) return 'theirs'
-      hosted.push(policy as BytesMergeFn)
-      return hosted.length - 1
-    }
-    const lowered = (rules: Map<string, MergePolicy>) =>
-      [...rules].map(([k, policy]) => [k, lower(policy)])
-    const defaultMerge = opts.defaultMerge ?? this.defaultMergeFn
     const current = this.currentCommitHash
-    const generation = this.generations.get(current)
     const args = {
       branch: this.branch,
       base: this.baseCommitHash,
@@ -881,25 +826,96 @@ export class VersionedKV extends VersionedBase {
       chunks: [],
       onMoved,
       onConflict,
-      mergeFns: lowered(new Map([...this.mergeFns, ...(opts.mergeFns ?? [])])),
-      mergePrefixes: lowered(new Map([...this.mergePrefixes, ...(opts.mergePrefixes ?? [])])),
-      defaultMerge: defaultMerge === null ? null : lower(defaultMerge),
+      ...this.lowered(hosted, opts),
       recover: this.recoverFromCorruptHead !== undefined,
       // Opening checked the store is stamped v4, the only version read.
       stamped: true,
-      roots: this.nodeCache === null ? [] : [[current, this.root]],
-      generations: generation === undefined ? [] : [[current, generation]],
+      ...this.known(current),
     }
     const info = opts.info ?? null
     const c = await core()
     const memo = this.nodeCache === null ? uncached(c) : this.nodeCache.memo(c)
     const op = c.Op.commit(JSON.stringify(args), info === null ? undefined : pyDumps(info), memo)
+    return this.land(op, held, hosted)
+  }
+
+  /**
+   * Merge `theirs` into this branch, or, given `from`, apply the change
+   * from `from` to `theirs`: one operation of the core, which this
+   * handle moves to the result of once it lands.
+   */
+  protected async mergeOnce(
+    theirs: string,
+    from: string | null,
+    opts: MergeHeadsOptions,
+  ): Promise<MergeResult> {
+    const onConflict = checkDisposition(opts.onConflict)
+    const hosted: BytesMergeFn[] = []
+    const current = this.currentCommitHash
+    const postCheck = opts.postCheck ?? undefined
+    const args = {
+      branch: this.branch,
+      ours: current,
+      theirs,
+      from,
+      fastForward: from === null && opts.fastForward !== false,
+      onConflict,
+      ...this.lowered(hosted, opts),
+      postCheck: postCheck !== undefined,
+      recover: this.recoverFromCorruptHead !== undefined,
+      stamped: true,
+      ...this.known(current),
+    }
+    const info = opts.info ?? null
+    const c = await core()
+    const memo = this.nodeCache === null ? uncached(c) : this.nodeCache.memo(c)
+    const op = c.Op.merge(JSON.stringify(args), info === null ? undefined : pyDumps(info), memo)
+    return this.land(op, new Map(), hosted, postCheck)
+  }
+
+  /** The merge rules in effect, layered over this handle's, as the core
+   *  names them: a side, or the number of a function in `hosted`, which
+   *  gains each function named. */
+  private lowered(hosted: BytesMergeFn[], opts: MergeRuleOptions) {
+    const lower = (policy: MergePolicy): string | number => {
+      if (policy === MergeChoice.OURS) return 'ours'
+      if (policy === MergeChoice.THEIRS) return 'theirs'
+      hosted.push(policy as BytesMergeFn)
+      return hosted.length - 1
+    }
+    const lowerAll = (rules: Map<string, MergePolicy>) =>
+      [...rules].map(([k, policy]) => [k, lower(policy)])
+    const defaultMerge = opts.defaultMerge ?? this.defaultMergeFn
+    return {
+      mergeFns: lowerAll(new Map([...this.mergeFns, ...(opts.mergeFns ?? [])])),
+      mergePrefixes: lowerAll(new Map([...this.mergePrefixes, ...(opts.mergePrefixes ?? [])])),
+      defaultMerge: defaultMerge === null ? null : lower(defaultMerge),
+    }
+  }
+
+  /** The root and generation this handle knows of `commit`. */
+  private known(commit: string) {
+    const generation = this.generations.get(commit)
+    return {
+      roots: this.nodeCache === null ? [] : [[commit, this.root]],
+      generations: generation === undefined ? [] : [[commit, generation]],
+    }
+  }
+
+  /** Run a commit or merge, and move this handle to what it landed. */
+  private async land(
+    op: Op,
+    held: Map<string, Uint8Array>,
+    hosted: BytesMergeFn[],
+    postCheck?: PostCheck,
+  ): Promise<MergeResult> {
     let done: Committed
     try {
       done = await driveCommit(op, {
         store: this.store,
         held,
         mergeFns: hosted,
+        postCheck,
         recover: this.recoverFromCorruptHead,
         now: this.now,
       })
@@ -927,74 +943,12 @@ export class VersionedKV extends VersionedBase {
     return this.finish(result)
   }
 
-  /** Open a commit attempt: from here the key maps record what they
-   *  change, so a failure can put it back. */
-  protected snapshotState(): Attempt {
-    this.attempt = { currentCommit: this.currentCommitHash, root: this.root, undo: new Map() }
-    return this.attempt
-  }
-
-  /**
-   * Restore in-memory state after a failed attempt: each key the
-   * attempt changed gets its old entry back. The attempt's commits are
-   * abandoned, so their in-flight markers are withdrawn and they become
-   * ordinary orphans. Best effort: a marker left behind lapses after
-   * `IN_FLIGHT_TTL`.
-   */
-  protected restoreState(saved: unknown): void {
-    const s = saved as Attempt
-    // Only the open attempt is undone. Loading another commit closes
-    // it, and that state is newer than anything the attempt saved.
-    if (this.attempt === s) {
-      if (this.nodeCache !== null) {
-        // A lazy handle's whole state is its root.
-        this.root = s.root
-      } else {
-        const keys = this.ownedKeys()
-        for (const [key, prev] of s.undo) {
-          if (prev.blob === undefined) keys.delete(key)
-          else keys.set(key, prev.blob)
-          if (prev.meta === undefined) this.meta.delete(key)
-          else this.meta.set(key, prev.meta)
-        }
-      }
-      this.currentCommitHash = s.currentCommit
-      this.attempt = null
-    }
-    if (this.inFlight.size > 0) {
-      // Each marker goes only if it still holds the bytes this attempt
-      // wrote: another writer that produced the same commit may have
-      // overwritten it, and its protection must stay.
-      const withdrawn = [...this.inFlight].map(([commit, marker]) => {
-        const key = IN_FLIGHT_KEY(commit)
-        return this.store.casMany(new Map([[key, marker]]), new Map(), [key])
-      })
-      this.inFlight = new Map()
-      Promise.all(withdrawn).catch(() => {})
-    }
-  }
-
-  protected override rollBackAttempt(): void {
-    if (this.attempt !== null) this.restoreState(this.attempt)
-  }
-
-  protected override endAttempt(): void {
-    this.attempt = null
-  }
-
-  /**
-   * Point `key` at `blob`, or remove it (null), in place. The open
-   * attempt records the entry it held first, so a failure can restore
-   * it. Called only once a commit's batch has landed, never while the
-   * attempt can still fail before it.
-   */
+  /** Point `key` at `blob`, or remove it (null), in place, once a
+   *  commit or merge has landed. */
   private setEntry(key: string, entry: { blob: string; meta: MetaEntry } | null): void {
     // A lazy handle holds no key maps: the new root is the change.
     if (this.nodeCache !== null) return
     const keys = this.ownedKeys()
-    if (this.attempt !== null && !this.attempt.undo.has(key)) {
-      this.attempt.undo.set(key, { blob: keys.get(key), meta: this.meta.get(key) })
-    }
     if (entry === null) {
       keys.delete(key)
       this.meta.delete(key)
@@ -1002,118 +956,6 @@ export class VersionedKV extends VersionedBase {
       keys.set(key, entry.blob)
       this.meta.set(key, entry.meta)
     }
-  }
-
-  /**
-   * Write a commit's batch, marked in flight, while no sweep runs. The
-   * batch is conditional on the lease record read after waiting any
-   * live sweep out, so it lands before a sweep starts or after one ends,
-   * never during; landing before is safe because the marker makes every
-   * later sweep treat the commit as live until it is published.
-   */
-  private async landBatch(commit: string, writes: Map<string, Uint8Array>): Promise<void> {
-    const marker = inFlightMarker()
-    writes.set(IN_FLIGHT_KEY(commit), marker)
-    for (;;) {
-      const lease = await waitForGc(this.store)
-      if (await this.store.casMany(new Map([[GC_LEASE_KEY, lease]]), writes)) {
-        this.inFlight.set(commit, marker)
-        this.leaseSeen = lease
-        return
-      }
-    }
-  }
-
-  protected async createCommit(opts: {
-    updates?: Map<string, Uint8Array>
-    removals?: Set<string>
-    info?: CommitInfo
-  }): Promise<string> {
-    const updates = opts.updates ?? new Map<string, Uint8Array>()
-    const removals = opts.removals ?? new Set<string>()
-    const info = opts.info ?? null
-
-    // Every blob is written, even one already stored: the key is its
-    // content, so the rewrite changes nothing but guarantees the batch
-    // holds everything its commit needs.
-    const writes = new Map<string, Uint8Array>()
-    const keysetUpdates: Array<[string, KeysetEntry]> = []
-    for (const [key, value] of updates) {
-      const pointer = await blobKey(value)
-      writes.set(pointer, value)
-      keysetUpdates.push([key, { blob: pointer, meta: { size: value.length } }])
-    }
-
-    // Apply the changes to the parent's HAMT: structural sharing reuses
-    // every subtree the commit didn't touch.
-    const newKs = await this.applyToKeyset(keysetUpdates, removals)
-    for (const [k, v] of newKs.pending) writes.set(k, v)
-
-    // The hash is computed last, over the parents, the root, the time
-    // and the info, so it names exactly one root.
-    const parents = [this.currentCommitHash]
-    const parentGens = await this.parentGenerations(parents)
-    const created = this.now()
-    const newHash = await commitHash(parents, newKs.root, created, info)
-    const records = commitRecords({
-      commit: newHash,
-      root: newKs.root,
-      parents,
-      parentGens,
-      created,
-      info,
-    })
-    for (const [k, v] of records) writes.set(k, v)
-
-    // One batch, so a crash mid-write doesn't strand a partial commit.
-    await this.landBatch(newHash, writes)
-
-    // Landed: change the key maps in place, removals first so an update
-    // to a removed key wins. Nothing between here and the return awaits,
-    // so no reader sees a half-applied commit.
-    for (const key of removals) this.setEntry(key, null)
-    for (const [key, entry] of keysetUpdates) this.setEntry(key, entry)
-    this.adoptRoot(newKs)
-    this.currentCommitHash = newHash
-    this.generations.set(newHash, generationOf(parentGens))
-    return newHash
-  }
-
-  /** A commit's keyset root, or the empty tree's for a commit with none. */
-  private async rootOf(commit: string): Promise<string> {
-    return rootOfCommit(this.store, commit)
-  }
-
-  /**
-   * The current keyset with `updates` and `removals` applied, its new
-   * nodes pending. An eager handle applies them one key at a time; a
-   * lazy one loads every changed key's path a level at a time through
-   * the node cache, then rewrites each node on those paths once.
-   */
-  private async applyToKeyset(
-    updates: Iterable<readonly [string, KeysetEntry]>,
-    removals: Iterable<string>,
-  ): Promise<Keyset> {
-    if (this.nodeCache === null) {
-      const parentKs = Keyset.fromRoot(this.store, await this.rootOf(this.currentCommitHash))
-      return parentKs.updated({ updates, removals })
-    }
-    const ks = this.lazyKeyset()
-    const updateList = [...updates]
-    const removalList = [...removals]
-    await ks.getMany([...updateList.map(([k]) => k), ...removalList])
-    return ks.updatedBatch({ updates: updateList, removals: removalList })
-  }
-
-  /** A lazy handle moves to a keyset it just landed: its root, with the
-   *  new nodes in the cache, where the next reads start. Synchronous, so
-   *  the root and the commit change together. */
-  private adoptRoot(ks: Keyset): void {
-    if (this.nodeCache === null) return
-    for (const [k, bytes] of ks.pending) {
-      this.nodeCache.setBytes(k.slice(Keyset.DEFAULT_PREFIX.length), bytes)
-    }
-    this.root = ks.root
   }
 
   /** The generation of each of a new commit's parents. */
@@ -1152,161 +994,6 @@ export class VersionedKV extends VersionedBase {
     return highest + 1
   }
 
-  /**
-   * A commit from a resolved merge: our state with the resolution's
-   * changes applied. An entry carried from either side keeps its own
-   * metadata, which describes its blob; a value a merge function
-   * produced is a new blob, never chunked.
-   */
-  protected async createMergeCommit(
-    resolution: MergeResolution,
-    parents: readonly string[],
-    info: CommitInfo | null,
-  ): Promise<string> {
-    const writes = new Map<string, Uint8Array>()
-    const updates = new Map(resolution.updates)
-    for (const [key, value] of resolution.mergedValues) {
-      const pointer = await blobKey(value)
-      writes.set(pointer, value)
-      updates.set(key, { blob: pointer, meta: { size: value.length } })
-    }
-
-    // Apply the changes on top of our HAMT, so structural sharing keeps
-    // every subtree the merge did not touch.
-    const newKs = await this.applyToKeyset(updates, resolution.removals)
-    for (const [k, v] of newKs.pending) writes.set(k, v)
-
-    const parentGens = await this.parentGenerations(parents)
-    const created = this.now()
-    const mergeHash = await commitHash(parents, newKs.root, created, info)
-    const records = commitRecords({
-      commit: mergeHash,
-      root: newKs.root,
-      parents,
-      parentGens,
-      created,
-      info,
-    })
-    for (const [k, v] of records) writes.set(k, v)
-    await this.landBatch(mergeHash, writes)
-
-    // Landed: change the key maps in place, without awaiting.
-    for (const [key, entry] of updates) this.setEntry(key, entry)
-    for (const key of resolution.removals) this.setEntry(key, null)
-    this.adoptRoot(newKs)
-    this.currentCommitHash = mergeHash
-    this.generations.set(mergeHash, generationOf(parentGens))
-    return mergeHash
-  }
-
-  /**
-   * Move HEAD from our head to `theirHead`, a descendant of it, writing
-   * no commit. The write expects HEAD to hold our head: a branch that
-   * moved meanwhile fails it as a merge commit's publish would, and a
-   * deleted one is not recreated.
-   */
-  protected async fastForward(
-    theirHead: string,
-    onConflict: ConflictDisposition,
-  ): Promise<MergeResult> {
-    const ourHead = this.currentCommitHash
-    const carried = [...(await this.changes(ourHead, theirHead)).keys()].sort(compareCodePoints)
-    const branchKey = BRANCH_HEAD(this.branch)
-    const expected = dumps(ourHead)
-    const writes = new Map([
-      [branchKey, dumps(theirHead)],
-      [BRANCH_HEAD_PREV(this.branch), expected],
-    ])
-    // The existence check and the write are decided against one lease
-    // record, so a sweep can't take the commit between them.
-    let moved = false
-    for (;;) {
-      const lease = await waitForGc(this.store)
-      if ((await this.store.get(COMMIT_ROOT(theirHead))) === null) {
-        throw new UnknownCommitError(theirHead)
-      }
-      const landed = await tryLand(this.store, lease, new Map([[branchKey, expected]]), writes)
-      if (landed === null) continue
-      if (landed) break
-      if ((await this.store.get(branchKey)) === null) throw new UnknownBranchError(this.branch)
-      if (await healHead(this.store, this.branch, ourHead)) continue
-      moved = true
-      break
-    }
-    if (moved) {
-      if (onConflict === 'abandon') {
-        return {
-          merged: false,
-          commit: null,
-          strategy: 'fast_forward',
-          autoMergedKeys: [],
-          carriedKeys: [],
-        }
-      }
-      throw new ConcurrencyError('HEAD changed during merge. Refresh and retry.')
-    }
-    await this.loadCommitInto(theirHead, true)
-    return {
-      merged: true,
-      commit: theirHead,
-      strategy: 'fast_forward',
-      autoMergedKeys: [],
-      carriedKeys: carried,
-    }
-  }
-
-  /**
-   * Publish `newHead` as this branch's HEAD if HEAD is `expected`.
-   *
-   * One atomic write moves HEAD, records `expected` as the backup, and
-   * removes the in-flight markers of the commits being published, so
-   * the backup always names the commit HEAD held immediately before,
-   * and a published commit never keeps a marker, nor loses it before
-   * its head lands.
-   *
-   * The write also expects the lease record, so it can't land while a
-   * sweep runs (a head installed under a sweep could name a commit the
-   * sweep is about to take); after a sweep it waits and tries again. And
-   * it expects each marker to hold the bytes this handle wrote: a marker
-   * only disappears early if it lapsed and a sweep reaped it, possibly
-   * with the commit, and then the publish fails rather than naming a
-   * commit that may be gone.
-   *
-   * A write that fails against a *damaged* HEAD is retried behind
-   * {@link healHead}, which repairs it atomically.
-   */
-  protected async casHead(expected: string, newHead: string): Promise<boolean> {
-    const branchKey = BRANCH_HEAD(this.branch)
-    const expectedBytes = dumps(expected)
-    const writes = new Map([
-      [branchKey, dumps(newHead)],
-      [BRANCH_HEAD_PREV(this.branch), expectedBytes],
-    ])
-    const markers = new Map([...this.inFlight].map(([c, m]) => [IN_FLIGHT_KEY(c), m] as const))
-    let lease = this.inFlight.size > 0 ? this.leaseSeen : await waitForGc(this.store)
-    for (;;) {
-      const expect = new Map<string, Uint8Array | null>([
-        [GC_LEASE_KEY, lease],
-        [branchKey, expectedBytes],
-        ...markers,
-      ])
-      if (await this.store.casMany(expect, writes, markers.keys())) break
-      if (!sameBytes(await this.store.get(GC_LEASE_KEY), lease)) {
-        // A sweep ran, or is running: wait it out and try again. A
-        // marker it reaped fails the next attempt on its own.
-        lease = await waitForGc(this.store)
-        continue
-      }
-      const present = await this.store.getMany(markers.keys())
-      for (const [key, marker] of markers) {
-        if (!sameBytes(present.get(key) ?? null, marker)) return false
-      }
-      if (!(await healHead(this.store, this.branch, expected))) return false
-    }
-    this.inFlight = new Map()
-    return true
-  }
-
   protected async changes(commitA: string | null, commitB: string): Promise<Map<string, Change>> {
     return commitChanges(this.store, commitA, commitB, this.nodeCache ?? undefined)
   }
@@ -1324,10 +1011,6 @@ export class VersionedKV extends VersionedBase {
 
   protected async readBlob(blobId: string): Promise<Uint8Array | null> {
     return this.store.get(blobId)
-  }
-
-  protected async hasCommit(commit: string): Promise<boolean> {
-    return (await this.store.get(COMMIT_ROOT(commit))) !== null
   }
 
   // --- Navigation ---
@@ -1551,7 +1234,6 @@ export class VersionedKV extends VersionedBase {
       this.currentCommitHash = commitHash
       if (updateBase) this.baseCommitHash = commitHash
       this.root = root
-      this.attempt = null
       return
     }
     const { commitKeys, meta } = await populateState(this.store, commitHash)
@@ -1561,7 +1243,6 @@ export class VersionedKV extends VersionedBase {
     if (updateBase) this.baseCommitHash = commitHash
     this.replaceKeys(commitKeys)
     this.meta = meta
-    this.attempt = null
   }
 }
 

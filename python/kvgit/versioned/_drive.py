@@ -55,6 +55,7 @@ def steps(
     *,
     held: dict[str, bytes] | None = None,
     merge_fns: Sequence[Callable[..., Any]] = (),
+    post_check: Callable[[str, bytes], bool] | None = None,
     recoverer: Callable[[KVStore, str], Any] | None = None,
     clock: Callable[[], float],
     sleep: Callable[[float], None],
@@ -64,7 +65,8 @@ def steps(
 
     ``held`` holds the bytes the operation writes by key without
     reading them; values merge functions make join it. ``merge_fns`` are
-    the functions the operation names by number.
+    the functions the operation names by number, and ``post_check`` the
+    check it runs over the values they make.
     """
     held = {} if held is None else held
     errors: dict[str, Exception] = {}
@@ -105,6 +107,13 @@ def steps(
                 reply = _merge(store, request[1], merge_fns, held, errors)
             elif kind == "now":
                 reply = clock()
+            elif kind == "check":
+                reply = [
+                    key
+                    for key, blob, made in request[1]
+                    if post_check is not None
+                    and not post_check(key, held[blob] if made is None else made)
+                ]
             elif kind == "recover":
                 guess = recoverer(store, request[1]) if recoverer else None
                 if guess is not None and not isinstance(guess, str):

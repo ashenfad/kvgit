@@ -18,7 +18,9 @@ use kvgit_core::merge::{MergeAnswer, MergeAsk, Rule, Rules};
 use kvgit_core::ops::{self, Out};
 use kvgit_core::text::{TextRule, text_merge};
 use kvgit_core::tree::walk;
-use kvgit_core::write::{CommitArgs, Committed, Done, OnConflict, OnMoved, commit};
+use kvgit_core::write::{
+    CommitArgs, Committed, Done, MergeArgs, OnConflict, OnMoved, commit, merge,
+};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -53,6 +55,10 @@ const KNOWN: &[&str] = &[
     "repair_head",
     "diff",
     "merge_base",
+    "merge",
+    "apply",
+    "cherry_pick",
+    "revert",
 ];
 
 /// The scenarios it must run: a scenario that gains a step it doesn't
@@ -63,9 +69,13 @@ const EXPECTED: &[&str] = &[
     "format/encoding",
     "history/commit-scan-recovery",
     "history/head-recovery",
+    "history/merge-base",
     "history/refs",
+    "merges/apply",
+    "merges/branch-merges",
     "merges/text",
     "races/lost-before-batch",
+    "regressions/builtin-names",
 ];
 
 fn scenarios(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -159,6 +169,8 @@ struct Wt {
     branch: String,
     /// Whether its repo has a recoverer.
     recover: bool,
+    /// The step that opened its repo, which gives the repo's merge rules.
+    repo: Value,
     base: String,
     keys: BTreeMap<String, Entry>,
     pending: BTreeMap<String, Option<Vec<u8>>>,
@@ -175,8 +187,11 @@ struct Job {
 }
 
 struct Run {
-    /// Each repo, and whether it recovers heads by a commit scan.
-    repos: HashMap<String, bool>,
+    /// Each repo: whether it recovers heads by a commit scan, and the
+    /// step that opened it.
+    repos: HashMap<String, (bool, Value)>,
+    /// Values the scenario's merge functions made, by blob key.
+    made: HashMap<String, Vec<u8>>,
     store: BTreeMap<String, Vec<u8>>,
     clock: f64,
     vars: HashMap<String, Value>,
@@ -200,6 +215,7 @@ impl Run {
         };
         Run {
             repos: HashMap::new(),
+            made: HashMap::new(),
             store,
             clock,
             vars: HashMap::from([("$root".into(), Value::Str(ROOT_COMMIT.into()))]),
@@ -300,12 +316,13 @@ impl Run {
                     self.store.insert(STORAGE_VERSION_KEY.into(), b"4".to_vec());
                 }
                 let scan = step.get("recover").and_then(Value::as_str) == Some("commit_scan");
-                self.repos.insert(self.arg(step, "as"), scan);
+                self.repos
+                    .insert(self.arg(step, "as"), (scan, step.clone()));
                 Ok(Value::Null)
             }
             "worktree" => {
                 let branch = self.arg(step, "branch");
-                let recover = self.repos[&self.arg(step, "repo")];
+                let (recover, repo) = self.repos[&self.arg(step, "repo")].clone();
                 let head = match self.head_of(&branch, recover) {
                     Err(e)
                         if e == "UnknownBranchError"
@@ -327,6 +344,7 @@ impl Run {
                 let wt = Wt {
                     branch,
                     recover,
+                    repo,
                     keys: self.keyset(&head),
                     base: head,
                     pending: BTreeMap::new(),
@@ -427,7 +445,7 @@ impl Run {
                 Ok(Value::Null)
             }
             "branches" => {
-                let recover = self.repos[&self.arg(step, "repo")];
+                let recover = self.repos[&self.arg(step, "repo")].0;
                 let Value::Array(names) = self.call("branches", args(&[]), false)? else {
                     panic!("branches")
                 };
@@ -488,7 +506,7 @@ impl Run {
                 ))
             }
             "repair_head" => {
-                let recover = self.repos[&self.arg(step, "repo")];
+                let recover = self.repos[&self.arg(step, "repo")].0;
                 let name = self.arg(step, "name");
                 let mut fields = vec![("branch".to_string(), Value::Str(name))];
                 fields.push(("recover".into(), Value::Bool(recover)));
@@ -578,6 +596,73 @@ impl Run {
             "store_delete" => {
                 self.store.remove(&self.arg(step, "key"));
                 Ok(Value::Null)
+            }
+            "merge" | "apply" | "cherry_pick" | "revert" => {
+                let name = self.arg(step, "wt");
+                if !self.wts[&name].pending.is_empty() {
+                    return Err("invalid".into());
+                }
+                let parent_of = |run: &mut Run, commit: &str| -> Result<String, String> {
+                    let found = run.call("get_commit", args(&[("commit", commit)]), false)?;
+                    Ok(match found.get("parents") {
+                        Some(Value::Array(ps)) if !ps.is_empty() => {
+                            ps[0].as_str().unwrap().to_string()
+                        }
+                        _ => ROOT_COMMIT.to_string(),
+                    })
+                };
+                let (theirs, from) = match op(step) {
+                    "merge" => {
+                        let field = ["branch", "commit", "tag"]
+                            .into_iter()
+                            .find(|f| step.get(f).is_some())
+                            .unwrap();
+                        let mut fields =
+                            vec![(field.to_string(), Value::Str(self.arg(step, field)))];
+                        fields.push(("recover".into(), Value::Bool(false)));
+                        let found = self.call("resolve_ref", Value::Object(fields), false)?;
+                        (
+                            found.get("commit").unwrap().as_str().unwrap().to_string(),
+                            None,
+                        )
+                    }
+                    "apply" => (self.arg(step, "target"), Some(self.arg(step, "base"))),
+                    "cherry_pick" => {
+                        let commit = self.arg(step, "commit");
+                        let parent = parent_of(self, &commit)?;
+                        (commit, Some(parent))
+                    }
+                    _ => {
+                        let commit = self.arg(step, "commit");
+                        let parent = parent_of(self, &commit)?;
+                        (parent, Some(commit))
+                    }
+                };
+                let wt = &self.wts[&name];
+                let on_conflict = match step.get("on_conflict").and_then(Value::as_str) {
+                    Some("abandon") => OnConflict::Abandon,
+                    _ => OnConflict::Raise,
+                };
+                let margs = MergeArgs {
+                    branch: wt.branch.clone(),
+                    ours: wt.base.clone(),
+                    theirs,
+                    from,
+                    fast_forward: step.get("fast_forward") != Some(&Value::Bool(false)),
+                    shape: shape(),
+                    rules: rules(&wt.repo, step),
+                    on_conflict,
+                    info: step.get("info").cloned(),
+                    post_check: false,
+                    recover: wt.recover,
+                    stamped: wt.stamped,
+                    roots: vec![],
+                    generations: vec![],
+                };
+                let recover = wt.recover;
+                let machine = Machine::new(move |io| merge(io, margs));
+                let done = self.drive(machine, &HashMap::new(), recover);
+                self.finish(&name, done)
             }
             "commit" => {
                 let name = self.arg(step, "wt");
@@ -743,7 +828,7 @@ impl Run {
             info: step.get("info").cloned(),
             on_moved,
             on_conflict,
-            rules: rules(step),
+            rules: rules(&wt.repo, step),
             recover: wt.recover,
             stamped: wt.stamped,
             roots: vec![],
@@ -813,7 +898,7 @@ impl Run {
                 for (key, write) in writes {
                     let bytes = match write {
                         Write::Bytes(bytes) => bytes,
-                        Write::Held => values[&key].clone(),
+                        Write::Held => values.get(&key).unwrap_or_else(|| &self.made[&key]).clone(),
                     };
                     self.store.insert(key, bytes);
                 }
@@ -841,22 +926,24 @@ impl Run {
             }
             Request::Recover(_) => Reply::Recovered(None),
             Request::Emit(_) => Reply::Next,
+            Request::Check(_) => Reply::Refused(vec![]),
             Request::Now => Reply::Now(self.clock),
         }
     }
 
-    fn host_merge(&self, ask: &MergeAsk) -> MergeAnswer {
+    fn host_merge(&mut self, ask: &MergeAsk) -> MergeAnswer {
         let side = |blob: &Option<String>| blob.as_ref().map(|b| self.store[b].clone());
         match HOST_RULES[ask.rule as usize] {
             "pick_ours" => MergeAnswer::Ours,
             "pick_theirs" => MergeAnswer::Theirs,
             "concat" => {
                 let mut merged = side(&ask.theirs).unwrap_or_default();
+                merged.push(b'+');
                 merged.extend(side(&ask.ours).unwrap_or_default());
-                MergeAnswer::Value {
-                    blob: blob_key(&merged),
-                    size: merged.len() as u64,
-                }
+                let blob = blob_key(&merged);
+                let size = merged.len() as u64;
+                self.made.insert(blob.clone(), merged);
+                MergeAnswer::Value { blob, size }
             }
             _ => MergeAnswer::Failed("refused".into()),
         }
@@ -902,18 +989,30 @@ fn rule(name: &str) -> Rule {
     }
 }
 
-fn rules(step: &Value) -> Rules {
-    let map = |field: &str| match step.get(field) {
-        Some(Value::Object(pairs)) => pairs
-            .iter()
-            .map(|(k, v)| (k.clone(), rule(v.as_str().unwrap())))
-            .collect(),
-        _ => vec![],
+/// The rules a step runs under: its own over its repo's.
+fn rules(repo: &Value, step: &Value) -> Rules {
+    let map = |field: &str| {
+        let mut out: Vec<(String, Rule)> = Vec::new();
+        for source in [repo, step] {
+            if let Some(Value::Object(pairs)) = source.get(field) {
+                for (k, v) in pairs {
+                    out.retain(|(o, _)| o != k);
+                    out.push((k.clone(), rule(v.as_str().unwrap())));
+                }
+            }
+        }
+        out
+    };
+    let default = |source: &Value| {
+        source
+            .get("default_merge")
+            .and_then(Value::as_str)
+            .map(rule)
     };
     Rules {
         keys: map("merge_fns").into_iter().collect(),
         prefixes: map("merge_prefixes"),
-        default: step.get("default_merge").and_then(Value::as_str).map(rule),
+        default: default(step).or_else(|| default(repo)),
     }
 }
 

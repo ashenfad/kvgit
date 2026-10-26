@@ -83,6 +83,7 @@ impl Store {
             Request::Now => Reply::Now(self.clock),
             Request::Recover(_) => Reply::Recovered(None),
             Request::Emit(_) => Reply::Next,
+            Request::Check(_) => Reply::Refused(vec![]),
             Request::Merge(_) => panic!("no merges here"),
         }
     }

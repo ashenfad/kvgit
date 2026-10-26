@@ -14,7 +14,7 @@ mod _core {
     use kvgit_core::refs;
     use kvgit_core::text::{self, TextError, TextRule};
     use kvgit_core::tree::{self, Shape, TreeDiff, TreeError, Updated};
-    use kvgit_core::write::{CommitArgs, Committed, OnConflict, OnMoved};
+    use kvgit_core::write::{CommitArgs, Committed, MergeArgs, OnConflict, OnMoved};
     use pyo3::exceptions::{PyTypeError, PyValueError};
     use pyo3::prelude::*;
     use pyo3::types::{
@@ -569,6 +569,8 @@ mod _core {
     /// - `("now",)`: the time to stamp a commit with.
     /// - `("emit", part)`: part of the answer, ready early; `None`, to
     ///   go on.
+    /// - `("check", values)`: the keys refused of `(key, blob, bytes)`,
+    ///   `bytes` given where the host doesn't hold the blob.
     ///
     /// Every call passes wall time; `failed=True` answers a request the
     /// host couldn't perform.
@@ -615,6 +617,30 @@ mod _core {
         }))
     }
 
+    /// Merge rules as Python hands them over: by key, by prefix, and a
+    /// default.
+    fn rules_of(
+        merge_fns: &Bound<'_, PyDict>,
+        merge_prefixes: &[(String, Bound<'_, PyAny>)],
+        default_merge: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Rules> {
+        let mut keys = HashMap::new();
+        for (k, r) in merge_fns.iter() {
+            keys.insert(k.extract::<String>()?, rule_of(&r)?);
+        }
+        Ok(Rules {
+            keys,
+            prefixes: merge_prefixes
+                .iter()
+                .map(|(p, r)| Ok((p.clone(), rule_of(r)?)))
+                .collect::<PyResult<_>>()?,
+            default: default_merge
+                .filter(|d| !d.is_none())
+                .map(rule_of)
+                .transpose()?,
+        })
+    }
+
     fn reply_of(asked: &Request, reply: Option<&Bound<'_, PyAny>>) -> PyResult<Reply> {
         match asked {
             Request::Wait(_) => return Ok(Reply::Waited),
@@ -629,6 +655,7 @@ mod _core {
         let reply = reply.ok_or_else(|| PyValueError::new_err("a request needs a reply"))?;
         Ok(match asked {
             Request::Get(_) => Reply::Values(bytes_of(reply.cast::<PyDict>()?)?),
+            Request::Check(_) => Reply::Refused(reply.extract()?),
             Request::Scan(_) => Reply::Keys(
                 reply
                     .try_iter()?
@@ -706,6 +733,13 @@ mod _core {
             Request::Recover(branch) => ("recover", branch).into_pyobject(py),
             Request::Now => ("now",).into_pyobject(py),
             Request::Emit(part) => ("emit", from_value(py, part)?).into_pyobject(py),
+            Request::Check(values) => {
+                let values = values
+                    .iter()
+                    .map(|(k, blob, made)| (k, blob, bytes(made)))
+                    .collect::<Vec<_>>();
+                ("check", PyList::new(py, values)?).into_pyobject(py)
+            }
         }
     }
 
@@ -811,21 +845,7 @@ mod _core {
                 .iter()
                 .map(|(k, e)| Ok((k.clone(), entry_from_py(e)?)))
                 .collect::<PyResult<_>>()?;
-            let mut keys = HashMap::new();
-            for (k, r) in merge_fns.iter() {
-                keys.insert(k.extract::<String>()?, rule_of(&r)?);
-            }
-            let rules = Rules {
-                keys,
-                prefixes: merge_prefixes
-                    .iter()
-                    .map(|(p, r)| Ok((p.clone(), rule_of(r)?)))
-                    .collect::<PyResult<_>>()?,
-                default: default_merge
-                    .filter(|d| !d.is_none())
-                    .map(rule_of)
-                    .transpose()?,
-            };
+            let rules = rules_of(merge_fns, &merge_prefixes, default_merge)?;
             let args = CommitArgs {
                 branch,
                 base,
@@ -853,6 +873,57 @@ mod _core {
             };
             Ok(Op {
                 machine: Some(ops::commit(args)),
+                asked: None,
+            })
+        }
+
+        /// A merge of `theirs` into the branch at `ours`, or, given
+        /// `from_`, an apply of the change from `from_` to `theirs`.
+        #[staticmethod]
+        #[allow(clippy::too_many_arguments)]
+        #[pyo3(signature = (
+            branch, ours, theirs, from_, fast_forward, info, on_conflict, merge_fns,
+            merge_prefixes, default_merge, post_check, recover, stamped, roots, generations,
+        ))]
+        fn merge(
+            branch: String,
+            ours: String,
+            theirs: String,
+            from_: Option<String>,
+            fast_forward: bool,
+            info: Option<&Bound<'_, PyAny>>,
+            on_conflict: &str,
+            merge_fns: &Bound<'_, PyDict>,
+            merge_prefixes: Vec<(String, Bound<'_, PyAny>)>,
+            default_merge: Option<&Bound<'_, PyAny>>,
+            post_check: bool,
+            recover: bool,
+            stamped: bool,
+            roots: Vec<(String, String)>,
+            generations: Vec<(String, u64)>,
+        ) -> PyResult<Op> {
+            let args = MergeArgs {
+                branch,
+                ours,
+                theirs,
+                from: from_,
+                fast_forward,
+                shape: kvgit_core::keyset::shape(),
+                rules: rules_of(merge_fns, &merge_prefixes, default_merge)?,
+                on_conflict: if on_conflict == "abandon" {
+                    OnConflict::Abandon
+                } else {
+                    OnConflict::Raise
+                },
+                info: info.filter(|v| !v.is_none()).map(to_value).transpose()?,
+                post_check,
+                recover,
+                stamped,
+                roots,
+                generations,
+            };
+            Ok(Op {
+                machine: Some(ops::merge(args)),
                 asked: None,
             })
         }

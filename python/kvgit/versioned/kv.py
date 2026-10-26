@@ -88,12 +88,10 @@ from .. import _core
 from ..encoding import dumps, loads, safe_loads
 from ..errors import (
     BranchExistsError,
-    ConcurrencyError,
     CorruptHeadError,
     GcBusy,
     StorageVersionError,
     UnknownBranchError,
-    UnknownCommitError,
 )
 from ..hamt import EMPTY_HASH
 from ..kv.base import KVStore
@@ -102,8 +100,8 @@ from ._drive import drive, steps
 from .base import VersionedBase
 from .helpers import walk_history
 from .keyset import Keyset, KeysetEntry, MetaEntry
-from .merge import Change, MergeResolution
-from .protocol import MergeChoice, MergePolicy, MergeResult, TagInfo
+from .merge import Change
+from .protocol import MergeChoice, MergePolicy, MergeResult, PostCheck, TagInfo
 
 PARENT_COMMIT = "__parent_commit__%s"
 PARENT_GENS = "__parent_gens__%s"
@@ -1567,19 +1565,7 @@ class VersionedKV(VersionedBase):
             chunk_keys.append(CHUNK_PREFIX + chunk_hash)
 
         hosted: list[MergePolicy] = []
-
-        def lower(policy: MergePolicy) -> str | int:
-            if isinstance(policy, MergeChoice):
-                return policy.value
-            hosted.append(policy)
-            return len(hosted) - 1
-
-        fns = {**self._merge_fns, **(merge_fns or {})}
-        prefixes = {**self._merge_prefixes, **(merge_prefixes or {})}
-        default = default_merge or self._default_merge
         current = self._current_commit
-        root = self._roots.get(current)
-        generation = self._generations.get(current)
         op = _core.Op.commit(
             self._branch,
             self._base_commit,
@@ -1590,19 +1576,192 @@ class VersionedKV(VersionedBase):
             info,
             on_moved,
             on_conflict,
+            *self._lowered(hosted, merge_fns, merge_prefixes, default_merge),
+            self._recover_from_corrupt_head is not None,
+            self._blob_version_stamped,
+            *self._known(current),
+        )
+        return self._land(op, held, hosted)
+
+    def merge_heads(
+        self,
+        their_head: str,
+        *,
+        on_conflict: str = "raise",
+        merge_fns: dict[str, MergePolicy] | None = None,
+        merge_prefixes: dict[str, MergePolicy] | None = None,
+        default_merge: MergePolicy | None = None,
+        post_check: PostCheck | None = None,
+        info: dict | None = None,
+        fast_forward: bool = True,
+    ) -> MergeResult:
+        """Merge another head into this branch.
+
+        ``their_head`` is any commit in the store — usually another
+        branch's HEAD. Finds the lowest common ancestor with our head,
+        three-way resolves, and creates a two-parent merge commit,
+        CAS-guarded on our own head (a race raises ``ConcurrencyError``
+        and changes nothing). No common ancestor raises
+        ``ConcurrencyError`` likewise without changing anything; retrying
+        cannot help that case, unlike a race. A ``their_head`` not in the
+        store raises ``UnknownCommitError`` before anything else is read.
+
+        A head our history already contains merges as a no-op, provided
+        the branch is still at our head. When ours is an ancestor of
+        theirs, the branch fast-forwards — HEAD moves to ``their_head``
+        and no commit is written, so ``info`` is not recorded — unless
+        ``fast_forward=False``, which writes the merge commit anyway.
+
+        ``post_check`` runs over each merge-function-produced value;
+        a False files that key as conflicted (handled per
+        ``on_conflict`` like any other conflict).
+        """
+        return self._merge(
+            their_head,
+            None,
+            fast_forward,
+            on_conflict,
+            merge_fns,
+            merge_prefixes,
+            default_merge,
+            post_check,
+            info,
+        )
+
+    def apply_change(
+        self,
+        base: str,
+        target: str,
+        *,
+        on_conflict: str = "raise",
+        merge_fns: dict[str, MergePolicy] | None = None,
+        merge_prefixes: dict[str, MergePolicy] | None = None,
+        default_merge: MergePolicy | None = None,
+        post_check: PostCheck | None = None,
+        info: dict | None = None,
+    ) -> MergeResult:
+        """Apply the change from ``base`` to ``target`` as one commit.
+
+        A three-way merge with ``base`` in place of the common ancestor:
+        what ``target`` changed relative to ``base`` lands on our head,
+        and our own changes since then are kept, conflicts resolved (or
+        raised) as in a merge. The result is an ordinary single-parent
+        commit, CAS-guarded on our head — a cherry-pick is
+        ``apply_change(parent, commit)`` and a revert
+        ``apply_change(commit, parent)``.
+
+        A change already present commits nothing (``no_op``), provided the
+        branch is still at our head: if it moved, the answer may no longer
+        hold, and this raises ``ConcurrencyError`` (or abandons, with
+        ``on_conflict='abandon'``) as a lost publish would.
+
+        Raises:
+            UnknownCommitError: if ``base`` or ``target`` is not in the
+                store, checked before anything else is read.
+            UnknownBranchError: if the branch was deleted.
+            ConcurrencyError: if the branch moved during the apply, or
+                away from our head when the change is already present.
+            MergeConflict: if keys conflict and no merge function
+                resolves them.
+        """
+        return self._merge(
+            target,
+            base,
+            False,
+            on_conflict,
+            merge_fns,
+            merge_prefixes,
+            default_merge,
+            post_check,
+            info,
+        )
+
+    def _merge(
+        self,
+        theirs: str,
+        base: str | None,
+        fast_forward: bool,
+        on_conflict: str,
+        merge_fns: dict[str, MergePolicy] | None,
+        merge_prefixes: dict[str, MergePolicy] | None,
+        default_merge: MergePolicy | None,
+        post_check: PostCheck | None,
+        info: dict | None,
+    ) -> MergeResult:
+        """Merge ``theirs``, or with ``base`` apply the change from it."""
+        if on_conflict not in ("raise", "abandon"):
+            raise ValueError(
+                f"on_conflict must be 'raise' or 'abandon', got {on_conflict!r}"
+            )
+        hosted: list[MergePolicy] = []
+        current = self._current_commit
+        op = _core.Op.merge(
+            self._branch,
+            current,
+            theirs,
+            base,
+            fast_forward,
+            info,
+            on_conflict,
+            *self._lowered(hosted, merge_fns, merge_prefixes, default_merge),
+            post_check is not None,
+            self._recover_from_corrupt_head is not None,
+            self._blob_version_stamped,
+            *self._known(current),
+        )
+        return self._land(op, {}, hosted, post_check)
+
+    def _lowered(
+        self,
+        hosted: list[MergePolicy],
+        merge_fns: dict[str, MergePolicy] | None,
+        merge_prefixes: dict[str, MergePolicy] | None,
+        default_merge: MergePolicy | None,
+    ) -> tuple[dict[str, str | int], list[tuple[str, str | int]], str | int | None]:
+        """The merge rules in effect, layered over this handle's, as the
+        core names them: a side, or the number of a function in
+        ``hosted``, which gains each function named."""
+
+        def lower(policy: MergePolicy) -> str | int:
+            if isinstance(policy, MergeChoice):
+                return policy.value
+            hosted.append(policy)
+            return len(hosted) - 1
+
+        fns = {**self._merge_fns, **(merge_fns or {})}
+        prefixes = {**self._merge_prefixes, **(merge_prefixes or {})}
+        default = default_merge or self._default_merge
+        return (
             {k: lower(p) for k, p in fns.items()},
             [(k, lower(p)) for k, p in prefixes.items()],
             lower(default) if default is not None else None,
-            self._recover_from_corrupt_head is not None,
-            self._blob_version_stamped,
-            [] if root is None else [(current, root)],
-            [] if generation is None else [(current, generation)],
         )
+
+    def _known(
+        self, commit: str
+    ) -> tuple[list[tuple[str, str]], list[tuple[str, int]]]:
+        """The root and generation this handle knows of ``commit``."""
+        root = self._roots.get(commit)
+        generation = self._generations.get(commit)
+        return (
+            [] if root is None else [(commit, root)],
+            [] if generation is None else [(commit, generation)],
+        )
+
+    def _land(
+        self,
+        op: Any,
+        held: dict[str, bytes],
+        hosted: list[MergePolicy],
+        post_check: PostCheck | None = None,
+    ) -> MergeResult:
+        """Run a commit or merge, and move this handle to what it landed."""
         done = drive(
             op,
             self.store,
             held=held,
             merge_fns=hosted,
+            post_check=post_check,
             recoverer=self._recover_from_corrupt_head,
             clock=time.time,
             sleep=time.sleep,
@@ -1830,58 +1989,6 @@ class VersionedKV(VersionedBase):
             _stamp_version_at_least(self.store, BLOB_STORAGE_VERSION)
             self._blob_version_stamped = True
 
-    def _create_merge_commit(
-        self,
-        resolution: MergeResolution,
-        parents: tuple[str, ...],
-        info: dict | None,
-    ) -> str:
-        """Create a commit from a resolved merge: our state with the
-        resolution's changes applied.
-
-        An entry carried from either side keeps its own metadata, which
-        describes its blob. A value a merge function produced is a new
-        blob, never chunked, so its metadata lists no chunks.
-        """
-        diffs: dict[str, bytes] = {}
-        updates = dict(resolution.updates)
-        for key, value in resolution.merged_values.items():
-            pointer = blob_key(value)
-            diffs[pointer] = value
-            updates[key] = KeysetEntry(blob=pointer, meta=MetaEntry(size=len(value)))
-
-        # Apply the changes on top of our HAMT, so structural sharing
-        # keeps every subtree the merge did not touch.
-        our_root = self._root_of(self._current_commit)
-        new_ks, pending = Keyset(self.store, root=our_root).updated(
-            updates=updates, removals=resolution.removals
-        )
-        diffs.update(pending)
-
-        parent_gens = self._parent_generations(parents)
-        created = time.time()
-        merge_hash = commit_hash(parents, new_ks.root, created, info)
-        diffs[COMMIT_ROOT % merge_hash] = dumps(new_ks.root)
-        diffs[PARENT_COMMIT % merge_hash] = dumps(list(parents))
-        diffs[PARENT_GENS % merge_hash] = dumps(parent_gens)
-        diffs[COMMIT_TIME % merge_hash] = dumps(created)
-        if info is not None:
-            diffs[INFO_KEY % merge_hash] = dumps(info)
-
-        self._stamp_blob_version()
-        self._land_batch(merge_hash, diffs)
-        self._remember_root(merge_hash, new_ks.root)
-
-        # Landed: change the key maps in place.
-        for key, entry in updates.items():
-            self._set_entry(key, (entry.blob, entry.meta))
-        for key in resolution.removals:
-            self._set_entry(key, None)
-        self._current_commit = merge_hash
-        self._remember_generations({merge_hash: 1 + max(parent_gens)})
-
-        return merge_hash
-
     def _cas_head(self, expected: str, new_head: str) -> bool:
         """Publish ``new_head`` as this branch's HEAD if HEAD is ``expected``.
 
@@ -1935,58 +2042,6 @@ class VersionedKV(VersionedBase):
         self._in_flight = {}
         return True
 
-    def _fast_forward(self, their_head: str, *, on_conflict: str) -> MergeResult:
-        """Move HEAD from our head to ``their_head``, a descendant of it.
-
-        The existence check and the write are decided against one lease
-        record, as in :meth:`reset_to`, so a sweep cannot take the commit
-        between them. The write expects HEAD to hold our head: a branch
-        that moved meanwhile fails it like a merge commit's publish would,
-        and a deleted one is not recreated.
-        """
-        our_head = self._current_commit
-        carried = tuple(sorted(self._changes(our_head, their_head)))
-        branch_key = BRANCH_HEAD % self._branch
-        expected = dumps(our_head)
-        writes = {
-            branch_key: dumps(their_head),
-            BRANCH_HEAD_PREV % self._branch: expected,
-        }
-        while True:
-            lease = _wait_for_gc(self.store)
-            if self.store.get(COMMIT_ROOT % their_head) is None:
-                raise UnknownCommitError(f"Commit '{their_head}' does not exist")
-            landed = _try_land(self.store, lease, {branch_key: expected}, writes)
-            if landed is None:
-                continue
-            if landed:
-                break
-            if self.store.get(branch_key) is None:
-                raise UnknownBranchError(f"Branch '{self._branch}' does not exist")
-            if _heal_head(self.store, self._branch, our_head):
-                continue
-            if on_conflict == "abandon":
-                result = MergeResult(
-                    merged=False,
-                    commit=None,
-                    strategy="fast_forward",
-                    auto_merged_keys=(),
-                    carried_keys=(),
-                )
-                self.last_merge_result = result
-                return result
-            raise ConcurrencyError("HEAD changed during merge. Refresh and retry.")
-        self._load_commit(their_head, update_base=True)
-        result = MergeResult(
-            merged=True,
-            commit=their_head,
-            strategy="fast_forward",
-            auto_merged_keys=(),
-            carried_keys=carried,
-        )
-        self.last_merge_result = result
-        return result
-
     def _changes(self, commit_a: str | None, commit_b: str) -> dict[str, Change]:
         """Each key whose value differs from commit ``a`` to ``b``; see
         :func:`commit_changes`."""
@@ -1996,22 +2051,12 @@ class VersionedKV(VersionedBase):
         """Load the parent tuple for a commit."""
         return load_parents(self.store, commit_hash)
 
-    def _missing_commits(self, commits: Iterable[str]) -> set[str]:
-        """Which of ``commits`` have no root in the store, in one read."""
-        keys = {commit: COMMIT_ROOT % commit for commit in commits}
-        found = self.store.get_many(list(keys.values()))
-        return {commit for commit, key in keys.items() if key not in found}
-
     def _find_lca(self, commit_a: str, commit_b: str) -> str | None:
         """Lowest common ancestor of two commits; see :func:`merge_base`."""
         found: dict[str, int] = {}
         base = merge_base(self.store, commit_a, commit_b, known=found)
         self._remember_generations(found)
         return base
-
-    def _read_blob(self, content_id: str) -> bytes | None:
-        """Read a blob by its versioned key."""
-        return self.store.get(content_id)
 
     # -- Navigation --
 
