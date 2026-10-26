@@ -135,6 +135,9 @@ own engine code; both suites and the corpus pass.
   host, on the core's primitives.
 - Python gets the primitives; whether they are public in 0.5.0 is the
   open question in the design.
+- What TypeScript's sync still does itself goes with it: the lease
+  helpers (`tryLand`, `waitForGc`, `inFlightMarker`), the ancestry
+  walk, and the entry encoding its replay builds trees with.
 
 **Exit:** the TypeScript sync suites and the corpus's sync scenarios
 pass, the latter in both hosts, and the live GitHub test against the
@@ -144,11 +147,16 @@ scratch repository passes.
 
 - Python: `kvgit.versioned`, `kvgit.hamt` and the keyset module leave
   the public API; the IndexedDB backend and the Pyodide guide go; the
-  three-way resolve over caller-named values and `EMPTY_ROOT` arrive;
-  `now` on `Repo`; the value cache stays byte-bounded.
+  three-way resolve over caller-named values and `EMPTY_ROOT` arrive,
+  replacing `resolve_merge` and `pick_merge_policy`; `now` on `Repo`;
+  the value cache stays byte-bounded. The code only `VersionedKV` and
+  `VersionedBase` reach (the history walk, `commit_changes`) goes with
+  them.
 - TypeScript: `VersionedKV`, `VersionedBase`, `Staged`, the JSON
-  encoder pair and the tree classes leave the exports; the value cache
-  becomes byte-bounded; `lazy` retires or becomes a no-op.
+  encoder pair, the tree classes, `SequenceMatcher`,
+  `encodeEntry`/`decodeEntry`, `diffKeysets` and `walkHistory` leave
+  the exports, and the code only they reach goes with them; the value
+  cache becomes byte-bounded; `lazy` retires or becomes a no-op.
 - Docs: a README per host, the storage format and the request protocol
   documented once, the CHANGELOG with every breaking change.
 

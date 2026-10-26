@@ -99,40 +99,37 @@ async function world(results, files, rounds) {
   }
   results.add('world.bulk_import', imports, { keys: files })
 
-  for (const lazy of [false, true]) {
-    const tag = lazy ? 'world.lazy.' : 'world.'
-    const fresh = async () => (await Repo.open(store)).worktree('main', { lazy })
+  const fresh = async () => (await Repo.open(store)).worktree('main')
 
-    results.add(`${tag}open`, await repeat(fresh, rounds))
-    results.add(`${tag}keys_cold`, await repeat(async () => (await fresh()).keys(), rounds))
-    const w = await fresh()
-    await w.keys()
-    results.add(`${tag}keys_warm`, await repeat(() => w.keys(), rounds))
-    results.add(
-      `${tag}list_dir`,
-      await repeat(
-        async () => (await w.keys()).filter((k) => k.startsWith('files/d07/')).sort(),
-        rounds,
-      ),
-    )
-    const readAll = async () => {
-      const r = await fresh()
-      const names = (await r.keys()).sort()
-      for (let start = 0; start < names.length; start += 1000) {
-        await r.getMany(names.slice(start, start + 1000))
-      }
+  results.add('world.open', await repeat(fresh, rounds))
+  results.add('world.keys_cold', await repeat(async () => (await fresh()).keys(), rounds))
+  const w = await fresh()
+  await w.keys()
+  results.add('world.keys_warm', await repeat(() => w.keys(), rounds))
+  results.add(
+    'world.list_dir',
+    await repeat(
+      async () => (await w.keys()).filter((k) => k.startsWith('files/d07/')).sort(),
+      rounds,
+    ),
+  )
+  const readAll = async () => {
+    const r = await fresh()
+    const names = (await r.keys()).sort()
+    for (let start = 0; start < names.length; start += 1000) {
+      await r.getMany(names.slice(start, start + 1000))
     }
-    results.add(`${tag}read_all`, await repeat(readAll, Math.max(1, Math.floor(rounds / 2))))
-
-    const rng = { x: 7 }
-    const hot = Array.from({ length: 1000 }, () => filePath(randrange(rng, files)))
-    const picks = Array.from({ length: 10_000 }, () => hot[randrange(rng, hot.length)])
-    const reads = async () => {
-      const r = await fresh()
-      for (const k of picks) await r.get(k)
-    }
-    results.add(`${tag}reads_10k`, await repeat(reads, rounds))
   }
+  results.add('world.read_all', await repeat(readAll, Math.max(1, Math.floor(rounds / 2))))
+
+  const rng = { x: 7 }
+  const hot = Array.from({ length: 1000 }, () => filePath(randrange(rng, files)))
+  const picks = Array.from({ length: 10_000 }, () => hot[randrange(rng, hot.length)])
+  const reads = async () => {
+    const r = await fresh()
+    for (const k of picks) await r.get(k)
+  }
+  results.add('world.reads_10k', await repeat(reads, rounds))
 
   const one = []
   for (let n = 0; n < rounds * 10; n++) {
