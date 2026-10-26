@@ -49,10 +49,9 @@ import {
   type Versioned,
   type VersionedCommitOptions,
 } from '../types'
-import { type CommitRecord, NoGenerations, generationOfRecord, loadRecords } from './ancestry'
 import { VersionedBase, checkDisposition, checkMoved } from './base'
 import { type Committed, type StoredEntry, callCore, driveCommit } from './drive'
-import { type ParentLoader, walkHistory } from './helpers'
+import { walkHistory } from './helpers'
 import {
   BLOB_PREFIX,
   BRANCH_HEAD,
@@ -313,189 +312,6 @@ export async function deleteBranchHead(store: KVStore, name: string): Promise<vo
 }
 
 /**
- * The lowest common ancestor, from the two commits' whole histories:
- * for history written before generations were stored. On a criss-cross
- * tie the smallest hash wins: deterministic, but arbitrary.
- */
-async function mergeBaseByWalk(
-  commitA: string,
-  commitB: string,
-  loadParents: ParentLoader,
-): Promise<string | null> {
-  // Ancestor-set intersection with non-minimal candidates dropped
-  // (a candidate that is itself an ancestor of another candidate is
-  // not lowest). When several commits tie for lowest — criss-cross
-  // histories — the smallest hash wins: deterministic, but
-  // arbitrary, so criss-cross merges resolve cleanly rather than
-  // raising.
-  if (commitA === commitB) return commitA
-
-  const parents = new Map<string, readonly string[]>()
-  const ancestorsA = await walkAncestors(commitA, parents, loadParents)
-  // Fast path: B inside A's history (or vice versa) names the
-  // lowest directly — every other common ancestor sits above it.
-  if (ancestorsA.has(commitB)) return commitB
-  const ancestorsB = await walkAncestors(commitB, parents, loadParents)
-  if (ancestorsB.has(commitA)) return commitA
-
-  const common = new Set<string>()
-  for (const c of ancestorsA) {
-    if (ancestorsB.has(c)) common.add(c)
-  }
-  if (common.size === 0) return null
-  // Minimality in one bottom-up pass: a candidate is lowest when no
-  // other candidate sits below it. Propagate "a candidate is
-  // at-or-below here" from tips to roots over the in-memory parent
-  // map — no further store reads, linear in the history.
-  const children = new Map<string, string[]>()
-  for (const node of parents.keys()) children.set(node, [])
-  for (const [node, nodeParents] of parents) {
-    for (const parent of nodeParents) {
-      const kids = children.get(parent)
-      if (kids !== undefined) kids.push(node)
-    }
-  }
-  const below = new Map<string, boolean>()
-  const remaining = new Map<string, number>()
-  for (const [node, kids] of children) {
-    below.set(node, false)
-    remaining.set(node, kids.length)
-  }
-  const queue: string[] = []
-  for (const [node, kids] of children) {
-    if (kids.length === 0) queue.push(node)
-  }
-  while (queue.length > 0) {
-    const node = queue.shift() as string
-    const nodeParents = parents.get(node) ?? []
-    for (const parent of nodeParents) {
-      if (common.has(node) || below.get(node) === true) below.set(parent, true)
-      const left = (remaining.get(parent) ?? 1) - 1
-      remaining.set(parent, left)
-      if (left === 0) queue.push(parent)
-    }
-  }
-  let best: string | null = null
-  for (const c of common) {
-    if (below.get(c) !== true && (best === null || c < best)) best = c
-  }
-  return best
-}
-
-async function walkAncestors(
-  start: string,
-  parents: Map<string, readonly string[]>,
-  loadParents: ParentLoader,
-): Promise<Set<string>> {
-  // All ancestors of `start` (itself included), recording each
-  // visited commit's parents in `parents` for later passes.
-  const ancestors = new Set<string>([start])
-  const stack = [start]
-  while (stack.length > 0) {
-    const current = stack.pop() as string
-    if (parents.has(current)) continue
-    const nodeParents = await loadParents(current)
-    parents.set(current, nodeParents)
-    for (const parent of nodeParents) {
-      if (!ancestors.has(parent)) {
-        ancestors.add(parent)
-        stack.push(parent)
-      }
-    }
-  }
-  return ancestors
-}
-
-const FROM_A = 1
-const FROM_B = 2
-const STALE = 4
-const FROM_BOTH = FROM_A | FROM_B
-
-/**
- * The lowest common ancestor, searching down from both commits at once.
- *
- * Commits are visited highest generation first, every commit of one
- * generation in one batched read. A commit is visited only after every
- * descendant the search reached, so the sides it was reached from are
- * final when it is popped. Reached from both, it is a common ancestor,
- * and a lowest one unless it was reached through a common ancestor
- * already found: finding one marks everything below it stale. The
- * search stops once every commit still queued is stale; for two tips
- * that forked recently, that is a few reads whatever the length of the
- * history below.
- *
- * @throws NoGenerations if it reaches a commit that stores no
- *   generations for its parents.
- */
-async function mergeBaseByGeneration(
-  store: KVStore,
-  commitA: string,
-  commitB: string,
-  known: Map<string, number> | undefined,
-): Promise<string | null> {
-  const records = await loadRecords(store, [commitA, commitB])
-  const gens = new Map<string, number>()
-  for (const c of [commitA, commitB]) {
-    const g = generationOfRecord(records.get(c) as CommitRecord)
-    if (g === null) throw new NoGenerations()
-    gens.set(c, g)
-  }
-  if (known !== undefined) for (const [c, g] of gens) known.set(c, g)
-  const flags = new Map<string, number>([
-    [commitA, FROM_A],
-    [commitB, FROM_B],
-  ])
-  const levels = new Map<number, Set<string>>()
-  const enqueue = (c: string, g: number): void => {
-    const level = levels.get(g)
-    if (level === undefined) levels.set(g, new Set([c]))
-    else level.add(c)
-  }
-  enqueue(commitA, gens.get(commitA) as number)
-  enqueue(commitB, gens.get(commitB) as number)
-  const active = new Set([commitA, commitB])
-  const found: string[] = []
-  while (active.size > 0) {
-    const levelGen = Math.max(...levels.keys())
-    const level = levels.get(levelGen) as Set<string>
-    levels.delete(levelGen)
-    const unread = [...level].filter((c) => !records.has(c))
-    if (unread.length > 0) {
-      for (const [c, r] of await loadRecords(store, unread)) records.set(c, r)
-    }
-    for (const c of [...level].sort()) {
-      active.delete(c)
-      let f = flags.get(c) as number
-      if ((f & FROM_BOTH) === FROM_BOTH && (f & STALE) === 0) {
-        found.push(c)
-        f |= STALE
-        flags.set(c, f)
-      }
-      const { parents, gens: parentGens } = records.get(c) as CommitRecord
-      if (parents.length > 0 && parentGens === null) throw new NoGenerations()
-      for (let i = 0; i < parents.length; i++) {
-        const parent = parents[i] as string
-        const parentGen = (parentGens as readonly number[])[i] as number
-        // Inconsistent data: search the slow way.
-        if (parentGen >= levelGen) throw new NoGenerations()
-        const before = flags.get(parent) ?? 0
-        const after = before | f
-        if (after === before) continue
-        flags.set(parent, after)
-        if (!gens.has(parent)) {
-          gens.set(parent, parentGen)
-          enqueue(parent, parentGen)
-        }
-        if ((after & STALE) !== 0) active.delete(parent)
-        else active.add(parent)
-      }
-    }
-  }
-  if (known !== undefined) for (const [c, g] of gens) known.set(c, g)
-  return found.length === 0 ? null : found.reduce((a, b) => (b < a ? b : a))
-}
-
-/**
  * The lowest common ancestor of two commits, or null if they share no
  * history. On a criss-cross tie the smallest hash wins: deterministic,
  * but arbitrary, so criss-cross merges resolve cleanly rather than
@@ -508,13 +324,13 @@ export async function mergeBase(
   commitB: string,
   known?: Map<string, number>,
 ): Promise<string | null> {
-  if (commitA === commitB) return commitA
-  try {
-    return await mergeBaseByGeneration(store, commitA, commitB, known)
-  } catch (e) {
-    if (!(e instanceof NoGenerations)) throw e
-    return mergeBaseByWalk(commitA, commitB, (h) => loadParents(store, h))
+  const args = { a: commitA, b: commitB, check: false }
+  const found = (await callCore('merge_base', args, { store, now: wallClock })) as {
+    base: string | null
+    generations: Array<[string, number]>
   }
+  for (const [commit, gen] of found.generations) known?.set(commit, gen)
+  return found.base
 }
 
 /**

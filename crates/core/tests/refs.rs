@@ -1,7 +1,7 @@
-//! Branches, tags and head recovery under the interleavings the corpus
+//! Branches, tags, head recovery and history under what the corpus
 //! can't stage: a write that loses to another writer between its read
-//! and its write, a sweep's lease held across a create, and the commit
-//! scan's choice among equals.
+//! and its write, a sweep's lease held across a create, the commit
+//! scan's choice among equals, and the order and reads of a log.
 
 use kvgit_core::error::Error;
 use kvgit_core::json::{Value, dumps};
@@ -82,25 +82,37 @@ impl Store {
             }
             Request::Now => Reply::Now(self.clock),
             Request::Recover(_) => Reply::Recovered(None),
+            Request::Emit(_) => Reply::Next,
             Request::Merge(_) => panic!("no merges here"),
         }
     }
 
     /// Run `op`, calling `before` with each request before performing
     /// it, so a test can act as another writer at that point.
-    fn run(
+    fn run(&mut self, op: Op, before: impl FnMut(&mut Store, &Request)) -> Result<Value, Error> {
+        self.run_emitting(op, before).0
+    }
+
+    /// [`run`](Self::run), with the items of the parts it emitted.
+    fn run_emitting(
         &mut self,
         mut op: Op,
         mut before: impl FnMut(&mut Store, &Request),
-    ) -> Result<Value, Error> {
+    ) -> (Result<Value, Error>, Vec<Value>) {
+        let mut emitted = Vec::new();
         let mut step = op.resume_at(self.clock, None);
         loop {
             match step {
                 Step::Done(done) => {
-                    return done.result.map(|out| match out {
+                    let result = done.result.map(|out| match out {
                         Out::Value(v) => v,
                         Out::Committed(_) => panic!("committed"),
                     });
+                    return (result, emitted);
+                }
+                Step::Request(Request::Emit(Value::Array(part))) => {
+                    emitted.extend(part);
+                    step = op.resume_at(self.clock, Some(Reply::Next));
                 }
                 Step::Request(r) => {
                     before(self, &r);
@@ -207,4 +219,128 @@ fn the_commit_scan_takes_the_newest_unclaimed_tip_and_breaks_ties_by_hash() {
     store.put(branch_head("main"), &s("garbage"));
     let op = call("recover_by_commit_scan", &[("branch", s("main"))]);
     assert_eq!(store.run(op, |_, _| {}).unwrap(), s(B));
+}
+
+const D: &str = "dddddddddddddddddddddddddddddddddddddddd";
+
+/// A diamond: A, then B and C on it, then D merging C into B.
+fn diamond() -> Store {
+    let mut store = Store::new();
+    store.commit(A, &[], T0);
+    store.commit(B, &[A], T0 + 1.0);
+    store.commit(C, &[A], T0 + 2.0);
+    store.commit(D, &[B, C], T0 + 3.0);
+    store
+}
+
+fn log(
+    store: &mut Store,
+    limit: Value,
+    first_parent: bool,
+) -> (Result<Value, Error>, Vec<String>, usize) {
+    let op = call(
+        "log",
+        &[
+            ("start", s(D)),
+            ("limit", limit),
+            ("first_parent", Value::Bool(first_parent)),
+        ],
+    );
+    let mut reads = 0;
+    let (result, records) = store.run_emitting(op, |_, r| {
+        if matches!(r, Request::Get(_)) {
+            reads += 1;
+        }
+    });
+    let hashes = records
+        .iter()
+        .map(|r| r.get("hash").unwrap().as_str().unwrap().to_string())
+        .collect();
+    (result, hashes, reads)
+}
+
+#[test]
+fn a_log_lists_breadth_first_reading_a_level_at_a_time() {
+    let mut store = diamond();
+    let (result, hashes, reads) = log(&mut store, Value::Null, false);
+    assert_eq!(result.unwrap(), Value::Null);
+    assert_eq!(hashes, [D, B, C, A]);
+    assert_eq!(reads, 3);
+}
+
+#[test]
+fn a_first_parent_log_follows_the_branch_itself() {
+    let mut store = diamond();
+    let (_, hashes, _) = log(&mut store, Value::Null, true);
+    assert_eq!(hashes, [D, B, A]);
+}
+
+#[test]
+fn a_log_stops_reading_at_its_limit() {
+    let mut store = diamond();
+    let (_, hashes, reads) = log(&mut store, Value::Int(1), false);
+    assert_eq!(hashes, [D]);
+    assert_eq!(reads, 1);
+}
+
+#[test]
+fn a_log_fails_where_a_missing_commit_would_be_listed() {
+    let mut store = diamond();
+    store.data.remove(&commit_root(C));
+    let (result, hashes, _) = log(&mut store, Value::Null, false);
+    assert_eq!(hashes, [D, B]);
+    assert!(matches!(result, Err(Error::UnknownCommit { commit }) if commit == C));
+}
+
+#[test]
+fn a_log_hands_over_its_newest_commit_alone_then_doubling_batches() {
+    let mut store = Store::new();
+    let hashes: Vec<String> = (0..10).map(|i| format!("{i:040}")).collect();
+    for (i, hash) in hashes.iter().enumerate() {
+        let parents: Vec<&str> = if i == 0 { vec![] } else { vec![&hashes[i - 1]] };
+        store.commit(hash, &parents, T0 + i as f64);
+    }
+    let mut op = call(
+        "log",
+        &[
+            ("start", s(&hashes[9])),
+            ("limit", Value::Null),
+            ("first_parent", Value::Bool(true)),
+        ],
+    );
+    let mut parts = Vec::new();
+    let mut step = op.resume_at(store.clock, None);
+    loop {
+        match step {
+            Step::Done(done) => {
+                assert!(done.result.is_ok());
+                break;
+            }
+            Step::Request(Request::Emit(Value::Array(part))) => {
+                parts.push(part.len());
+                step = op.resume_at(store.clock, Some(Reply::Next));
+            }
+            Step::Request(r) => {
+                let reply = store.perform(r);
+                step = op.resume_at(store.clock, Some(reply));
+            }
+        }
+    }
+    assert_eq!(parts, [1, 2, 4, 3]);
+}
+
+#[test]
+fn a_damaged_root_fails_a_read_rather_than_passing_for_an_empty_tree() {
+    let mut store = diamond();
+    store.data.insert(commit_root(B), b"not json".to_vec());
+    store.put(commit_root(C), &Value::Int(7));
+    for commit in [B, C] {
+        let op = call("get_commit", &[("commit", s(commit))]);
+        assert!(matches!(store.run(op, |_, _| {}), Err(Error::Malformed(_))));
+        let op = call(
+            "resolve_ref",
+            &[("commit", s(commit)), ("recover", Value::Bool(false))],
+        );
+        assert!(matches!(store.run(op, |_, _| {}), Err(Error::Malformed(_))));
+    }
 }

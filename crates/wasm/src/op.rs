@@ -22,7 +22,7 @@ use wasm_bindgen::prelude::*;
 /// `kvgit_core::ops`) or by `Op.commit`. Each `reply*` call (and the
 /// first, `start`), passing wall time, returns the kind of the next
 /// request (`"get"`, `"scan"`, `"cas"`, `"wait"`, `"merge"`,
-/// `"recover"`, `"now"`) or `"done"`; `requestJson` and `requestData`
+/// `"recover"`, `"now"`, `"emit"`) or `"done"`; `requestJson` and `requestData`
 /// describe the request, and `outcome` the result.
 #[wasm_bindgen]
 pub struct Op {
@@ -172,6 +172,7 @@ fn kind(request: &Request) -> &'static str {
         Request::Merge(_) => "merge",
         Request::Recover(_) => "recover",
         Request::Now => "now",
+        Request::Emit(_) => "emit",
     }
 }
 
@@ -263,6 +264,12 @@ impl Op {
         self.step(wall, Some(Reply::Keys(keys)))
     }
 
+    /// Go on, past part of the answer emitted early.
+    #[wasm_bindgen(js_name = replyNext)]
+    pub fn reply_next(&mut self, wall: f64) -> Result<String, JsError> {
+        self.step(wall, Some(Reply::Next))
+    }
+
     #[wasm_bindgen(js_name = replyLanded)]
     pub fn reply_landed(&mut self, wall: f64, landed: bool) -> Result<String, JsError> {
         self.step(wall, Some(Reply::Landed(landed)))
@@ -318,7 +325,8 @@ impl Op {
     /// writes, removes}`, each expected or written value its length in
     /// `requestData` (`null`: absent, or for a write the bytes the host
     /// holds); a wait's seconds; the merges asked, each `[rule, key,
-    /// old, ours, theirs]`; the branch to recover.
+    /// old, ours, theirs]`; the branch to recover; a scan's prefix; the part
+    /// of the answer emitted.
     #[wasm_bindgen(js_name = requestJson)]
     pub fn request_json(&self) -> Result<String, JsError> {
         let asked = self
@@ -377,6 +385,7 @@ impl Op {
             }
             Request::Recover(branch) => write_string(&mut out, branch),
             Request::Now => out.push_str("null"),
+            Request::Emit(part) => out.push_str(&json::dumps(part, false)),
         }
         Ok(out)
     }

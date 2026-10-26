@@ -17,7 +17,7 @@
 use crate::commit::commit_hash;
 use crate::error::Error;
 use crate::head::{Notes, heal_head, latest_head};
-use crate::history::{decode_record, generations, merge_base};
+use crate::history::{self, decode_record, generations, merge_base};
 use crate::json::Value;
 use crate::keyset::Entry;
 use crate::layout::{
@@ -643,40 +643,7 @@ impl<'a> Writer<'a> {
         b: &str,
     ) -> Result<BTreeMap<String, Change>, Error> {
         let (ra, rb) = (self.root_of(a).await?, self.root_of(b).await?);
-        let diff = tree::diff(self.io.clone(), self.args.shape.clone(), ra, rb).await?;
-        let decode = |raw: &[u8]| Entry::decode(raw).map_err(Error::Malformed);
-        let mut out = BTreeMap::new();
-        for (key, raw) in diff.added {
-            out.insert(
-                key,
-                Change {
-                    old: None,
-                    new: Some(decode(&raw)?),
-                },
-            );
-        }
-        for (key, raw) in diff.removed {
-            out.insert(
-                key,
-                Change {
-                    old: Some(decode(&raw)?),
-                    new: None,
-                },
-            );
-        }
-        for (key, old, new) in diff.modified {
-            let (old, new) = (decode(&old)?, decode(&new)?);
-            if old.blob != new.blob {
-                out.insert(
-                    key,
-                    Change {
-                        old: Some(old),
-                        new: Some(new),
-                    },
-                );
-            }
-        }
-        Ok(out)
+        history::changes(self.io, self.args.shape.clone(), ra, rb).await
     }
 
     /// Abandon what this attempt wrote: its commits become ordinary

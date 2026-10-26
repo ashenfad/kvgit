@@ -10,7 +10,7 @@
  */
 
 import type { Op } from '../../wasm/kvgit_wasm.js'
-import { core } from '../core'
+import { core, coreIfLoaded } from '../core'
 import {
   BranchExistsError,
   BranchMovedError,
@@ -75,13 +75,53 @@ export interface DriveEnv {
   now: () => number
 }
 
+const encoder = new TextEncoder()
+
+/** An answer's JSON, integers past the safe range kept exact. The core
+ *  writes JSON without spaces, so a number starts after `:`, `[` or
+ *  `,`; plain `JSON.parse` serves any text without one 16 digits long. */
+const parseValue = (text: string): unknown =>
+  /[:,[]-?\d{16}/.test(text) ? loadsInfo(encoder.encode(text)) : JSON.parse(text)
+
+/** Operation `name` on `args`. Arguments that carry a caller's info go
+ *  through the Python-compatible encoder, which keeps its integers and
+ *  floats as they are; the rest are plain strings, flags and counts. */
+async function start(name: string, args: object): Promise<Op> {
+  const c = coreIfLoaded() ?? (await core())
+  return new c.Op(name, 'info' in args ? pyDumps(args) : JSON.stringify(args))
+}
+
 /** Run the core's operation `name` on `args` against `env.store`, and
  *  return what it answers. */
 export async function callCore(name: string, args: object, env: DriveEnv): Promise<unknown> {
-  const c = await core()
-  const op = new c.Op(name, pyDumps(args))
+  const op = await start(name, args)
   try {
-    return await drive(op, env, (text) => loadsInfo(new TextEncoder().encode(text)))
+    return await drive(op, env, parseValue)
+  } finally {
+    op.free()
+  }
+}
+
+/** Run the core's operation `name`, yielding each item of the parts it
+ *  emits. */
+export async function* streamCore(
+  name: string,
+  args: object,
+  env: DriveEnv,
+): AsyncGenerator<unknown, void, undefined> {
+  const op = await start(name, args)
+  try {
+    const run: Run = { causes: new Map(), raised: null }
+    let kind = op.start(leaseEnv.clock())
+    while (kind !== 'done') {
+      if (kind === 'emit') {
+        yield* parseValue(op.requestJson()) as unknown[]
+        kind = op.replyNext(leaseEnv.clock())
+      } else {
+        kind = await advance(op, kind, env, run)
+      }
+    }
+    finish(op, parseValue, run)
   } finally {
     op.free()
   }
@@ -93,27 +133,42 @@ export async function driveCommit(op: Op, env: DriveEnv): Promise<Committed> {
   return (await drive(op, env, JSON.parse)) as Committed
 }
 
+/** What an operation's driver keeps while it runs: the exceptions
+ *  merge functions raised, by key, and the first request that threw. */
+interface Run {
+  causes: Map<string, unknown>
+  raised: { error: unknown } | null
+}
+
 /** Perform `op`'s requests until it is done, and return its outcome,
  *  decoded by `parse`. */
 async function drive(op: Op, env: DriveEnv, parse: (text: string) => unknown): Promise<unknown> {
-  const causes = new Map<string, unknown>()
-  let raised: { error: unknown } | null = null
+  const run: Run = { causes: new Map(), raised: null }
   let kind = op.start(leaseEnv.clock())
-  while (kind !== 'done') {
-    let next: (wall: number) => string
-    try {
-      next = await perform(op, kind, env, causes)
-    } catch (e) {
-      raised ??= { error: e }
-      next = (wall) => op.replyFailed(wall)
-    }
-    kind = next(leaseEnv.clock())
+  while (kind !== 'done') kind = await advance(op, kind, env, run)
+  return finish(op, parse, run)
+}
+
+/** Perform one request, answer it, and return the kind of the next. A
+ *  request that throws is answered as failed. */
+async function advance(op: Op, kind: string, env: DriveEnv, run: Run): Promise<string> {
+  let next: (wall: number) => string
+  try {
+    next = await perform(op, kind, env, run.causes)
+  } catch (e) {
+    run.raised ??= { error: e }
+    next = (wall) => op.replyFailed(wall)
   }
+  return next(leaseEnv.clock())
+}
+
+/** A finished operation's answer, decoded by `parse`, or its error. */
+function finish(op: Op, parse: (text: string) => unknown, run: Run): unknown {
   const outcome = parse(op.outcome()) as { ok?: unknown; error?: Failure; notes: Note[] }
   for (const note of outcome.notes) warn(note)
   if (outcome.error === undefined) return outcome.ok
-  if (raised !== null) throw raised.error
-  throw toError(outcome.error, causes)
+  if (run.raised !== null) throw run.raised.error
+  throw toError(outcome.error, run.causes)
 }
 
 /** Perform one request; the reply, to send with the clock. */

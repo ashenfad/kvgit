@@ -7,6 +7,7 @@
 //! namespace, so a branch can never pass for a tag, or move one.
 
 use crate::error::Error;
+use crate::head::{Notes, Resolved, head_of};
 use crate::json::Value;
 use crate::layout::{
     BRANCH_HEAD_PREFIX, EMPTY_HASH, ROOT_COMMIT, TAG_BRANCH_PREFIX, branch_head, branch_head_prev,
@@ -326,5 +327,52 @@ pub async fn delete_tag(io: &Io, name: &str) -> Result<(), Error> {
         Err(Error::Concurrency(format!(
             "Tag '{name}' changed while being deleted; nothing was removed"
         )))
+    }
+}
+
+/// What a caller names a commit by.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Ref {
+    Commit(String),
+    Branch(String),
+    Tag(String),
+}
+
+/// The commit `r` names, which must be in the store, and its root,
+/// which must be a string: a reader about to open the tree must not
+/// take damage for an empty one.
+pub async fn resolve_ref(
+    io: &Io,
+    r: &Ref,
+    recover: bool,
+    notes: &mut Notes,
+) -> Result<(String, String), Error> {
+    let found = match r {
+        Ref::Branch(name) => head_of(io, name, recover, notes).await?,
+        Ref::Tag(name) => {
+            let commit = resolve_tag(io, name)
+                .await?
+                .ok_or_else(|| Error::UnknownTag { tag: name.clone() })?;
+            present(io, commit).await?
+        }
+        Ref::Commit(commit) => present(io, commit.clone()).await?,
+    };
+    match found.root {
+        Some(root) => Ok((found.commit, root)),
+        None => Err(Error::Malformed(format!(
+            "commit {}'s root isn't a string",
+            found.commit
+        ))),
+    }
+}
+
+/// `commit` and its root as stored, if it is in the store.
+async fn present(io: &Io, commit: String) -> Result<Resolved, Error> {
+    match io.get_one(&commit_root(&commit)).await? {
+        Some(raw) => Ok(Resolved {
+            root: loads_str(&raw),
+            commit,
+        }),
+        None => Err(Error::UnknownCommit { commit }),
     }
 }

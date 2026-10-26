@@ -1,5 +1,6 @@
-//! Commit history: each commit's parents, its generation, and the
-//! lowest common ancestor of two commits.
+//! Commit history: each commit's record, its parents and generation,
+//! the commits a log walks, what changed between two commits, and the
+//! lowest common ancestor of two.
 //!
 //! A commit's generation is one more than its highest parent's, and 0
 //! for a commit with no parents, so a commit's generation is above all
@@ -10,9 +11,12 @@
 
 use crate::error::Error;
 use crate::json::{Value, loads};
-use crate::layout::{parent_commit, parent_gens};
+use crate::keyset::Entry;
+use crate::layout::{commit_root, commit_time, info_key, parent_commit, parent_gens};
 use crate::machine::Io;
+use crate::merge::Change;
 use crate::store::safe_loads;
+use crate::tree::{self, Shape};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 /// A commit's parents, and their generations if the commit stores them.
@@ -355,4 +359,208 @@ async fn by_walk(io: &Io, a: &str, b: &str) -> Result<Option<String>, Error> {
         }
     }
     Ok(common.into_iter().filter(|c| !below[*c]).min().cloned())
+}
+
+/// One commit's record, as a reader sees it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Commit {
+    pub hash: String,
+    pub parents: Vec<String>,
+    /// Seconds; `None` where the time is missing or not a number.
+    pub time: Option<f64>,
+    /// What the caller said about it; `None` where nothing was said.
+    pub info: Option<Value>,
+    pub root: String,
+}
+
+impl Commit {
+    pub fn to_value(&self) -> Value {
+        Value::Object(vec![
+            ("hash".into(), Value::Str(self.hash.clone())),
+            (
+                "parents".into(),
+                Value::Array(self.parents.iter().cloned().map(Value::Str).collect()),
+            ),
+            ("time".into(), self.time.map_or(Value::Null, Value::Float)),
+            ("info".into(), self.info.clone().unwrap_or(Value::Null)),
+            ("root".into(), Value::Str(self.root.clone())),
+        ])
+    }
+}
+
+/// The records of `commits`, in one read; a commit whose root isn't
+/// stored is left out, and one whose root isn't a string fails the read.
+/// Parents a record can't name (a damaged record) read as none.
+pub async fn read_commits(io: &Io, commits: &[String]) -> Result<HashMap<String, Commit>, Error> {
+    let keys = commits
+        .iter()
+        .flat_map(|c| {
+            [
+                commit_root(c),
+                parent_commit(c),
+                commit_time(c),
+                info_key(c),
+            ]
+        })
+        .collect();
+    let found = io.get(keys).await?;
+    let read = |key: String| found.get(&key).and_then(|raw| safe_loads(raw));
+    let mut out = HashMap::new();
+    for c in commits {
+        let Some(raw) = found.get(&commit_root(c)) else {
+            continue;
+        };
+        let root = crate::store::loads_str(raw).ok_or_else(|| {
+            Error::Malformed(format!(
+                "commit {c}'s root {:?}",
+                String::from_utf8_lossy(raw)
+            ))
+        })?;
+        let parents = match read(parent_commit(c)) {
+            Some(Value::Str(p)) => vec![p],
+            Some(Value::Array(items)) => items
+                .into_iter()
+                .filter_map(|v| match v {
+                    Value::Str(s) => Some(s),
+                    _ => None,
+                })
+                .collect(),
+            _ => vec![],
+        };
+        let time = match read(commit_time(c)) {
+            Some(Value::Int(n)) => Some(n as f64),
+            Some(Value::BigInt(digits)) => digits.parse().ok(),
+            Some(Value::Float(x)) => Some(x),
+            _ => None,
+        };
+        let commit = Commit {
+            hash: c.clone(),
+            parents,
+            time,
+            info: read(info_key(c)),
+            root,
+        };
+        out.insert(c.clone(), commit);
+    }
+    Ok(out)
+}
+
+/// One commit's record.
+pub async fn get_commit(io: &Io, commit: &str) -> Result<Commit, Error> {
+    read_commits(io, &[commit.to_string()])
+        .await?
+        .remove(commit)
+        .ok_or_else(|| Error::UnknownCommit {
+            commit: commit.to_string(),
+        })
+}
+
+/// Emit the records of the commits reachable from `start`, newest
+/// first, up to `limit` of them, as lists of records. Breadth first
+/// across every parent, each commit once; or, with `first_parent`, down
+/// each commit's first parent only: the line of history made on the
+/// branch itself. Every commit queued is read at once, so a log costs a
+/// read per level of history, not per commit. The first record goes to
+/// the host at once and later ones in batches that double, to at most
+/// [`LOG_BATCH`], so a caller after the newest commit reads just that,
+/// and one walking far crosses to the host seldom. A commit the walk
+/// reaches that isn't in the store fails it, at the point it would be
+/// listed.
+pub async fn log(
+    io: &Io,
+    start: &str,
+    limit: Option<u64>,
+    first_parent: bool,
+) -> Result<(), Error> {
+    let mut count = 0u64;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<String> = VecDeque::from([start.to_string()]);
+    let mut read: HashMap<String, Commit> = HashMap::new();
+    let mut part = Vec::new();
+    let mut batch = 1;
+    while !queue.is_empty() && limit.is_none_or(|l| count < l) {
+        let wanted: Vec<String> = queue
+            .iter()
+            .filter(|c| !read.contains_key(*c) && !seen.contains(*c))
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        read.extend(read_commits(io, &wanted).await?);
+        while let Some(c) = queue.front().cloned() {
+            if limit.is_some_and(|l| count >= l) {
+                break;
+            }
+            if seen.contains(&c) {
+                queue.pop_front();
+                continue;
+            }
+            let Some(commit) = read.remove(&c) else {
+                if wanted.contains(&c) {
+                    if !part.is_empty() {
+                        io.emit(Value::Array(std::mem::take(&mut part))).await?;
+                    }
+                    return Err(Error::UnknownCommit { commit: c });
+                }
+                break;
+            };
+            queue.pop_front();
+            seen.insert(c);
+            let parents = if first_parent {
+                commit.parents.iter().take(1).cloned().collect::<Vec<_>>()
+            } else {
+                commit.parents.clone()
+            };
+            queue.extend(parents.into_iter().filter(|p| !seen.contains(p)));
+            part.push(commit.to_value());
+            count += 1;
+        }
+        if part.len() >= batch {
+            io.emit(Value::Array(std::mem::take(&mut part))).await?;
+            batch = (batch * 2).min(LOG_BATCH);
+        }
+    }
+    if !part.is_empty() {
+        io.emit(Value::Array(part)).await?;
+    }
+    Ok(())
+}
+
+/// The most records a log hands the host at once.
+pub const LOG_BATCH: usize = 64;
+
+/// Each key whose value differs from keyset `a` to keyset `b`: a
+/// structural diff, skipping the subtrees the two share, so the cost
+/// follows the size of the change. A key whose entry differs only in
+/// metadata, with the same blob, is not a change.
+pub async fn changes(
+    io: &Io,
+    shape: Shape,
+    a: String,
+    b: String,
+) -> Result<BTreeMap<String, Change>, Error> {
+    let diff = tree::diff(io.clone(), shape, a, b).await?;
+    let decode = |raw: &[u8]| Entry::decode(raw).map_err(Error::Malformed);
+    let mut out = BTreeMap::new();
+    for (key, raw) in diff.added {
+        let new = Some(decode(&raw)?);
+        out.insert(key, Change { old: None, new });
+    }
+    for (key, raw) in diff.removed {
+        let old = Some(decode(&raw)?);
+        out.insert(key, Change { old, new: None });
+    }
+    for (key, old, new) in diff.modified {
+        let (old, new) = (decode(&old)?, decode(&new)?);
+        if old.blob != new.blob {
+            out.insert(
+                key,
+                Change {
+                    old: Some(old),
+                    new: Some(new),
+                },
+            );
+        }
+    }
+    Ok(out)
 }

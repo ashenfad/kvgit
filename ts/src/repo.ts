@@ -12,11 +12,11 @@
 
 import { type Codec, type CodecName, bytesCodec, resolveCodec } from './codec'
 import { core } from './core'
-import { BranchExistsError, UnknownCommitError, UnknownTagError } from './errors'
+import { BranchExistsError, UnknownTagError } from './errors'
 import { NodeCache } from './hamt'
 import { Keyset } from './keyset'
 import type { CommitInfo, DiffResult, KVStore } from './types'
-import { walkHistory } from './versioned/helpers'
+import { callCore, streamCore } from './versioned/drive'
 import {
   type CorruptHeadRecoverer,
   type GcOptions,
@@ -26,21 +26,9 @@ import {
   deleteBranchHead,
   gcStore,
   headOf,
-  loadParents,
-  mergeBase,
   repairHead,
 } from './versioned/kv'
-import {
-  COMMIT_ROOT,
-  COMMIT_TIME,
-  INFO_KEY,
-  PARENT_COMMIT,
-  ROOT_COMMIT,
-  checkStorageVersion,
-  loads,
-  loadsInfo,
-  safeLoads,
-} from './versioned/layout'
+import { ROOT_COMMIT, checkStorageVersion } from './versioned/layout'
 import {
   type TagInfo,
   createTag,
@@ -223,28 +211,11 @@ export class Repo<V = Uint8Array> {
    * @throws UnknownCommitError if it is not in the store.
    */
   async getCommit(commit: string): Promise<Commit> {
-    const keys = [COMMIT_ROOT(commit), PARENT_COMMIT(commit), COMMIT_TIME(commit), INFO_KEY(commit)]
-    const found = await this.store.getMany(keys)
-    const rootRaw = found.get(keys[0] as string)
-    if (rootRaw === undefined) throw new UnknownCommitError(commit)
-    const parentsRaw = found.get(keys[1] as string)
-    const parsed = parentsRaw === undefined ? [] : safeLoads(parentsRaw)
-    const parents =
-      typeof parsed === 'string'
-        ? [parsed]
-        : Array.isArray(parsed)
-          ? parsed.filter((p): p is string => typeof p === 'string')
-          : []
-    const timeRaw = found.get(keys[2] as string)
-    const time = timeRaw === undefined ? null : safeLoads(timeRaw)
-    const infoRaw = found.get(keys[3] as string)
-    return {
-      hash: commit,
-      parents,
-      time: typeof time === 'number' ? time : null,
-      info: infoRaw === undefined ? null : (loadsInfo(infoRaw) as CommitInfo),
-      root: loads(rootRaw) as string,
-    }
+    return (await callCore(
+      'get_commit',
+      { commit },
+      { store: this.store, now: this.now },
+    )) as Commit
   }
 
   /**
@@ -257,13 +228,9 @@ export class Repo<V = Uint8Array> {
     opts: { limit?: number; firstParent?: boolean } = {},
   ): AsyncIterable<Commit> {
     const start = await this.resolveRef(ref)
-    let count = 0
-    for await (const hash of walkHistory(start, (h) => loadParents(this.store, h), {
-      allParents: opts.firstParent !== true,
-    })) {
-      if (opts.limit !== undefined && count >= opts.limit) return
-      count++
-      yield await this.getCommit(hash)
+    const args = { start, limit: opts.limit ?? null, first_parent: opts.firstParent === true }
+    for await (const record of streamCore('log', args, { store: this.store, now: this.now })) {
+      yield record as Commit
     }
   }
 
@@ -275,14 +242,15 @@ export class Repo<V = Uint8Array> {
    * @throws UnknownCommitError if either commit is not in the store.
    */
   async diff(a: string, b: string): Promise<DiffResult> {
-    const [rootA, rootB] = await Promise.all([this.rootOf(a), this.rootOf(b)])
-    const changes = await Keyset.fromRoot(this.store, rootA).diff(
-      Keyset.fromRoot(this.store, rootB),
-    )
+    const found = (await callCore('diff', { a, b }, { store: this.store, now: this.now })) as {
+      added: string[]
+      removed: string[]
+      modified: string[]
+    }
     return {
-      added: new Set(changes.added.keys()),
-      removed: new Set(changes.removed.keys()),
-      modified: new Set(changes.modified.keys()),
+      added: new Set(found.added),
+      removed: new Set(found.removed),
+      modified: new Set(found.modified),
     }
   }
 
@@ -293,8 +261,9 @@ export class Repo<V = Uint8Array> {
    * @throws UnknownCommitError if either commit is not in the store.
    */
   async mergeBase(a: string, b: string): Promise<string | null> {
-    await Promise.all([this.rootOf(a), this.rootOf(b)])
-    return mergeBase(this.store, a, b)
+    const args = { a, b, check: true }
+    const found = await callCore('merge_base', args, { store: this.store, now: this.now })
+    return (found as { base: string | null }).base
   }
 
   /**
@@ -303,8 +272,8 @@ export class Repo<V = Uint8Array> {
    * it.
    */
   async snapshot(ref: Ref): Promise<Snapshot<V>> {
-    const commit = await this.resolveRef(ref)
-    return new Snapshot(this, commit, await this.rootOf(commit))
+    const { commit, root } = await this.resolve(ref)
+    return new Snapshot(this, commit, root)
   }
 
   // --- Maintenance ---
@@ -326,23 +295,20 @@ export class Repo<V = Uint8Array> {
 
   /** @internal The commit a ref names. */
   async resolveRef(ref: Ref): Promise<string> {
-    const given = Object.keys(ref).filter((k) => (ref as Record<string, unknown>)[k] !== undefined)
-    if (given.length !== 1) throw new TypeError('name exactly one of commit, branch or tag')
-    if ('branch' in ref) return this.branches.get(ref.branch)
-    if ('tag' in ref) {
-      const tagged = await resolveTag(this.store, ref.tag)
-      if (tagged === null) throw new UnknownTagError(ref.tag)
-      await this.rootOf(tagged)
-      return tagged
-    }
-    await this.rootOf(ref.commit)
-    return ref.commit
+    return (await this.resolve(ref)).commit
   }
 
-  private async rootOf(commit: string): Promise<string> {
-    const raw = await this.store.get(COMMIT_ROOT(commit))
-    if (raw === null) throw new UnknownCommitError(commit)
-    return loads(raw) as string
+  /** The commit a ref names, and its root. */
+  private async resolve(ref: Ref): Promise<{ commit: string; root: string }> {
+    const given = Object.keys(ref).filter((k) => (ref as Record<string, unknown>)[k] !== undefined)
+    if (given.length !== 1) throw new TypeError('name exactly one of commit, branch or tag')
+    const name = given[0] as string
+    const args = {
+      [name]: (ref as Record<string, unknown>)[name],
+      recover: this.recover !== undefined,
+    }
+    const env = { store: this.store, recover: this.recover, now: this.now }
+    return (await callCore('resolve_ref', args, env)) as { commit: string; root: string }
   }
 }
 

@@ -567,6 +567,8 @@ mod _core {
     ///   size)`, `"ours"`, `"theirs"` or `("failed", reason)`.
     /// - `("recover", branch)`: the recoverer's guess, or `None`.
     /// - `("now",)`: the time to stamp a commit with.
+    /// - `("emit", part)`: part of the answer, ready early; `None`, to
+    ///   go on.
     ///
     /// Every call passes wall time; `failed=True` answers a request the
     /// host couldn't perform.
@@ -616,6 +618,7 @@ mod _core {
     fn reply_of(asked: &Request, reply: Option<&Bound<'_, PyAny>>) -> PyResult<Reply> {
         match asked {
             Request::Wait(_) => return Ok(Reply::Waited),
+            Request::Emit(_) => return Ok(Reply::Next),
             Request::Recover(_) => {
                 return Ok(Reply::Recovered(
                     reply.map(|r| r.extract()).transpose()?.flatten(),
@@ -633,7 +636,9 @@ mod _core {
                     .collect(),
             ),
             Request::Cas(_) => Reply::Landed(reply.extract()?),
-            Request::Wait(_) | Request::Recover(_) => unreachable!("answered above"),
+            Request::Wait(_) | Request::Recover(_) | Request::Emit(_) => {
+                unreachable!("answered above")
+            }
             Request::Now => Reply::Now(reply.extract()?),
             Request::Merge(_) => {
                 let mut answers = Vec::new();
@@ -700,6 +705,7 @@ mod _core {
             }
             Request::Recover(branch) => ("recover", branch).into_pyobject(py),
             Request::Now => ("now",).into_pyobject(py),
+            Request::Emit(part) => ("emit", from_value(py, part)?).into_pyobject(py),
         }
     }
 

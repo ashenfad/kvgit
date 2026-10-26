@@ -81,8 +81,7 @@ import logging
 import os
 import time
 import uuid
-from collections import deque
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from typing import Any
 
 from .. import _core
@@ -99,7 +98,7 @@ from ..errors import (
 from ..hamt import EMPTY_HASH
 from ..kv.base import KVStore
 from ..kv.memory import Memory
-from ._drive import drive
+from ._drive import drive, steps
 from .base import VersionedBase
 from .helpers import walk_history
 from .keyset import Keyset, KeysetEntry, MetaEntry
@@ -337,6 +336,26 @@ def _call(
         clock=time.time,
         sleep=time.sleep,
     )
+
+
+def _stream(
+    op: str,
+    store: KVStore,
+    recoverer: Callable[[KVStore, str], Any] | None = None,
+    /,
+    **args: Any,
+) -> Iterator[Any]:
+    """Run the core's operation ``op``, yielding each item of the parts
+    it emits."""
+    run = steps(
+        _core.Op(op, args),
+        store,
+        recoverer=recoverer,
+        clock=time.time,
+        sleep=time.sleep,
+    )
+    for part in run:
+        yield from part
 
 
 # "Not read yet", for a value the caller may already hold, where None
@@ -974,157 +993,6 @@ def _generations(
     return {c: memo[c] for c in commits}
 
 
-class _NoGenerations(Exception):
-    """The search reached history written before generations were stored."""
-
-
-_FROM_A, _FROM_B, _STALE = 1, 2, 4
-_FROM_BOTH = _FROM_A | _FROM_B
-
-
-def _merge_base_by_generation(
-    store: KVStore,
-    commit_a: str,
-    commit_b: str,
-    known: dict[str, int] | None,
-) -> str | None:
-    """The lowest common ancestor, searching down from both commits at once.
-
-    Commits are visited highest generation first, every commit of one
-    generation in one batched read. A commit is visited only after
-    every descendant the search reached, so the sides it was reached
-    from are final when it is popped. Reached from both, it is a common
-    ancestor, and a lowest one unless it was reached through a common
-    ancestor already found: finding one marks everything below it
-    stale. The search stops once every commit still queued is stale;
-    for two tips that forked recently, that is a few reads whatever the
-    length of the history below.
-
-    Raises:
-        _NoGenerations: the search reached a commit that stores no
-            generations for its parents.
-    """
-    records = _load_records(store, (commit_a, commit_b))
-    gens: dict[str, int] = {}
-    for c in (commit_a, commit_b):
-        g = _generation(records[c])
-        if g is None:
-            raise _NoGenerations
-        gens[c] = g
-    if known is not None:
-        known.update(gens)
-    flags = {commit_a: _FROM_A, commit_b: _FROM_B}
-    levels: dict[int, set[str]] = {}
-    for c in (commit_a, commit_b):
-        levels.setdefault(gens[c], set()).add(c)
-    active = {commit_a, commit_b}
-    found: list[str] = []
-    while active:
-        level_gen = max(levels)
-        level = levels.pop(level_gen)
-        unread = [c for c in level if c not in records]
-        if unread:
-            records.update(_load_records(store, unread))
-        for c in sorted(level):
-            active.discard(c)
-            f = flags[c]
-            if f & _FROM_BOTH == _FROM_BOTH and not f & _STALE:
-                found.append(c)
-                f |= _STALE
-                flags[c] = f
-            parents, parent_gens = records[c]
-            if parents and parent_gens is None:
-                raise _NoGenerations
-            for parent, parent_gen in zip(parents, parent_gens or (), strict=True):
-                if parent_gen >= level_gen:
-                    raise _NoGenerations  # inconsistent data: search the slow way
-                before = flags.get(parent, 0)
-                after = before | f
-                if after == before:
-                    continue
-                flags[parent] = after
-                if parent not in gens:
-                    gens[parent] = parent_gen
-                    levels.setdefault(parent_gen, set()).add(parent)
-                if after & _STALE:
-                    active.discard(parent)
-                else:
-                    active.add(parent)
-    if known is not None:
-        known.update(gens)
-    return min(found) if found else None
-
-
-def _walk_ancestors(
-    store: KVStore, start: str, parents: dict[str, tuple[str, ...]]
-) -> set[str]:
-    """All ancestors of ``start`` (itself included), recording each
-    visited commit's parents in ``parents`` for later passes."""
-    ancestors = {start}
-    stack = [start]
-    while stack:
-        current = stack.pop()
-        if current in parents:
-            continue
-        node_parents = load_parents(store, current)
-        parents[current] = node_parents
-        for parent in node_parents:
-            if parent not in ancestors:
-                ancestors.add(parent)
-                stack.append(parent)
-    return ancestors
-
-
-def _merge_base_by_walk(store: KVStore, commit_a: str, commit_b: str) -> str | None:
-    """The lowest common ancestor, from the two commits' whole histories.
-
-    For history written before generations were stored. Ancestor-set
-    intersection with non-minimal candidates dropped
-    (a candidate that is itself an ancestor of another candidate is
-    not lowest). When several commits tie for lowest — criss-cross
-    histories — the smallest hash wins: deterministic, but
-    arbitrary, so criss-cross merges resolve cleanly rather than
-    raising.
-    """
-    if commit_a == commit_b:
-        return commit_a
-
-    parents: dict[str, tuple[str, ...]] = {}
-    ancestors_a = _walk_ancestors(store, commit_a, parents)
-    # Fast path: b inside a's history (or vice versa) names the
-    # lowest directly — every other common ancestor sits above it.
-    if commit_b in ancestors_a:
-        return commit_b
-    ancestors_b = _walk_ancestors(store, commit_b, parents)
-    if commit_a in ancestors_b:
-        return commit_a
-
-    common = ancestors_a & ancestors_b
-    if not common:
-        return None
-    # Minimality in one bottom-up pass: a candidate is lowest when
-    # no other candidate sits below it. Propagate "a candidate is
-    # at-or-below here" from tips to roots over the in-memory
-    # parent map — no further store reads, linear in the history.
-    children: dict[str, list[str]] = {node: [] for node in parents}
-    for node, node_parents in parents.items():
-        for parent in node_parents:
-            children[parent].append(node)
-    below: dict[str, bool] = dict.fromkeys(parents, False)
-    remaining = {node: len(kids) for node, kids in children.items()}
-    queue = deque(node for node, kids in children.items() if not kids)
-    while queue:
-        node = queue.popleft()
-        for parent in parents[node]:
-            if node in common or below[node]:
-                below[parent] = True
-            remaining[parent] -= 1
-            if remaining[parent] == 0:
-                queue.append(parent)
-    best = {c for c in common if not below[c]}
-    return min(best) if best else None
-
-
 def merge_base(
     store: KVStore,
     commit_a: str,
@@ -1140,12 +1008,10 @@ def merge_base(
     generations the search works out, for a caller that writes a commit
     over these two next.
     """
-    if commit_a == commit_b:
-        return commit_a
-    try:
-        return _merge_base_by_generation(store, commit_a, commit_b, known)
-    except _NoGenerations:
-        return _merge_base_by_walk(store, commit_a, commit_b)
+    found = _call("merge_base", store, a=commit_a, b=commit_b, check=False)
+    if known is not None:
+        known.update(found["generations"])
+    return found["base"]
 
 
 def gc(
