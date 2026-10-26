@@ -112,15 +112,24 @@ class HookStore(Memory):
 
     # -- KVStore overrides --
 
-    def get(self, key: str) -> bytes | None:
-        value = super().get(key)
+    def _read(self, key: str) -> None:
         armed = self._on_get.get(key)
         if armed is not None:
             armed[1] -= 1
             if armed[1] <= 0:
                 del self._on_get[key]
                 armed[0]()
+
+    def get(self, key: str) -> bytes | None:
+        value = super().get(key)
+        self._read(key)
         return value
+
+    def get_many(self, *args):
+        found = super().get_many(*args)
+        for key in self._normalize_keys(args):
+            self._read(key)
+        return found
 
     def set(self, key: str, value: bytes) -> None:
         fn = self._on_set.pop(key, None)
@@ -821,6 +830,16 @@ class TestRecovererThreading:
         store.set(BRANCH_HEAD % branch, b"")
         store.remove(BRANCH_HEAD_PREV % branch)
         return store, tip
+
+    def test_a_commit_takes_a_recoverer_that_cannot_say(self):
+        # A recoverer answering None leaves the branch unrecoverable; the
+        # commit then reports the branch, not a failure of its own.
+        store, tip = self._damaged("main")
+        v = VersionedKV(
+            store, commit_hash=tip, recover_from_corrupt_head=lambda s, b: None
+        )
+        with pytest.raises(UnknownBranchError):
+            v.commit({"k": b"2"})
 
     def test_latest_head_uses_the_recoverer(self):
         store, tip = self._damaged("main")

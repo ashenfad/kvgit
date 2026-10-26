@@ -1,31 +1,34 @@
-//! The commit protocol across the boundary.
+//! The core's operations across the boundary.
 //!
-//! A commit's arguments come in as one JSON text; each request goes out
-//! as its kind, a JSON text and, for a write, its bytes end to end; each
-//! reply comes back through the method for its kind.
+//! An operation's arguments come in as one JSON text; each request goes
+//! out as its kind, a JSON text and, for a write, its bytes end to end;
+//! each reply comes back through the method for its kind.
 
 use super::{NodeMemo, pairs, shape, strings_json, to_js};
 use kvgit_core::error::Error;
 use kvgit_core::head::Note;
-use kvgit_core::json::{Value, loads, write_string};
+use kvgit_core::json::{self, Value, loads, write_string};
 use kvgit_core::keyset::{self, Entry};
 use kvgit_core::machine::{Machine, Reply, Request, Step, Write};
 use kvgit_core::merge::{MergeAnswer, Rule, Rules};
+use kvgit_core::ops::{self, Out};
 use kvgit_core::text::TextRule;
-use kvgit_core::write::{self, CommitArgs, Committed, Done, OnConflict, OnMoved};
+use kvgit_core::write::{CommitArgs, Committed, Done, OnConflict, OnMoved};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use wasm_bindgen::prelude::*;
 
-/// A commit in progress. Each `reply*` call (and the first, `start`),
-/// passing wall time, returns the kind of the next request (`"get"`,
-/// `"cas"`, `"wait"`, `"merge"`, `"recover"`, `"now"`) or `"done"`; `requestJson` and
-/// `requestData` describe the request, and `outcome` the result.
+/// An operation of the core in progress, started by name (see
+/// `kvgit_core::ops`) or by `Op.commit`. Each `reply*` call (and the
+/// first, `start`), passing wall time, returns the kind of the next
+/// request (`"get"`, `"scan"`, `"cas"`, `"wait"`, `"merge"`,
+/// `"recover"`, `"now"`) or `"done"`; `requestJson` and `requestData`
+/// describe the request, and `outcome` the result.
 #[wasm_bindgen]
-pub struct CommitOp {
-    machine: Option<Machine<Done<Committed>>>,
+pub struct Op {
+    machine: Option<Machine<Done<Out>>>,
     asked: Option<Request>,
-    done: Option<Done<Committed>>,
+    done: Option<Done<Out>>,
 }
 
 fn field<'a>(args: &'a Value, name: &str) -> Result<&'a Value, JsError> {
@@ -163,6 +166,7 @@ fn args_of(json: &str, info: Option<String>, memo: &NodeMemo) -> Result<CommitAr
 fn kind(request: &Request) -> &'static str {
     match request {
         Request::Get(_) => "get",
+        Request::Scan(_) => "scan",
         Request::Cas(_) => "cas",
         Request::Wait(_) => "wait",
         Request::Merge(_) => "merge",
@@ -183,18 +187,24 @@ fn json_list(out: &mut String, items: &[String]) {
 }
 
 #[wasm_bindgen]
-impl CommitOp {
+impl Op {
+    /// Operation `name` on `args_json`, an object.
+    #[wasm_bindgen(constructor)]
+    pub fn new(name: &str, args_json: &str) -> Result<Op, JsError> {
+        let args = loads(args_json.as_bytes()).map_err(to_js)?;
+        Ok(Op {
+            machine: Some(ops::call(name, args).map_err(to_js)?),
+            asked: None,
+            done: None,
+        })
+    }
+
     /// A commit of `args_json`, with `info` its info's JSON text, if
     /// any, reading tree nodes through `memo` (0 bytes: none).
-    #[wasm_bindgen(constructor)]
-    pub fn new(
-        args_json: &str,
-        info: Option<String>,
-        memo: &NodeMemo,
-    ) -> Result<CommitOp, JsError> {
+    pub fn commit(args_json: &str, info: Option<String>, memo: &NodeMemo) -> Result<Op, JsError> {
         let args = args_of(args_json, info, memo)?;
-        Ok(CommitOp {
-            machine: Some(Machine::new(move |io| write::commit(io, args))),
+        Ok(Op {
+            machine: Some(ops::commit(args)),
             asked: None,
             done: None,
         })
@@ -204,7 +214,7 @@ impl CommitOp {
         let machine = self
             .machine
             .as_mut()
-            .ok_or_else(|| JsError::new("the commit is done"))?;
+            .ok_or_else(|| JsError::new("the operation is done"))?;
         match machine.resume_at(wall, reply) {
             Step::Request(request) => {
                 let kind = kind(&request);
@@ -243,6 +253,14 @@ impl CommitOp {
         let found: HashMap<String, Vec<u8>> =
             pairs(keys_json, data, lengths)?.into_iter().collect();
         self.step(wall, Some(Reply::Values(found)))
+    }
+
+    /// The stored keys asked for, as a JSON list.
+    #[wasm_bindgen(js_name = replyKeys)]
+    pub fn reply_keys(&mut self, wall: f64, keys_json: &str) -> Result<String, JsError> {
+        let keys = loads(keys_json.as_bytes()).map_err(to_js)?;
+        let keys = texts(&keys, "keys")?;
+        self.step(wall, Some(Reply::Keys(keys)))
     }
 
     #[wasm_bindgen(js_name = replyLanded)]
@@ -310,6 +328,7 @@ impl CommitOp {
         let mut out = String::new();
         match asked {
             Request::Get(keys) => json_list(&mut out, keys),
+            Request::Scan(prefix) => write_string(&mut out, prefix),
             Request::Cas(cas) => {
                 out.push_str("{\"expect\":[");
                 for (i, (k, v)) in cas.expect.iter().enumerate() {
@@ -381,117 +400,112 @@ impl CommitOp {
         out
     }
 
-    /// The outcome, as JSON: `{"ok": {...}}` or `{"error": {"kind",
-    /// "message", ...}}`, with the notes made on the way.
+    /// The outcome, as JSON: `{"ok": value}` (a commit's value an
+    /// object of what it committed) or `{"error": {"kind", "message",
+    /// ...}}`, with the notes made on the way.
     pub fn outcome(&self) -> Result<String, JsError> {
         let done = self
             .done
             .as_ref()
-            .ok_or_else(|| JsError::new("the commit isn't done"))?;
+            .ok_or_else(|| JsError::new("the operation isn't done"))?;
         let mut out = String::from("{");
         match &done.result {
-            Ok(c) => {
-                out.push_str("\"ok\":{\"merged\":");
-                out.push_str(if c.merged { "true" } else { "false" });
-                out.push_str(",\"commit\":");
-                json_opt(&mut out, c.commit.as_deref());
-                let _ = write!(
-                    out,
-                    ",\"strategy\":\"{}\",\"autoMerged\":",
-                    c.strategy.name()
-                );
-                json_list(&mut out, &c.auto_merged);
-                out.push_str(",\"carried\":");
-                json_list(&mut out, &c.carried);
-                out.push_str(",\"changes\":[");
-                for (i, (k, e)) in c.changes.iter().enumerate() {
-                    out.push_str(if i > 0 { ",[" } else { "[" });
-                    write_string(&mut out, k);
-                    out.push(',');
-                    match e {
-                        Some(e) => out.push_str(std::str::from_utf8(&e.encode()).map_err(to_js)?),
-                        None => out.push_str("null"),
-                    }
-                    out.push(']');
-                }
-                out.push_str("],\"roots\":[");
-                for (i, (commit, root)) in c.roots.iter().enumerate() {
-                    out.push_str(if i > 0 { ",[" } else { "[" });
-                    write_string(&mut out, commit);
-                    out.push(',');
-                    write_string(&mut out, root);
-                    out.push(']');
-                }
-                out.push_str("],\"generations\":[");
-                for (i, (commit, g)) in c.generations.iter().enumerate() {
-                    out.push_str(if i > 0 { ",[" } else { "[" });
-                    write_string(&mut out, commit);
-                    let _ = write!(out, ",{g}]");
-                }
-                let _ = write!(out, "],\"stamped\":{}}}", c.stamped);
+            Ok(Out::Value(v)) => {
+                out.push_str("\"ok\":");
+                out.push_str(&json::dumps(v, false));
             }
+            Ok(Out::Committed(c)) => committed_json(&mut out, c)?,
             Err(e) => {
                 out.push_str("\"error\":{\"kind\":");
-                let kind = match e {
-                    Error::Host => "host",
-                    Error::BranchMoved { .. } => "branch_moved",
-                    Error::UnknownBranch { .. } => "unknown_branch",
-                    Error::Concurrency(_) => "concurrency",
-                    Error::MergeConflict { .. } => "merge_conflict",
-                    Error::Malformed(_) => "malformed",
-                };
-                write_string(&mut out, kind);
+                write_string(&mut out, e.kind());
                 out.push_str(",\"message\":");
                 write_string(&mut out, &e.to_string());
-                match e {
-                    Error::BranchMoved { branch, base, head } => {
-                        for (name, v) in [("branch", branch), ("base", base), ("head", head)] {
-                            let _ = write!(out, ",\"{name}\":");
-                            write_string(&mut out, v);
-                        }
-                    }
-                    Error::UnknownBranch { branch } => {
-                        out.push_str(",\"branch\":");
-                        write_string(&mut out, branch);
-                    }
-                    Error::MergeConflict { keys, failures } => {
-                        out.push_str(",\"keys\":");
-                        json_list(&mut out, keys);
-                        out.push_str(",\"failures\":[");
-                        for (i, (k, why)) in failures.iter().enumerate() {
-                            out.push_str(if i > 0 { ",[" } else { "[" });
-                            write_string(&mut out, k);
-                            out.push(',');
-                            write_string(&mut out, why);
-                            out.push(']');
-                        }
+                for (name, v) in e.fields() {
+                    let _ = write!(out, ",\"{name}\":");
+                    write_string(&mut out, v);
+                }
+                if let Error::MergeConflict { keys, failures } = e {
+                    out.push_str(",\"keys\":");
+                    json_list(&mut out, keys);
+                    out.push_str(",\"failures\":[");
+                    for (i, (k, why)) in failures.iter().enumerate() {
+                        out.push_str(if i > 0 { ",[" } else { "[" });
+                        write_string(&mut out, k);
+                        out.push(',');
+                        write_string(&mut out, why);
                         out.push(']');
                     }
-                    _ => {}
+                    out.push(']');
                 }
                 out.push('}');
             }
         }
-        out.push_str(",\"notes\":[");
-        for (i, note) in done.notes.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            let (kind, branch, answer) = match note {
-                Note::FromBackup { branch } => ("from_backup", branch, None),
-                Note::FromRecoverer { branch } => ("from_recoverer", branch, None),
-                Note::RecovererMissed { branch, answer } => {
-                    ("recoverer_missed", branch, Some(answer))
-                }
-                Note::Healed { branch } => ("healed", branch, None),
-            };
-            let _ = write!(out, "{{\"kind\":\"{kind}\",\"branch\":");
-            write_string(&mut out, branch);
-            out.push_str(",\"answer\":");
-            json_opt(&mut out, answer.map(String::as_str));
-            out.push('}');
-        }
-        out.push_str("]}");
+        notes_json(&mut out, &done.notes);
         Ok(out)
     }
+}
+
+/// What a commit committed, as the outcome's `ok` field.
+fn committed_json(out: &mut String, c: &Committed) -> Result<(), JsError> {
+    out.push_str("\"ok\":{\"merged\":");
+    out.push_str(if c.merged { "true" } else { "false" });
+    out.push_str(",\"commit\":");
+    json_opt(out, c.commit.as_deref());
+    let _ = write!(
+        out,
+        ",\"strategy\":\"{}\",\"autoMerged\":",
+        c.strategy.name()
+    );
+    json_list(out, &c.auto_merged);
+    out.push_str(",\"carried\":");
+    json_list(out, &c.carried);
+    out.push_str(",\"changes\":[");
+    for (i, (k, e)) in c.changes.iter().enumerate() {
+        out.push_str(if i > 0 { ",[" } else { "[" });
+        write_string(out, k);
+        out.push(',');
+        match e {
+            Some(e) => out.push_str(std::str::from_utf8(&e.encode()).map_err(to_js)?),
+            None => out.push_str("null"),
+        }
+        out.push(']');
+    }
+    out.push_str("],\"roots\":[");
+    for (i, (commit, root)) in c.roots.iter().enumerate() {
+        out.push_str(if i > 0 { ",[" } else { "[" });
+        write_string(out, commit);
+        out.push(',');
+        write_string(out, root);
+        out.push(']');
+    }
+    out.push_str("],\"generations\":[");
+    for (i, (commit, g)) in c.generations.iter().enumerate() {
+        out.push_str(if i > 0 { ",[" } else { "[" });
+        write_string(out, commit);
+        let _ = write!(out, ",{g}]");
+    }
+    let _ = write!(out, "],\"stamped\":{}}}", c.stamped);
+    Ok(())
+}
+
+/// The notes an operation made, as the outcome's `notes` field.
+fn notes_json(out: &mut String, notes: &[Note]) {
+    out.push_str(",\"notes\":[");
+    for (i, note) in notes.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let (kind, branch, answer) = match note {
+            Note::FromBackup { branch } => ("from_backup", branch, None),
+            Note::FromRecoverer { branch } => ("from_recoverer", branch, None),
+            Note::RecovererMissed { branch, answer } => ("recoverer_missed", branch, Some(answer)),
+            Note::Healed { branch } => ("healed", branch, None),
+        };
+        let _ = write!(out, "{{\"kind\":\"{kind}\",\"branch\":");
+        write_string(out, branch);
+        out.push_str(",\"answer\":");
+        json_opt(out, answer.map(String::as_str));
+        out.push('}');
+    }
+    out.push_str("]}");
 }

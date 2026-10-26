@@ -10,9 +10,11 @@ mod _core {
     use kvgit_core::keyset::Entry;
     use kvgit_core::machine::{Cas, Machine, Reply, Request, Step, Write};
     use kvgit_core::merge::{MergeAnswer, Rule, Rules};
+    use kvgit_core::ops::{self, Out as OpOut};
+    use kvgit_core::refs;
     use kvgit_core::text::{self, TextError, TextRule};
     use kvgit_core::tree::{self, Shape, TreeDiff, TreeError, Updated};
-    use kvgit_core::write::{self, CommitArgs, Committed, Done, OnConflict, OnMoved};
+    use kvgit_core::write::{CommitArgs, Committed, OnConflict, OnMoved};
     use pyo3::exceptions::{PyTypeError, PyValueError};
     use pyo3::prelude::*;
     use pyo3::types::{
@@ -81,6 +83,18 @@ mod _core {
 
     #[pymodule_export]
     const MAX_MARK_BYTES: usize = text::MAX_MARK_BYTES;
+
+    /// Raise `ValueError` for a name that can't be a branch.
+    #[pyfunction]
+    fn check_branch_name(name: &str) -> PyResult<()> {
+        refs::check_branch_name(name).map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    /// Raise `ValueError` for a name that can't be a tag.
+    #[pyfunction]
+    fn check_tag_name(name: &str) -> PyResult<()> {
+        refs::check_tag_name(name).map_err(|e| PyValueError::new_err(e.to_string()))
+    }
 
     /// A Python value as JSON, as `json.dumps` would read it. Object
     /// keys must be strings: `json.dumps` writes others as strings, so
@@ -534,12 +548,15 @@ mod _core {
         }
     }
 
-    /// A commit in progress, driven like a tree operation: `resume`
-    /// returns the next request as a tuple, to be answered by the next
-    /// call, until it returns `("done", outcome, notes)`.
+    /// An operation of the core in progress, started by name (see
+    /// `kvgit_core::ops`) with its arguments as a dict, or by
+    /// `Op.commit`. It is driven like a tree operation: `resume` returns
+    /// the next request as a tuple, to be answered by the next call,
+    /// until it returns `("done", outcome, notes)`.
     ///
     /// - `("get", keys)`: a dict of the stored values, absent ones left
     ///   out.
+    /// - `("scan", prefix)`: the stored keys starting with `prefix`.
     /// - `("cas", expect, writes, removes)`: whether the batch landed.
     ///   `expect` and `writes` are lists of `(key, bytes)`; an expected
     ///   `None` means absent, and a write of `None` writes the bytes the
@@ -554,19 +571,19 @@ mod _core {
     /// Every call passes wall time; `failed=True` answers a request the
     /// host couldn't perform.
     #[pyclass]
-    struct CommitOp {
-        machine: Option<Machine<Done<Committed>>>,
+    struct Op {
+        machine: Option<ops::Op>,
         asked: Option<Request>,
     }
 
     // SAFETY: a machine is neither `Send` nor `Sync` only for the `Rc`s
     // between it and its operation, and every clone of them lives inside
-    // this object: the commit's shape has no memo and its arguments hold
-    // none. Moved to another thread, the object takes them all along.
-    // Python reaches the machine only through `resume`, which takes the
-    // object mutably, so no two threads ever touch them at once.
-    unsafe impl Send for CommitOp {}
-    unsafe impl Sync for CommitOp {}
+    // this object: a commit's shape has no memo, and no operation's
+    // arguments hold any. Moved to another thread, the object takes them
+    // all along. Python reaches the machine only through `resume`, which
+    // takes the object mutably, so no two threads ever touch them at once.
+    unsafe impl Send for Op {}
+    unsafe impl Sync for Op {}
 
     /// A merge rule as Python hands one over: `"ours"`, `"theirs"`, a
     /// host function's number, or `("text", ours_label, theirs_label,
@@ -597,15 +614,26 @@ mod _core {
     }
 
     fn reply_of(asked: &Request, reply: Option<&Bound<'_, PyAny>>) -> PyResult<Reply> {
-        if let Request::Wait(_) = asked {
-            return Ok(Reply::Waited);
+        match asked {
+            Request::Wait(_) => return Ok(Reply::Waited),
+            Request::Recover(_) => {
+                return Ok(Reply::Recovered(
+                    reply.map(|r| r.extract()).transpose()?.flatten(),
+                ));
+            }
+            _ => {}
         }
         let reply = reply.ok_or_else(|| PyValueError::new_err("a request needs a reply"))?;
         Ok(match asked {
             Request::Get(_) => Reply::Values(bytes_of(reply.cast::<PyDict>()?)?),
+            Request::Scan(_) => Reply::Keys(
+                reply
+                    .try_iter()?
+                    .filter_map(|k| k.and_then(|k| k.extract::<String>()).ok())
+                    .collect(),
+            ),
             Request::Cas(_) => Reply::Landed(reply.extract()?),
-            Request::Wait(_) => unreachable!("answered above"),
-            Request::Recover(_) => Reply::Recovered(reply.extract()?),
+            Request::Wait(_) | Request::Recover(_) => unreachable!("answered above"),
             Request::Now => Reply::Now(reply.extract()?),
             Request::Merge(_) => {
                 let mut answers = Vec::new();
@@ -637,6 +665,7 @@ mod _core {
         let bytes = |b: &Option<Vec<u8>>| b.as_ref().map(|b| PyBytes::new(py, b));
         match request {
             Request::Get(keys) => ("get", PyList::new(py, keys)?).into_pyobject(py),
+            Request::Scan(prefix) => ("scan", prefix).into_pyobject(py),
             Request::Cas(Cas {
                 expect,
                 writes,
@@ -687,72 +716,74 @@ mod _core {
         }
     }
 
-    /// An outcome as `("ok", fields)`, or `("error", kind, fields)`.
+    fn committed_to_py<'py>(py: Python<'py>, c: &Committed) -> PyResult<Bound<'py, PyAny>> {
+        let fields = PyDict::new(py);
+        fields.set_item("merged", c.merged)?;
+        fields.set_item("commit", &c.commit)?;
+        fields.set_item("strategy", c.strategy.name())?;
+        fields.set_item("auto_merged_keys", PyTuple::new(py, &c.auto_merged)?)?;
+        fields.set_item("carried_keys", PyTuple::new(py, &c.carried)?)?;
+        let changes = PyList::empty(py);
+        for (key, entry) in &c.changes {
+            let entry = match entry {
+                Some(e) => entry_to_py(py, e)?.into_any(),
+                None => py.None(),
+            };
+            changes.append((key, entry))?;
+        }
+        fields.set_item("changes", changes)?;
+        fields.set_item("roots", PyList::new(py, &c.roots)?)?;
+        fields.set_item("generations", PyList::new(py, &c.generations)?)?;
+        fields.set_item("stamped", c.stamped)?;
+        Ok(fields.into_any())
+    }
+
+    /// An outcome as `("ok", value)`, or `("error", kind, fields)`, the
+    /// fields always holding the message.
     fn outcome_to_py<'py>(
         py: Python<'py>,
-        result: &Result<Committed, Error>,
+        result: &Result<OpOut, Error>,
     ) -> PyResult<Bound<'py, PyTuple>> {
-        let fields = PyDict::new(py);
         match result {
-            Ok(c) => {
-                fields.set_item("merged", c.merged)?;
-                fields.set_item("commit", &c.commit)?;
-                fields.set_item("strategy", c.strategy.name())?;
-                fields.set_item("auto_merged_keys", PyTuple::new(py, &c.auto_merged)?)?;
-                fields.set_item("carried_keys", PyTuple::new(py, &c.carried)?)?;
-                let changes = PyList::empty(py);
-                for (key, entry) in &c.changes {
-                    let entry = match entry {
-                        Some(e) => entry_to_py(py, e)?.into_any(),
-                        None => py.None(),
-                    };
-                    changes.append((key, entry))?;
-                }
-                fields.set_item("changes", changes)?;
-                fields.set_item("roots", PyList::new(py, &c.roots)?)?;
-                fields.set_item("generations", PyList::new(py, &c.generations)?)?;
-                fields.set_item("stamped", c.stamped)?;
-                ("ok", fields).into_pyobject(py)
-            }
+            Ok(OpOut::Committed(c)) => ("ok", committed_to_py(py, c)?).into_pyobject(py),
+            Ok(OpOut::Value(v)) => ("ok", from_value(py, v)?).into_pyobject(py),
             Err(e) => {
-                let kind = match e {
-                    Error::Host => "host",
-                    Error::BranchMoved { branch, base, head } => {
-                        fields.set_item("branch", branch)?;
-                        fields.set_item("base", base)?;
-                        fields.set_item("head", head)?;
-                        "branch_moved"
-                    }
-                    Error::UnknownBranch { branch } => {
-                        fields.set_item("branch", branch)?;
-                        "unknown_branch"
-                    }
-                    Error::Concurrency(_) => "concurrency",
-                    Error::MergeConflict { keys, failures } => {
-                        fields.set_item("keys", PyList::new(py, keys)?)?;
-                        fields.set_item(
-                            "failures",
-                            PyDict::from_sequence(&PyList::new(py, failures)?.into_any())?,
-                        )?;
-                        "merge_conflict"
-                    }
-                    Error::Malformed(_) => "malformed",
-                };
+                let fields = PyDict::new(py);
+                for (name, value) in e.fields() {
+                    fields.set_item(name, value)?;
+                }
+                if let Error::MergeConflict { keys, failures } = e {
+                    fields.set_item("keys", PyList::new(py, keys)?)?;
+                    fields.set_item(
+                        "failures",
+                        PyDict::from_sequence(&PyList::new(py, failures)?.into_any())?,
+                    )?;
+                }
                 fields.set_item("message", e.to_string())?;
-                ("error", kind, fields).into_pyobject(py)
+                ("error", e.kind(), fields).into_pyobject(py)
             }
         }
     }
 
     #[pymethods]
-    impl CommitOp {
+    impl Op {
         #[new]
+        fn new(name: &str, args: &Bound<'_, PyAny>) -> PyResult<Op> {
+            let machine = ops::call(name, to_value(args)?)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            Ok(Op {
+                machine: Some(machine),
+                asked: None,
+            })
+        }
+
+        #[staticmethod]
         #[allow(clippy::too_many_arguments)]
         #[pyo3(signature = (
             branch, base, current, updates, removals, chunks, info, on_moved, on_conflict,
             merge_fns, merge_prefixes, default_merge, recover, stamped, roots, generations,
         ))]
-        fn new(
+        fn commit(
             branch: String,
             base: String,
             current: String,
@@ -769,7 +800,7 @@ mod _core {
             stamped: bool,
             roots: Vec<(String, String)>,
             generations: Vec<(String, u64)>,
-        ) -> PyResult<CommitOp> {
+        ) -> PyResult<Op> {
             let updates = updates
                 .iter()
                 .map(|(k, e)| Ok((k.clone(), entry_from_py(e)?)))
@@ -814,8 +845,8 @@ mod _core {
                 roots,
                 generations,
             };
-            Ok(CommitOp {
-                machine: Some(Machine::new(move |io| write::commit(io, args))),
+            Ok(Op {
+                machine: Some(ops::commit(args)),
                 asked: None,
             })
         }
@@ -836,7 +867,7 @@ mod _core {
             let machine = self
                 .machine
                 .as_mut()
-                .ok_or_else(|| PyValueError::new_err("the commit is done"))?;
+                .ok_or_else(|| PyValueError::new_err("the operation is done"))?;
             match machine.resume_at(wall, reply) {
                 Step::Request(request) => {
                     let out = request_to_py(py, &request);

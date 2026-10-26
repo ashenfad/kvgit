@@ -5,18 +5,20 @@
 //!
 //! Until the rest of the engine is in the core, this runner keeps the
 //! worktree state and the reads a scenario checks by itself, and runs
-//! only the scenarios made of the steps it knows.
+//! only the scenarios made of the steps it knows. Branches, tags and
+//! heads go through the core's operations by name, as the hosts call
+//! them.
 
 use kvgit_core::error::Error;
-use kvgit_core::json::{Value, dumps, loads};
+use kvgit_core::json::{Value, loads};
 use kvgit_core::keyset::{Entry, shape};
 use kvgit_core::layout::{
-    BRANCH_HEAD_PREFIX, EMPTY_HASH, GC_LEASE_KEY, ROOT_COMMIT, STORAGE_VERSION_KEY,
-    TAG_BRANCH_PREFIX, blob_key, branch_head, branch_head_prev, commit_root, commit_time, info_key,
+    ROOT_COMMIT, STORAGE_VERSION_KEY, blob_key, branch_head, commit_root, commit_time, info_key,
     parent_commit,
 };
 use kvgit_core::machine::{Cas, Machine, Reply, Request, Step, Write};
 use kvgit_core::merge::{MergeAnswer, MergeAsk, Rule, Rules};
+use kvgit_core::ops::{self, Out};
 use kvgit_core::text::{TextRule, text_merge};
 use kvgit_core::tree::walk;
 use kvgit_core::write::{CommitArgs, Committed, Done, OnConflict, OnMoved, commit};
@@ -46,6 +48,12 @@ const KNOWN: &[&str] = &[
     "resume",
     "store_set",
     "store_delete",
+    "branch_create",
+    "branch_delete",
+    "tag_create",
+    "tag_delete",
+    "tags",
+    "repair_head",
 ];
 
 /// The scenarios it must run: a scenario that gains a step it doesn't
@@ -53,6 +61,9 @@ const KNOWN: &[&str] = &[
 const EXPECTED: &[&str] = &[
     "basics/first-commit",
     "basics/lost-race",
+    "history/commit-scan-recovery",
+    "history/head-recovery",
+    "history/refs",
     "merges/text",
     "races/lost-before-batch",
 ];
@@ -146,6 +157,8 @@ fn strings(items: &[String]) -> Value {
 #[derive(Clone)]
 struct Wt {
     branch: String,
+    /// Whether its repo has a recoverer.
+    recover: bool,
     base: String,
     keys: BTreeMap<String, Entry>,
     pending: BTreeMap<String, Option<Vec<u8>>>,
@@ -158,9 +171,12 @@ struct Job {
     held: Request,
     wt: String,
     values: HashMap<String, Vec<u8>>,
+    recover: bool,
 }
 
 struct Run {
+    /// Each repo, and whether it recovers heads by a commit scan.
+    repos: HashMap<String, bool>,
     store: BTreeMap<String, Vec<u8>>,
     clock: f64,
     vars: HashMap<String, Value>,
@@ -183,6 +199,7 @@ impl Run {
             other => panic!("clock: {other:?}"),
         };
         Run {
+            repos: HashMap::new(),
             store,
             clock,
             vars: HashMap::from([("$root".into(), Value::Str(ROOT_COMMIT.into()))]),
@@ -282,20 +299,34 @@ impl Run {
                 if !self.store.contains_key(STORAGE_VERSION_KEY) {
                     self.store.insert(STORAGE_VERSION_KEY.into(), b"4".to_vec());
                 }
+                let scan = step.get("recover").and_then(Value::as_str) == Some("commit_scan");
+                self.repos.insert(self.arg(step, "as"), scan);
                 Ok(Value::Null)
             }
             "worktree" => {
                 let branch = self.arg(step, "branch");
-                let head = match self.head(&branch) {
-                    Some(head) => head,
-                    None if step.get("create") == Some(&Value::Bool(true)) => {
-                        self.create_branch(&branch);
-                        ROOT_COMMIT.to_string()
+                let recover = self.repos[&self.arg(step, "repo")];
+                let head = match self.head_of(&branch, recover) {
+                    Err(e)
+                        if e == "UnknownBranchError"
+                            && step.get("create") == Some(&Value::Bool(true)) =>
+                    {
+                        match self.call(
+                            "create_branch",
+                            args(&[("name", &branch), ("target", ROOT_COMMIT)]),
+                            false,
+                        ) {
+                            Ok(_) => {}
+                            Err(e) if e == "BranchExistsError" => {}
+                            Err(e) => return Err(e),
+                        }
+                        self.head_of(&branch, recover)?
                     }
-                    None => return Err("UnknownBranchError".into()),
+                    other => other?,
                 };
                 let wt = Wt {
                     branch,
+                    recover,
                     keys: self.keyset(&head),
                     base: head,
                     pending: BTreeMap::new(),
@@ -306,9 +337,7 @@ impl Run {
             }
             "snapshot" => {
                 let commit = match step.get("branch") {
-                    Some(_) => self
-                        .head(&self.arg(step, "branch"))
-                        .ok_or("UnknownBranchError")?,
+                    Some(_) => self.head_of(&self.arg(step, "branch"), false)?,
                     None => self.arg(step, "commit"),
                 };
                 let keys = self.keyset(&commit);
@@ -342,8 +371,8 @@ impl Run {
             }
             "refresh" => {
                 let name = self.arg(step, "wt");
-                let branch = self.wts[&name].branch.clone();
-                let head = self.head(&branch).ok_or("UnknownBranchError")?;
+                let (branch, recover) = (self.wts[&name].branch.clone(), self.wts[&name].recover);
+                let head = self.head_of(&branch, recover)?;
                 let keys = self.keyset(&head);
                 let wt = self.wts.get_mut(&name).unwrap();
                 (wt.base, wt.keys) = (head, keys);
@@ -398,15 +427,72 @@ impl Run {
                 Ok(Value::Null)
             }
             "branches" => {
+                let recover = self.repos[&self.arg(step, "repo")];
+                let Value::Array(names) = self.call("branches", args(&[]), false)? else {
+                    panic!("branches")
+                };
                 let mut out = Vec::new();
-                for (key, raw) in &self.store {
-                    if let Some(branch) = key.strip_prefix(BRANCH_HEAD_PREFIX)
-                        && !branch.starts_with(TAG_BRANCH_PREFIX)
-                    {
-                        out.push((branch.to_string(), loads(raw).unwrap()));
-                    }
+                for name in names {
+                    let name = name.as_str().unwrap().to_string();
+                    let head = self.head_of(&name, recover)?;
+                    out.push((name, Value::Str(head)));
                 }
                 Ok(Value::Object(out))
+            }
+            "branch_create" => {
+                let name = self.arg(step, "name");
+                let target = match step.get("at") {
+                    Some(_) => self.arg(step, "at"),
+                    None => ROOT_COMMIT.to_string(),
+                };
+                self.call(
+                    "create_branch",
+                    args(&[("name", &name), ("target", &target)]),
+                    false,
+                )?;
+                Ok(Value::Str(target))
+            }
+            "branch_delete" => {
+                let name = self.arg(step, "name");
+                self.call("delete_branch", args(&[("name", &name)]), false)
+            }
+            "tag_create" => {
+                let mut fields = vec![
+                    ("name".to_string(), Value::Str(self.arg(step, "name"))),
+                    ("target".to_string(), Value::Str(self.arg(step, "commit"))),
+                ];
+                fields.push((
+                    "info".into(),
+                    step.get("info").cloned().unwrap_or(Value::Null),
+                ));
+                self.call("create_tag", Value::Object(fields), false)
+            }
+            "tag_delete" => {
+                let name = self.arg(step, "name");
+                self.call("delete_tag", args(&[("name", &name)]), false)
+            }
+            "tags" => {
+                let Value::Array(pairs) = self.call("tags", args(&[]), false)? else {
+                    panic!("tags")
+                };
+                Ok(Value::Object(
+                    pairs
+                        .into_iter()
+                        .map(|pair| match pair {
+                            Value::Array(two) => {
+                                (two[0].as_str().unwrap().to_string(), two[1].clone())
+                            }
+                            other => panic!("a tag: {other:?}"),
+                        })
+                        .collect(),
+                ))
+            }
+            "repair_head" => {
+                let recover = self.repos[&self.arg(step, "repo")];
+                let name = self.arg(step, "name");
+                let mut fields = vec![("branch".to_string(), Value::Str(name))];
+                fields.push(("recover".into(), Value::Bool(recover)));
+                self.call("repair_head", Value::Object(fields), recover)
             }
             "get_commit" => {
                 let c = self.arg(step, "commit");
@@ -424,9 +510,7 @@ impl Run {
             }
             "log" => {
                 let start = match step.get("branch") {
-                    Some(_) => self
-                        .head(&self.arg(step, "branch"))
-                        .ok_or("UnknownBranchError")?,
+                    Some(_) => self.head_of(&self.arg(step, "branch"), false)?,
                     None => self.arg(step, "commit"),
                 };
                 let mut out = Vec::new();
@@ -494,7 +578,8 @@ impl Run {
             "commit" => {
                 let name = self.arg(step, "wt");
                 let (machine, values) = self.start_commit(step, &name);
-                let done = self.drive(machine, &values, None).expect("not held");
+                let recover = self.wts[&name].recover;
+                let done = self.drive(machine, &values, recover);
                 self.finish(&name, done)
             }
             "start" => {
@@ -508,6 +593,7 @@ impl Run {
                     .to_string();
                 let (machine, values) = self.start_commit(&inner, &name);
                 let branch = self.wts[&name].branch.clone();
+                let recover = self.wts[&name].recover;
                 let held = Box::new(move |r: &Request| holds(r, &pause, &branch));
                 let mut machine = machine;
                 let mut step_now = machine.resume_at(self.clock_now(), None);
@@ -519,14 +605,14 @@ impl Run {
                                 machine,
                                 held: r,
                                 wt: name,
-
                                 values,
+                                recover,
                             };
                             self.jobs.insert(self.arg(step, "job"), job);
                             return Ok(Value::Null);
                         }
                         Step::Request(r) => {
-                            let reply = self.perform(r, &values);
+                            let reply = self.perform(r, &values, recover);
                             step_now = machine.resume_at(self.clock_now(), Some(reply));
                         }
                     }
@@ -542,10 +628,11 @@ impl Run {
                     held,
                     wt,
                     values,
+                    recover,
                 } = job;
-                let reply = self.perform(held, &values);
+                let reply = self.perform(held, &values, recover);
                 let first = machine.resume_at(self.clock_now(), Some(reply));
-                let done = self.drive_from(machine, first, &values);
+                let done = self.drive_from(machine, first, &values, recover);
                 self.finish(&wt, done)
             }
             other => panic!("{context}: {other} is not a known step"),
@@ -556,35 +643,33 @@ impl Run {
         self.clock
     }
 
-    fn head(&self, branch: &str) -> Option<String> {
-        let raw = self.store.get(&branch_head(branch))?;
-        loads(raw).ok()?.as_str().map(String::from)
+    /// A branch's head, resolved as a repo resolves it.
+    fn head_of(&mut self, branch: &str, recover: bool) -> Result<String, String> {
+        let mut fields = vec![("branch".to_string(), Value::Str(branch.into()))];
+        fields.push(("recover".into(), Value::Bool(recover)));
+        let found = self.call("head_of", Value::Object(fields), recover)?;
+        Ok(found.get("commit").unwrap().as_str().unwrap().to_string())
     }
 
-    /// A branch at the root commit, as both packages make one.
-    fn create_branch(&mut self, branch: &str) {
-        assert!(
-            !self.store.contains_key(GC_LEASE_KEY),
-            "a branch made under a lease"
-        );
-        let root = commit_root(ROOT_COMMIT);
-        if !self.store.contains_key(&root) {
-            self.store.insert(
-                root,
-                dumps(&Value::Str(EMPTY_HASH.clone()), false).into_bytes(),
-            );
-            self.store
-                .insert(parent_commit(ROOT_COMMIT), b"[]".to_vec());
-            self.store.insert(
-                commit_time(ROOT_COMMIT),
-                dumps(&Value::Float(self.clock), false).into_bytes(),
-            );
+    /// Run the core's operation `name` against the store.
+    fn call(&mut self, name: &str, args: Value, recover: bool) -> Result<Value, String> {
+        let mut machine = ops::call(name, args).map_err(|e| error_name(&e))?;
+        let mut step = machine.resume_at(self.clock_now(), None);
+        loop {
+            match step {
+                Step::Done(done) => {
+                    return match done.result {
+                        Ok(Out::Value(v)) => Ok(v),
+                        Ok(Out::Committed(_)) => panic!("{name} committed"),
+                        Err(e) => Err(error_name(&e)),
+                    };
+                }
+                Step::Request(r) => {
+                    let reply = self.perform(r, &HashMap::new(), recover);
+                    step = machine.resume_at(self.clock_now(), Some(reply));
+                }
+            }
         }
-        self.store.insert(
-            branch_head(branch),
-            dumps(&Value::Str(ROOT_COMMIT.into()), false).into_bytes(),
-        );
-        self.store.remove(&branch_head_prev(branch));
     }
 
     /// A commit's keyset, read through the core's walk.
@@ -646,7 +731,7 @@ impl Run {
             on_moved,
             on_conflict,
             rules: rules(step),
-            recover: false,
+            recover: wt.recover,
             stamped: wt.stamped,
             roots: vec![],
             generations: vec![],
@@ -658,10 +743,10 @@ impl Run {
         &mut self,
         mut machine: Machine<Done<Committed>>,
         values: &HashMap<String, Vec<u8>>,
-        _held: Option<()>,
-    ) -> Option<Done<Committed>> {
+        recover: bool,
+    ) -> Done<Committed> {
         let first = machine.resume_at(self.clock_now(), None);
-        Some(self.drive_from(machine, first, values))
+        self.drive_from(machine, first, values, recover)
     }
 
     fn drive_from(
@@ -669,12 +754,13 @@ impl Run {
         mut machine: Machine<Done<Committed>>,
         mut step: Step<Done<Committed>>,
         values: &HashMap<String, Vec<u8>>,
+        recover: bool,
     ) -> Done<Committed> {
         loop {
             match step {
                 Step::Done(done) => return done,
                 Step::Request(r) => {
-                    let reply = self.perform(r, values);
+                    let reply = self.perform(r, values, recover);
                     step = machine.resume_at(self.clock_now(), Some(reply));
                 }
             }
@@ -682,12 +768,25 @@ impl Run {
     }
 
     /// Perform a request against the store. `values` are the bytes the
-    /// commit's driver holds, by blob key.
-    fn perform(&mut self, request: Request, values: &HashMap<String, Vec<u8>>) -> Reply {
+    /// commit's driver holds, by blob key; `recover`, whether a head is
+    /// recovered by the commit scan.
+    fn perform(
+        &mut self,
+        request: Request,
+        values: &HashMap<String, Vec<u8>>,
+        recover: bool,
+    ) -> Reply {
         match request {
             Request::Get(keys) => Reply::Values(
                 keys.into_iter()
                     .filter_map(|k| self.store.get(&k).map(|v| (k, v.clone())))
+                    .collect(),
+            ),
+            Request::Scan(prefix) => Reply::Keys(
+                self.store
+                    .keys()
+                    .filter(|k| k.starts_with(&prefix))
+                    .cloned()
                     .collect(),
             ),
             Request::Cas(Cas {
@@ -716,6 +815,16 @@ impl Run {
             }
             Request::Merge(asks) => {
                 Reply::Merged(asks.iter().map(|a| self.host_merge(a)).collect())
+            }
+            Request::Recover(branch) if recover => {
+                let guess = self
+                    .call(
+                        "recover_by_commit_scan",
+                        args(&[("branch", &branch)]),
+                        false,
+                    )
+                    .unwrap();
+                Reply::Recovered(guess.as_str().map(String::from))
             }
             Request::Recover(_) => Reply::Recovered(None),
             Request::Now => Reply::Now(self.clock),
@@ -811,10 +920,25 @@ fn holds(request: &Request, pause: &str, branch: &str) -> bool {
 fn error_name(e: &Error) -> String {
     match e {
         Error::BranchMoved { .. } => "BranchMovedError",
-        Error::UnknownBranch { .. } => "UnknownBranchError",
+        Error::UnknownBranch { .. } | Error::HeadGone { .. } => "UnknownBranchError",
+        Error::CorruptHead { .. } => "CorruptHeadError",
+        Error::UnknownTag { .. } => "UnknownTagError",
+        Error::UnknownCommit { .. } => "UnknownCommitError",
+        Error::BranchExists { .. } => "BranchExistsError",
+        Error::TagExists { .. } => "TagExistsError",
         Error::Concurrency(_) => "ConcurrencyError",
         Error::MergeConflict { .. } => "MergeConflict",
-        Error::Malformed(_) | Error::Host => "invalid",
+        Error::Malformed(_) | Error::Host | Error::Invalid(_) => "invalid",
     }
     .into()
+}
+
+/// Arguments for an operation, all strings.
+fn args(pairs: &[(&str, &str)]) -> Value {
+    Value::Object(
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), Value::Str(v.to_string())))
+            .collect(),
+    )
 }

@@ -231,7 +231,7 @@ impl<'a> Writer<'a> {
             ours_built = true;
         }
         let Some(theirs) = head else {
-            return Err(Error::unknown_branch(&a.branch));
+            return Err(Error::head_gone(&a.branch));
         };
         if !ours_built {
             self.build_ours(None).await?;
@@ -243,7 +243,7 @@ impl<'a> Writer<'a> {
     fn refuse_moved(&self, head: Option<String>) -> Result<(), Error> {
         let a = self.args;
         match head {
-            None => Err(Error::unknown_branch(&a.branch)),
+            None => Err(Error::head_gone(&a.branch)),
             Some(head) if head != a.base => Err(Error::BranchMoved {
                 branch: a.branch.clone(),
                 base: a.base.clone(),

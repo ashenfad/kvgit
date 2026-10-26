@@ -28,6 +28,7 @@ import {
   makeTextMerge,
   pullBranch,
   pushBranch,
+  recoverByCommitScan,
   syncBranch,
   textMergeResult,
 } from '../../src/index'
@@ -616,12 +617,14 @@ export class Run {
   }
 
   async op_open(step: Step): Promise<void> {
-    if (step.recover !== undefined) {
+    if (step.recover !== undefined && step.recover !== 'commit_scan') {
       throw new ScenarioFailure(`no recoverer ${show(step.recover)} in this package`)
     }
+    const recover =
+      step.recover === undefined ? {} : { recoverFromCorruptHead: recoverByCommitScan }
     this.repos.set(
       step.as as string,
-      await Repo.open(this.storeOf(step), { now: () => this.clock, ...rules(step) }),
+      await Repo.open(this.storeOf(step), { now: () => this.clock, ...recover, ...rules(step) }),
     )
   }
 

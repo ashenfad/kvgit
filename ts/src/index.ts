@@ -17,6 +17,7 @@ export {
 export { VersionedBase } from './versioned/base'
 export {
   VersionedKV,
+  recoverByCommitScan,
   repairHead,
   type CorruptHeadRecoverer,
   type LazyKeysetOptions,

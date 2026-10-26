@@ -107,8 +107,7 @@ class HookStore extends Memory {
     else seen.push(commit)
   }
 
-  override async get(key: string): Promise<Uint8Array | null> {
-    const value = await super.get(key)
+  private async read(key: string): Promise<void> {
     const armed = this.onGet.get(key)
     if (armed !== undefined) {
       armed.nth -= 1
@@ -117,7 +116,19 @@ class HookStore extends Memory {
         await armed.fire()
       }
     }
+  }
+
+  override async get(key: string): Promise<Uint8Array | null> {
+    const value = await super.get(key)
+    await this.read(key)
     return value
+  }
+
+  override async getMany(keys: Iterable<string>): Promise<Map<string, Uint8Array>> {
+    const wanted = [...keys]
+    const found = await super.getMany(wanted)
+    for (const key of wanted) await this.read(key)
+    return found
   }
 
   override async set(key: string, value: Uint8Array): Promise<void> {

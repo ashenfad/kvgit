@@ -5,9 +5,9 @@ from __future__ import annotations
 from collections.abc import ItemsView, Iterator, Mapping
 from typing import TYPE_CHECKING
 
-from .errors import CorruptHeadError, UnknownBranchError, UnknownTagError
+from .errors import UnknownTagError
 from .versioned import kv as _kv
-from .versioned.kv import BRANCH_HEAD, ROOT_COMMIT, VersionedKV
+from .versioned.kv import ROOT_COMMIT, VersionedKV
 from .versioned.protocol import TagInfo
 
 if TYPE_CHECKING:
@@ -40,16 +40,17 @@ class Branches(Mapping[str, str]):
     def _resolve(self, name: str, roots: dict[str, str] | None = None) -> str:
         """The branch's head, recording its root in ``roots`` when given
         (see :meth:`Repo._resolve_ref`)."""
-        _kv._reject_reserved_branch(name)
-        store = self._repo._store
-        commit = _kv._resolve_head(
-            store, name, recover_from_corrupt_head=self._repo._recover, roots=roots
+        recover = self._repo._recover
+        found = _kv._call(
+            "head_of",
+            self._repo._store,
+            recover,
+            branch=name,
+            recover=recover is not None,
         )
-        if commit is not None:
-            return commit
-        if store.get(BRANCH_HEAD % name) is not None:
-            raise CorruptHeadError(f"Branch '{name}' HEAD is corrupt and unrecoverable")
-        raise UnknownBranchError(f"Branch '{name}' does not exist")
+        if roots is not None and found["root"] is not None:
+            roots[found["commit"]] = found["root"]
+        return found["commit"]
 
     def __contains__(self, name: object) -> bool:
         return isinstance(name, str) and VersionedKV.exists(self._repo._store, name)

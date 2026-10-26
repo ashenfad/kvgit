@@ -106,6 +106,13 @@ impl Store {
                     })
                     .collect(),
             ),
+            Request::Scan(prefix) => Reply::Keys(
+                self.data
+                    .keys()
+                    .filter(|k| k.starts_with(&prefix))
+                    .cloned()
+                    .collect(),
+            ),
             Request::Recover(_) => Reply::Recovered(None),
             Request::Now => Reply::Now(self.clock),
         }

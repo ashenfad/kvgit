@@ -93,10 +93,8 @@ from ..errors import (
     CorruptHeadError,
     GcBusy,
     StorageVersionError,
-    TagExistsError,
     UnknownBranchError,
     UnknownCommitError,
-    UnknownTagError,
 )
 from ..hamt import EMPTY_HASH
 from ..kv.base import KVStore
@@ -324,6 +322,23 @@ def _check_storage_version(store: KVStore) -> None:
     store.set(STORAGE_VERSION_KEY, dumps(STORAGE_VERSION))
 
 
+def _call(
+    op: str,
+    store: KVStore,
+    recoverer: Callable[[KVStore, str], Any] | None = None,
+    /,
+    **args: Any,
+) -> Any:
+    """Run the core's operation ``op`` on ``args`` against ``store``."""
+    return drive(
+        _core.Op(op, args),
+        store,
+        recoverer=recoverer,
+        clock=time.time,
+        sleep=time.sleep,
+    )
+
+
 # "Not read yet", for a value the caller may already hold, where None
 # already means "read, and absent".
 _UNREAD: Any = object()
@@ -379,7 +394,6 @@ def _resolve_head(
     branch: str,
     *,
     recover_from_corrupt_head: CorruptHeadRecoverer | None = None,
-    head_bytes: Any = _UNREAD,
     roots: dict[str, str] | None = None,
 ) -> str | None:
     """Resolve a branch HEAD, falling back to prev HEAD then an injected recoverer.
@@ -392,79 +406,28 @@ def _resolve_head(
     is the explicit call that makes it durable, and the write path heals
     HEAD itself as part of the CAS that has to move it anyway.
 
-    The cost of not persisting is paid per read on a damaged store: two
-    extra ``get`` calls for the prev-HEAD tier, plus whatever the
-    injected recoverer costs below it. A store sitting on a corrupt HEAD
-    has a bigger problem than read latency.
-
     Args:
         recover_from_corrupt_head: Optional third tier, fired only when
             HEAD exists, is unusable, and the backup did not save it.
             Unset — the default — means such a branch resolves to None.
             See :data:`CorruptHeadRecoverer`.
-        head_bytes: HEAD's bytes when the caller has already read them,
-            in the same round trip as something else it needed.
         roots: Where to record the root of the commit this resolves to,
-            read while checking it (see :func:`_has_root`).
+            read while checking it.
 
     Returns a valid commit hash, or None if unrecoverable.
     """
-    # 1. Try current HEAD
-    if head_bytes is _UNREAD:
-        head_bytes = store.get(BRANCH_HEAD % branch)
-    if head_bytes is not None:
-        commit_hash = safe_loads(head_bytes)
-        if _has_root(store, commit_hash, roots):
-            return commit_hash
-
-    # 2. HEAD is present but unusable — try the backup.
-    #
-    # Only reached when HEAD exists. An absent HEAD does not mean
-    # damage, it means the branch is gone — ``delete_branch`` removes
-    # the key — and a backup that outlives its branch must not bring
-    # the branch back. This code writes a backup only in the same atomic
-    # write as its HEAD and removes the two together, but a store an
-    # older kvgit wrote, which did each separately, can hold a backup
-    # with no HEAD.
-    prev_bytes = (
-        store.get(BRANCH_HEAD_PREV % branch) if head_bytes is not None else None
+    found = _call(
+        "resolve_head",
+        store,
+        recover_from_corrupt_head,
+        branch=branch,
+        recover=recover_from_corrupt_head is not None,
     )
-    if prev_bytes is not None:
-        commit_hash = safe_loads(prev_bytes)
-        if _has_root(store, commit_hash, roots):
-            logger.warning(
-                "Branch '%s': HEAD corrupt, recovered from prev HEAD", branch
-            )
-            return commit_hash
-
-    # 3. HEAD existed, is corrupt, and the backup did not save it. The
-    # store no longer holds the answer, so there is nothing left to
-    # read — only to guess. Guessing is the caller's call, not ours.
-    if recover_from_corrupt_head is not None and head_bytes is not None:
-        commit_hash = recover_from_corrupt_head(store, branch)
-        # A recoverer is caller-supplied, so its answer is checked the
-        # same way anything else read out of the store is: a string
-        # naming a commit whose root is present. This function promises
-        # a valid commit or None, and an unchecked answer is worse than
-        # no answer — ``repair_head`` makes it durable, replacing
-        # obviously-corrupt HEAD bytes with a plausible hash naming
-        # nothing, which is harder to diagnose than the damage it
-        # replaced.
-        if _has_root(store, commit_hash, roots):
-            logger.warning(
-                "Branch '%s': HEAD corrupt, recovered via injected recoverer",
-                branch,
-            )
-            return commit_hash
-        if commit_hash is not None:
-            logger.warning(
-                "Branch '%s': recoverer returned %r, which is not a commit in "
-                "this store; treating the branch as unrecoverable",
-                branch,
-                commit_hash,
-            )
-
-    return None
+    if found is None:
+        return None
+    if roots is not None and found["root"] is not None:
+        roots[found["commit"]] = found["root"]
+    return found["commit"]
 
 
 def recover_by_commit_scan(store: KVStore, branch: str) -> str | None:
@@ -507,82 +470,10 @@ def recover_by_commit_scan(store: KVStore, branch: str) -> str | None:
     where branches are never deleted, has neither hazard in play. That
     judgement belongs to whoever owns the data.
     """
-    root_prefix = COMMIT_ROOT.replace("%s", "")
-    all_commits: dict[str, float] = {}
-    for key in store.keys(root_prefix):
-        if not isinstance(key, str) or not key.startswith(root_prefix):
-            continue
-        h = key[len(root_prefix) :]
-        if not h:
-            continue
-        time_bytes = store.get(COMMIT_TIME % h)
-        ts = 0.0
-        if time_bytes is not None:
-            try:
-                val = safe_loads(time_bytes)
-                if isinstance(val, (int, float)):
-                    ts = float(val)
-            except Exception:  # noqa: BLE001 — recovery scan over a store
-                # already known to be damaged; an unreadable timestamp
-                # must degrade to 0.0, never abort the scan.
-                pass
-        all_commits[h] = ts
-
-    if not all_commits:
-        return None
-
-    # Exclude commits reachable from healthy branches
-    claimed: set[str] = set()
-    head_prefix = BRANCH_HEAD.replace("%s", "")
-    for key in store.keys(head_prefix):
-        if not isinstance(key, str) or not key.startswith(head_prefix):
-            continue
-        other = key[len(head_prefix) :]
-        if other == branch or not other:
-            continue
-        hb = store.get(key)
-        if hb is None:
-            continue
-        h = safe_loads(hb)
-        if not isinstance(h, str) or store.get(COMMIT_ROOT % h) is None:
-            continue
-        # Walk parent chain
-        stack = [h]
-        while stack:
-            c = stack.pop()
-            if c in claimed:
-                continue
-            claimed.add(c)
-            pb = store.get(PARENT_COMMIT % c)
-            if pb is not None:
-                parsed = safe_loads(pb)
-                if isinstance(parsed, str):
-                    stack.append(parsed)
-                elif isinstance(parsed, list):
-                    stack.extend(p for p in parsed if isinstance(p, str))
-
-    candidates = {h for h in all_commits if h not in claimed}
-    if not candidates:
-        candidates = set(all_commits)
-
-    # Find tips (not a parent of any other candidate)
-    all_parents: set[str] = set()
-    for h in candidates:
-        pb = store.get(PARENT_COMMIT % h)
-        if pb is not None:
-            parsed = safe_loads(pb)
-            if isinstance(parsed, str):
-                all_parents.add(parsed)
-            elif isinstance(parsed, list):
-                all_parents.update(p for p in parsed if isinstance(p, str))
-    tips = candidates - all_parents
-    if not tips:
-        tips = candidates
-
-    return max(tips, key=lambda h: all_commits.get(h, 0))
+    return _call("recover_by_commit_scan", store, branch=branch)
 
 
-def _heal_head(store: KVStore, branch: str, recovered: bytes) -> bool:
+def _heal_head(store: KVStore, branch: str, commit: str) -> bool:
     """Atomically replace an unresolvable HEAD with a recovered value.
 
     Returns True only when HEAD was damaged *and* this call is the one
@@ -591,7 +482,7 @@ def _heal_head(store: KVStore, branch: str, recovered: bytes) -> bool:
     * HEAD resolves fine — it did not break, it *moved*, and another
       writer won a legitimate race. Overwriting it would destroy a good
       commit to make a losing CAS succeed.
-    * HEAD already holds ``recovered`` — nothing to do.
+    * HEAD already names ``commit`` — nothing to do.
     * HEAD is absent — the branch was deleted. Re-creating the key is
       exactly the resurrection ``delete_branch`` drops the prev-HEAD
       backup to prevent.
@@ -601,32 +492,7 @@ def _heal_head(store: KVStore, branch: str, recovered: bytes) -> bool:
     someone else repaired (or advanced) in the meantime is never
     clobbered.
     """
-    branch_key = BRANCH_HEAD % branch
-    # Installing a recovered HEAD makes a commit reachable that the
-    # store did not claim a moment ago — a root appearing under a sweep
-    # that has already decided what is reachable. So the checks and the
-    # write happen against one lease record, and a sweep in between
-    # sends the whole decision round again.
-    while True:
-        lease = _wait_for_gc(store)
-        raw = store.get(branch_key)
-        if raw is None or raw == recovered:
-            return False
-        commit_hash = safe_loads(raw)
-        if (
-            isinstance(commit_hash, str)
-            and store.get(COMMIT_ROOT % commit_hash) is not None
-        ):
-            return False
-        landed = _try_land(store, lease, {branch_key: raw}, {branch_key: recovered})
-        if landed is None:
-            continue
-        if not landed:
-            return False
-        logger.warning(
-            "Branch '%s': corrupt HEAD replaced with recovered commit", branch
-        )
-        return True
+    return _call("heal_head", store, branch=branch, commit=commit)
 
 
 def repair_head(
@@ -668,15 +534,12 @@ def repair_head(
         The commit HEAD now names, or None if the branch does not exist
         or nothing recoverable was found.
     """
-    commit_hash = _resolve_head(
-        store, branch, recover_from_corrupt_head=recover_from_corrupt_head
-    )
-    if commit_hash is None:
-        return None
-    if _heal_head(store, branch, dumps(commit_hash)):
-        return commit_hash
-    return _resolve_head(
-        store, branch, recover_from_corrupt_head=recover_from_corrupt_head
+    return _call(
+        "repair_head",
+        store,
+        recover_from_corrupt_head,
+        branch=branch,
+        recover=recover_from_corrupt_head is not None,
     )
 
 
@@ -690,10 +553,9 @@ def _validate_tag_name(name: str) -> None:
     carrying its own format specifier turns the key template into
     something other than a template.
     """
-    if not isinstance(name, str) or not name:
+    if not isinstance(name, str):
         raise ValueError("Tag name must be a non-empty string")
-    if "%" in name:
-        raise ValueError(f"Tag name must not contain '%': {name!r}")
+    _core.check_tag_name(name)
 
 
 def _tag_branch(name: str) -> str:
@@ -713,14 +575,8 @@ def _reject_reserved_branch(name: str) -> None:
     up in ``tags()``, and moving it would silently move the tag. Tags
     are created, listed and deleted through the tag API instead.
     """
-    if name == "":
-        raise ValueError("Branch name must be a non-empty string")
-    if isinstance(name, str) and name.startswith(TAG_BRANCH_PREFIX):
-        raise ValueError(
-            f"Branch name {name!r} is reserved for tags "
-            f"(the '{TAG_BRANCH_PREFIX}' namespace). "
-            "Use tag() / tags() / delete_tag() instead."
-        )
+    if isinstance(name, str):
+        _core.check_branch_name(name)
 
 
 def _resolve_tag(store: KVStore, name: str) -> str | None:
@@ -732,11 +588,7 @@ def _resolve_tag(store: KVStore, name: str) -> str | None:
     left by something that treated the tag as an ordinary branch
     describes a move that is not ours to honour.
     """
-    raw = store.get(BRANCH_HEAD % _tag_branch(name))
-    if raw is None:
-        return None
-    commit_hash = safe_loads(raw)
-    return commit_hash if isinstance(commit_hash, str) else None
+    return _call("resolve_tag", store, name=name)
 
 
 def tags(store: KVStore) -> dict[str, str]:
@@ -746,46 +598,13 @@ def tags(store: KVStore) -> dict[str, str]:
     included, because leaving them out would make a damaged tag look
     deleted. :func:`tag_info` says which is which.
     """
-    prefix = BRANCH_HEAD % TAG_BRANCH_PREFIX
-    keys = [
-        key
-        for key in store.keys(prefix)
-        if isinstance(key, str) and key.startswith(prefix) and key != prefix
-    ]
-    found: dict[str, str] = {}
-    for key, raw in store.get_many(keys).items() if keys else ():
-        commit_hash = safe_loads(raw)
-        if isinstance(commit_hash, str):
-            found[key[len(prefix) :]] = commit_hash
-    return dict(sorted(found.items()))
+    return dict(_call("tags", store))
 
 
 def tag_info(store: KVStore, name: str) -> TagInfo | None:
     """Describe one tag, or None if the store has no such tag."""
-    commit_hash = _resolve_tag(store, name)
-    if commit_hash is None:
-        return None
-
-    created: float | None = None
-    info: dict | None = None
-    record_bytes = store.get(TAG_INFO_KEY % name)
-    if record_bytes is not None:
-        record = safe_loads(record_bytes)
-        if isinstance(record, dict):
-            ts = record.get("time")
-            if isinstance(ts, (int, float)) and not isinstance(ts, bool):
-                created = float(ts)
-            stored_info = record.get("info")
-            if isinstance(stored_info, dict):
-                info = stored_info
-
-    return TagInfo(
-        name=name,
-        commit=commit_hash,
-        time=created,
-        info=info,
-        dangling=store.get(COMMIT_ROOT % commit_hash) is None,
-    )
+    found = _call("tag_info", store, name=name)
+    return None if found is None else TagInfo(**found)
 
 
 def _lease_expiry(raw: bytes | None) -> float:
@@ -920,15 +739,6 @@ def _release_gc_lease(
     store.cas(GC_LEASE_KEY, dumps({"owner": owner, "expires": 0}), expected=ours)
 
 
-def _root_commit_writes() -> dict[str, bytes]:
-    """The empty root commit's metadata, for a store that lacks it."""
-    return {
-        COMMIT_ROOT % ROOT_COMMIT: dumps(EMPTY_HASH),
-        PARENT_COMMIT % ROOT_COMMIT: dumps([]),
-        COMMIT_TIME % ROOT_COMMIT: dumps(time.time()),
-    }
-
-
 def create_branch(store: KVStore, name: str, target: str) -> None:
     """Create branch ``name`` pointing at commit ``target``.
 
@@ -949,25 +759,7 @@ def create_branch(store: KVStore, name: str, target: str) -> None:
         BranchExistsError: if the name is taken.
         UnknownCommitError: if ``target`` is not in the store.
     """
-    _reject_reserved_branch(name)
-    branch_key = BRANCH_HEAD % name
-    while True:
-        lease = _wait_for_gc(store)
-        expected: dict[str, bytes | None] = {branch_key: None}
-        writes = {branch_key: dumps(target)}
-        if store.get(COMMIT_ROOT % target) is None:
-            if target != ROOT_COMMIT:
-                raise UnknownCommitError(f"Commit '{target}' does not exist")
-            # Minted with the head, and only if nobody minted it first.
-            expected[COMMIT_ROOT % ROOT_COMMIT] = None
-            writes.update(_root_commit_writes())
-        landed = _try_land(store, lease, expected, writes, (BRANCH_HEAD_PREV % name,))
-        if landed:
-            return
-        if landed is False and store.get(branch_key) is not None:
-            raise BranchExistsError(f"Branch '{name}' already exists")
-        # A sweep moved the lease, or another writer minted the root
-        # commit first: decide again.
+    _call("create_branch", store, name=name, target=target)
 
 
 def delete_branch(store: KVStore, name: str) -> None:
@@ -996,17 +788,7 @@ def delete_branch(store: KVStore, name: str) -> None:
             removal; nothing was removed.
         ValueError: if ``name`` is empty or in the reserved tag namespace.
     """
-    _reject_reserved_branch(name)
-    branch_key = BRANCH_HEAD % name
-    current = store.get(branch_key)
-    if current is None:
-        raise UnknownBranchError(f"Branch '{name}' does not exist")
-    if not store.cas_many(
-        {branch_key: current}, {}, (branch_key, BRANCH_HEAD_PREV % name)
-    ):
-        raise ConcurrencyError(
-            f"Branch '{name}' changed while being deleted; nothing was removed"
-        )
+    _call("delete_branch", store, name=name)
 
 
 def create_tag(
@@ -1027,29 +809,7 @@ def create_tag(
         TagExistsError: if the name is taken.
         UnknownCommitError: if ``target`` is not in the store.
     """
-    _validate_tag_name(name)
-    # Encoded before anything is written, so info that cannot be
-    # serialized raises without leaving a tag behind.
-    dumps(info)
-    head_key = BRANCH_HEAD % _tag_branch(name)
-    while True:
-        lease = _wait_for_gc(store)
-        if store.get(COMMIT_ROOT % target) is None:
-            raise UnknownCommitError(f"Commit '{target}' does not exist")
-        # Built after the wait, so its time is when the tag lands.
-        record = dumps({"time": time.time(), "info": info})
-        landed = _try_land(
-            store,
-            lease,
-            {head_key: None},
-            {head_key: dumps(target), TAG_INFO_KEY % name: record},
-            (BRANCH_HEAD_PREV % _tag_branch(name),),
-        )
-        if landed is None:
-            continue
-        if not landed:
-            raise TagExistsError(f"Tag '{name}' already exists")
-        return
+    _call("create_tag", store, name=name, target=target, info=info)
 
 
 def delete_tag(store: KVStore, name: str) -> None:
@@ -1078,19 +838,7 @@ def delete_tag(store: KVStore, name: str) -> None:
             read and the removal; nothing was removed.
         ValueError: if ``name`` is not a valid tag name.
     """
-    _validate_tag_name(name)
-    head_key = BRANCH_HEAD % _tag_branch(name)
-    record_key = TAG_INFO_KEY % name
-    found = store.get_many([head_key, record_key])
-    current = found.get(head_key)
-    if current is None:
-        raise UnknownTagError(f"Tag '{name}' does not exist")
-    expected = {head_key: current, record_key: found.get(record_key)}
-    removes = (head_key, BRANCH_HEAD_PREV % _tag_branch(name), record_key)
-    if not store.cas_many(expected, {}, removes):
-        raise ConcurrencyError(
-            f"Tag '{name}' changed while being deleted; nothing was removed"
-        )
+    _call("delete_tag", store, name=name)
 
 
 def commit_changes(
@@ -1834,7 +1582,6 @@ class VersionedKV(VersionedBase):
             self.store,
             self._branch,
             recover_from_corrupt_head=self._recover_from_corrupt_head,
-            head_bytes=head_bytes,
             roots=self._roots,
         )
 
@@ -1967,7 +1714,7 @@ class VersionedKV(VersionedBase):
         current = self._current_commit
         root = self._roots.get(current)
         generation = self._generations.get(current)
-        op = _core.CommitOp(
+        op = _core.Op.commit(
             self._branch,
             self._base_commit,
             current,
@@ -2317,7 +2064,7 @@ class VersionedKV(VersionedBase):
             present = self.store.get_many(markers.keys())
             if any(present.get(key) != marker for key, marker in markers.items()):
                 return False
-            if not _heal_head(self.store, self._branch, expected_bytes):
+            if not _heal_head(self.store, self._branch, expected):
                 return False
         self._in_flight = {}
         return True
@@ -2350,7 +2097,7 @@ class VersionedKV(VersionedBase):
                 break
             if self.store.get(branch_key) is None:
                 raise UnknownBranchError(f"Branch '{self._branch}' does not exist")
-            if _heal_head(self.store, self._branch, expected):
+            if _heal_head(self.store, self._branch, our_head):
                 continue
             if on_conflict == "abandon":
                 result = MergeResult(
@@ -2576,14 +2323,7 @@ class VersionedKV(VersionedBase):
         user — and a tag is none of those things. :meth:`tags` lists
         those.
         """
-        prefix = BRANCH_HEAD.replace("%s", "")
-        result = []
-        for key in store.keys(prefix):
-            if isinstance(key, str) and key.startswith(prefix):
-                branch_name = key[len(prefix) :]
-                if branch_name and not branch_name.startswith(TAG_BRANCH_PREFIX):
-                    result.append(branch_name)
-        return sorted(result)
+        return _call("branches", store)
 
     def list_branches(self) -> list[str]:
         """List all branch names in the store."""
@@ -2600,9 +2340,7 @@ class VersionedKV(VersionedBase):
         it raises either way. Never writes, so checking cannot resurrect
         a deleted branch.
         """
-        if not isinstance(name, str) or not name or name.startswith(TAG_BRANCH_PREFIX):
-            return False
-        return store.get(BRANCH_HEAD % name) is not None
+        return isinstance(name, str) and _call("branch_exists", store, name=name)
 
     def branch_exists(self, name: str) -> bool:
         """Whether a branch exists in this handle's store."""
