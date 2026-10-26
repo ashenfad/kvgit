@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **Breaking (Python): stores stamped v2 or v3 are refused.** Opening or sweeping one raises `StorageVersionError`, as TypeScript did; the objects an older kvgit wrote still read once a store's stamp is v4.
-- **A worktree opens without loading its keyset.** Opening reads the head's root alone, reads walk the tree through the content cache, and the first listing builds a key index the later ones read.
+- **A worktree opens without loading its keyset.** Opening reads the head's root alone, reads walk the tree through the content cache, and the first listing builds a key index the later ones read. A snapshot reads the same way.
 - **TypeScript's `lazy` option does nothing.** Every worktree reads on demand now, so `Worktree.lazy` is always true and `nodeCache` null, and a worktree keeps the values it reads, as an eager one did.
 - **Breaking (TypeScript): an empty tag name throws `RangeError`.** It threw `TypeError`; every name the branch and tag calls refuse now throws `RangeError`.
 - **A log reads a level of history at a time.** `log` reads every commit queued in one batch, where it read each commit's records on its own.

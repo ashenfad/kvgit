@@ -293,3 +293,14 @@ def test_concurrent_readers_share_one_cache():
         t.join()
     assert errors == []
     assert repo.cache.size_bytes <= repo.cache.max_bytes
+
+
+def test_a_snapshots_second_listing_reads_no_tree_nodes():
+    store, _, _ = _filled(cache_bytes=0)
+    snap = Repo(store, cache_bytes=0).snapshot(branch="main")
+    store.reset()
+    assert len(list(snap)) == 500
+    assert any(k.startswith("kvgit:keyset:") for k in store.keys_read)
+    store.reset()
+    assert len(snap) == 500 and "nothing" not in snap
+    assert not [k for k in store.keys_read if k.startswith("kvgit:keyset:")]
