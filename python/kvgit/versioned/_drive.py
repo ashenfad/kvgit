@@ -16,6 +16,7 @@ from ..errors import (
     BranchMovedError,
     ConcurrencyError,
     CorruptHeadError,
+    GcBusy,
     MergeConflict,
     TagExistsError,
     UnknownBranchError,
@@ -35,7 +36,12 @@ _NOTES = {
     "recoverer_missed": "Branch '%s': recoverer returned %r, which is not a commit "
     "in this store; treating the branch as unrecoverable",
     "healed": "Branch '%s': corrupt HEAD replaced with recovered commit",
+    "lease_overrun": "a sweep ran %.1fs past its %.1fs GC lease; writers were "
+    "free to write during that window. Raise lease_ttl.",
 }
+
+# The logger each note goes to, where it isn't "kvgit".
+_LOGGERS = {"lease_overrun": "kvgit.orphans"}
 
 
 def drive(op: Any, store: KVStore, **env: Any) -> Any:
@@ -57,6 +63,7 @@ def steps(
     merge_fns: Sequence[Callable[..., Any]] = (),
     post_check: Callable[[str, bytes], bool] | None = None,
     recoverer: Callable[[KVStore, str], Any] | None = None,
+    owner: Callable[[], str] | None = None,
     clock: Callable[[], float],
     sleep: Callable[[float], None],
 ) -> Generator[Any, None, Any]:
@@ -78,9 +85,10 @@ def steps(
         kind = request[0]
         if kind == "done":
             _, outcome, notes = request
-            for note, branch, extra in notes:
-                args = (branch,) if extra is None else (branch, extra)
-                logger.warning(_NOTES[note], *args)
+            for note, *args in notes:
+                logging.getLogger(_LOGGERS.get(note, "kvgit")).warning(
+                    _NOTES[note], *args
+                )
             if outcome[0] == "ok":
                 return outcome[1]
             if raised is not None:
@@ -107,6 +115,8 @@ def steps(
                 reply = _merge(store, request[1], merge_fns, held, errors)
             elif kind == "now":
                 reply = clock()
+            elif kind == "owner":
+                reply = owner() if owner is not None else None
             elif kind == "check":
                 reply = [
                     key
@@ -163,6 +173,7 @@ _ERRORS: dict[str, Callable[[str], Exception]] = {
     "branch_exists": BranchExistsError,
     "tag_exists": TagExistsError,
     "concurrency": ConcurrencyError,
+    "gc_busy": GcBusy,
 }
 
 

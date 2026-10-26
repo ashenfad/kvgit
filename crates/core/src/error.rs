@@ -33,6 +33,9 @@ pub enum Error {
     BranchExists { branch: String },
     /// A tag of this name exists.
     TagExists { tag: String },
+    /// Another sweep holds the GC lease, and the caller would rather
+    /// not wait.
+    GcBusy(String),
     /// The caller asked for something that can't be: a name that can't
     /// be a branch or a tag, arguments of the wrong shape.
     Invalid(String),
@@ -73,6 +76,7 @@ impl Error {
             Error::MergeConflict { .. } => "merge_conflict",
             Error::Malformed(_) => "malformed",
             Error::Invalid(_) => "invalid",
+            Error::GcBusy(_) => "gc_busy",
         }
     }
 
@@ -110,9 +114,10 @@ impl fmt::Display for Error {
             Error::UnknownCommit { commit } => write!(f, "Commit '{commit}' does not exist"),
             Error::BranchExists { branch } => write!(f, "Branch '{branch}' already exists"),
             Error::TagExists { tag } => write!(f, "Tag '{tag}' already exists"),
-            Error::Concurrency(message) | Error::Malformed(message) | Error::Invalid(message) => {
-                f.write_str(message)
-            }
+            Error::Concurrency(message)
+            | Error::Malformed(message)
+            | Error::Invalid(message)
+            | Error::GcBusy(message) => f.write_str(message),
             Error::MergeConflict { keys, .. } => {
                 write!(f, "Merge conflict on keys: {}", keys.join(", "))
             }

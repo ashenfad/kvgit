@@ -19,7 +19,7 @@ use crate::store::{dumps_str, loads_str, safe_loads};
 use std::collections::{HashMap, HashSet};
 
 /// Something the host should tell its user about, as it logs warnings.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Note {
     /// The head was unusable; its backup stood in.
     FromBackup { branch: String },
@@ -30,6 +30,9 @@ pub enum Note {
     RecovererMissed { branch: String, answer: String },
     /// A damaged head was replaced.
     Healed { branch: String },
+    /// A sweep ran `overrun` seconds past its lease of `ttl` seconds,
+    /// so writers were free to write during that time.
+    LeaseOverrun { overrun: f64, ttl: f64 },
 }
 
 /// Notes made while an operation ran.

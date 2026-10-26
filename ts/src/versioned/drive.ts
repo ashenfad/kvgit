@@ -16,6 +16,7 @@ import {
   BranchMovedError,
   ConcurrencyError,
   CorruptHeadError,
+  GcBusy,
   MergeConflict,
   TagExistsError,
   UnknownBranchError,
@@ -57,11 +58,13 @@ interface Failure {
   failures?: Array<[string, string]>
 }
 
-interface Note {
-  kind: 'from_backup' | 'from_recoverer' | 'recoverer_missed' | 'healed'
-  branch: string
-  answer: string | null
-}
+type Note =
+  | {
+      kind: 'from_backup' | 'from_recoverer' | 'recoverer_missed' | 'healed'
+      branch: string
+      answer: string | null
+    }
+  | { kind: 'lease_overrun'; overrun: number; ttl: number }
 
 export interface DriveEnv {
   store: KVStore
@@ -237,6 +240,10 @@ async function perform(
       const text = JSON.stringify(refused)
       return (wall) => op.replyRefused(wall, text)
     }
+    case 'owner': {
+      const owner = leaseEnv.owner()
+      return (wall) => op.replyOwner(wall, owner)
+    }
     case 'now': {
       const now = env.now()
       return (wall) => op.replyNow(wall, now)
@@ -304,6 +311,8 @@ function toError(f: Failure, causes: Map<string, unknown>): Error {
       return new TagExistsError(f.tag as string)
     case 'invalid':
       return new RangeError(f.message)
+    case 'gc_busy':
+      return new GcBusy(f.message)
     case 'concurrency':
       return new ConcurrencyError(f.message)
     case 'merge_conflict': {
@@ -317,6 +326,12 @@ function toError(f: Failure, causes: Map<string, unknown>): Error {
 }
 
 function warn(note: Note): void {
+  if (note.kind === 'lease_overrun') {
+    console.warn(
+      `kvgit: a sweep ran ${note.overrun.toFixed(1)}s past its ${note.ttl}s GC lease; writers were free to write during that window. Raise leaseTtl.`,
+    )
+    return
+  }
   const at = `kvgit: branch '${note.branch}'`
   switch (note.kind) {
     case 'from_backup':

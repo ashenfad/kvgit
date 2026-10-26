@@ -1,14 +1,18 @@
-//! Branches, tags, head recovery and history under what the corpus
-//! can't stage: a write that loses to another writer between its read
-//! and its write, a sweep's lease held across a create, the commit
-//! scan's choice among equals, and the order and reads of a log.
+//! Branches, tags, head recovery, history and the lease under what the
+//! corpus can't stage: a write that loses to another writer between its
+//! read and its write, a sweep's lease held across a create, the commit
+//! scan's choice among equals, the order and reads of a log, and the
+//! version stamp's writes.
 
 use kvgit_core::error::Error;
+use kvgit_core::json::loads;
 use kvgit_core::json::{Value, dumps};
+use kvgit_core::layout::STORAGE_VERSION_KEY;
 use kvgit_core::layout::{
     EMPTY_HASH, GC_LEASE_KEY, branch_head, commit_root, commit_time, parent_commit, tag_info_key,
 };
-use kvgit_core::machine::{Cas, Reply, Request, Step};
+use kvgit_core::lease::{stamp_version_at_least, wait_for_gc};
+use kvgit_core::machine::{Cas, Machine, Reply, Request, Step};
 use kvgit_core::ops::{self, Op, Out};
 use std::collections::BTreeMap;
 
@@ -84,6 +88,7 @@ impl Store {
             Request::Recover(_) => Reply::Recovered(None),
             Request::Emit(_) => Reply::Next,
             Request::Check(_) => Reply::Refused(vec![]),
+            Request::Owner => Reply::Owner("lease-1".into()),
             Request::Merge(_) => panic!("no merges here"),
         }
     }
@@ -344,4 +349,75 @@ fn a_damaged_root_fails_a_read_rather_than_passing_for_an_empty_tree() {
         );
         assert!(matches!(store.run(op, |_, _| {}), Err(Error::Malformed(_))));
     }
+}
+
+/// Run `machine` against `store`, calling `before` with each request
+/// before performing it.
+fn drive<T: 'static>(
+    store: &mut Store,
+    mut machine: Machine<T>,
+    mut before: impl FnMut(&mut Store, &Request),
+) -> T {
+    let mut step = machine.resume_at(store.clock, None);
+    loop {
+        match step {
+            Step::Done(out) => return out,
+            Step::Request(r) => {
+                before(store, &r);
+                let reply = store.perform(r);
+                step = machine.resume_at(store.clock, Some(reply));
+            }
+        }
+    }
+}
+
+fn stamp(store: &mut Store, version: i64, before: impl FnMut(&mut Store, &Request)) {
+    let machine = Machine::new(move |io| async move { stamp_version_at_least(&io, version).await });
+    drive(store, machine, before).unwrap();
+}
+
+fn version(store: &Store) -> Value {
+    loads(&store.data[STORAGE_VERSION_KEY]).unwrap()
+}
+
+#[test]
+fn a_stamp_only_rises() {
+    let mut store = Store::new();
+    store.put(STORAGE_VERSION_KEY.into(), &Value::Int(3));
+    stamp(&mut store, 2, |_, _| {});
+    assert_eq!(version(&store), Value::Int(3));
+    let mut fresh = Store::new();
+    stamp(&mut fresh, 3, |_, _| {});
+    assert_eq!(version(&fresh), Value::Int(3));
+}
+
+#[test]
+fn a_stale_stamp_loses_to_a_higher_one() {
+    // Another writer raises the stamp between this one's read and its
+    // write: the write expects what it read, fails, and reads again.
+    let mut store = Store::new();
+    store.put(STORAGE_VERSION_KEY.into(), &Value::Int(2));
+    let mut raced = false;
+    stamp(&mut store, 3, |store, r| {
+        if matches!(r, Request::Cas(_)) && !raced {
+            raced = true;
+            store.put(STORAGE_VERSION_KEY.into(), &Value::Int(4));
+        }
+    });
+    assert!(raced);
+    assert_eq!(version(&store), Value::Int(4));
+}
+
+#[test]
+fn no_lease_costs_one_read() {
+    let mut store = Store::new();
+    let mut reads = 0;
+    let machine = Machine::new(|io| async move { wait_for_gc(&io, None).await });
+    let lease = drive(&mut store, machine, |_, r| {
+        if matches!(r, Request::Get(_)) {
+            reads += 1;
+        }
+    });
+    assert_eq!(lease, Ok(None));
+    assert_eq!(reads, 1);
 }

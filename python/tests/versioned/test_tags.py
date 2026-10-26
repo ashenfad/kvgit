@@ -30,7 +30,6 @@ from kvgit.versioned.kv import (
     TAG_BRANCH_PREFIX,
     TAG_INFO_KEY,
     VersionedKV as Versioned,
-    _stamp_version_at_least,
     blob_key,
     clean_orphans,
 )
@@ -463,53 +462,6 @@ class TestReservedBranchNames:
         v.tag("v1")
         with pytest.raises(ValueError, match="reserved for tags"):
             v.peek("x", branch="refs/tags/v1")
-
-
-class TestVersionStamp:
-    """The stamp helper still guards the v2 -> v3 chunk upgrade."""
-
-    def test_stamping_is_monotonic(self):
-        backend = Memory()
-        backend.set(STORAGE_VERSION_KEY, dumps(3))
-        _stamp_version_at_least(backend, 2)
-        assert _version(backend) == 3
-
-    def test_stamping_an_unstamped_store_writes_the_version(self):
-        backend = Memory()
-        _stamp_version_at_least(backend, 3)
-        assert _version(backend) == 3
-
-    def test_a_stale_writer_cannot_lower_the_stamp(self):
-        """Read-then-set would let two first-time writers interleave so
-        the lower version lands last, leaving a store whose stamp
-        under-describes what is in it — exactly the store older readers
-        are willing to open. The write is a CAS against the bytes the
-        decision was made from, so a stale writer loses and re-reads."""
-
-        class StaleReadStore(Memory):
-            """Serves one stale read of the version stamp.
-
-            Stands in for a writer that read the stamp before another
-            writer raised it and only reached its own write afterwards.
-            """
-
-            def __init__(self) -> None:
-                super().__init__()
-                self.stale_reads = 1
-
-            def get(self, key):
-                if key == STORAGE_VERSION_KEY and self.stale_reads:
-                    self.stale_reads -= 1
-                    return dumps(2)
-                return super().get(key)
-
-        backend = StaleReadStore()
-        backend.set(STORAGE_VERSION_KEY, dumps(4))  # the other writer won
-
-        _stamp_version_at_least(backend, 3)
-
-        assert backend.stale_reads == 0  # the stale value really was served
-        assert _version(backend) == 4
 
 
 class TestUnknownStorageVersionIsRefused:

@@ -861,9 +861,7 @@ class TestThreeWayMerge:
 
         v2 = Versioned(store)
         v1.commit({"a": b"1"})
-        # v2 creates a local commit, then three-way merge
-        v2._create_commit({"b": b"2"})
-
+        # v2's base is stale: its commit three-way merges onto v1's.
         v2.commit({"b": b"2"})
         # The merge commit (on HEAD) has two parents
         parents = v2._load_parents(v2.current_commit)
@@ -922,11 +920,9 @@ class TestThreeWayMerge:
         v1 = Versioned(store)
         r_base = v1.commit({"base": b"0"})
 
-        v2 = Versioned(store)
-        v1._create_commit({"a": b"1"})
-        h1 = v1.current_commit
-        v2._create_commit({"b": b"2"})
-        h2 = v2.current_commit
+        v2 = v1.create_branch("dev")
+        h1 = v1.commit({"a": b"1"}).commit
+        h2 = v2.commit({"b": b"2"}).commit
 
         lca = v1._find_lca(h1, h2)
         assert lca == r_base.commit

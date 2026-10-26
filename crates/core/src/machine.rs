@@ -66,6 +66,9 @@ pub enum Request {
     /// core made them (the host holds the rest by blob key). Answered
     /// [`Reply::Refused`] with the keys whose values it refuses.
     Check(Vec<(String, String, Option<Vec<u8>>)>),
+    /// A name for a GC lease about to be taken, unique among sweepers:
+    /// the core has no source of randomness. Answered [`Reply::Owner`].
+    Owner,
 }
 
 /// A conditional batch: `writes` and `removes` land together, and only
@@ -98,6 +101,7 @@ pub enum Reply {
     Now(f64),
     Next,
     Refused(Vec<String>),
+    Owner(String),
     /// The host couldn't perform the request, and holds the reason.
     Failed,
 }
@@ -210,6 +214,15 @@ impl Io {
             Reply::Refused(keys) => Ok(keys),
             Reply::Failed => Err(HostFailed),
             other => panic!("a check answered with {other:?}"),
+        }
+    }
+
+    /// A fresh lease owner's name.
+    pub async fn owner(&self) -> Result<String, HostFailed> {
+        match self.ask(Request::Owner).await {
+            Reply::Owner(name) => Ok(name),
+            Reply::Failed => Err(HostFailed),
+            other => panic!("an owner answered with {other:?}"),
         }
     }
 

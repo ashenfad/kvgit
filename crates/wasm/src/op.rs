@@ -219,6 +219,7 @@ fn kind(request: &Request) -> &'static str {
         Request::Now => "now",
         Request::Emit(_) => "emit",
         Request::Check(_) => "check",
+        Request::Owner => "owner",
     }
 }
 
@@ -320,6 +321,12 @@ impl Op {
             asked: None,
             done: None,
         })
+    }
+
+    /// A fresh name for a GC lease.
+    #[wasm_bindgen(js_name = replyOwner)]
+    pub fn reply_owner(&mut self, wall: f64, owner: String) -> Result<String, JsError> {
+        self.step(wall, Some(Reply::Owner(owner)))
     }
 
     /// The keys a check refuses, as a JSON list.
@@ -452,7 +459,7 @@ impl Op {
                 out.push(']');
             }
             Request::Recover(branch) => write_string(&mut out, branch),
-            Request::Now => out.push_str("null"),
+            Request::Now | Request::Owner => out.push_str("null"),
             Request::Emit(part) => out.push_str(&json::dumps(part, false)),
             Request::Check(values) => {
                 out.push('[');
@@ -600,6 +607,13 @@ fn notes_json(out: &mut String, notes: &[Note]) {
             Note::FromRecoverer { branch } => ("from_recoverer", branch, None),
             Note::RecovererMissed { branch, answer } => ("recoverer_missed", branch, Some(answer)),
             Note::Healed { branch } => ("healed", branch, None),
+            Note::LeaseOverrun { overrun, ttl } => {
+                let _ = write!(
+                    out,
+                    "{{\"kind\":\"lease_overrun\",\"overrun\":{overrun},\"ttl\":{ttl}}}"
+                );
+                continue;
+            }
         };
         let _ = write!(out, "{{\"kind\":\"{kind}\",\"branch\":");
         write_string(out, branch);

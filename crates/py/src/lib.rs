@@ -569,6 +569,7 @@ mod _core {
     /// - `("now",)`: the time to stamp a commit with.
     /// - `("emit", part)`: part of the answer, ready early; `None`, to
     ///   go on.
+    /// - `("owner",)`: a fresh name for a GC lease.
     /// - `("check", values)`: the keys refused of `(key, blob, bytes)`,
     ///   `bytes` given where the host doesn't hold the blob.
     ///
@@ -656,6 +657,7 @@ mod _core {
         Ok(match asked {
             Request::Get(_) => Reply::Values(bytes_of(reply.cast::<PyDict>()?)?),
             Request::Check(_) => Reply::Refused(reply.extract()?),
+            Request::Owner => Reply::Owner(reply.extract()?),
             Request::Scan(_) => Reply::Keys(
                 reply
                     .try_iter()?
@@ -732,6 +734,7 @@ mod _core {
             }
             Request::Recover(branch) => ("recover", branch).into_pyobject(py),
             Request::Now => ("now",).into_pyobject(py),
+            Request::Owner => ("owner",).into_pyobject(py),
             Request::Emit(part) => ("emit", from_value(py, part)?).into_pyobject(py),
             Request::Check(values) => {
                 let values = values
@@ -743,16 +746,18 @@ mod _core {
         }
     }
 
+    /// A note as `(kind, *args)`, the arguments its message takes.
     fn note_to_py<'py>(py: Python<'py>, note: &Note) -> PyResult<Bound<'py, PyTuple>> {
         match note {
-            Note::FromBackup { branch } => ("from_backup", branch, py.None()).into_pyobject(py),
-            Note::FromRecoverer { branch } => {
-                ("from_recoverer", branch, py.None()).into_pyobject(py)
-            }
+            Note::FromBackup { branch } => ("from_backup", branch).into_pyobject(py),
+            Note::FromRecoverer { branch } => ("from_recoverer", branch).into_pyobject(py),
             Note::RecovererMissed { branch, answer } => {
                 ("recoverer_missed", branch, answer).into_pyobject(py)
             }
-            Note::Healed { branch } => ("healed", branch, py.None()).into_pyobject(py),
+            Note::Healed { branch } => ("healed", branch).into_pyobject(py),
+            Note::LeaseOverrun { overrun, ttl } => {
+                ("lease_overrun", *overrun, *ttl).into_pyobject(py)
+            }
         }
     }
 

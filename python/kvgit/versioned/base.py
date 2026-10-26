@@ -191,43 +191,6 @@ class VersionedBase(ABC):
         """Read HEAD directly from storage (reflects other writers)."""
 
     @abstractmethod
-    def _snapshot_state(self) -> tuple:
-        """Capture in-memory state before a commit attempt."""
-
-    @abstractmethod
-    def _restore_state(self, saved: tuple) -> None:
-        """Restore in-memory state after a failed commit attempt."""
-
-    def _roll_back_attempt(self) -> None:  # noqa: B027 - optional hook
-        """Restore the state an attempt opened by ``_snapshot_state``
-        started from, if one is still open: the call running it raised."""
-
-    def _end_attempt(self) -> None:  # noqa: B027 - optional hook
-        """Forget the open attempt, if any: the call running it is over."""
-
-    @abstractmethod
-    def _create_commit(
-        self,
-        updates: dict[str, bytes] | None = None,
-        removals: set[str] | None = None,
-        *,
-        info: dict | None = None,
-        chunks: dict[str, bytes] | None = None,
-        chunk_refs: dict[str, list[str]] | None = None,
-    ) -> str:
-        """Create a single-parent commit with the given changes.
-
-        Must update ``self._commit_keys`` and ``self._current_commit``.
-        ``chunks`` / ``chunk_refs`` are the optional content-addressed
-        chunks referenced by encoded blobs; backends that don't
-        support them should ignore.
-        """
-
-    @abstractmethod
-    def _cas_head(self, expected: str, new_head: str) -> bool:
-        """Atomically advance branch HEAD from expected to new_head."""
-
-    @abstractmethod
     def _changes(self, commit_a: str | None, commit_b: str) -> dict[str, Change]:
         """Each key whose value differs from commit ``a`` to ``b``; a
         ``None`` or missing ``a`` reads as empty."""

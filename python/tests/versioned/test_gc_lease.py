@@ -24,7 +24,7 @@ import threading
 import time
 
 import pytest
-from support import fork, worktree
+from support import fork, hold_lease, release_lease, worktree
 
 from kvgit import ConcurrencyError, GcBusy, MergeConflict
 from kvgit.encoding import dumps, loads
@@ -41,12 +41,8 @@ from kvgit.versioned.kv import (
     IN_FLIGHT_KEY,
     STORAGE_VERSION_KEY,
     VersionedKV,
-    _acquire_gc_lease,
-    _lease_expiry,
     _load_root,
-    _release_gc_lease,
     _resolve_head,
-    _wait_for_gc,
     clean_orphans,
     deep_clean,
 )
@@ -58,14 +54,16 @@ from .test_gc_concurrency import (
     chunk_keys,
     chunky_decoder,
     chunky_encoder,
-    in_a_thread,
     missing_nodes,
     node_hashes,
 )
 
 
 def lease_is_live(store) -> bool:
-    return _lease_expiry(store.get(GC_LEASE_KEY)) > time.time()
+    raw = store.get(GC_LEASE_KEY)
+    record = loads(raw) if raw is not None else None
+    expires = record.get("expires") if isinstance(record, dict) else None
+    return isinstance(expires, (int, float)) and expires > time.time()
 
 
 class LeaseHookStore(Memory):
@@ -85,10 +83,20 @@ class LeaseHookStore(Memory):
 
     def cas(self, key: str, value: bytes, expected: bytes | None) -> bool:
         won = super().cas(key, value, expected)
-        if won and key == GC_LEASE_KEY and self._on_acquire is not None:
+        if won and key == GC_LEASE_KEY:
+            self._acquired()
+        return won
+
+    def cas_many(self, expected, writes, removes=()):
+        won = super().cas_many(expected, writes, removes)
+        if won and GC_LEASE_KEY in writes:
+            self._acquired()
+        return won
+
+    def _acquired(self) -> None:
+        if self._on_acquire is not None:
             fn, self._on_acquire = self._on_acquire, None
             fn()
-        return won
 
 
 class CountingMemory(Memory):
@@ -188,7 +196,7 @@ class TestWritersUnderTheLease:
         s["seed"] = 1
         s.commit()
 
-        ours, _, expires = _acquire_gc_lease(store, 60.0)
+        ours = hold_lease(store, 60.0)
         wrote = threading.Event()
 
         def writer():
@@ -201,7 +209,7 @@ class TestWritersUnderTheLease:
         writer_thread.start()
         try:
             assert not wrote.wait(0.3), "a writer wrote while the lease was live"
-            _release_gc_lease(store, ours, expires, 60.0)
+            release_lease(store, ours)
             assert wrote.wait(10), "a writer did not proceed after the release"
         finally:
             writer_thread.join(timeout=10)
@@ -211,16 +219,13 @@ class TestWritersUnderTheLease:
     def test_a_writer_does_not_wait_past_the_leases_expiry(self):
         """A holder that dies mid-sweep blocks writers for its term only."""
         store = Memory()
-        _acquire_gc_lease(store, 0.2)  # never released
+        s = worktree(store)
+        hold_lease(store, 0.2)  # never released
+        s["late"] = 1
         started = time.monotonic()
-        _wait_for_gc(store)
+        s.commit()
         waited = time.monotonic() - started
         assert 0.1 < waited < 5.0, f"waited {waited:.2f}s for a 0.2s lease"
-
-    def test_no_lease_costs_one_read(self):
-        store = CountingMemory()
-        _wait_for_gc(store)
-        assert store.gets == 1
 
 
 class TestLeaseArithmetic:
@@ -237,7 +242,7 @@ class TestLeaseArithmetic:
 
     def test_a_second_deep_clean_is_refused(self):
         store = Memory()
-        ours, _, _ = _acquire_gc_lease(store, 60.0)
+        ours = hold_lease(store, 60.0)
         with pytest.raises(GcBusy):
             deep_clean(store, min_age=0)
         assert store.get(GC_LEASE_KEY) == ours, (
@@ -267,15 +272,17 @@ class TestLeaseArithmetic:
         # The real proof it was released: the next call can take it.
         deep_clean(store, min_age=0)
 
-    def test_the_lease_is_released_when_the_sweep_raises(self, monkeypatch):
-        store = Memory()
+    def test_the_lease_is_released_when_the_sweep_raises(self):
+        class FailingScan(Memory):
+            def keys(self, prefix=""):
+                if prefix == "__inflight__":
+                    raise RuntimeError("sweep exploded")
+                return super().keys(prefix)
 
-        def boom(*args, **kwargs):
-            raise RuntimeError("sweep exploded")
-
-        monkeypatch.setattr(kv_module, "_sweep", boom)
+        store = FailingScan()
         with pytest.raises(RuntimeError, match="sweep exploded"):
             deep_clean(store, min_age=0)
+        assert store.get(GC_LEASE_KEY) is not None
         assert not lease_is_live(store)
 
     def test_an_overrun_lease_is_reported_not_extended(self, caplog):
@@ -300,7 +307,7 @@ class TestLeaseArithmetic:
         """``clean_orphans`` runs inside ``delete_branch``, so meeting
         another sweep it waits rather than failing the delete."""
         store = Memory()
-        ours, _, expires = _acquire_gc_lease(store, 60.0)
+        ours = hold_lease(store, 60.0)
         done = threading.Event()
         sweeper = threading.Thread(
             target=lambda: (clean_orphans(store, min_age=0), done.set())
@@ -308,7 +315,7 @@ class TestLeaseArithmetic:
         sweeper.start()
         try:
             assert not done.wait(0.3), "swept while another sweep held the lease"
-            _release_gc_lease(store, ours, expires, 60.0)
+            release_lease(store, ours)
             assert done.wait(10), "never swept after the lease was released"
         finally:
             sweeper.join(timeout=10)
@@ -509,20 +516,32 @@ class TestInFlightMarkers:
         """A writer that died before publishing leaves a marker that
         protects its commit only until it lapses; the next sweep then
         takes both."""
-        store = Memory()
+        store = PausingMemory()
         worktree(store).commit()
+        reached, release = threading.Event(), threading.Event()
         dead = VersionedKV(store)
-        dead._create_commit({"k": b"never published"})
-        orphan = dead.current_commit
-        marker = IN_FLIGHT_KEY % orphan
+        store.pause_after_batch(reached, release)
+        writer = threading.Thread(
+            target=quietly(dead.commit, {"k": b"never published"})
+        )
+        writer.start()
+        try:
+            assert reached.wait(5), "the writer never wrote its batch"
+            [marker] = list(store.keys("__inflight__"))
+            orphan = marker[len("__inflight__") :]
 
-        clean_orphans(store, min_age=0)
-        assert store.get(COMMIT_ROOT % orphan) is not None, "a live marker was ignored"
+            clean_orphans(store, min_age=0)
+            assert store.get(COMMIT_ROOT % orphan) is not None, (
+                "a live marker was ignored"
+            )
 
-        store.set(marker, dumps(time.time() - 1))
-        clean_orphans(store, min_age=0)
-        assert store.get(COMMIT_ROOT % orphan) is None
-        assert store.get(marker) is None
+            store.set(marker, dumps(time.time() - 1))
+            clean_orphans(store, min_age=0)
+            assert store.get(COMMIT_ROOT % orphan) is None
+            assert store.get(marker) is None
+        finally:
+            release.set()
+            writer.join(timeout=10)
 
 
 class LapsingMemory(Memory):
@@ -559,63 +578,97 @@ class TestALapsedMarker:
         assert store.get(COMMIT_ROOT % head) is not None
 
 
-class SlowSweepStore(ScanHookStore):
-    """Scan-hook store that dawdles before it deletes, so a writer
-    started from a scan seam reliably acts before the sweep's removals."""
+class PausingScanStore(PausingMemory, ScanHookStore):
+    """A pausing store with scan seams: a writer held after its batch,
+    released from a point in a sweep's scans."""
 
-    def remove_many(self, *args) -> None:
-        time.sleep(0.2)
-        super().remove_many(*args)
+
+class ThreadClock:
+    """The ``time`` module, with one named thread's clock behind."""
+
+    def __init__(self, thread: str, behind: float) -> None:
+        self._thread = thread
+        self._behind = behind
+
+    def time(self) -> float:
+        now = time.time()
+        if threading.current_thread().name == self._thread:
+            return now - self._behind
+        return now
+
+    def sleep(self, seconds: float) -> None:
+        time.sleep(seconds)
+
+
+def quietly(fn, *args):
+    """``fn(*args)`` for a thread, its failure expected and dropped: a
+    writer the test leaves to lose."""
+
+    def run():
+        try:
+            fn(*args)
+        except Exception:  # noqa: BLE001 — the loss is the point
+            pass
+
+    return run
 
 
 class TestPublishingUnderASweep:
     def test_a_publish_waits_for_a_running_sweep(self):
-        store = Memory()
+        store = PausingMemory()
         v = VersionedKV(store)
         v.commit({"base": b"1"})
-        base = v.current_commit
-        v._create_commit({"late": b"written before the sweep"})
-        commit = v.current_commit
-
-        ours, _, expires = _acquire_gc_lease(store, 60.0)
+        reached, release = threading.Event(), threading.Event()
+        store.pause_after_batch(reached, release)
         done = threading.Event()
+        landed: dict[str, str | None] = {}
         publisher = threading.Thread(
-            target=lambda: (v._cas_head(base, commit), done.set())
+            target=lambda: (
+                landed.update(commit=v.commit({"late": b"before the sweep"}).commit),
+                done.set(),
+            )
         )
         publisher.start()
         try:
+            assert reached.wait(5), "the writer never wrote its batch"
+            ours = hold_lease(store, 60.0)
+            release.set()
             assert not done.wait(0.3), "published while a sweep held the lease"
-            _release_gc_lease(store, ours, expires, 60.0)
+            release_lease(store, ours)
             assert done.wait(10), "never published after the release"
         finally:
+            release.set()
             publisher.join(timeout=10)
-        assert _resolve_head(store, "main") == commit
+        assert _resolve_head(store, "main") == landed["commit"]
 
     def test_a_lapsed_marker_cannot_publish_between_a_sweeps_scans_and_its_removals(
-        self,
+        self, monkeypatch
     ):
         """A sweep reads a lapsed marker as stale and the old HEAD as the
         branch's root; a publish landing after those reads and before the
         sweep deletes would install a head over a commit about to go."""
-        store = SlowSweepStore()
+        store = PausingScanStore()
         v = VersionedKV(store)
         v.commit({"base": b"1"})
         base = v.current_commit
-        v._create_commit({"late": b"a very slow writer"})
-        commit = v.current_commit
-        marker = dumps(time.time() - 1)
-        store.set(IN_FLIGHT_KEY % commit, marker)
-        v._in_flight[commit] = marker
-
-        published: dict[str, bool] = {}
-        start, publisher = in_a_thread(
-            lambda: published.update(ok=v._cas_head(base, commit))
+        # The writer's clock runs behind, so the marker its batch writes
+        # has lapsed by the sweep's: a writer slower than its marker.
+        monkeypatch.setattr(kv_module, "time", ThreadClock("slow writer", 700.0))
+        reached, release = threading.Event(), threading.Event()
+        store.pause_after_batch(reached, release)
+        writer = threading.Thread(
+            target=quietly(v.commit, {"late": b"a very slow writer"}),
+            name="slow writer",
         )
-        store.arm(AFTER_COMMIT_ROOT_SCAN, start)
-        clean_orphans(store, min_age=0)
-        publisher.join(timeout=10)
+        writer.start()
+        try:
+            assert reached.wait(5), "the writer never wrote its batch"
+            store.arm(AFTER_COMMIT_ROOT_SCAN, release.set)
+            clean_orphans(store, min_age=0)
+        finally:
+            release.set()
+            writer.join(timeout=10)
 
-        assert published == {"ok": False}
         assert loads(store.get(BRANCH_HEAD % "main")) == base
         assert _resolve_head(store, "main") == base
 
@@ -625,12 +678,12 @@ class TestTagTimes:
         store = Memory()
         v = VersionedKV(store)
         v.commit({"k": b"v"})
-        ours, _, expires = _acquire_gc_lease(store, 60.0)
+        ours = hold_lease(store, 60.0)
         tagger = threading.Thread(target=lambda: v.tag("v1"))
         tagger.start()
         time.sleep(0.3)
         released_at = time.time()
-        _release_gc_lease(store, ours, expires, 60.0)
+        release_lease(store, ours)
         tagger.join(timeout=10)
         assert v.tag_info("v1").time >= released_at
 

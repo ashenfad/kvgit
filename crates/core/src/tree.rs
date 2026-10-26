@@ -469,8 +469,20 @@ pub async fn walk(
     root: String,
     skip: impl Fn(&str) -> bool,
 ) -> Result<(Vec<(String, Vec<u8>)>, Vec<String>), TreeError> {
+    walk_many(io, shape, vec![root], skip).await
+}
+
+/// [`walk`] over several trees at once: every level of all of them in
+/// one read, each node once however many trees share it. A key two
+/// trees hold is listed for each.
+pub async fn walk_many(
+    io: Io,
+    shape: Shape,
+    roots: Vec<String>,
+    skip: impl Fn(&str) -> bool,
+) -> Result<(Vec<(String, Vec<u8>)>, Vec<String>), TreeError> {
     let mut items = Vec::new();
-    let visited = walk_leaves(io, shape, root, skip, |k, v| {
+    let visited = walk_leaves(io, shape, roots, skip, |k, v| {
         items.push((k.to_string(), decode_value(k, v)?));
         Ok(())
     })
@@ -484,7 +496,7 @@ pub async fn keys(io: Io, shape: Shape, root: String) -> Result<Vec<String>, Tre
     walk_leaves(
         io,
         shape,
-        root,
+        vec![root],
         |_| false,
         |k, _| {
             keys.push(k.to_string());
@@ -500,19 +512,19 @@ pub async fn keys(io: Io, shape: Shape, root: String) -> Result<Vec<String>, Tre
 async fn walk_leaves(
     io: Io,
     shape: Shape,
-    root: String,
+    roots: Vec<String>,
     skip: impl Fn(&str) -> bool,
     mut each: impl FnMut(&str, &str) -> Result<(), TreeError>,
 ) -> Result<Vec<String>, TreeError> {
     let mut nodes = Nodes::new(io, shape, HashMap::new())?;
     let mut visited = Vec::new();
-    let mut level = if root == EMPTY_HASH.as_str() || skip(&root) {
-        vec![]
-    } else {
-        vec![root]
-    };
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut level = roots;
     while !level.is_empty() {
-        let wanted: Vec<String> = level.iter().filter(|h| !skip(h)).cloned().collect();
+        let wanted: Vec<String> = level
+            .into_iter()
+            .filter(|h| h != EMPTY_HASH.as_str() && !skip(h) && seen.insert(h.clone()))
+            .collect();
         nodes.fetch(&wanted).await?;
         let mut next = Vec::new();
         for hash in wanted {

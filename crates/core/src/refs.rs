@@ -376,3 +376,36 @@ async fn present(io: &Io, commit: String) -> Result<Resolved, Error> {
         None => Err(Error::UnknownCommit { commit }),
     }
 }
+
+/// Move branch `name` to commit `target`, whatever it held, which
+/// becomes its backup in the same write; `false` if `target` isn't in
+/// the store. That the commit is here and the head names it are decided
+/// against one lease record, as in [`create_branch`]. A writer moving
+/// the head in between doesn't stop the reset, which tries again from
+/// the new head; a deleted branch isn't made again.
+pub async fn reset_branch(io: &Io, name: &str, target: &str) -> Result<bool, Error> {
+    check_branch_name(name)?;
+    let head = branch_head(name);
+    loop {
+        let lease = wait_for_gc(io, None).await?;
+        if io.get_one(&commit_root(target)).await?.is_none() {
+            return Ok(false);
+        }
+        let Some(current) = io.get_one(&head).await? else {
+            return Err(Error::UnknownBranch {
+                branch: name.to_string(),
+            });
+        };
+        let cas = Cas {
+            expect: vec![(head.clone(), Some(current.clone()))],
+            writes: vec![
+                (head.clone(), Write::Bytes(dumps_str(target))),
+                (branch_head_prev(name), Write::Bytes(current)),
+            ],
+            removes: vec![],
+        };
+        if try_land(io, lease, cas).await? == Some(true) {
+            return Ok(true);
+        }
+    }
+}
