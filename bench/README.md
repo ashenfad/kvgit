@@ -3,8 +3,8 @@
 The same workloads in both packages, through their public APIs, on the
 in-memory backend. Numbers from the code before the core are the
 baseline (`baseline/`) the core is measured against; the gate after the
-kernel stage asks that nothing that matters gets slower. `kernel/`
-holds the numbers once both packages ran the kernel.
+kernel stage asks that nothing that matters gets slower. `kernel/`,
+`protocol/` and `engine/` hold the numbers after each stage since.
 
 The in-memory backend keeps storage out of the numbers, so they show
 what the engine costs: encoding, hashing, building and walking the
@@ -45,9 +45,12 @@ bytes in 100 directories.
 | `world.merge` | A three-way merge of a branch where each side changed 100 files. |
 | `world.gc` | A sweep reclaiming a deleted branch's 20 commits. |
 
-TypeScript also runs the reads with `lazy` worktrees (`world.lazy.*`),
-which hold the keyset's root and read the tree through a node cache:
-the worktree model the core proposes, against the materialized one.
+Up to the write-protocol stage, TypeScript also ran the reads with
+`lazy` worktrees (`world.lazy.*`), which hold the keyset's root and
+read the tree through a node cache: the worktree model the core
+proposed, against the materialized one. Every worktree reads that way
+since the engine stage, and `lazy` does nothing, so the runner no
+longer makes the second pass.
 
 **kvsql's shape:** a changeset log on a branch whose tree holds about a
 hundred keys, beside a database snapshot in 8 MB chunks.
@@ -248,3 +251,96 @@ crosses the boundary as JSON.
 
 The core now carries the commit protocol, merge resolution, history
 and the text merge.
+
+## The engine
+
+Recorded with the engine stage's last PR: both packages run entirely
+on the core, refs, history, merges, GC and the content cache
+included, and worktrees and snapshots hold a keyset's root and the key
+index its first listing builds, where they used to load the keyset
+(`bench/engine/`). Each build was run twice, back to back with the
+write-protocol stage's, and each column is the faster of its two runs.
+TypeScript's `lazy` option does nothing now, so the runner no longer
+makes the `world.lazy.*` pass.
+
+**Python** (`engine/python.json`):
+
+| workload | before ms | after ms | after ÷ before |
+|---|---|---|---|
+| `world.bulk_import` | 2,033.174 | 2,091.057 | 1.03× |
+| `world.open` | 235.382 | 0.024 | 0.00× |
+| `world.keys_cold` | 239.444 | 139.687 | 0.58× |
+| `world.keys_warm` | 3.144 | 10.007 | 3.18× |
+| `world.list_dir` | 6.319 | 14.514 | 2.30× |
+| `world.read_all` | 426.436 | 888.533 | 2.08× |
+| `world.reads_10k` | 240.452 | 71.458 | 0.30× |
+| `world.commit_one` | 0.067 | 0.056 | 0.84× |
+| `world.commit_1k` | 30.720 | 27.071 | 0.88× |
+| `world.merge` | 8.644 | 5.116 | 0.59× |
+| `world.gc` | 604.344 | 327.867 | 0.54× |
+| `kvsql.snapshot` | 22.536 | 22.778 | 1.01× |
+| `kvsql.append` | 0.041 | 0.030 | 0.73× |
+| `kvsql.open` | 0.173 | 0.021 | 0.12× |
+| `kvsql.replay` | 82.389 | 68.335 | 0.83× |
+| `kvsql.merge` | 0.144 | 0.062 | 0.43× |
+| `kvsql.gc` | 465.033 | 54.626 | 0.12× |
+
+**TypeScript** (`engine/ts.json`):
+
+| workload | before ms | after ms | after ÷ before |
+|---|---|---|---|
+| `world.bulk_import` | 5,125.990 | 5,239.807 | 1.02× |
+| `world.open` | 295.470 | 0.109 | 0.00× |
+| `world.keys_cold` | 353.579 | 188.933 | 0.53× |
+| `world.keys_warm` | 36.785 | 35.569 | 0.97× |
+| `world.list_dir` | 38.301 | 39.938 | 1.04× |
+| `world.read_all` | 496.542 | 1,235.827 | 2.49× |
+| `world.reads_10k` | 302.784 | 16.800 | 0.06× |
+| `world.commit_one` | 0.159 | 0.161 | 1.01× |
+| `world.commit_1k` | 66.448 | 74.865 | 1.13× |
+| `world.merge` | 16.691 | 12.720 | 0.76× |
+| `world.gc` | 471.084 | 540.592 | 1.15× |
+| `kvsql.snapshot` | 31.773 | 32.804 | 1.03× |
+| `kvsql.append` | 0.098 | 0.090 | 0.92× |
+| `kvsql.open` | 0.224 | 0.035 | 0.16× |
+| `kvsql.replay` | 84.921 | 94.453 | 1.11× |
+| `kvsql.merge` | 0.230 | 0.193 | 0.84× |
+| `kvsql.gc` | 87.916 | 97.516 | 1.11× |
+
+What the engine in the core buys:
+
+- **Opening is free.** A worktree reads its head's root and nothing
+  under it: the world's 100,000 files open in hundredths of a
+  millisecond where they took a quarter of a second, and kvsql's log
+  opens five to eight times as fast.
+- **Reads of a working set** are three times as fast in Python and
+  eighteen times in TypeScript, opening included, and the first listing
+  takes half as long in both.
+- **Python's merges and sweeps** take about half as long, and kvsql's
+  sweep of a 3,000-commit log is eight times as fast.
+
+What it costs:
+
+- **Reading every file of the world** takes twice as long in Python
+  and two and a half times in TypeScript. Each read walks the tree
+  through the content cache, where a loaded worktree held every entry.
+  TypeScript's repositories on one store share a cache, and the
+  world's tree, about 43 MB decoded, doesn't fit the default 32 MB: a
+  full pass pushes out nodes it is about to read. With `cacheBytes` at
+  64 MB it reads every file about a quarter faster. Trees a few times
+  smaller than this one fit the default.
+- **Python lists an open worktree three times slower** (3 ms to 10 ms
+  over 100,000 keys, and one directory's files twice as slowly), since
+  every listing brings the keys across from the core's index, where
+  the loaded worktree handed back a view of a dictionary it held.
+- **TypeScript's bulk commits and sweeps** take 10 to 15% longer, and
+  kvsql's replay of 3,000 small reads a tenth longer: each operation pays a fixed
+  cost crossing into wasm, and requests cross it as JSON.
+
+| | before | after |
+|---|---|---|
+| the wasm, bytes | 471,136 | 648,654 |
+| the wasm, gzipped | 163 KB | 221 KB |
+
+Both measured the same way (`gzip -9`); the core now also carries refs,
+history, merges, GC, the content cache and the worktree model.
