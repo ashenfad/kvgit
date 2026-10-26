@@ -1,6 +1,5 @@
 {
   "description": "With both HEAD and its backup unusable, the commit-scan recoverer guesses the branch's head from a scan of every commit, and repair_head makes the guess durable.",
-  "only": ["python"],
   "clock": 1700000900.5,
   "steps": [
     { "op": "open", "as": "r" },

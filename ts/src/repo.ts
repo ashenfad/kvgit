@@ -12,13 +12,7 @@
 
 import { type Codec, type CodecName, bytesCodec, resolveCodec } from './codec'
 import { core } from './core'
-import {
-  BranchExistsError,
-  CorruptHeadError,
-  UnknownBranchError,
-  UnknownCommitError,
-  UnknownTagError,
-} from './errors'
+import { BranchExistsError, UnknownCommitError, UnknownTagError } from './errors'
 import { NodeCache } from './hamt'
 import { Keyset } from './keyset'
 import type { CommitInfo, DiffResult, KVStore } from './types'
@@ -31,13 +25,12 @@ import {
   createBranchHead,
   deleteBranchHead,
   gcStore,
+  headOf,
   loadParents,
   mergeBase,
   repairHead,
-  resolveHead,
 } from './versioned/kv'
 import {
-  BRANCH_HEAD,
   COMMIT_ROOT,
   COMMIT_TIME,
   INFO_KEY,
@@ -185,7 +178,7 @@ export class Repo<V = Uint8Array> {
     name: string,
     opts: { create?: boolean; lazy?: boolean | LazyKeysetOptions } = {},
   ): Promise<Worktree<V>> {
-    rejectReservedBranch(name)
+    await rejectReservedBranch(name)
     if (opts.create === true && !(await this.branches.has(name))) {
       try {
         await createBranchHead(this.store, name, ROOT_COMMIT, this.now)
@@ -216,7 +209,7 @@ export class Repo<V = Uint8Array> {
    *   recoverable.
    */
   async repairHead(name: string): Promise<string | null> {
-    rejectReservedBranch(name)
+    await rejectReservedBranch(name)
     return repairHead(this.store, name, {
       ...(this.recover !== undefined && { recoverFromCorruptHead: this.recover }),
     })
@@ -368,14 +361,7 @@ export class Branches {
    * @throws CorruptHeadError if its HEAD is damaged beyond recovery.
    */
   async get(name: string): Promise<string> {
-    rejectReservedBranch(name)
-    const { store, recover } = this.repo
-    const commit = await resolveHead(store, name, {
-      ...(recover !== undefined && { recoverFromCorruptHead: recover }),
-    })
-    if (commit !== null) return commit
-    if ((await store.get(BRANCH_HEAD(name))) !== null) throw new CorruptHeadError(name)
-    throw new UnknownBranchError(name)
+    return headOf(this.repo.store, name, this.repo.recover)
   }
 
   /** Whether the branch exists. Never writes; a damaged HEAD counts. */

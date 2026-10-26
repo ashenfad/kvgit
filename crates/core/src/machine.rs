@@ -38,6 +38,9 @@ pub enum Request {
     /// The values of these keys; a key the store lacks is left out of
     /// the reply.
     Get(Vec<String>),
+    /// Every stored key starting with this prefix, in any order.
+    /// Answered [`Reply::Keys`].
+    Scan(String),
     /// One atomic write, landing only if every expected key holds what
     /// is expected (`None`: absent). Answered [`Reply::Landed`].
     Cas(Cas),
@@ -77,6 +80,7 @@ pub enum Write {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Reply {
     Values(HashMap<String, Vec<u8>>),
+    Keys(Vec<String>),
     Landed(bool),
     Waited,
     Merged(Vec<MergeAnswer>),
@@ -127,6 +131,22 @@ impl Io {
     /// The stored value of one key.
     pub async fn get_one(&self, key: &str) -> Result<Option<Vec<u8>>, HostFailed> {
         Ok(self.get(vec![key.to_string()]).await?.remove(key))
+    }
+
+    /// Every stored key starting with `prefix`, sorted.
+    pub async fn scan(&self, prefix: &str) -> Result<Vec<String>, HostFailed> {
+        match self.ask(Request::Scan(prefix.to_string())).await {
+            Reply::Keys(mut keys) => {
+                // A host's listing may include keys outside the prefix
+                // (a backend that matches loosely) or repeat one.
+                keys.retain(|k| k.starts_with(prefix));
+                keys.sort();
+                keys.dedup();
+                Ok(keys)
+            }
+            Reply::Failed => Err(HostFailed),
+            other => panic!("a scan answered with {other:?}"),
+        }
     }
 
     /// Whether the batch landed.

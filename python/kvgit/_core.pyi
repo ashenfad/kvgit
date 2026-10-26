@@ -86,13 +86,21 @@ def text_merge(
 def check_text_labels(ours_label: str, theirs_label: str) -> None:
     """Raise ``ValueError`` if either label holds a line break."""
 
-class CommitOp:
-    """A commit in progress. ``resume`` returns the next request as a
-    tuple, to be answered by the next call, until it returns
-    ``("done", outcome, notes)``; see ``kvgit.versioned._drive``."""
+def check_branch_name(name: str) -> None:
+    """Raise ``ValueError`` for a name that can't be a branch."""
 
-    def __init__(
-        self,
+def check_tag_name(name: str) -> None:
+    """Raise ``ValueError`` for a name that can't be a tag."""
+
+class Op:
+    """An operation of the core in progress, started by name with its
+    arguments as a dict, or by ``Op.commit``. ``resume`` returns the next
+    request as a tuple, to be answered by the next call, until it
+    returns ``("done", outcome, notes)``; see ``kvgit.versioned._drive``."""
+
+    def __init__(self, name: str, args: dict[str, Any]) -> None: ...
+    @staticmethod
+    def commit(
         branch: str,
         base: str,
         current: str,
@@ -109,7 +117,7 @@ class CommitOp:
         stamped: bool,
         roots: list[tuple[str, str]],
         generations: list[tuple[str, int]],
-    ) -> None: ...
+    ) -> Op: ...
     def resume(
         self, wall: float, reply: Any = None, failed: bool = False
     ) -> tuple[Any, ...]: ...

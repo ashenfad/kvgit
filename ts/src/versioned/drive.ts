@@ -9,12 +9,24 @@
  * @internal
  */
 
-import type { CommitOp } from '../../wasm/kvgit_wasm.js'
-import { BranchMovedError, ConcurrencyError, MergeConflict, UnknownBranchError } from '../errors'
+import type { Op } from '../../wasm/kvgit_wasm.js'
+import { core } from '../core'
+import {
+  BranchExistsError,
+  BranchMovedError,
+  ConcurrencyError,
+  CorruptHeadError,
+  MergeConflict,
+  TagExistsError,
+  UnknownBranchError,
+  UnknownCommitError,
+  UnknownTagError,
+} from '../errors'
 import { pack, unpack } from '../hamt'
 import { CantMark } from '../merges'
+import { pyDumps } from '../pyjson'
 import { type BytesMergeFn, type KVStore, MergeChoice } from '../types'
-import { blobKey } from './layout'
+import { blobKey, loadsInfo } from './layout'
 import { leaseEnv } from './lease'
 
 /** What a landed (or abandoned) commit reports. */
@@ -39,6 +51,8 @@ interface Failure {
   branch?: string
   base?: string
   head?: string
+  tag?: string
+  commit?: string
   keys?: string[]
   failures?: Array<[string, string]>
 }
@@ -53,16 +67,35 @@ export interface DriveEnv {
   store: KVStore
   /** The bytes the operation writes by key without reading them;
    *  values merge functions make join it. */
-  held: Map<string, Uint8Array>
+  held?: Map<string, Uint8Array>
   /** The functions the operation names by number. */
-  mergeFns: readonly BytesMergeFn[]
+  mergeFns?: readonly BytesMergeFn[]
   recover?: ((store: KVStore, branch: string) => Promise<string | null>) | undefined
-  /** The commit clock, in seconds, read once for each commit made. */
+  /** The clock commit and tag times are read from, in seconds. */
   now: () => number
 }
 
-/** Perform `op`'s requests until it is done, and return its outcome. */
-export async function driveCommit(op: CommitOp, env: DriveEnv): Promise<Committed> {
+/** Run the core's operation `name` on `args` against `env.store`, and
+ *  return what it answers. */
+export async function callCore(name: string, args: object, env: DriveEnv): Promise<unknown> {
+  const c = await core()
+  const op = new c.Op(name, pyDumps(args))
+  try {
+    return await drive(op, env, (text) => loadsInfo(new TextEncoder().encode(text)))
+  } finally {
+    op.free()
+  }
+}
+
+/** Perform a commit's requests until it is done, and return what it
+ *  committed. */
+export async function driveCommit(op: Op, env: DriveEnv): Promise<Committed> {
+  return (await drive(op, env, JSON.parse)) as Committed
+}
+
+/** Perform `op`'s requests until it is done, and return its outcome,
+ *  decoded by `parse`. */
+async function drive(op: Op, env: DriveEnv, parse: (text: string) => unknown): Promise<unknown> {
   const causes = new Map<string, unknown>()
   let raised: { error: unknown } | null = null
   let kind = op.start(leaseEnv.clock())
@@ -76,27 +109,34 @@ export async function driveCommit(op: CommitOp, env: DriveEnv): Promise<Committe
     }
     kind = next(leaseEnv.clock())
   }
-  const outcome = JSON.parse(op.outcome()) as { ok?: Committed; error?: Failure; notes: Note[] }
+  const outcome = parse(op.outcome()) as { ok?: unknown; error?: Failure; notes: Note[] }
   for (const note of outcome.notes) warn(note)
-  if (outcome.ok !== undefined) return outcome.ok
+  if (outcome.error === undefined) return outcome.ok
   if (raised !== null) throw raised.error
-  throw toError(outcome.error as Failure, causes)
+  throw toError(outcome.error, causes)
 }
 
 /** Perform one request; the reply, to send with the clock. */
 async function perform(
-  op: CommitOp,
+  op: Op,
   kind: string,
   env: DriveEnv,
   causes: Map<string, unknown>,
 ): Promise<(wall: number) => string> {
-  const { store, held } = env
+  const store = env.store
+  const held = env.held ?? new Map<string, Uint8Array>()
   switch (kind) {
     case 'get': {
       const found = await store.getMany(JSON.parse(op.requestJson()) as string[])
       const [data, lengths] = pack(found.values())
       const keys = JSON.stringify([...found.keys()])
       return (wall) => op.replyValues(wall, keys, data, lengths)
+    }
+    case 'scan': {
+      const keys: string[] = []
+      for await (const key of store.keys(JSON.parse(op.requestJson()) as string)) keys.push(key)
+      const text = JSON.stringify(keys)
+      return (wall) => op.replyKeys(wall, text)
     }
     case 'cas': {
       const cas = JSON.parse(op.requestJson()) as {
@@ -159,7 +199,8 @@ async function merge(
     const [old, ours, theirs] = sides.map((b) => (b === null ? null : (values.get(b) ?? null)))
     let result: Uint8Array | MergeChoice
     try {
-      result = (env.mergeFns[rule] as BytesMergeFn)(old ?? null, ours ?? null, theirs ?? null)
+      const fn = env.mergeFns?.[rule] as BytesMergeFn
+      result = fn(old ?? null, ours ?? null, theirs ?? null)
     } catch (e) {
       causes.set(key, e)
       answers.push(['failed', e instanceof Error ? e.message : String(e)])
@@ -169,7 +210,7 @@ async function merge(
       answers.push(result === MergeChoice.THEIRS ? 'theirs' : 'ours')
     } else {
       const blob = await blobKey(result)
-      env.held.set(blob, result)
+      env.held?.set(blob, result)
       answers.push(['value', blob, result.length])
     }
   }
@@ -182,6 +223,18 @@ function toError(f: Failure, causes: Map<string, unknown>): Error {
       return new BranchMovedError(f.branch as string, f.base as string, f.head as string)
     case 'unknown_branch':
       return new UnknownBranchError(f.branch as string)
+    case 'corrupt_head':
+      return new CorruptHeadError(f.branch as string)
+    case 'unknown_tag':
+      return new UnknownTagError(f.tag as string)
+    case 'unknown_commit':
+      return new UnknownCommitError(f.commit as string)
+    case 'branch_exists':
+      return new BranchExistsError(f.branch as string)
+    case 'tag_exists':
+      return new TagExistsError(f.tag as string)
+    case 'invalid':
+      return new RangeError(f.message)
     case 'concurrency':
       return new ConcurrencyError(f.message)
     case 'merge_conflict': {

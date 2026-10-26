@@ -380,7 +380,7 @@ export async function markSyncing(store: KVStore, branch: string): Promise<void>
  * @throws UnknownBranchError if there is no such branch.
  */
 export async function deleteBranchUnlessSynced(store: KVStore, branch: string): Promise<boolean> {
-  rejectReservedBranch(branch)
+  await rejectReservedBranch(branch)
   const head = BRANCH_HEAD(branch)
   for (;;) {
     const current = await store.get(head)

@@ -13,8 +13,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 
-mod commit;
-pub use commit::CommitOp;
+mod op;
+pub use op::Op;
 
 /// The version of the core, which is the version of the package.
 #[wasm_bindgen]
@@ -99,6 +99,22 @@ pub fn text_merge(
 #[wasm_bindgen(js_name = maxMarkBytes)]
 pub fn max_mark_bytes() -> usize {
     kvgit_core::text::MAX_MARK_BYTES
+}
+
+/// The reason `name` can't be a branch, or nothing if it can.
+#[wasm_bindgen(js_name = branchNameProblem)]
+pub fn branch_name_problem(name: &str) -> Option<String> {
+    kvgit_core::refs::check_branch_name(name)
+        .err()
+        .map(|e| e.to_string())
+}
+
+/// The reason `name` can't be a tag, or nothing if it can.
+#[wasm_bindgen(js_name = tagNameProblem)]
+pub fn tag_name_problem(name: &str) -> Option<String> {
+    kvgit_core::refs::check_tag_name(name)
+        .err()
+        .map(|e| e.to_string())
 }
 
 fn to_js(e: impl std::fmt::Display) -> JsError {

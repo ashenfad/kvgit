@@ -12,10 +12,15 @@ from collections.abc import Callable, Sequence
 from typing import Any
 
 from ..errors import (
+    BranchExistsError,
     BranchMovedError,
     ConcurrencyError,
+    CorruptHeadError,
     MergeConflict,
+    TagExistsError,
     UnknownBranchError,
+    UnknownCommitError,
+    UnknownTagError,
 )
 from ..kv.base import KVStore
 from .protocol import MergeChoice
@@ -37,18 +42,19 @@ def drive(
     op: Any,
     store: KVStore,
     *,
-    held: dict[str, bytes],
-    merge_fns: Sequence[Callable[..., Any]],
-    recoverer: Callable[[KVStore, str], Any] | None,
+    held: dict[str, bytes] | None = None,
+    merge_fns: Sequence[Callable[..., Any]] = (),
+    recoverer: Callable[[KVStore, str], Any] | None = None,
     clock: Callable[[], float],
     sleep: Callable[[float], None],
-) -> dict[str, Any]:
+) -> Any:
     """Perform `op`'s requests until it is done, and return its outcome.
 
     ``held`` holds the bytes the operation writes by key without
     reading them; values merge functions make join it. ``merge_fns`` are
     the functions the operation names by number.
     """
+    held = {} if held is None else held
     errors: dict[str, Exception] = {}
     raised: BaseException | None = None
     reply: Any = None
@@ -70,6 +76,8 @@ def drive(
         try:
             if kind == "get":
                 reply = dict(store.get_many(request[1]))
+            elif kind == "scan":
+                reply = list(store.keys(request[1]))
             elif kind == "cas":
                 _, expect, writes, removes = request
                 values = {k: held[k] if v is None else v for k, v in writes}
@@ -121,16 +129,25 @@ def _merge(
     return answers
 
 
+_ERRORS: dict[str, Callable[[str], Exception]] = {
+    "unknown_branch": UnknownBranchError,
+    "corrupt_head": CorruptHeadError,
+    "unknown_tag": UnknownTagError,
+    "unknown_commit": UnknownCommitError,
+    "branch_exists": BranchExistsError,
+    "tag_exists": TagExistsError,
+    "concurrency": ConcurrencyError,
+}
+
+
 def _error(
     kind: str, fields: dict[str, Any], errors: dict[str, Exception]
 ) -> Exception:
     """The exception the core's error `kind` is raised as."""
     if kind == "branch_moved":
         return BranchMovedError(fields["branch"], fields["base"], fields["head"])
-    if kind == "unknown_branch":
-        return UnknownBranchError(fields["message"])
-    if kind == "concurrency":
-        return ConcurrencyError(fields["message"])
+    if kind in _ERRORS:
+        return _ERRORS[kind](fields["message"])
     if kind == "merge_conflict":
         from ..merges import CantMark
 

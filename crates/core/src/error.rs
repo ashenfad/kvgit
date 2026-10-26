@@ -16,8 +16,26 @@ pub enum Error {
         base: String,
         head: String,
     },
-    /// The branch has no head: it was deleted, or never made.
+    /// No branch has this name.
     UnknownBranch { branch: String },
+    /// The branch a commit was made on has no head any more: it was
+    /// deleted while the commit was being made. The same kind as
+    /// [`Error::UnknownBranch`].
+    HeadGone { branch: String },
+    /// The branch's head and its backup are unusable, and no recoverer
+    /// named a commit.
+    CorruptHead { branch: String },
+    /// No tag has this name.
+    UnknownTag { tag: String },
+    /// No commit has this hash in the store.
+    UnknownCommit { commit: String },
+    /// A branch of this name exists.
+    BranchExists { branch: String },
+    /// A tag of this name exists.
+    TagExists { tag: String },
+    /// The caller asked for something that can't be: a name that can't
+    /// be a branch or a tag, arguments of the wrong shape.
+    Invalid(String),
     /// Another writer won a race this call can't merge past.
     Concurrency(String),
     /// Keys no rule resolved, sorted. A rule that failed on a key gives
@@ -32,9 +50,45 @@ pub enum Error {
 }
 
 impl Error {
-    pub fn unknown_branch(branch: &str) -> Error {
-        Error::UnknownBranch {
+    pub fn head_gone(branch: &str) -> Error {
+        Error::HeadGone {
             branch: branch.to_string(),
+        }
+    }
+}
+
+impl Error {
+    /// The kind's name, as hosts match on it.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Error::Host => "host",
+            Error::BranchMoved { .. } => "branch_moved",
+            Error::UnknownBranch { .. } | Error::HeadGone { .. } => "unknown_branch",
+            Error::CorruptHead { .. } => "corrupt_head",
+            Error::UnknownTag { .. } => "unknown_tag",
+            Error::UnknownCommit { .. } => "unknown_commit",
+            Error::BranchExists { .. } => "branch_exists",
+            Error::TagExists { .. } => "tag_exists",
+            Error::Concurrency(_) => "concurrency",
+            Error::MergeConflict { .. } => "merge_conflict",
+            Error::Malformed(_) => "malformed",
+            Error::Invalid(_) => "invalid",
+        }
+    }
+
+    /// The kind's fields besides its message, by name.
+    pub fn fields(&self) -> Vec<(&'static str, &str)> {
+        match self {
+            Error::BranchMoved { branch, base, head } => {
+                vec![("branch", branch), ("base", base), ("head", head)]
+            }
+            Error::UnknownBranch { branch }
+            | Error::HeadGone { branch }
+            | Error::CorruptHead { branch }
+            | Error::BranchExists { branch } => vec![("branch", branch)],
+            Error::UnknownTag { tag } | Error::TagExists { tag } => vec![("tag", tag)],
+            Error::UnknownCommit { commit } => vec![("commit", commit)],
+            _ => vec![],
         }
     }
 }
@@ -47,8 +101,18 @@ impl fmt::Display for Error {
                 f,
                 "Branch '{branch}' moved from {base} to {head}; nothing was committed"
             ),
-            Error::UnknownBranch { branch } => write!(f, "Branch '{branch}' has no HEAD"),
-            Error::Concurrency(message) | Error::Malformed(message) => f.write_str(message),
+            Error::UnknownBranch { branch } => write!(f, "Branch '{branch}' does not exist"),
+            Error::HeadGone { branch } => write!(f, "Branch '{branch}' has no HEAD"),
+            Error::CorruptHead { branch } => {
+                write!(f, "Branch '{branch}' HEAD is corrupt and unrecoverable")
+            }
+            Error::UnknownTag { tag } => write!(f, "Tag '{tag}' does not exist"),
+            Error::UnknownCommit { commit } => write!(f, "Commit '{commit}' does not exist"),
+            Error::BranchExists { branch } => write!(f, "Branch '{branch}' already exists"),
+            Error::TagExists { tag } => write!(f, "Tag '{tag}' already exists"),
+            Error::Concurrency(message) | Error::Malformed(message) | Error::Invalid(message) => {
+                f.write_str(message)
+            }
             Error::MergeConflict { keys, .. } => {
                 write!(f, "Merge conflict on keys: {}", keys.join(", "))
             }

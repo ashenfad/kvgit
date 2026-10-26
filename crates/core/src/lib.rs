@@ -13,6 +13,8 @@ pub mod layout;
 pub mod lease;
 pub mod machine;
 pub mod merge;
+pub mod ops;
+pub mod refs;
 pub mod store;
 pub mod text;
 pub mod tree;
