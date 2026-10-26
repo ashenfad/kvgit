@@ -502,10 +502,15 @@ impl<'a> Writer<'a> {
         )
         .await?;
         // Once landed, the nodes are stored like any other, and the
-        // memo, if there is one, holds them for the reads that follow.
-        let landed_nodes = shape.memo.as_ref().map(|_| updated.nodes.clone());
-        for (hash, bytes) in updated.nodes {
-            writes.insert(format!("{}{hash}", shape.prefix), Write::Bytes(bytes));
+        // shape's memo or the content cache holds them, decoded, for the
+        // reads that follow.
+        let mut landed_nodes = Vec::with_capacity(updated.nodes.len());
+        let mut landed_bytes = 0;
+        for ((hash, bytes), node) in updated.nodes.into_iter().zip(updated.decoded) {
+            let key = format!("{}{hash}", shape.prefix);
+            landed_bytes += key.len() + bytes.len();
+            landed_nodes.push((hash, key.clone(), node, bytes.len()));
+            writes.insert(key, Write::Bytes(bytes));
         }
         let parents: Vec<String> = parents.iter().map(|p| p.to_string()).collect();
         let gens_of_parents = self.parent_generations(&parents).await?;
@@ -538,11 +543,19 @@ impl<'a> Writer<'a> {
             self.stamped = true;
         }
         self.land(&hash, writes).await?;
-        if let (Some(memo), Some(nodes)) = (&shape.memo, landed_nodes) {
-            let mut memo = memo.borrow_mut();
-            for (node, bytes) in nodes {
-                memo.hold(&node, &bytes)?;
+        if let Some(memo) = &shape.memo {
+            let mut memo = memo.lock().unwrap();
+            for (hash, _, node, size) in landed_nodes {
+                memo.hold_decoded(&hash, node, size);
             }
+        } else if crate::cache::is_node(&shape.prefix) {
+            self.io.remember_landed_nodes(
+                landed_nodes
+                    .into_iter()
+                    .map(|(_, key, node, _)| (key, node))
+                    .collect(),
+                landed_bytes,
+            );
         }
         let generation = 1 + gens_of_parents.iter().max().copied().unwrap_or(0);
         self.roots.insert(hash.clone(), updated.root.clone());

@@ -192,7 +192,7 @@ def test_a_tag_on_a_swept_commit_reads_as_dangling():
 def test_the_budget_bounds_what_is_held():
     cache = ContentCache(max_bytes=4_000)
     for i in range(100):
-        cache.remember({f"kvgit:keyset:{i}": b"x" * 200})
+        cache.remember({f"__parent_commit__{i}": b"x" * 200})
     assert cache.size_bytes <= 4_000
     assert 0 < len(cache) < 100
 
@@ -200,12 +200,14 @@ def test_the_budget_bounds_what_is_held():
 def test_the_least_recently_used_goes_first():
     # Room for two of these three entries, not all of them.
     cache = ContentCache(max_bytes=800)
-    cache.remember({"kvgit:keyset:a": b"a" * 250})
-    cache.remember({"kvgit:keyset:b": b"b" * 250})
-    cache.lookup(["kvgit:keyset:a"])  # a is now the more recent
-    cache.remember({"kvgit:keyset:c": b"c" * 250})
-    held = cache.lookup(["kvgit:keyset:a", "kvgit:keyset:b", "kvgit:keyset:c"])
-    assert set(held) == {"kvgit:keyset:a", "kvgit:keyset:c"}
+    cache.remember({"__parent_commit__a": b"a" * 250})
+    cache.remember({"__parent_commit__b": b"b" * 250})
+    cache.lookup(["__parent_commit__a"])  # a is now the more recent
+    cache.remember({"__parent_commit__c": b"c" * 250})
+    held = cache.lookup(
+        ["__parent_commit__a", "__parent_commit__b", "__parent_commit__c"]
+    )
+    assert set(held) == {"__parent_commit__a", "__parent_commit__c"}
 
 
 def test_an_entry_larger_than_the_budget_is_not_held():

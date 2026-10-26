@@ -202,7 +202,7 @@ describe('NodeCache', () => {
   })
 })
 
-describe('lazy VersionedKV', () => {
+describe('a VersionedKV', () => {
   it('opens reading the head and its root, and no keyset node', async () => {
     const store = new CountingMemory()
     const writer = await VersionedKV.open(store)
@@ -211,16 +211,11 @@ describe('lazy VersionedKV', () => {
     await writer.commit({ updates })
 
     store.reads = []
-    const lazy = await VersionedKV.open(store, { lazy: true })
-    expect(store.reads.filter((k) => k.startsWith('kvgit:'))).toEqual([])
-    expect(lazy.isLazy).toBe(true)
-
-    store.reads = []
     await VersionedKV.open(store)
-    expect(store.reads.filter((k) => k.startsWith('kvgit:keyset:')).length).toBeGreaterThan(10)
+    expect(store.reads.filter((k) => k.startsWith('kvgit:'))).toEqual([])
   })
 
-  it('reads, writes and commits what an eager handle does, commit for commit', async () => {
+  it('the lazy option changes nothing, commit for commit', async () => {
     // Two stores, the same clock and the same changes: the commits must
     // hash the same, so the trees are the same.
     let clockA = 1_760_000_000
@@ -258,20 +253,16 @@ describe('lazy VersionedKV', () => {
   })
 
   // A 3,000-key commit: seconds on a loaded runner.
-  it('hits the node cache for repeated reads', async () => {
-    const store = new Memory()
-    const writer = await VersionedKV.open(store)
-    const updates = new Map<string, Uint8Array>()
-    for (let i = 0; i < 3000; i++) updates.set(`page/${i}`, bytes(`v${i}`))
-    await writer.commit({ updates })
-    const cache = new NodeCache()
-    const lazy = await VersionedKV.open(store, { lazy: { cache } })
-    await lazy.get('page/42')
-    const cold = cache.stats()
-    expect(cold.misses).toBeGreaterThan(1)
-    cache.resetStats()
-    expect(text(await lazy.get('page/42'))).toBe('v42')
-    expect(cache.stats()).toMatchObject({ misses: 0 })
+  it('reads the tree a commit wrote from the content cache', async () => {
+    const store = new CountingMemory()
+    const repo = await Repo.open(store)
+    const writer = await repo.worktree('main', { create: true })
+    for (let i = 0; i < 3000; i++) writer.set(`page/${i}`, bytes(`v${i}`))
+    await writer.commit()
+    const reader = await repo.worktree('main')
+    store.reads = []
+    expect(text((await reader.get('page/42')) as Uint8Array)).toBe('v42')
+    expect(store.reads.filter((k) => k.startsWith('kvgit:keyset:'))).toEqual([])
   }, 30_000)
 })
 

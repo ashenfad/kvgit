@@ -10,7 +10,7 @@ import pickle
 import tempfile
 
 import pytest
-from support import fork, worktree
+from support import fork, pointers, worktree
 
 from kvgit import MergeConflict, Repo
 from kvgit.encoding import dumps, safe_loads
@@ -253,7 +253,7 @@ class TestRepoTagPaths:
                 wt.commit()
                 repo.tags.create("v1", wt.head)
                 tagged = wt.head
-                pointer = wt._engine._commit_keys["keep"]
+                pointer = pointers(wt.repo.store, wt.head)["keep"]
 
             with Repo(Disk(p)) as repo:
                 repo.branches.delete("main")

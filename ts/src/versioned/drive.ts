@@ -9,7 +9,7 @@
  * @internal
  */
 
-import type { ContentCache, Op } from '../../wasm/kvgit_wasm.js'
+import type { ContentCache, Op, WorktreeState } from '../../wasm/kvgit_wasm.js'
 import { core, coreIfLoaded } from '../core'
 import {
   BranchExistsError,
@@ -78,6 +78,8 @@ export interface DriveEnv {
   recover?: ((store: KVStore, branch: string) => Promise<string | null>) | undefined
   /** The clock commit and tag times are read from, in seconds. */
   now: () => number
+  /** The worktree state the operation reads from and moves. */
+  tree?: WorktreeState
 }
 
 const encoder = new TextEncoder()
@@ -118,11 +120,19 @@ async function start(name: string, args: object): Promise<Op> {
 }
 
 /** Run the core's operation `name` on `args` against `env.store`, and
- *  return what it answers. */
-export async function callCore(name: string, args: object, env: DriveEnv): Promise<unknown> {
+ *  return what it answers. `settled`, if given, is called with the
+ *  answer in the same turn the operation finishes, before anything
+ *  else can run. */
+export async function callCore(
+  name: string,
+  args: object,
+  env: DriveEnv,
+  settled?: (value: unknown) => void,
+): Promise<unknown> {
   const op = cached(await start(name, args), env.store)
+  if (env.tree !== undefined) op.useTree(env.tree)
   try {
-    return await drive(op, env, parseValue)
+    return await drive(op, env, parseValue, settled)
   } finally {
     op.free()
   }
@@ -154,9 +164,20 @@ export async function* streamCore(
 }
 
 /** Perform a commit's requests until it is done, and return what it
- *  committed. */
-export async function driveCommit(op: Op, env: DriveEnv): Promise<Committed> {
-  return (await drive(cached(op, env.store), env, JSON.parse)) as Committed
+ *  committed. `settled`, if given, is called with it in the same turn
+ *  the commit finishes, before anything else can run. */
+export async function driveCommit(
+  op: Op,
+  env: DriveEnv,
+  settled?: (done: Committed) => void,
+): Promise<Committed> {
+  if (env.tree !== undefined) op.useTree(env.tree)
+  return (await drive(
+    cached(op, env.store),
+    env,
+    JSON.parse,
+    settled as ((value: unknown) => void) | undefined,
+  )) as Committed
 }
 
 /** What an operation's driver keeps while it runs: the exceptions
@@ -167,25 +188,51 @@ interface Run {
 }
 
 /** Perform `op`'s requests until it is done, and return its outcome,
- *  decoded by `parse`. */
-async function drive(op: Op, env: DriveEnv, parse: (text: string) => unknown): Promise<unknown> {
+ *  decoded by `parse`. The outcome is read, and given to `settled`, in
+ *  the turn the last reply finishes the operation: an operation that
+ *  moves a worktree's state has moved it by then, and whatever the
+ *  host keeps beside that state must move with it, before another
+ *  task reads either. */
+async function drive(
+  op: Op,
+  env: DriveEnv,
+  parse: (text: string) => unknown,
+  settled?: (value: unknown) => void,
+): Promise<unknown> {
   const run: Run = { causes: new Map(), raised: null }
+  const done = () => {
+    const value = finish(op, parse, run)
+    settled?.(value)
+    return value
+  }
   let kind = op.start(leaseEnv.clock())
-  while (kind !== 'done') kind = await advance(op, kind, env, run)
-  return finish(op, parse, run)
+  while (kind !== 'done') {
+    const next = await request(op, kind, env, run)
+    kind = next(leaseEnv.clock())
+  }
+  return done()
 }
 
 /** Perform one request, answer it, and return the kind of the next. A
  *  request that throws is answered as failed. */
 async function advance(op: Op, kind: string, env: DriveEnv, run: Run): Promise<string> {
-  let next: (wall: number) => string
+  return (await request(op, kind, env, run))(leaseEnv.clock())
+}
+
+/** Perform one request; the reply, to send with the clock. A request
+ *  that throws is answered as failed. */
+async function request(
+  op: Op,
+  kind: string,
+  env: DriveEnv,
+  run: Run,
+): Promise<(wall: number) => string> {
   try {
-    next = await perform(op, kind, env, run.causes)
+    return await perform(op, kind, env, run.causes)
   } catch (e) {
     run.raised ??= { error: e }
-    next = (wall) => op.replyFailed(wall)
+    return (wall) => op.replyFailed(wall)
   }
-  return next(leaseEnv.clock())
 }
 
 /** A finished operation's answer, decoded by `parse`, or its error. */

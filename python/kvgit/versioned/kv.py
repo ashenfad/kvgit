@@ -81,7 +81,7 @@ import logging
 import os
 import time
 import uuid
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, KeysView
 from typing import Any
 
 from .. import _core
@@ -938,18 +938,14 @@ class VersionedKV(VersionedBase):
         # here goes stale either.
         self._roots: dict[str, str] = {}
 
-        # Materialize keyset + meta from the HAMT
-        self._meta: dict[str, MetaEntry] = {}
+        # The committed state is the keyset's root, held by the core,
+        # with the key index the first listing builds.
+        self._tree: _core.WorktreeState | None = None
         self._populate_state(commit_hash)
 
     def _populate_state(self, commit_hash: str) -> None:
-        """Walk the commit's HAMT and populate ``_commit_keys`` / ``_meta``.
-
-        Uses ``Keyset.materialize`` (batched BFS, one ``get_many`` per
-        tree level) so cold loads against high-latency stores like
-        Redis or IndexedDB are O(log_branching N) round-trips, not
-        O(N).
-        """
+        """Move to a commit's keyset root: read it, and nothing of the
+        tree under it. A key index already built follows the move."""
         # The commit's parent record rides along with its root, so the
         # handle knows the generation its next commit builds on without
         # another read.
@@ -969,14 +965,26 @@ class VersionedKV(VersionedBase):
         root_raw = found.get(COMMIT_ROOT % commit_hash)
         root = safe_loads(root_raw) if root_raw is not None else None
         if not isinstance(root, str):
-            self._commit_keys = {}
-            self._meta = {}
-            return
-        self._remember_root(commit_hash, root)
+            root = EMPTY_HASH
+        else:
+            self._remember_root(commit_hash, root)
+        if self._tree is None:
+            self._tree = _core.WorktreeState(root)
+        else:
+            self._on_tree("wt_move", root=root)
 
-        materialized = Keyset(self.store, root=root).materialize()
-        self._commit_keys = {k: e.blob for k, e in materialized.items()}
-        self._meta = {k: e.meta for k, e in materialized.items()}
+    def _on_tree(self, op: str, **args: Any) -> Any:
+        """Run the core's operation ``op`` on this handle's state."""
+        run = _core.Op(op, args)
+        run.use_tree(self._tree)
+        return drive(
+            run,
+            self.store,
+            recoverer=self._recover_from_corrupt_head,
+            owner=lambda: _new_lease_owner(),
+            clock=time.time,
+            sleep=time.sleep,
+        )
 
     @property
     def latest_head(self) -> str | None:
@@ -1011,20 +1019,17 @@ class VersionedKV(VersionedBase):
 
     def get(self, key: str) -> bytes | None:
         """Get a value from the current commit."""
-        versioned_key = self._commit_keys.get(key)
-        if versioned_key is None:
-            return None
-        return self.store.get(versioned_key)
+        return self.get_many(key).get(key)
 
     def get_many(self, *keys: str) -> dict[str, bytes]:
         """Get multiple values from the current commit."""
         # Keys holding equal bytes share one blob, so a blob answers for
         # every key that points at it. Missing keys are skipped.
         keys_by_blob: dict[str, list[str]] = {}
-        for key in keys:
-            blob = self._commit_keys.get(key)
-            if blob is not None:
-                keys_by_blob.setdefault(blob, []).append(key)
+        for key, (blob, _size, _chunks) in self._on_tree(
+            "wt_lookup", keys=list(dict.fromkeys(keys))
+        ):
+            keys_by_blob.setdefault(blob, []).append(key)
 
         if not keys_by_blob:
             return {}
@@ -1314,6 +1319,7 @@ class VersionedKV(VersionedBase):
         post_check: PostCheck | None = None,
     ) -> MergeResult:
         """Run a commit or merge, and move this handle to what it landed."""
+        op.use_tree(self._tree)
         done = drive(
             op,
             self.store,
@@ -1334,9 +1340,7 @@ class VersionedKV(VersionedBase):
         self.last_merge_result = result
         if not result.merged or result.strategy == "no_op":
             return result
-        # Landed: change the key maps in place, by what the commit changed.
-        for key, entry in done["changes"]:
-            self._set_entry(key, None if entry is None else (entry.blob, entry.meta))
+        # Landed: the core moved this handle's state with it.
         for commit, commit_root in done["roots"]:
             self._remember_root(commit, commit_root)
         self._remember_generations(dict(done["generations"]))
@@ -1346,15 +1350,13 @@ class VersionedKV(VersionedBase):
 
     # -- Abstract method implementations --
 
-    def _set_entry(self, key: str, entry: tuple[str, MetaEntry] | None) -> None:
-        """Point ``key`` at a blob and its meta, or remove it (None), in
-        place, once a commit or merge has landed."""
-        keys = self._owned_keys()
-        if entry is None:
-            keys.pop(key, None)
-            self._meta.pop(key, None)
-        else:
-            keys[key], self._meta[key] = entry
+    def keys(self) -> KeysView[str]:
+        """All keys in the current commit. The first call builds the key
+        index with one walk of the tree; later ones read it."""
+        return dict.fromkeys(self._on_tree("wt_keys")).keys()
+
+    def __contains__(self, key: object) -> bool:
+        return isinstance(key, str) and self._on_tree("wt_contains", key=key)
 
     _GENERATION_CACHE_LIMIT = 10_000
 

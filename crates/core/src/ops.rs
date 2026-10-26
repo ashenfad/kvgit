@@ -13,6 +13,7 @@ use crate::layout::commit_root;
 use crate::machine::{Io, Machine};
 use crate::refs::{self, Ref};
 use crate::store::{dumps_str, loads_str};
+use crate::worktree;
 use crate::write::{self, CommitArgs, Committed, Done, MergeArgs};
 use std::collections::HashMap;
 
@@ -55,6 +56,14 @@ pub type Op = Machine<Done<Out>>;
 /// - `gc {min_age, deep, wait, lease_ttl}`: the number of commits swept.
 /// - `reset_branch {name, target}`: whether the branch moved; false when
 ///   `target` isn't in the store.
+///
+/// On the worktree the operation is given:
+///
+/// - `wt_lookup {keys}`: `[key, entry]` for each of the keys it holds,
+///   each entry `[blob, size, chunks]`.
+/// - `wt_contains {key}`: whether it holds the key.
+/// - `wt_keys {}`: every key, sorted.
+/// - `wt_move {root}`: move it to a root it didn't write; null.
 pub const NAMES: &[&str] = &[
     "resolve_head",
     "head_of",
@@ -77,6 +86,10 @@ pub const NAMES: &[&str] = &[
     "merge_base",
     "gc",
     "reset_branch",
+    "wt_lookup",
+    "wt_contains",
+    "wt_keys",
+    "wt_move",
 ];
 
 /// Start operation `name` on `args`, an object.
@@ -92,25 +105,36 @@ pub fn call(name: &str, args: Value) -> Result<Op, Error> {
     }))
 }
 
-/// Start a commit.
+/// Start a commit. Given a worktree, one that lands moves it.
 pub fn commit(args: CommitArgs) -> Op {
     Machine::new(move |io| async move {
+        let tree = io.tree();
         let done = write::commit(io, args).await;
-        Done {
-            result: done.result.map(|c| Out::Committed(Box::new(c))),
-            notes: done.notes,
-        }
+        landed(tree, done)
     })
 }
 
-/// Start a merge or an apply.
+/// Move a worktree to what a commit or merge landed.
+fn landed(tree: Option<worktree::Shared>, done: Done<Committed>) -> Done<Out> {
+    if let (Some(tree), Ok(c)) = (tree, &done.result)
+        && c.merged
+        && let Some(commit) = &c.commit
+        && let Some((_, root)) = c.roots.iter().find(|(r, _)| r == commit)
+    {
+        tree.lock().unwrap().landed(root.clone(), &c.changes);
+    }
+    Done {
+        result: done.result.map(|c| Out::Committed(Box::new(c))),
+        notes: done.notes,
+    }
+}
+
+/// Start a merge or an apply. Given a worktree, one that lands moves it.
 pub fn merge(args: MergeArgs) -> Op {
     Machine::new(move |io| async move {
+        let tree = io.tree();
         let done = write::merge(io, args).await;
-        Done {
-            result: done.result.map(|c| Out::Committed(Box::new(c))),
-            notes: done.notes,
-        }
+        landed(tree, done)
     })
 }
 
@@ -314,6 +338,49 @@ async fn run(io: &Io, name: &str, args: &Value, notes: &mut Notes) -> Result<Val
         }
         "reset_branch" => {
             Value::Bool(refs::reset_branch(io, text(args, "name")?, text(args, "target")?).await?)
+        }
+        "wt_lookup" | "wt_contains" | "wt_keys" | "wt_move" => {
+            let tree = io
+                .tree()
+                .ok_or_else(|| Error::Invalid(format!("{name} needs a worktree")))?;
+            let shape = keyset::shape();
+            match name {
+                "wt_lookup" => {
+                    let keys = match arg(args, "keys")? {
+                        Value::Array(keys) => keys
+                            .iter()
+                            .map(|k| {
+                                k.as_str()
+                                    .map(String::from)
+                                    .ok_or_else(|| Error::Invalid("a key isn't a string".into()))
+                            })
+                            .collect::<Result<Vec<_>, _>>()?,
+                        _ => return Err(Error::Invalid("\"keys\" isn't a list".into())),
+                    };
+                    let found = worktree::lookup(io, shape, &tree, keys).await?;
+                    Value::Array(
+                        found
+                            .into_iter()
+                            .map(|(k, e)| {
+                                let chunks = strings(e.chunks.clone());
+                                Value::Array(vec![
+                                    Value::Str(k),
+                                    Value::Array(vec![Value::Str(e.blob), e.size, chunks]),
+                                ])
+                            })
+                            .collect(),
+                    )
+                }
+                "wt_contains" => {
+                    Value::Bool(worktree::contains(io, shape, &tree, text(args, "key")?).await?)
+                }
+                "wt_keys" => strings(worktree::keys(io, shape, &tree).await?),
+                _ => {
+                    let root = text(args, "root")?.to_string();
+                    worktree::move_to(io, shape, &tree, root).await?;
+                    Value::Null
+                }
+            }
         }
         "gc" => {
             let sweep = Gc {

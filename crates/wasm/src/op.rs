@@ -288,6 +288,16 @@ impl Op {
         Ok(())
     }
 
+    /// Read from, and move, `state`; given before `start`.
+    #[wasm_bindgen(js_name = useTree)]
+    pub fn use_tree(&mut self, state: &super::WorktreeState) -> Result<(), JsError> {
+        self.machine
+            .as_mut()
+            .ok_or_else(|| JsError::new("the operation is done"))?
+            .use_tree(state.shared());
+        Ok(())
+    }
+
     pub fn start(&mut self, wall: f64) -> Result<String, JsError> {
         self.step(wall, None)
     }

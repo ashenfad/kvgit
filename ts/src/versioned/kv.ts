@@ -25,30 +25,27 @@
  * rewriting a full snapshot per commit.
  */
 
-import type { Op } from '../../wasm/kvgit_wasm.js'
+import type { Op, WorktreeState } from '../../wasm/kvgit_wasm.js'
 import { core } from '../core'
 import { CorruptHeadError, UnknownBranchError, UnknownCommitError } from '../errors'
-import { EMPTY_HASH, NodeCache, uncached } from '../hamt'
-import { Keyset, decodeEntry } from '../keyset'
-import { compareCodePoints, pyDumps, pyDumpsBytes } from '../pyjson'
+import { EMPTY_HASH, type NodeCache, uncached } from '../hamt'
+import { Keyset } from '../keyset'
+import { compareCodePoints, pyDumps } from '../pyjson'
 import {
   type BytesMergeFn,
   type CommitInfo,
   type KVStore,
-  type KeysetEntry,
   MergeChoice,
   type MergeHeadsOptions,
   type MergePolicy,
   type MergeResult,
   type MergeRuleOptions,
-  type MetaEntry,
   type PostCheck,
   type Versioned,
   type VersionedCommitOptions,
 } from '../types'
 import { VersionedBase, checkDisposition, checkMoved } from './base'
-import { type Committed, type StoredEntry, callCore, driveCommit } from './drive'
-import {} from './helpers'
+import { type Committed, callCore, driveCommit } from './drive'
 import {
   BRANCH_HEAD,
   COMMIT_ROOT,
@@ -398,63 +395,44 @@ export async function loadParents(store: KVStore, commit: string): Promise<reado
  */
 export class VersionedKV extends VersionedBase {
   readonly store: KVStore
-  private meta: Map<string, MetaEntry>
   private readonly recoverFromCorruptHead: CorruptHeadRecoverer | undefined
   private readonly now: () => number
   /** Generations of commits this handle has written or read. A
    *  commit's generation never changes, so nothing here goes stale. */
   private readonly generations = new Map<string, number>()
-  /** A lazy handle's node cache; null for a handle that holds its
-   *  whole keyset in `commitKeys` and `meta`. */
-  private readonly nodeCache: NodeCache | null
-  /** A lazy handle's current keyset root. */
-  private root: string
+  /** The committed state: the keyset's root, held by the core, with
+   *  the key index the first listing builds. */
+  private readonly state: WorktreeState
 
   private constructor(opts: {
     store: KVStore
     branch: string
     commitHash: string
-    commitKeys: Map<string, string>
-    meta: Map<string, MetaEntry>
     recoverFromCorruptHead: CorruptHeadRecoverer | undefined
     now: () => number
-    nodeCache: NodeCache | null
-    root: string
+    state: WorktreeState
   }) {
     super({ branch: opts.branch, commitHash: opts.commitHash })
     this.store = opts.store
-    this.commitKeys = opts.commitKeys
-    this.meta = opts.meta
     this.recoverFromCorruptHead = opts.recoverFromCorruptHead
     this.now = opts.now
-    this.nodeCache = opts.nodeCache
-    this.root = opts.root
-  }
-
-  /** Whether this handle reads its keyset on demand. */
-  get isLazy(): boolean {
-    return this.nodeCache !== null
-  }
-
-  /** A lazy handle's node cache (null when eager). */
-  get keysetCache(): NodeCache | null {
-    return this.nodeCache
+    this.state = opts.state
   }
 
   /** The options a handle derived from this one opens with. */
-  private inherited(): Pick<VersionedKVOptions, 'recoverFromCorruptHead' | 'now' | 'lazy'> {
+  private inherited(): Pick<VersionedKVOptions, 'recoverFromCorruptHead' | 'now'> {
     return {
       now: this.now,
       ...(this.recoverFromCorruptHead !== undefined && {
         recoverFromCorruptHead: this.recoverFromCorruptHead,
       }),
-      ...(this.nodeCache !== null && { lazy: { cache: this.nodeCache } }),
     }
   }
 
-  /** The keyset at the current commit, reading through the node cache. */
-  private lazyKeyset(): Keyset {
-    return Keyset.fromRoot(this.store, this.root, { cache: this.nodeCache as NodeCache })
+  /** Run the core's operation `name` on this handle's state; `settled`
+   *  as `callCore` takes it. */
+  private onTree(name: string, args: object, settled?: (value: unknown) => void): Promise<unknown> {
+    return callCore(name, args, { store: this.store, now: this.now, tree: this.state }, settled)
   }
 
   /**
@@ -510,51 +488,33 @@ export class VersionedKV extends VersionedBase {
       }
     }
 
-    const lazy = opts.lazy === undefined || opts.lazy === false ? null : opts.lazy
-    if (lazy !== null) {
-      return new VersionedKV({
-        store,
-        branch,
-        commitHash,
-        commitKeys: new Map(),
-        meta: new Map(),
-        recoverFromCorruptHead: opts.recoverFromCorruptHead,
-        now: opts.now ?? wallClock,
-        nodeCache: (lazy === true ? undefined : lazy.cache) ?? new NodeCache(),
-        root: await rootOfCommit(store, commitHash),
-      })
-    }
-    const { commitKeys, meta } = await populateState(store, commitHash)
+    const c = await core()
     return new VersionedKV({
       store,
       branch,
       commitHash,
-      commitKeys,
-      meta,
       recoverFromCorruptHead: opts.recoverFromCorruptHead,
       now: opts.now ?? wallClock,
-      nodeCache: null,
-      root: EMPTY_HASH,
+      state: new c.WorktreeState(await rootOfCommit(store, commitHash)),
     })
   }
 
   // --- Reads ---
 
-  override async get(key: string): Promise<Uint8Array | null> {
-    if (this.nodeCache === null) return super.get(key)
-    const entry = await this.lazyKeyset().get(key)
-    return entry === null ? null : this.readBlob(entry.blob)
+  async get(key: string): Promise<Uint8Array | null> {
+    return (await this.getMany([key])).get(key) ?? null
   }
 
-  /** In a lazy handle, the tree is walked for all the keys a level at a
-   *  time, and the blobs read in one batch. */
-  override async getMany(keys: Iterable<string>): Promise<Map<string, Uint8Array>> {
-    if (this.nodeCache === null) return super.getMany(keys)
-    const entries = await this.lazyKeyset().getMany(keys)
+  /** The tree is walked for all the keys a level at a time, through the
+   *  repository's content cache, and the blobs read in one batch. */
+  async getMany(keys: Iterable<string>): Promise<Map<string, Uint8Array>> {
+    const found = (await this.onTree('wt_lookup', { keys: [...new Set(keys)] })) as Array<
+      [string, [string, number, string[]]]
+    >
     const byBlob = new Map<string, string[]>()
-    for (const [key, entry] of entries) {
-      const at = byBlob.get(entry.blob)
-      if (at === undefined) byBlob.set(entry.blob, [key])
+    for (const [key, [blob]] of found) {
+      const at = byBlob.get(blob)
+      if (at === undefined) byBlob.set(blob, [key])
       else at.push(key)
     }
     const out = new Map<string, Uint8Array>()
@@ -565,19 +525,14 @@ export class VersionedKV extends VersionedBase {
     return out
   }
 
-  override async has(key: string): Promise<boolean> {
-    if (this.nodeCache === null) return super.has(key)
-    return this.lazyKeyset().has(key)
+  async has(key: string): Promise<boolean> {
+    return (await this.onTree('wt_contains', { key })) as boolean
   }
 
-  /** In a lazy handle, every call walks the whole tree, a level at a
-   *  time, from the root current when it starts. */
-  override async *keys(): AsyncIterable<string> {
-    if (this.nodeCache === null) {
-      yield* super.keys()
-      return
-    }
-    yield* Keyset.fromRoot(this.store, this.root).keysBatched()
+  /** Every key, sorted. The first listing builds the key index with one
+   *  walk of the tree; later ones read it. */
+  async *keys(): AsyncIterable<string> {
+    yield* (await this.onTree('wt_keys', {})) as string[]
   }
 
   // --- VersionedBase abstract methods ---
@@ -626,8 +581,11 @@ export class VersionedKV extends VersionedBase {
     }
     const info = opts.info ?? null
     const c = await core()
-    const memo = this.nodeCache === null ? uncached(c) : this.nodeCache.memo(c)
-    const op = c.Op.commit(JSON.stringify(args), info === null ? undefined : pyDumps(info), memo)
+    const op = c.Op.commit(
+      JSON.stringify(args),
+      info === null ? undefined : pyDumps(info),
+      uncached(c),
+    )
     return this.land(op, held, hosted)
   }
 
@@ -660,8 +618,11 @@ export class VersionedKV extends VersionedBase {
     }
     const info = opts.info ?? null
     const c = await core()
-    const memo = this.nodeCache === null ? uncached(c) : this.nodeCache.memo(c)
-    const op = c.Op.merge(JSON.stringify(args), info === null ? undefined : pyDumps(info), memo)
+    const op = c.Op.merge(
+      JSON.stringify(args),
+      info === null ? undefined : pyDumps(info),
+      uncached(c),
+    )
     return this.land(op, new Map(), hosted, postCheck)
   }
 
@@ -689,7 +650,7 @@ export class VersionedKV extends VersionedBase {
   private known(commit: string) {
     const generation = this.generations.get(commit)
     return {
-      roots: this.nodeCache === null ? [] : [[commit, this.root]],
+      roots: commit === this.currentCommitHash ? [[commit, this.state.root()]] : [],
       generations: generation === undefined ? [] : [[commit, generation]],
     }
   }
@@ -701,16 +662,28 @@ export class VersionedKV extends VersionedBase {
     hosted: BytesMergeFn[],
     postCheck?: PostCheck,
   ): Promise<MergeResult> {
+    // A commit that lands moves this handle's state as it finishes, and
+    // the commit it is at moves in the same turn.
+    const moved = (done: Committed) => {
+      if (!done.merged || done.strategy === 'no_op') return
+      for (const [commit, gen] of done.generations) this.generations.set(commit, gen)
+      this.currentCommitHash = this.baseCommitHash = done.commit as string
+    }
     let done: Committed
     try {
-      done = await driveCommit(op, {
-        store: this.store,
-        held,
-        mergeFns: hosted,
-        postCheck,
-        recover: this.recoverFromCorruptHead,
-        now: this.now,
-      })
+      done = await driveCommit(
+        op,
+        {
+          store: this.store,
+          held,
+          mergeFns: hosted,
+          postCheck,
+          recover: this.recoverFromCorruptHead,
+          now: this.now,
+          tree: this.state,
+        },
+        moved,
+      )
     } finally {
       op.free()
     }
@@ -721,33 +694,7 @@ export class VersionedKV extends VersionedBase {
       autoMergedKeys: done.autoMerged,
       carriedKeys: done.carried,
     }
-    if (!done.merged || done.strategy === 'no_op') return this.finish(result)
-    // Landed: change the key maps in place, by what the commit changed.
-    for (const [key, stored] of done.changes) {
-      this.setEntry(key, stored === null ? null : decodeStored(stored))
-    }
-    for (const [commit, gen] of done.generations) this.generations.set(commit, gen)
-    const commit = done.commit as string
-    if (this.nodeCache !== null) {
-      this.root = done.roots.find(([c]) => c === commit)?.[1] ?? this.root
-    }
-    this.currentCommitHash = this.baseCommitHash = commit
     return this.finish(result)
-  }
-
-  /** Point `key` at `blob`, or remove it (null), in place, once a
-   *  commit or merge has landed. */
-  private setEntry(key: string, entry: { blob: string; meta: MetaEntry } | null): void {
-    // A lazy handle holds no key maps: the new root is the change.
-    if (this.nodeCache !== null) return
-    const keys = this.ownedKeys()
-    if (entry === null) {
-      keys.delete(key)
-      this.meta.delete(key)
-    } else {
-      keys.set(key, entry.blob)
-      this.meta.set(key, entry.meta)
-    }
   }
 
   /** The generation of each of a new commit's parents. */
@@ -787,7 +734,7 @@ export class VersionedKV extends VersionedBase {
   }
 
   protected async changes(commitA: string | null, commitB: string): Promise<Map<string, Change>> {
-    return commitChanges(this.store, commitA, commitB, this.nodeCache ?? undefined)
+    return commitChanges(this.store, commitA, commitB)
   }
 
   protected async loadParents(commitHash: string): Promise<readonly string[]> {
@@ -1004,20 +951,12 @@ export class VersionedKV extends VersionedBase {
   // --- Internal ---
 
   private async loadCommitInto(commitHash: string, updateBase: boolean): Promise<void> {
-    if (this.nodeCache !== null) {
-      const root = await rootOfCommit(this.store, commitHash)
+    // The commit moves in the turn the root does, so no reader sees one
+    // commit's hash over another's keys.
+    await this.onTree('wt_move', { root: await rootOfCommit(this.store, commitHash) }, () => {
       this.currentCommitHash = commitHash
       if (updateBase) this.baseCommitHash = commitHash
-      this.root = root
-      return
-    }
-    const { commitKeys, meta } = await populateState(this.store, commitHash)
-    // The commit and its keys change together, after the read, so no
-    // reader sees one commit's hash over another's keys.
-    this.currentCommitHash = commitHash
-    if (updateBase) this.baseCommitHash = commitHash
-    this.replaceKeys(commitKeys)
-    this.meta = meta
+    })
   }
 }
 
@@ -1025,47 +964,4 @@ export class VersionedKV extends VersionedBase {
 async function rootOfCommit(store: KVStore, commit: string): Promise<string> {
   const raw = await store.get(COMMIT_ROOT(commit))
   return raw === null ? EMPTY_HASH : (loads(raw) as string)
-}
-
-/**
- * Materialize a commit's flat keyset and meta map from its HAMT.
- *
- * Uses `Keyset.materialize()` (batched BFS, one `getMany` per HAMT
- * level) so cold loads against high-latency stores are O(log N)
- * round-trips instead of O(N).
- *
- * **Eager-materialization tradeoff.** This holds the entire commit's
- * keyset (key → blob pointer + meta) in memory. The benefit:
- * `get(key)` is one in-memory map lookup followed by a single store
- * fetch for the blob, regardless of total commit size. The cost:
- * memory scales with key count.
- *
- * Matches kvgit-py's design. For agex sessions (typically hundreds
- * to a few thousand keys) this is fine. For very large keysets, open
- * the handle with `lazy`, which walks the HAMT on demand through a
- * bounded node cache, at the cost of extra store reads per `get`.
- */
-async function populateState(
-  store: KVStore,
-  commitHash: string,
-): Promise<{ commitKeys: Map<string, string>; meta: Map<string, MetaEntry> }> {
-  const rootBytes = await store.get(COMMIT_ROOT(commitHash))
-  if (rootBytes === null) {
-    return { commitKeys: new Map(), meta: new Map() }
-  }
-  const root = loads(rootBytes) as string
-  const ks = Keyset.fromRoot(store, root)
-  const materialized = await ks.materialize()
-  const commitKeys = new Map<string, string>()
-  const meta = new Map<string, MetaEntry>()
-  for (const [k, entry] of materialized) {
-    commitKeys.set(k, entry.blob)
-    meta.set(k, entry.meta)
-  }
-  return { commitKeys, meta }
-}
-
-/** An entry as the core reports it, stored form parsed. */
-function decodeStored(stored: StoredEntry): KeysetEntry {
-  return decodeEntry(pyDumpsBytes(stored))
 }

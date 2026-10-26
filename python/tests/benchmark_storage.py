@@ -148,7 +148,7 @@ def run(n_keys: int, n_commits: int) -> None:
         v2 = VersionedKV(backend2)
         t_load = time.perf_counter() - t0
         print(f"  wall: {t_load * 1000:6.1f} ms")
-        print(f"  recovered: {len(v2._commit_keys)} keys")
+        print(f"  recovered: {len(v2.keys())} keys")
 
         # Sanity-check that mutations actually persisted
         sample_key = "k000500"
@@ -190,7 +190,7 @@ def run_latency(n_keys: int, latency_ms: float) -> None:
     v_cold = VersionedKV(slow_store_a, commit_hash=seed_root_commit)
     t_versioned = time.perf_counter() - t0
     print(f"  wall: {t_versioned * 1000:7.1f} ms")
-    print(f"  keys recovered: {len(v_cold._commit_keys)}")
+    print(f"  keys recovered: {len(v_cold.keys())}")
     print()
 
     # ---- Drain items() instead, for comparison

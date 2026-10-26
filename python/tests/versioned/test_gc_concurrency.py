@@ -20,7 +20,7 @@ from __future__ import annotations
 import threading
 import time
 
-from support import fork, worktree
+from support import fork, pointers, worktree
 
 from kvgit.encoding import dumps
 from kvgit.hamt import EMPTY_HASH
@@ -353,7 +353,7 @@ class TestOrdinaryGarbage:
         dev_root = _load_root(store, dev_commit)
         dev_nodes = node_hashes(store, dev_commit) - node_hashes(store, s.head)
         dev_chunks = set(chunk_keys(store)) - live_chunks
-        dev_blob = dev._engine._commit_keys["dev_only"]
+        dev_blob = pointers(dev.repo.store, dev.head)["dev_only"]
         assert dev_chunks
         assert store.get(dev_blob) is not None
 

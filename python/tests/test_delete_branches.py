@@ -4,7 +4,7 @@ import os
 import tempfile
 
 import pytest
-from support import fork, worktree
+from support import fork, pointers, worktree
 
 from kvgit import Repo, UnknownBranchError
 from kvgit.kv.disk import Disk
@@ -93,7 +93,7 @@ class TestDeleteBranch:
                 dev["secret"] = "unique-blob-value"
                 dev.commit()
                 dev_commit = dev.head
-                pointer = dev._engine._commit_keys["secret"]
+                pointer = pointers(dev.repo.store, dev.head)["secret"]
 
             with Repo(Disk(p)) as repo:
                 repo.branches.delete("dev")

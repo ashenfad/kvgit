@@ -27,12 +27,17 @@ def fork(wt: Worktree, name: str, at: str | None = None) -> Worktree:
     return wt.repo.worktree(name)
 
 
-def pointers(store, commit: str) -> dict[str, str]:
-    """A commit's keyset as key -> blob pointer."""
+def entries(store, commit: str) -> dict:
+    """A commit's keyset as key -> its stored entry."""
     root = _load_root(store, commit)
     if root is None:
         return {}
-    return {k: e.blob for k, e in Keyset(store, root=root).materialize().items()}
+    return Keyset(store, root=root).materialize()
+
+
+def pointers(store, commit: str) -> dict[str, str]:
+    """A commit's keyset as key -> blob pointer."""
+    return {k: e.blob for k, e in entries(store, commit).items()}
 
 
 def race_publish(store: KVStore, branch: str, advance, times: int | None = 1) -> None:
