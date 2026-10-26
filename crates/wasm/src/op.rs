@@ -13,7 +13,7 @@ use kvgit_core::machine::{Machine, Reply, Request, Step, Write};
 use kvgit_core::merge::{MergeAnswer, Rule, Rules};
 use kvgit_core::ops::{self, Out};
 use kvgit_core::text::TextRule;
-use kvgit_core::write::{CommitArgs, Committed, Done, OnConflict, OnMoved};
+use kvgit_core::write::{CommitArgs, Committed, Done, MergeArgs, OnConflict, OnMoved};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use wasm_bindgen::prelude::*;
@@ -117,10 +117,6 @@ fn args_of(json: &str, info: Option<String>, memo: &NodeMemo) -> Result<CommitAr
         })
         .collect::<Result<_, _>>()?;
     let keyset = keyset::shape();
-    let default = match field(&args, "defaultMerge")? {
-        Value::Null => None,
-        r => Some(rule(r)?),
-    };
     Ok(CommitArgs {
         branch: text(field(&args, "branch")?, "branch")?,
         base: text(field(&args, "base")?, "base")?,
@@ -137,29 +133,78 @@ fn args_of(json: &str, info: Option<String>, memo: &NodeMemo) -> Result<CommitAr
             Some("raise") => OnMoved::Raise,
             _ => OnMoved::Merge,
         },
-        on_conflict: match field(&args, "onConflict")?.as_str() {
-            Some("abandon") => OnConflict::Abandon,
-            _ => OnConflict::Raise,
-        },
-        rules: Rules {
-            keys: pairs_of(field(&args, "mergeFns")?, "mergeFns", |k, r| {
-                Ok((text(k, "a key")?, rule(r)?))
-            })?
-            .into_iter()
-            .collect(),
-            prefixes: pairs_of(field(&args, "mergePrefixes")?, "mergePrefixes", |p, r| {
-                Ok((text(p, "a prefix")?, rule(r)?))
-            })?,
-            default,
-        },
+        on_conflict: on_conflict_of(&args)?,
+        rules: rules_of(&args)?,
         recover: field(&args, "recover")? == &Value::Bool(true),
         stamped: field(&args, "stamped")? == &Value::Bool(true),
-        roots: pairs_of(field(&args, "roots")?, "roots", |c, r| {
-            Ok((text(c, "a commit")?, text(r, "a root")?))
+        roots: roots_of(&args)?,
+        generations: generations_of(&args)?,
+    })
+}
+
+/// The merge rules in `args`: `mergeFns`, `mergePrefixes` and
+/// `defaultMerge`.
+fn rules_of(args: &Value) -> Result<Rules, JsError> {
+    let default = match field(args, "defaultMerge")? {
+        Value::Null => None,
+        r => Some(rule(r)?),
+    };
+    Ok(Rules {
+        keys: pairs_of(field(args, "mergeFns")?, "mergeFns", |k, r| {
+            Ok((text(k, "a key")?, rule(r)?))
+        })?
+        .into_iter()
+        .collect(),
+        prefixes: pairs_of(field(args, "mergePrefixes")?, "mergePrefixes", |p, r| {
+            Ok((text(p, "a prefix")?, rule(r)?))
         })?,
-        generations: pairs_of(field(&args, "generations")?, "generations", |c, g| {
-            Ok((text(c, "a commit")?, number(g, "a generation")?))
-        })?,
+        default,
+    })
+}
+
+fn roots_of(args: &Value) -> Result<Vec<(String, String)>, JsError> {
+    pairs_of(field(args, "roots")?, "roots", |c, r| {
+        Ok((text(c, "a commit")?, text(r, "a root")?))
+    })
+}
+
+fn generations_of(args: &Value) -> Result<Vec<(String, u64)>, JsError> {
+    pairs_of(field(args, "generations")?, "generations", |c, g| {
+        Ok((text(c, "a commit")?, number(g, "a generation")?))
+    })
+}
+
+fn on_conflict_of(args: &Value) -> Result<OnConflict, JsError> {
+    Ok(match field(args, "onConflict")?.as_str() {
+        Some("abandon") => OnConflict::Abandon,
+        _ => OnConflict::Raise,
+    })
+}
+
+fn merge_args_of(json: &str, info: Option<String>, memo: &NodeMemo) -> Result<MergeArgs, JsError> {
+    let args = loads(json.as_bytes()).map_err(to_js)?;
+    let keyset = keyset::shape();
+    Ok(MergeArgs {
+        branch: text(field(&args, "branch")?, "branch")?,
+        ours: text(field(&args, "ours")?, "ours")?,
+        theirs: text(field(&args, "theirs")?, "theirs")?,
+        from: match field(&args, "from")? {
+            Value::Null => None,
+            from => Some(text(from, "from")?),
+        },
+        fast_forward: field(&args, "fastForward")? == &Value::Bool(true),
+        shape: shape(keyset.prefix, keyset.bucket_max, memo),
+        rules: rules_of(&args)?,
+        on_conflict: on_conflict_of(&args)?,
+        info: info
+            .map(|text| loads(text.as_bytes()))
+            .transpose()
+            .map_err(to_js)?,
+        post_check: field(&args, "postCheck")? == &Value::Bool(true),
+        recover: field(&args, "recover")? == &Value::Bool(true),
+        stamped: field(&args, "stamped")? == &Value::Bool(true),
+        roots: roots_of(&args)?,
+        generations: generations_of(&args)?,
     })
 }
 
@@ -173,6 +218,7 @@ fn kind(request: &Request) -> &'static str {
         Request::Recover(_) => "recover",
         Request::Now => "now",
         Request::Emit(_) => "emit",
+        Request::Check(_) => "check",
     }
 }
 
@@ -264,6 +310,26 @@ impl Op {
         self.step(wall, Some(Reply::Keys(keys)))
     }
 
+    /// A merge of `args_json` (`theirs` into the branch at `ours`, or,
+    /// given `from`, an apply of the change from `from` to `theirs`),
+    /// with `info` its info's JSON text, if any.
+    pub fn merge(args_json: &str, info: Option<String>, memo: &NodeMemo) -> Result<Op, JsError> {
+        let args = merge_args_of(args_json, info, memo)?;
+        Ok(Op {
+            machine: Some(ops::merge(args)),
+            asked: None,
+            done: None,
+        })
+    }
+
+    /// The keys a check refuses, as a JSON list.
+    #[wasm_bindgen(js_name = replyRefused)]
+    pub fn reply_refused(&mut self, wall: f64, keys_json: &str) -> Result<String, JsError> {
+        let keys = loads(keys_json.as_bytes()).map_err(to_js)?;
+        let keys = texts(&keys, "keys")?;
+        self.step(wall, Some(Reply::Refused(keys)))
+    }
+
     /// Go on, past part of the answer emitted early.
     #[wasm_bindgen(js_name = replyNext)]
     pub fn reply_next(&mut self, wall: f64) -> Result<String, JsError> {
@@ -326,7 +392,9 @@ impl Op {
     /// `requestData` (`null`: absent, or for a write the bytes the host
     /// holds); a wait's seconds; the merges asked, each `[rule, key,
     /// old, ours, theirs]`; the branch to recover; a scan's prefix; the part
-    /// of the answer emitted.
+    /// of the answer emitted; a check's `[key, blob, length]` values, each
+    /// length that of its bytes in `requestData`, or `null` where the
+    /// host holds the blob.
     #[wasm_bindgen(js_name = requestJson)]
     pub fn request_json(&self) -> Result<String, JsError> {
         let asked = self
@@ -386,6 +454,22 @@ impl Op {
             Request::Recover(branch) => write_string(&mut out, branch),
             Request::Now => out.push_str("null"),
             Request::Emit(part) => out.push_str(&json::dumps(part, false)),
+            Request::Check(values) => {
+                out.push('[');
+                for (i, (key, blob, made)) in values.iter().enumerate() {
+                    out.push_str(if i > 0 { ",[" } else { "[" });
+                    write_string(&mut out, key);
+                    out.push(',');
+                    write_string(&mut out, blob);
+                    match made {
+                        Some(b) => {
+                            let _ = write!(out, ",{}]", b.len());
+                        }
+                        None => out.push_str(",null]"),
+                    }
+                }
+                out.push(']');
+            }
         }
         Ok(out)
     }
@@ -394,6 +478,13 @@ impl Op {
     /// written ones, in the order `requestJson` lists them.
     #[wasm_bindgen(js_name = requestData)]
     pub fn request_data(&self) -> Vec<u8> {
+        if let Some(Request::Check(values)) = &self.asked {
+            return values
+                .iter()
+                .filter_map(|(_, _, b)| b.clone())
+                .flatten()
+                .collect();
+        }
         let Some(Request::Cas(cas)) = &self.asked else {
             return vec![];
         };

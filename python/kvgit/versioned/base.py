@@ -1,20 +1,13 @@
 """Shared commit/merge orchestration for versioned stores."""
 
-import functools
 import weakref
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Iterator, KeysView
 from typing import Any, TypeVar
 
-from ..errors import (
-    ConcurrencyError,
-    MergeConflict,
-    UnknownBranchError,
-    UnknownCommitError,
-)
 from .helpers import changes_as_diff, walk_history
-from .merge import Change, MergeResolution, resolve_merge
-from .protocol import DiffResult, MergePolicy, MergeResult, PostCheck
+from .merge import Change
+from .protocol import DiffResult, MergePolicy, MergeResult
 
 _F = TypeVar("_F", bound=Callable[..., Any])
 
@@ -46,23 +39,6 @@ def _viewing(ref: "weakref.ref[_CommitKeys]", keys: dict[str, str]) -> bool:
     """Whether the view ``ref`` names is alive and over ``keys``."""
     view = ref()
     return view is not None and view._keys is keys
-
-
-def _rolls_back(method: _F) -> _F:
-    """Wrap a state-changing call: one that raises partway rolls back
-    the attempt it opened, leaving the handle as it found it."""
-
-    @functools.wraps(method)
-    def wrapper(self: "VersionedBase", *args: Any, **kwargs: Any) -> Any:
-        try:
-            return method(self, *args, **kwargs)
-        except BaseException:
-            self._roll_back_attempt()
-            raise
-        finally:
-            self._end_attempt()
-
-    return wrapper  # type: ignore[return-value]
 
 
 class VersionedBase(ABC):
@@ -207,327 +183,7 @@ class VersionedBase(ABC):
         """
         return self._find_lca(commit_a, commit_b)
 
-    # -- Commit orchestration --
-
-    def _three_way_merge(
-        self,
-        their_head: str,
-        *,
-        on_conflict: str,
-        merge_fns: dict[str, MergePolicy] | None,
-        default_merge: MergePolicy | None,
-        merge_prefixes: dict[str, MergePolicy] | None = None,
-        post_check: PostCheck | None = None,
-        info: dict | None,
-        saved_state: tuple | None = None,
-        cas_from: str | None = None,
-        parents: tuple[str, ...] | None = None,
-        base: str | None = None,
-        strategy: str = "three_way",
-        ancestor: tuple[str | None] | None = None,
-    ) -> MergeResult:
-        """Perform a three-way merge between our branch and their HEAD.
-
-        ``their_head`` is any commit in the store — the moved HEAD of our
-        own branch (the concurrent-write path) or another branch's HEAD
-        (cross-branch merge). ``cas_from`` names the commit the merge
-        commits on top of (defaults to ``their_head``, the concurrent
-        case); cross-branch callers pass their own head.
-
-        ``base`` replaces the common ancestor, which is how a change is
-        applied rather than a history merged: the change from ``base`` to
-        ``their_head`` lands on ours as an ordinary commit (``parents``
-        of one), under ``strategy``. A change that leaves our state as it
-        is commits nothing.
-
-        ``ancestor`` passes in a common ancestor the caller has already
-        found, as a one-tuple, so that None (no common ancestor) can be
-        passed too.
-        """
-        if base is not None:
-            lca: str | None = base
-        elif ancestor is not None:
-            (lca,) = ancestor
-        else:
-            lca = self._find_lca(self._current_commit, their_head)
-        if lca is None:
-            if saved_state is not None:
-                self._restore_state(saved_state)
-            if on_conflict == "abandon":
-                result = MergeResult(
-                    merged=False,
-                    commit=None,
-                    strategy=strategy,
-                    auto_merged_keys=(),
-                    carried_keys=(),
-                )
-                self.last_merge_result = result
-                return result
-            raise ConcurrencyError(
-                "No common ancestor found between current commit and HEAD."
-            )
-
-        # Each side's changes since the ancestor, read as structural
-        # diffs: subtrees the two commits share are never read, so the
-        # cost follows the size of the change rather than the keyset.
-        our_changes = self._changes(lca, self._current_commit)
-        their_changes = self._changes(lca, their_head)
-
-        # Build effective merge function lookup
-        effective_fns = dict(self._merge_fns)
-        if merge_fns:
-            effective_fns.update(merge_fns)
-        effective_prefixes = dict(self._merge_prefixes)
-        if merge_prefixes:
-            effective_prefixes.update(merge_prefixes)
-        effective_default = default_merge or self._default_merge
-
-        # Resolve the merge
-        try:
-            resolution = resolve_merge(
-                our_changes,
-                their_changes,
-                blob_reader=self._read_blob,
-                merge_fns=effective_fns,
-                default_merge=effective_default,
-                merge_prefixes=effective_prefixes,
-            )
-            if post_check is not None:
-                refused = {
-                    key
-                    for key, value in resolution.merged_values.items()
-                    if not post_check(key, value)
-                }
-                if refused:
-                    raise MergeConflict(refused)
-        except MergeConflict:
-            if saved_state is not None:
-                self._restore_state(saved_state)
-            if on_conflict == "abandon":
-                result = MergeResult(
-                    merged=False,
-                    commit=None,
-                    strategy=strategy,
-                    auto_merged_keys=(),
-                    carried_keys=(),
-                )
-                self.last_merge_result = result
-                return result
-            raise
-
-        if base is not None and not resolution:
-            # The change is already in our state, or changes nothing: an
-            # answer that holds only while our state is the branch's.
-            return self._live_no_op(self._current_commit, on_conflict)
-
-        if parents is None:
-            # Concurrent-write default: keep following the moved HEAD, as
-            # before. Cross-branch callers pass (our_head, their_head) so
-            # linear history stays on the merging branch (git convention).
-            parents = (their_head, self._current_commit)
-
-        self._create_merge_commit(resolution, parents, info)
-        merge_hash = self._current_commit
-
-        # CAS HEAD onto the merge commit: from their_head in the
-        # concurrent-write path, from our own head cross-branch.
-        if self._cas_head(cas_from or their_head, merge_hash):
-            self._base_commit = merge_hash
-            result = MergeResult(
-                merged=True,
-                commit=merge_hash,
-                strategy=strategy,
-                auto_merged_keys=resolution.auto_merged_keys,
-                carried_keys=resolution.carried_keys,
-            )
-            self.last_merge_result = result
-            return result
-
-        if saved_state is not None:
-            self._restore_state(saved_state)
-        if on_conflict == "abandon":
-            result = MergeResult(
-                merged=False,
-                commit=None,
-                strategy=strategy,
-                auto_merged_keys=(),
-                carried_keys=(),
-            )
-            self.last_merge_result = result
-            return result
-        raise ConcurrencyError(
-            "HEAD changed during three-way merge. Refresh and retry."
-        )
-
-    @_rolls_back
-    def merge_heads(
-        self,
-        their_head: str,
-        *,
-        on_conflict: str = "raise",
-        merge_fns: dict[str, MergePolicy] | None = None,
-        merge_prefixes: dict[str, MergePolicy] | None = None,
-        default_merge: MergePolicy | None = None,
-        post_check: PostCheck | None = None,
-        info: dict | None = None,
-        fast_forward: bool = True,
-    ) -> MergeResult:
-        """Merge another head into this branch.
-
-        ``their_head`` is any commit in the store — usually another
-        branch's HEAD. Finds the lowest common ancestor with our head,
-        three-way resolves, and creates a two-parent merge commit,
-        CAS-guarded on our own head (a race raises ``ConcurrencyError``
-        and changes nothing). No common ancestor raises
-        ``ConcurrencyError`` likewise without changing anything; retrying
-        cannot help that case, unlike a race. A ``their_head`` not in the
-        store raises ``UnknownCommitError`` before anything else is read.
-
-        A head our history already contains merges as a no-op, provided
-        the branch is still at our head. When ours
-        is an ancestor of theirs, the branch fast-forwards — HEAD moves
-        to ``their_head`` and no commit is written, so ``info`` is not
-        recorded — unless ``fast_forward=False``, which writes the merge
-        commit anyway.
-
-        ``post_check`` runs over each merge-function-produced value;
-        a False files that key as conflicted (handled per
-        ``on_conflict`` like any other conflict).
-        """
-        if on_conflict not in ("raise", "abandon"):
-            raise ValueError(
-                f"on_conflict must be 'raise' or 'abandon', got {on_conflict!r}"
-            )
-        # Read as empty, an unknown head would surface as a misleading
-        # "no common ancestor".
-        self._require_commits(their_head)
-        our_head = self._current_commit
-        lca = self._find_lca(our_head, their_head)
-        if lca == their_head:
-            return self._live_no_op(our_head, on_conflict)
-        if lca == our_head and fast_forward:
-            return self._fast_forward(their_head, on_conflict=on_conflict)
-        return self._three_way_merge(
-            their_head,
-            on_conflict=on_conflict,
-            merge_fns=merge_fns,
-            merge_prefixes=merge_prefixes,
-            default_merge=default_merge,
-            post_check=post_check,
-            info=info,
-            saved_state=self._snapshot_state(),
-            cas_from=our_head,
-            parents=(our_head, their_head),
-            ancestor=(lca,),
-        )
-
-    @_rolls_back
-    def apply_change(
-        self,
-        base: str,
-        target: str,
-        *,
-        on_conflict: str = "raise",
-        merge_fns: dict[str, MergePolicy] | None = None,
-        merge_prefixes: dict[str, MergePolicy] | None = None,
-        default_merge: MergePolicy | None = None,
-        post_check: PostCheck | None = None,
-        info: dict | None = None,
-    ) -> MergeResult:
-        """Apply the change from ``base`` to ``target`` as one commit.
-
-        A three-way merge with ``base`` in place of the common ancestor:
-        what ``target`` changed relative to ``base`` lands on our head,
-        and our own changes since then are kept, conflicts resolved (or
-        raised) as in a merge. The result is an ordinary single-parent
-        commit, CAS-guarded on our head — a cherry-pick is
-        ``apply_change(parent, commit)`` and a revert
-        ``apply_change(commit, parent)``.
-
-        A change already present commits nothing (``no_op``), provided the
-        branch is still at our head: if it moved, the answer may no longer
-        hold, and this raises ``ConcurrencyError`` (or abandons, with
-        ``on_conflict='abandon'``) as a lost publish would.
-
-        Raises:
-            UnknownCommitError: if ``base`` or ``target`` is not in the
-                store, checked before anything else is read.
-            UnknownBranchError: if the branch was deleted.
-            ConcurrencyError: if the branch moved during the apply, or
-                away from our head when the change is already present.
-            MergeConflict: if keys conflict and no merge function
-                resolves them.
-        """
-        if on_conflict not in ("raise", "abandon"):
-            raise ValueError(
-                f"on_conflict must be 'raise' or 'abandon', got {on_conflict!r}"
-            )
-        # A missing commit would read as an empty tree, and applying the
-        # change to or from empty removes or adds every key.
-        self._require_commits(base, target)
-        our_head = self._current_commit
-        return self._three_way_merge(
-            target,
-            on_conflict=on_conflict,
-            merge_fns=merge_fns,
-            merge_prefixes=merge_prefixes,
-            default_merge=default_merge,
-            post_check=post_check,
-            info=info,
-            saved_state=self._snapshot_state(),
-            cas_from=our_head,
-            parents=(our_head,),
-            base=base,
-            strategy="apply",
-        )
-
-    def _live_no_op(self, our_head: str, on_conflict: str) -> MergeResult:
-        """A merge or apply that changes nothing, at ``our_head``.
-
-        Nothing is written, so no publish guards this answer the way the
-        other outcomes' CAS on our head does: it holds only if the branch
-        is still where this handle left it. A branch that moved raises
-        ``ConcurrencyError``, or abandons under ``on_conflict='abandon'``.
-        """
-        live = self.latest_head
-        if live is None:
-            raise UnknownBranchError(f"Branch '{self._branch}' has no HEAD")
-        if live != our_head:
-            if on_conflict == "abandon":
-                result = MergeResult(
-                    merged=False,
-                    commit=None,
-                    strategy="no_op",
-                    auto_merged_keys=(),
-                    carried_keys=(),
-                )
-                self.last_merge_result = result
-                return result
-            raise ConcurrencyError("HEAD changed during merge. Refresh and retry.")
-        result = MergeResult(
-            merged=True,
-            commit=our_head,
-            strategy="no_op",
-            auto_merged_keys=(),
-            carried_keys=(),
-        )
-        self.last_merge_result = result
-        return result
-
-    def _require_commits(self, *commits: str) -> None:
-        """Raise ``UnknownCommitError`` for the first of ``commits`` that is
-        not in the store."""
-        missing = self._missing_commits(commits)
-        for commit in commits:
-            if commit in missing:
-                raise UnknownCommitError(f"Commit '{commit}' does not exist")
-
     # -- Abstract methods (implemented by subclasses) --
-
-    @abstractmethod
-    def _fast_forward(self, their_head: str, *, on_conflict: str) -> MergeResult:
-        """Move this branch's HEAD from our head to ``their_head``, a
-        descendant of it, writing no commit."""
 
     @property
     @abstractmethod
@@ -568,19 +224,6 @@ class VersionedBase(ABC):
         """
 
     @abstractmethod
-    def _create_merge_commit(
-        self,
-        resolution: MergeResolution,
-        parents: tuple[str, ...],
-        info: dict | None,
-    ) -> str:
-        """Create a commit from a resolved merge, on ``parents``: our
-        state with the resolution's changes applied.
-
-        Must update ``self._commit_keys`` and ``self._current_commit``.
-        """
-
-    @abstractmethod
     def _cas_head(self, expected: str, new_head: str) -> bool:
         """Atomically advance branch HEAD from expected to new_head."""
 
@@ -594,13 +237,5 @@ class VersionedBase(ABC):
         """Load the parent tuple for a commit."""
 
     @abstractmethod
-    def _missing_commits(self, commits: Iterable[str]) -> set[str]:
-        """Which of ``commits`` are not in the store."""
-
-    @abstractmethod
     def _find_lca(self, commit_a: str, commit_b: str) -> str | None:
         """Find the lowest common ancestor of two commits."""
-
-    @abstractmethod
-    def _read_blob(self, content_id: str) -> bytes | None:
-        """Read a blob by its content identifier."""

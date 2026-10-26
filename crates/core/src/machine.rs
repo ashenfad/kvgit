@@ -61,6 +61,11 @@ pub enum Request {
     /// [`Reply::Next`] when it wants more. A host that wants no more
     /// drops the machine instead.
     Emit(crate::json::Value),
+    /// Ask the caller's check over values a merge made, before they are
+    /// written: each key, the value's blob key, and its bytes where the
+    /// core made them (the host holds the rest by blob key). Answered
+    /// [`Reply::Refused`] with the keys whose values it refuses.
+    Check(Vec<(String, String, Option<Vec<u8>>)>),
 }
 
 /// A conditional batch: `writes` and `removes` land together, and only
@@ -92,6 +97,7 @@ pub enum Reply {
     Recovered(Option<String>),
     Now(f64),
     Next,
+    Refused(Vec<String>),
     /// The host couldn't perform the request, and holds the reason.
     Failed,
 }
@@ -189,6 +195,21 @@ impl Io {
             Reply::Recovered(commit) => Ok(commit),
             Reply::Failed => Err(HostFailed),
             other => panic!("a recovery answered with {other:?}"),
+        }
+    }
+
+    /// The keys whose values the caller's check refuses.
+    pub async fn check(
+        &self,
+        values: Vec<(String, String, Option<Vec<u8>>)>,
+    ) -> Result<Vec<String>, HostFailed> {
+        if values.is_empty() {
+            return Ok(vec![]);
+        }
+        match self.ask(Request::Check(values)).await {
+            Reply::Refused(keys) => Ok(keys),
+            Reply::Failed => Err(HostFailed),
+            other => panic!("a check answered with {other:?}"),
         }
     }
 

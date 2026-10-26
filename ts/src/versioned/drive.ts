@@ -25,7 +25,7 @@ import {
 import { pack, unpack } from '../hamt'
 import { CantMark } from '../merges'
 import { pyDumps } from '../pyjson'
-import { type BytesMergeFn, type KVStore, MergeChoice } from '../types'
+import { type BytesMergeFn, type KVStore, MergeChoice, type PostCheck } from '../types'
 import { blobKey, loadsInfo } from './layout'
 import { leaseEnv } from './lease'
 
@@ -70,6 +70,8 @@ export interface DriveEnv {
   held?: Map<string, Uint8Array>
   /** The functions the operation names by number. */
   mergeFns?: readonly BytesMergeFn[]
+  /** The check the operation runs over the values they make. */
+  postCheck?: PostCheck | undefined
   recover?: ((store: KVStore, branch: string) => Promise<string | null>) | undefined
   /** The clock commit and tag times are read from, in seconds. */
   now: () => number
@@ -222,6 +224,18 @@ async function perform(
       )
       const text = JSON.stringify(answers)
       return (wall) => op.replyMerged(wall, text)
+    }
+    case 'check': {
+      const values = JSON.parse(op.requestJson()) as Array<[string, string, number | null]>
+      const made = unpack(op.requestData(), Uint32Array.from(values.flatMap(([, , n]) => n ?? [])))
+      let at = 0
+      const refused: string[] = []
+      for (const [key, blob, n] of values) {
+        const value = n === null ? (held.get(blob) as Uint8Array) : (made[at++] as Uint8Array)
+        if (env.postCheck !== undefined && !env.postCheck(key, value)) refused.push(key)
+      }
+      const text = JSON.stringify(refused)
+      return (wall) => op.replyRefused(wall, text)
     }
     case 'now': {
       const now = env.now()

@@ -1,5 +1,5 @@
-//! The commit: write a worktree's changes and publish them as its
-//! branch's new head.
+//! The commit, and the merges and applies a worktree makes: write
+//! changes and publish them as the branch's new head.
 //!
 //! A commit on a branch that hasn't moved lands as a fast-forward. One
 //! on a branch that has, or that loses the race to publish, merges
@@ -24,7 +24,7 @@ use crate::layout::{
     EMPTY_HASH, GC_LEASE_KEY, STORAGE_VERSION_KEY, branch_head, branch_head_prev, commit_root,
     commit_time, in_flight_key, info_key, parent_commit, parent_gens,
 };
-use crate::lease::{IN_FLIGHT_TTL, stamp_version_at_least, under_lease, wait_for_gc};
+use crate::lease::{IN_FLIGHT_TTL, stamp_version_at_least, try_land, under_lease, wait_for_gc};
 use crate::machine::{Cas, Io, Write};
 use crate::merge::{Change, Merged, Rules, resolve};
 use crate::store::{dumps, dumps_str, loads_str, safe_loads};
@@ -56,6 +56,7 @@ pub enum Strategy {
     NoOp,
     FastForward,
     ThreeWay,
+    Apply,
 }
 
 impl Strategy {
@@ -64,6 +65,7 @@ impl Strategy {
             Strategy::NoOp => "no_op",
             Strategy::FastForward => "fast_forward",
             Strategy::ThreeWay => "three_way",
+            Strategy::Apply => "apply",
         }
     }
 }
@@ -95,6 +97,32 @@ pub struct CommitArgs {
     pub stamped: bool,
     /// Roots and generations the host already knows: a commit's never
     /// change, so these save reads.
+    pub roots: Vec<(String, String)>,
+    pub generations: Vec<(String, u64)>,
+}
+
+/// A merge to make on a worktree with nothing pending: of another
+/// head into its branch, or of the change between two commits onto it.
+#[derive(Clone, Debug)]
+pub struct MergeArgs {
+    pub branch: String,
+    /// The head the worktree is at.
+    pub ours: String,
+    /// The head to merge, or the commit whose change to apply.
+    pub theirs: String,
+    /// For an apply, the commit the change is from, standing in for the
+    /// common ancestor; `None` for a merge.
+    pub from: Option<String>,
+    /// Whether a merge of a descendant only moves the head.
+    pub fast_forward: bool,
+    pub shape: Shape,
+    pub rules: Rules,
+    pub on_conflict: OnConflict,
+    pub info: Option<Value>,
+    /// Whether the caller checks the values merge functions make.
+    pub post_check: bool,
+    pub recover: bool,
+    pub stamped: bool,
     pub roots: Vec<(String, String)>,
     pub generations: Vec<(String, u64)>,
 }
@@ -142,6 +170,67 @@ pub async fn commit(io: Io, args: CommitArgs) -> Done<Committed> {
         result,
         notes: w.notes,
     }
+}
+
+/// Merge `args`: another head into the branch, or the change between
+/// two commits onto it.
+///
+/// A merge of a head the branch already contains changes nothing, and
+/// one of a descendant moves the head to it, unless made to write a
+/// merge commit anyway; otherwise the two merge three ways from their
+/// lowest common ancestor into a commit on both. An apply merges three
+/// ways from the commit the change is from, into an ordinary commit on
+/// ours; a change already present commits nothing. An answer of
+/// nothing holds only while the branch is still at our head, so it is
+/// checked against the live head. Every commit named must be in the
+/// store, checked before anything else is read, since a missing one
+/// would read as an empty tree.
+pub async fn merge(io: Io, args: MergeArgs) -> Done<Committed> {
+    let commit = CommitArgs {
+        branch: args.branch.clone(),
+        base: args.ours.clone(),
+        current: args.ours.clone(),
+        shape: args.shape.clone(),
+        updates: vec![],
+        removals: vec![],
+        chunks: vec![],
+        info: args.info.clone(),
+        on_moved: OnMoved::Merge,
+        on_conflict: args.on_conflict,
+        rules: args.rules.clone(),
+        recover: args.recover,
+        stamped: args.stamped,
+        roots: args.roots.clone(),
+        generations: args.generations.clone(),
+    };
+    let mut w = Writer::new(&io, &commit);
+    let mut result = w.merge(&args).await;
+    if !matches!(result, Ok(Committed { merged: true, .. })) {
+        w.roll_back().await;
+    }
+    if let Ok(done) = &mut result {
+        done.roots = w.new_roots.clone();
+        done.generations = w.new_generations.clone();
+        done.stamped = w.stamped;
+    }
+    Done {
+        result,
+        notes: w.notes,
+    }
+}
+
+/// How a three-way merge lands.
+struct Onto<'p> {
+    /// The common ancestor, or the commit an applied change is from.
+    base: String,
+    /// The merge commit's parents, in order.
+    parents: Vec<&'p str>,
+    /// The head the merge commit is published over.
+    over: &'p str,
+    strategy: Strategy,
+    /// Whether a merge that changes nothing commits nothing.
+    may_be_nothing: bool,
+    post_check: bool,
 }
 
 /// One commit attempt and what it has written so far.
@@ -561,32 +650,76 @@ impl<'a> Writer<'a> {
     /// Merge our commit with `theirs`, the branch's head, and publish
     /// the merge over it.
     async fn three_way(&mut self, theirs: &str) -> Result<Committed, Error> {
-        let a = self.args;
         let ours = self.current.clone();
         let Some(base) = merge_base(self.io, &ours, theirs, &mut self.gens).await? else {
-            self.roll_back().await;
-            if a.on_conflict == OnConflict::Abandon {
-                return Ok(Self::abandoned(Strategy::ThreeWay));
-            }
-            return Err(Error::Concurrency(
-                "No common ancestor found between current commit and HEAD.".into(),
-            ));
+            return self.no_ancestor(Strategy::ThreeWay).await;
         };
+        let onto = Onto {
+            base,
+            parents: vec![theirs, ours.as_str()],
+            over: theirs,
+            strategy: Strategy::ThreeWay,
+            may_be_nothing: false,
+            post_check: false,
+        };
+        self.merge_onto(theirs, onto).await
+    }
+
+    /// Two commits share no history: nothing to merge from.
+    async fn no_ancestor(&mut self, strategy: Strategy) -> Result<Committed, Error> {
+        self.roll_back().await;
+        if self.args.on_conflict == OnConflict::Abandon {
+            return Ok(Self::abandoned(strategy));
+        }
+        Err(Error::Concurrency(
+            "No common ancestor found between current commit and HEAD.".into(),
+        ))
+    }
+
+    /// Merge, three ways from `onto.base`, the current commit and
+    /// `theirs`, and publish the merge over `onto.over`.
+    async fn merge_onto(&mut self, theirs: &str, onto: Onto<'_>) -> Result<Committed, Error> {
+        let a = self.args;
+        let ours = self.current.clone();
         // Each side's changes since the ancestor, as structural diffs:
         // subtrees the two share are never read.
-        let our_changes = self.changes_between(&base, &ours).await?;
-        let their_changes = self.changes_between(&base, theirs).await?;
-        let resolution = match resolve(self.io, &our_changes, &their_changes, &a.rules).await {
+        let our_changes = self.changes_between(&onto.base, &ours).await?;
+        let their_changes = self.changes_between(&onto.base, theirs).await?;
+        let mut resolved = resolve(self.io, &our_changes, &their_changes, &a.rules).await;
+        if onto.post_check
+            && let Ok(resolution) = &resolved
+        {
+            let values = resolution
+                .merged
+                .iter()
+                .map(|(key, merged)| match merged {
+                    Merged::Held { blob, .. } => (key.clone(), blob.clone(), None),
+                    Merged::Made(bytes) => (key.clone(), merged.blob().0, Some(bytes.clone())),
+                })
+                .collect();
+            let mut refused = self.io.check(values).await?;
+            if !refused.is_empty() {
+                refused.sort();
+                resolved = Err(Error::MergeConflict {
+                    keys: refused,
+                    failures: vec![],
+                });
+            }
+        }
+        let resolution = match resolved {
             Ok(resolution) => resolution,
             Err(e @ Error::MergeConflict { .. }) => {
                 self.roll_back().await;
                 if a.on_conflict == OnConflict::Abandon {
-                    return Ok(Self::abandoned(Strategy::ThreeWay));
+                    return Ok(Self::abandoned(onto.strategy));
                 }
                 return Err(e);
             }
             Err(e) => return Err(e),
         };
+        if onto.may_be_nothing && !resolution.changes_anything() {
+            return self.live_no_op(&ours).await;
+        }
 
         let mut writes = BTreeMap::new();
         let mut updates: Vec<(String, Entry)> = resolution.updates.clone().into_iter().collect();
@@ -602,7 +735,7 @@ impl<'a> Writer<'a> {
         let removals: Vec<String> = resolution.removals.iter().cloned().collect();
         let merge = self
             .build(
-                &[theirs, ours.as_str()],
+                &onto.parents,
                 updates.clone(),
                 removals.clone(),
                 writes,
@@ -617,9 +750,9 @@ impl<'a> Writer<'a> {
         }
         self.current = merge.clone();
 
-        if self.publish(theirs, &merge).await? {
+        if self.publish(onto.over, &merge).await? {
             return Ok(self.landed(
-                Strategy::ThreeWay,
+                onto.strategy,
                 merge,
                 resolution.auto_merged,
                 resolution.carried,
@@ -627,11 +760,144 @@ impl<'a> Writer<'a> {
         }
         self.roll_back().await;
         if a.on_conflict == OnConflict::Abandon {
-            return Ok(Self::abandoned(Strategy::ThreeWay));
+            return Ok(Self::abandoned(onto.strategy));
         }
         Err(Error::Concurrency(
             "HEAD changed during three-way merge. Refresh and retry.".into(),
         ))
+    }
+
+    /// Merge another head, or apply a change, as `m` asks.
+    async fn merge(&mut self, m: &MergeArgs) -> Result<Committed, Error> {
+        let ours = m.ours.clone();
+        let mut named: Vec<&str> = m.from.iter().map(String::as_str).collect();
+        named.push(&m.theirs);
+        self.require(&named).await?;
+        if let Some(from) = &m.from {
+            let onto = Onto {
+                base: from.clone(),
+                parents: vec![ours.as_str()],
+                over: &ours,
+                strategy: Strategy::Apply,
+                may_be_nothing: true,
+                post_check: m.post_check,
+            };
+            return self.merge_onto(&m.theirs, onto).await;
+        }
+        let base = merge_base(self.io, &ours, &m.theirs, &mut self.gens).await?;
+        let Some(base) = base else {
+            return self.no_ancestor(Strategy::ThreeWay).await;
+        };
+        if base == m.theirs {
+            return self.live_no_op(&ours).await;
+        }
+        if base == ours && m.fast_forward {
+            return self.fast_forward(&ours, &m.theirs).await;
+        }
+        let onto = Onto {
+            base,
+            parents: vec![ours.as_str(), m.theirs.as_str()],
+            over: &ours,
+            strategy: Strategy::ThreeWay,
+            may_be_nothing: false,
+            post_check: m.post_check,
+        };
+        self.merge_onto(&m.theirs, onto).await
+    }
+
+    /// Fail for the first of `commits` that isn't in the store.
+    async fn require(&mut self, commits: &[&str]) -> Result<(), Error> {
+        let keys = commits.iter().map(|c| commit_root(c)).collect();
+        let found = self.io.get(keys).await?;
+        for commit in commits {
+            match found.get(&commit_root(commit)).and_then(|r| loads_str(r)) {
+                Some(root) => {
+                    self.roots.insert(commit.to_string(), root);
+                }
+                None if found.contains_key(&commit_root(commit)) => {}
+                None => {
+                    return Err(Error::UnknownCommit {
+                        commit: commit.to_string(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A merge or apply that changes nothing, at `ours`. Nothing is
+    /// written, so no publish guards the answer: it holds only while the
+    /// branch is still at our head.
+    async fn live_no_op(&mut self, ours: &str) -> Result<Committed, Error> {
+        match self.head(vec![]).await? {
+            None => Err(Error::head_gone(&self.args.branch)),
+            Some(live) if live != ours => {
+                if self.args.on_conflict == OnConflict::Abandon {
+                    return Ok(Self::abandoned(Strategy::NoOp));
+                }
+                Err(Error::Concurrency(
+                    "HEAD changed during merge. Refresh and retry.".into(),
+                ))
+            }
+            Some(_) => Ok(self.landed(Strategy::NoOp, ours.to_string(), vec![], vec![])),
+        }
+    }
+
+    /// Move the head from `ours` to `theirs`, a descendant of it, writing
+    /// no commit. That theirs is here and the head names it are decided
+    /// against one lease record, so a sweep can't take theirs between
+    /// them. The write expects our head: a branch that moved meanwhile
+    /// fails it, and a deleted one isn't made again.
+    async fn fast_forward(&mut self, ours: &str, theirs: &str) -> Result<Committed, Error> {
+        let changes = self.changes_between(ours, theirs).await?;
+        let branch = self.args.branch.clone();
+        let head_key = branch_head(&branch);
+        let expected = dumps_str(ours);
+        loop {
+            let lease = wait_for_gc(self.io, None).await?;
+            if self.io.get_one(&commit_root(theirs)).await?.is_none() {
+                return Err(Error::UnknownCommit {
+                    commit: theirs.to_string(),
+                });
+            }
+            let cas = Cas {
+                expect: vec![(head_key.clone(), Some(expected.clone()))],
+                writes: vec![
+                    (head_key.clone(), Write::Bytes(dumps_str(theirs))),
+                    (branch_head_prev(&branch), Write::Bytes(expected.clone())),
+                ],
+                removes: vec![],
+            };
+            match try_land(self.io, lease, cas).await? {
+                None => continue,
+                Some(true) => break,
+                Some(false) => {
+                    if self.io.get_one(&head_key).await?.is_none() {
+                        return Err(Error::UnknownBranch { branch });
+                    }
+                    if heal_head(self.io, &branch, &expected, &mut self.notes).await? {
+                        continue;
+                    }
+                    if self.args.on_conflict == OnConflict::Abandon {
+                        return Ok(Self::abandoned(Strategy::FastForward));
+                    }
+                    return Err(Error::Concurrency(
+                        "HEAD changed during merge. Refresh and retry.".into(),
+                    ));
+                }
+            }
+        }
+        let carried: Vec<String> = changes.keys().cloned().collect();
+        for (key, change) in changes {
+            self.changes.insert(key, change.new);
+        }
+        // The worktree is at theirs now, a commit it didn't write but
+        // whose root it may keep.
+        if let Some(root) = self.roots.get(theirs) {
+            self.new_roots.push((theirs.to_string(), root.clone()));
+        }
+        self.current = theirs.to_string();
+        Ok(self.landed(Strategy::FastForward, theirs.to_string(), vec![], carried))
     }
 
     /// Each key whose value differs from commit `a` to commit `b`. A key

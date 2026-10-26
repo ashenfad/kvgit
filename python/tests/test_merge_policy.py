@@ -554,14 +554,24 @@ class TestMergeChoicePolicy:
         worker.commit({"runs/1": b"theirs", "runs/2": b"theirs"})
 
         reads: list[str] = []
-        original = main._read_blob
-        main._read_blob = lambda cid: (reads.append(cid), original(cid))[1]
+        store = main.store
+        get, get_many = store.get, store.get_many
+
+        def counted_get(key):
+            reads.append(key)
+            return get(key)
+
+        def counted_get_many(*args):
+            reads.extend(store._normalize_keys(args))
+            return get_many(*args)
+
+        store.get, store.get_many = counted_get, counted_get_many
         try:
             result = main.merge_heads(worker.current_commit)
         finally:
-            main._read_blob = original
+            store.get, store.get_many = get, get_many
         assert result.merged
-        assert reads == []
+        assert [k for k in reads if k.startswith("kvgit:blob:")] == []
 
     def test_policy_writes_no_blob_and_keeps_our_pointer(self):
         main, worker = _branched_versioned()
