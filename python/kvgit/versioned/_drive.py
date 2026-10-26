@@ -76,6 +76,12 @@ def steps(
     check it runs over the values they make.
     """
     held = {} if held is None else held
+    # A store seen through a content cache: the operation reads through
+    # the cache itself, and its requests go to the store underneath.
+    cache = getattr(store, "_core_cache", None)
+    if cache is not None:
+        op.use_cache(cache)
+        store = store.backend  # type: ignore[attr-defined]
     errors: dict[str, Exception] = {}
     raised: BaseException | None = None
     reply: Any = None

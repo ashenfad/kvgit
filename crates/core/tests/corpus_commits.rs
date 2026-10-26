@@ -9,6 +9,7 @@
 //! heads go through the core's operations by name, as the hosts call
 //! them.
 
+use kvgit_core::cache::{Cache, DEFAULT_CACHE_BYTES, Shared};
 use kvgit_core::error::Error;
 use kvgit_core::json::{Value, loads};
 use kvgit_core::keyset::{Entry, shape};
@@ -207,6 +208,9 @@ struct Run {
     made: HashMap<String, Vec<u8>>,
     /// GC leases taken so far, which name each next one.
     leases: u64,
+    /// The content cache every operation reads through, as a
+    /// repository's do.
+    cache: Shared,
     store: BTreeMap<String, Vec<u8>>,
     clock: f64,
     vars: HashMap<String, Value>,
@@ -232,6 +236,7 @@ impl Run {
             repos: HashMap::new(),
             made: HashMap::new(),
             leases: 0,
+            cache: Cache::shared(DEFAULT_CACHE_BYTES),
             store,
             clock,
             vars: HashMap::from([("$root".into(), Value::Str(ROOT_COMMIT.into()))]),
@@ -702,7 +707,8 @@ impl Run {
                     generations: vec![],
                 };
                 let recover = wt.recover;
-                let machine = Machine::new(move |io| merge(io, margs));
+                let mut machine = Machine::new(move |io| merge(io, margs));
+                machine.use_cache(self.cache.clone());
                 let done = self.drive(machine, &HashMap::new(), recover);
                 self.finish(&name, done)
             }
@@ -823,6 +829,7 @@ impl Run {
     /// that emits its answer in parts answers with the parts' items.
     fn call(&mut self, name: &str, args: Value, recover: bool) -> Result<Value, String> {
         let mut machine = ops::call(name, args).map_err(|e| error_name(&e))?;
+        machine.use_cache(self.cache.clone());
         let mut step = machine.resume_at(self.clock_now(), None);
         let mut emitted = Vec::new();
         loop {
@@ -914,7 +921,9 @@ impl Run {
             roots: vec![],
             generations: vec![],
         };
-        (Machine::new(move |io| commit(io, args)), values)
+        let mut machine = Machine::new(move |io| commit(io, args));
+        machine.use_cache(self.cache.clone());
+        (machine, values)
     }
 
     fn drive(

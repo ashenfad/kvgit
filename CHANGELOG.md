@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **TypeScript repositories cache what the store never rewrites.** Tree nodes and commit records are answered from a cache of `cacheBytes` (32 MB by default, 0 turns it off), as Python's are, and any writer's sweep empties it before the next commit builds.
 - **TypeScript gains the commit-scan recoverer.** `recoverByCommitScan`, passed as `recoverFromCorruptHead`, guesses a damaged branch's head as Python's `recover_by_commit_scan` does, from the same code.
 
 ### Changed

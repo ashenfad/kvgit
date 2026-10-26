@@ -9,7 +9,7 @@
  * @internal
  */
 
-import type { Op } from '../../wasm/kvgit_wasm.js'
+import type { ContentCache, Op } from '../../wasm/kvgit_wasm.js'
 import { core, coreIfLoaded } from '../core'
 import {
   BranchExistsError,
@@ -82,6 +82,27 @@ export interface DriveEnv {
 
 const encoder = new TextEncoder()
 
+/** The content cache each store is read through, once a repository
+ *  opened over it gave it one. Every operation on the store uses it. */
+const caches = new WeakMap<KVStore, ContentCache>()
+
+/** @internal Read `store` through `cache` from now on. */
+export function cacheStore(store: KVStore, cache: ContentCache): void {
+  caches.set(store, cache)
+}
+
+/** @internal The content cache `store` is read through, if any. */
+export function cacheOf(store: KVStore): ContentCache | undefined {
+  return caches.get(store)
+}
+
+/** Read and write through the store's cache, if it has one. */
+function cached(op: Op, store: KVStore): Op {
+  const cache = caches.get(store)
+  if (cache !== undefined) op.useCache(cache)
+  return op
+}
+
 /** An answer's JSON, integers past the safe range kept exact. The core
  *  writes JSON without spaces, so a number starts after `:`, `[` or
  *  `,`; plain `JSON.parse` serves any text without one 16 digits long. */
@@ -99,7 +120,7 @@ async function start(name: string, args: object): Promise<Op> {
 /** Run the core's operation `name` on `args` against `env.store`, and
  *  return what it answers. */
 export async function callCore(name: string, args: object, env: DriveEnv): Promise<unknown> {
-  const op = await start(name, args)
+  const op = cached(await start(name, args), env.store)
   try {
     return await drive(op, env, parseValue)
   } finally {
@@ -114,7 +135,7 @@ export async function* streamCore(
   args: object,
   env: DriveEnv,
 ): AsyncGenerator<unknown, void, undefined> {
-  const op = await start(name, args)
+  const op = cached(await start(name, args), env.store)
   try {
     const run: Run = { causes: new Map(), raised: null }
     let kind = op.start(leaseEnv.clock())
@@ -135,7 +156,7 @@ export async function* streamCore(
 /** Perform a commit's requests until it is done, and return what it
  *  committed. */
 export async function driveCommit(op: Op, env: DriveEnv): Promise<Committed> {
-  return (await drive(op, env, JSON.parse)) as Committed
+  return (await drive(cached(op, env.store), env, JSON.parse)) as Committed
 }
 
 /** What an operation's driver keeps while it runs: the exceptions

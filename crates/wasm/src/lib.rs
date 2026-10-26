@@ -117,6 +117,47 @@ pub fn tag_name_problem(name: &str) -> Option<String> {
         .map(|e| e.to_string())
 }
 
+/// A repository's memory of write-once keys (tree nodes, commit
+/// records), least recently used first out, bounded in bytes, and
+/// emptied when a read finds the GC lease record changed.
+#[wasm_bindgen]
+pub struct ContentCache {
+    inner: kvgit_core::cache::Shared,
+}
+
+#[wasm_bindgen]
+impl ContentCache {
+    #[wasm_bindgen(constructor)]
+    pub fn new(max_bytes: usize) -> ContentCache {
+        ContentCache {
+            inner: kvgit_core::cache::Cache::shared(max_bytes),
+        }
+    }
+
+    /// `{hits, misses, clears, entries, bytes}`, as JSON.
+    pub fn stats(&self) -> String {
+        let c = self.inner.lock().unwrap();
+        format!(
+            r#"{{"hits":{},"misses":{},"clears":{},"entries":{},"bytes":{}}}"#,
+            c.hits,
+            c.misses,
+            c.clears,
+            c.len(),
+            c.size_bytes()
+        )
+    }
+
+    pub fn clear(&self) {
+        self.inner.lock().unwrap().clear();
+    }
+}
+
+impl ContentCache {
+    pub(crate) fn shared(&self) -> kvgit_core::cache::Shared {
+        self.inner.clone()
+    }
+}
+
 fn to_js(e: impl std::fmt::Display) -> JsError {
     JsError::new(&e.to_string())
 }

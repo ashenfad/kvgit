@@ -57,7 +57,11 @@ pub async fn gc(io: &Io, shape: Shape, args: &Gc, notes: &mut Notes) -> Result<u
             taken => break taken?,
         }
     };
+    // A sweep reads every live node once; leaving them in the content
+    // cache would only push out what commits and reads use.
+    io.pass_cache(true);
     let swept = sweep(io, shape, args.min_age, args.deep, notes).await;
+    io.pass_cache(false);
     let released = release(io, &ours, expires, args.lease_ttl, notes).await;
     let removed = swept?;
     released?;

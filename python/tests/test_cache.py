@@ -121,6 +121,27 @@ def test_another_processs_sweep_empties_the_cache_before_the_next_commit():
     assert ours.snapshot(branch="main")["k1"] == "after the sweep"
 
 
+def test_a_sweep_before_this_repositorys_first_lease_read_empties_it_too():
+    """A cache filled before anything here read the lease has no record
+    to compare against: the first one it finds may be a sweep's, run
+    since it filled, so that empties it too."""
+    backend = Memory()
+    _, writer, _ = _filled(backend)
+    writer.gc(min_age=0)  # the store has been swept once
+
+    ours = Repo(backend)
+    reader = ours.worktree("main")
+    reader.keys()
+    assert len(ours.cache) > 0
+
+    Repo(backend).gc(min_age=0)
+    reader["k1"] = "after the sweep"
+    reader.commit()
+
+    assert ours.cache.clears == 1
+    assert ours.snapshot(branch="main")["k1"] == "after the sweep"
+
+
 def test_this_processs_own_sweep_empties_it_too():
     _, repo, wt = _filled()
     wt["k1"] = "x"

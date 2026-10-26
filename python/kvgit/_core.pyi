@@ -92,6 +92,32 @@ def check_branch_name(name: str) -> None:
 def check_tag_name(name: str) -> None:
     """Raise ``ValueError`` for a name that can't be a tag."""
 
+def cacheable(key: str) -> bool:
+    """Whether ``key`` is one the store never rewrites."""
+
+class ContentCache:
+    """A repository's memory of write-once keys, shared by every
+    operation given it; see ``kvgit.cache``."""
+
+    def __init__(self, max_bytes: int) -> None: ...
+    @property
+    def max_bytes(self) -> int: ...
+    @property
+    def size_bytes(self) -> int: ...
+    @property
+    def hits(self) -> int: ...
+    @property
+    def misses(self) -> int: ...
+    @property
+    def clears(self) -> int: ...
+    def __len__(self) -> int: ...
+    def clear(self) -> None: ...
+    def lookup(self, keys: list[str]) -> dict[str, bytes]: ...
+    def count(self, hits: int, misses: int) -> None: ...
+    def remember(self, items: dict[str, bytes]) -> None: ...
+    def forget(self, keys: list[str]) -> None: ...
+    def saw_lease(self, record: bytes | None) -> None: ...
+
 class Op:
     """An operation of the core in progress, started by name with its
     arguments as a dict, or by ``Op.commit``. ``resume`` returns the next
@@ -118,6 +144,25 @@ class Op:
         roots: list[tuple[str, str]],
         generations: list[tuple[str, int]],
     ) -> Op: ...
+    @staticmethod
+    def merge(
+        branch: str,
+        ours: str,
+        theirs: str,
+        from_: str | None,
+        fast_forward: bool,
+        info: dict | None,
+        on_conflict: str,
+        merge_fns: dict[str, Any],
+        merge_prefixes: list[tuple[str, Any]],
+        default_merge: Any,
+        post_check: bool,
+        recover: bool,
+        stamped: bool,
+        roots: list[tuple[str, str]],
+        generations: list[tuple[str, int]],
+    ) -> Op: ...
+    def use_cache(self, cache: ContentCache) -> None: ...
     def resume(
         self, wall: float, reply: Any = None, failed: bool = False
     ) -> tuple[Any, ...]: ...
