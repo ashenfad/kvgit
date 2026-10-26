@@ -12,10 +12,7 @@
 use kvgit_core::error::Error;
 use kvgit_core::json::{Value, loads};
 use kvgit_core::keyset::{Entry, shape};
-use kvgit_core::layout::{
-    ROOT_COMMIT, STORAGE_VERSION_KEY, blob_key, branch_head, commit_root, commit_time, info_key,
-    parent_commit,
-};
+use kvgit_core::layout::{ROOT_COMMIT, STORAGE_VERSION_KEY, blob_key, branch_head, commit_root};
 use kvgit_core::machine::{Cas, Machine, Reply, Request, Step, Write};
 use kvgit_core::merge::{MergeAnswer, MergeAsk, Rule, Rules};
 use kvgit_core::ops::{self, Out};
@@ -54,6 +51,8 @@ const KNOWN: &[&str] = &[
     "tag_delete",
     "tags",
     "repair_head",
+    "diff",
+    "merge_base",
 ];
 
 /// The scenarios it must run: a scenario that gains a step it doesn't
@@ -61,6 +60,7 @@ const KNOWN: &[&str] = &[
 const EXPECTED: &[&str] = &[
     "basics/first-commit",
     "basics/lost-race",
+    "format/encoding",
     "history/commit-scan-recovery",
     "history/head-recovery",
     "history/refs",
@@ -495,42 +495,46 @@ impl Run {
                 self.call("repair_head", Value::Object(fields), recover)
             }
             "get_commit" => {
-                let c = self.arg(step, "commit");
-                let read = |key: String| self.store.get(&key).map(|raw| loads(raw).unwrap());
-                let mut fields = vec![
-                    (
-                        "parents".into(),
-                        read(parent_commit(&c)).ok_or("UnknownCommitError")?,
-                    ),
-                    ("root".into(), read(commit_root(&c)).unwrap_or(Value::Null)),
-                    ("time".into(), read(commit_time(&c)).unwrap_or(Value::Null)),
-                ];
-                fields.push(("info".into(), read(info_key(&c)).unwrap_or(Value::Null)));
-                Ok(Value::Object(fields))
+                let commit = self.arg(step, "commit");
+                let mut found = self.call("get_commit", args(&[("commit", &commit)]), false)?;
+                if let Value::Object(fields) = &mut found {
+                    fields.retain(|(k, _)| k != "hash");
+                }
+                Ok(found)
             }
             "log" => {
                 let start = match step.get("branch") {
                     Some(_) => self.head_of(&self.arg(step, "branch"), false)?,
                     None => self.arg(step, "commit"),
                 };
-                let mut out = Vec::new();
-                let mut queue = std::collections::VecDeque::from([start]);
-                while let Some(c) = queue.pop_front() {
-                    if out.contains(&c) {
-                        continue;
-                    }
-                    let parents = match self
-                        .store
-                        .get(&parent_commit(&c))
-                        .map(|r| loads(r).unwrap())
-                    {
-                        Some(Value::Array(ps)) => ps,
-                        _ => vec![],
-                    };
-                    queue.extend(parents.iter().filter_map(|p| p.as_str().map(String::from)));
-                    out.push(c);
-                }
-                Ok(strings(&out))
+                let mut fields = vec![("start".to_string(), Value::Str(start))];
+                fields.push((
+                    "limit".into(),
+                    step.get("limit").cloned().unwrap_or(Value::Null),
+                ));
+                let first = step.get("first_parent") == Some(&Value::Bool(true));
+                fields.push(("first_parent".into(), Value::Bool(first)));
+                let Value::Array(records) = self.call("log", Value::Object(fields), false)? else {
+                    panic!("log")
+                };
+                let hashes = records
+                    .iter()
+                    .map(|r| r.get("hash").unwrap().clone())
+                    .collect();
+                Ok(Value::Array(hashes))
+            }
+            "diff" => {
+                let (a, b) = (self.arg(step, "a"), self.arg(step, "b"));
+                self.call("diff", args(&[("a", &a), ("b", &b)]), false)
+            }
+            "merge_base" => {
+                let mut fields = vec![
+                    ("a".to_string(), Value::Str(self.arg(step, "a"))),
+                    ("b".to_string(), Value::Str(self.arg(step, "b"))),
+                ];
+                fields.push(("check".into(), Value::Bool(true)));
+                let found = self.call("merge_base", Value::Object(fields), false)?;
+                Ok(found.get("base").cloned().unwrap())
             }
             "text_merge" => {
                 let side = |name: &str| match step.get(name) {
@@ -651,18 +655,27 @@ impl Run {
         Ok(found.get("commit").unwrap().as_str().unwrap().to_string())
     }
 
-    /// Run the core's operation `name` against the store.
+    /// Run the core's operation `name` against the store. An operation
+    /// that emits its answer in parts answers with the parts' items.
     fn call(&mut self, name: &str, args: Value, recover: bool) -> Result<Value, String> {
         let mut machine = ops::call(name, args).map_err(|e| error_name(&e))?;
         let mut step = machine.resume_at(self.clock_now(), None);
+        let mut emitted = Vec::new();
         loop {
             match step {
                 Step::Done(done) => {
                     return match done.result {
+                        Ok(Out::Value(Value::Null)) if !emitted.is_empty() || name == "log" => {
+                            Ok(Value::Array(emitted))
+                        }
                         Ok(Out::Value(v)) => Ok(v),
                         Ok(Out::Committed(_)) => panic!("{name} committed"),
                         Err(e) => Err(error_name(&e)),
                     };
+                }
+                Step::Request(Request::Emit(Value::Array(part))) => {
+                    emitted.extend(part);
+                    step = machine.resume_at(self.clock_now(), Some(Reply::Next));
                 }
                 Step::Request(r) => {
                     let reply = self.perform(r, &HashMap::new(), recover);
@@ -827,6 +840,7 @@ impl Run {
                 Reply::Recovered(guess.as_str().map(String::from))
             }
             Request::Recover(_) => Reply::Recovered(None),
+            Request::Emit(_) => Reply::Next,
             Request::Now => Reply::Now(self.clock),
         }
     }

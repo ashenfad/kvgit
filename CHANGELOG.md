@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **Breaking (TypeScript): an empty tag name throws `RangeError`.** It threw `TypeError`; every name the branch and tag calls refuse now throws `RangeError`.
+- **A log reads a level of history at a time.** `log` reads every commit queued in one batch, where it read each commit's records on its own.
+- **Python reads a damaged commit record without raising.** `get_commit` and `log` treat parents, a time or info that don't parse as absent, as TypeScript did.
+- **TypeScript's `diff` ignores a change of metadata alone.** A key whose blob is unchanged isn't reported as modified, as in Python.
 - **The commit scan breaks ties by hash.** Of two unclaimed tips made at the same time, it recovers to the smaller hash, where Python picked either.
 - **Breaking (TypeScript): the text merge needs the core loaded.** `text`, `textMergeResult` and the functions `makeTextMerge` builds run the core's merge, which `Repo.open` loads; code that merges text before opening any repository awaits the new `loadCore()` first.
 - **Breaking (Python): commit info keys must be strings.** Other keys raise `TypeError`, since `json.dumps` writes them as strings and they wouldn't read back as the keys the commit hash covers.

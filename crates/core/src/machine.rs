@@ -56,6 +56,11 @@ pub enum Request {
     /// The time to stamp a commit with, in seconds, from the clock the
     /// caller may replace. Answered [`Reply::Now`].
     Now,
+    /// Part of the operation's answer, ready before the rest: the host
+    /// hands it on, to a caller iterating over the answer, and answers
+    /// [`Reply::Next`] when it wants more. A host that wants no more
+    /// drops the machine instead.
+    Emit(crate::json::Value),
 }
 
 /// A conditional batch: `writes` and `removes` land together, and only
@@ -86,6 +91,7 @@ pub enum Reply {
     Merged(Vec<MergeAnswer>),
     Recovered(Option<String>),
     Now(f64),
+    Next,
     /// The host couldn't perform the request, and holds the reason.
     Failed,
 }
@@ -183,6 +189,15 @@ impl Io {
             Reply::Recovered(commit) => Ok(commit),
             Reply::Failed => Err(HostFailed),
             other => panic!("a recovery answered with {other:?}"),
+        }
+    }
+
+    /// Hand the host part of the answer, and wait until it wants more.
+    pub async fn emit(&self, part: crate::json::Value) -> Result<(), HostFailed> {
+        match self.ask(Request::Emit(part)).await {
+            Reply::Next => Ok(()),
+            Reply::Failed => Err(HostFailed),
+            other => panic!("an emit answered with {other:?}"),
         }
     }
 

@@ -8,7 +8,7 @@ undoing what it wrote, and the exception is raised once it is done.
 
 import hashlib
 import logging
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Generator, Sequence
 from typing import Any
 
 from ..errors import (
@@ -38,7 +38,18 @@ _NOTES = {
 }
 
 
-def drive(
+def drive(op: Any, store: KVStore, **env: Any) -> Any:
+    """Perform `op`'s requests until it is done, and return its outcome;
+    see :func:`steps` for ``env``."""
+    run = steps(op, store, **env)
+    while True:
+        try:
+            next(run)
+        except StopIteration as done:
+            return done.value
+
+
+def steps(
     op: Any,
     store: KVStore,
     *,
@@ -47,8 +58,9 @@ def drive(
     recoverer: Callable[[KVStore, str], Any] | None = None,
     clock: Callable[[], float],
     sleep: Callable[[float], None],
-) -> Any:
-    """Perform `op`'s requests until it is done, and return its outcome.
+) -> Generator[Any, None, Any]:
+    """Perform `op`'s requests, yielding each part of the answer it emits
+    early, and return its outcome.
 
     ``held`` holds the bytes the operation writes by key without
     reading them; values merge functions make join it. ``merge_fns`` are
@@ -73,6 +85,11 @@ def drive(
                 raise raised
             raise _error(outcome[1], outcome[2], errors)
         reply, failed = None, False
+        if kind == "emit":
+            # Outside the handler below, so a caller that stops iterating
+            # closes this generator rather than failing the request.
+            yield request[1]
+            continue
         try:
             if kind == "get":
                 reply = dict(store.get_many(request[1]))

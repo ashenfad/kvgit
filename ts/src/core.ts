@@ -30,6 +30,11 @@ export async function loadCore(): Promise<void> {
   await core()
 }
 
+/** The core if it has loaded, else null. */
+export function coreIfLoaded(): Core | null {
+  return loaded
+}
+
 /** The core, for synchronous callers; it must have loaded. */
 export function loadedCore(): Core {
   if (loaded === null) {

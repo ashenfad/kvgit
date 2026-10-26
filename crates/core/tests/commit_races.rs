@@ -114,6 +114,7 @@ impl Store {
                     .collect(),
             ),
             Request::Recover(_) => Reply::Recovered(None),
+            Request::Emit(_) => Reply::Next,
             Request::Now => Reply::Now(self.clock),
         }
     }

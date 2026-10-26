@@ -14,23 +14,18 @@ from .cache import (
     ContentCache,
 )
 from .content_types import MergeFn
-from .encoding import loads, safe_loads
+from .encoding import loads
 from .errors import (
     BranchExistsError,
     UnknownCommitError,
-    UnknownTagError,
 )
 from .kv.base import KVStore
 from .refs import Branches, Tags
 from .versioned import kv as _kv
-from .versioned.helpers import changes_as_diff, walk_history
 from .versioned.keyset import Keyset
 from .versioned.kv import (
     COMMIT_ROOT,
-    COMMIT_TIME,
     GC_LEASE_TTL,
-    INFO_KEY,
-    PARENT_COMMIT,
     ROOT_COMMIT,
     CorruptHeadRecoverer,
     VersionedKV,
@@ -201,30 +196,7 @@ class Repo:
         Raises:
             UnknownCommitError: if it is not in the store.
         """
-        keys = (
-            COMMIT_ROOT % commit,
-            PARENT_COMMIT % commit,
-            COMMIT_TIME % commit,
-            INFO_KEY % commit,
-        )
-        found = self._store.get_many(*keys)
-        root_raw = found.get(keys[0])
-        if root_raw is None:
-            raise UnknownCommitError(f"Commit '{commit}' does not exist")
-        parents_raw = found.get(keys[1])
-        parents = loads(parents_raw) if parents_raw is not None else None
-        if isinstance(parents, str):
-            parents = [parents]
-        time_raw = found.get(keys[2])
-        time_val = safe_loads(time_raw) if time_raw is not None else None
-        info_raw = found.get(keys[3])
-        return Commit(
-            hash=commit,
-            parents=tuple(parents or ()),
-            time=float(time_val) if isinstance(time_val, (int, float)) else None,
-            info=loads(info_raw) if info_raw is not None else None,
-            root=loads(root_raw),
-        )
+        return _commit(_kv._call("get_commit", self._store, commit=commit))
 
     def log(
         self,
@@ -242,20 +214,11 @@ class Repo:
         branch itself, skipping what merges brought in.
         """
         start = self._resolve_ref(commit=commit, branch=branch, tag=tag)
-        records: dict[str, Commit] = {}
-
-        def parents_of(h: str) -> tuple[str, ...]:
-            record = records.pop(h, None) or self.get_commit(h)
-            return record.parents
-
-        for count, h in enumerate(
-            walk_history(start, parents_of, all_parents=not first_parent)
-        ):
-            if limit is not None and count >= limit:
-                return
-            record = self.get_commit(h)
-            records[h] = record
-            yield record
+        records = _kv._stream(
+            "log", self._store, start=start, limit=limit, first_parent=first_parent
+        )
+        for record in records:
+            yield _commit(record)
 
     def diff(self, a: str, b: str) -> DiffResult:
         """Keys added, removed and modified going from commit ``a`` to ``b``.
@@ -266,11 +229,12 @@ class Repo:
         Raises:
             UnknownCommitError: if either commit is not in the store.
         """
-        found = self._store.get_many(COMMIT_ROOT % a, COMMIT_ROOT % b)
-        for commit in (a, b):
-            if COMMIT_ROOT % commit not in found:
-                raise UnknownCommitError(f"Commit '{commit}' does not exist")
-        return changes_as_diff(_kv.commit_changes(self._store, a, b))
+        found = _kv._call("diff", self._store, a=a, b=b)
+        return DiffResult(
+            added=frozenset(found["added"]),
+            removed=frozenset(found["removed"]),
+            modified=frozenset(found["modified"]),
+        )
 
     def merge_base(self, a: str, b: str) -> str | None:
         """The lowest common ancestor of two commits, or None if they share
@@ -279,10 +243,7 @@ class Repo:
         Raises:
             UnknownCommitError: if either commit is not in the store.
         """
-        for commit in (a, b):
-            if self._store.get(COMMIT_ROOT % commit) is None:
-                raise UnknownCommitError(f"Commit '{commit}' does not exist")
-        return _kv.merge_base(self._store, a, b)
+        return _kv._call("merge_base", self._store, a=a, b=b, check=True)["base"]
 
     def snapshot(
         self,
@@ -337,21 +298,31 @@ class Repo:
         Checking that the commit exists reads its keyset root; ``roots``,
         when given, keeps it, for a caller about to open that tree.
         """
-        given = [ref for ref in (commit, branch, tag) if ref is not None]
+        given = {
+            name: ref
+            for name, ref in (("commit", commit), ("branch", branch), ("tag", tag))
+            if ref is not None
+        }
         if len(given) != 1:
             raise ValueError("name exactly one of commit, branch or tag")
-        if branch is not None:
-            return self.branches._resolve(branch, roots)
-        if tag is not None:
-            tagged = _kv._resolve_tag(self._store, tag)
-            if tagged is None:
-                raise UnknownTagError(f"Tag '{tag}' does not exist")
-            target = tagged
-        else:
-            target = commit  # type: ignore[assignment]
-        if not _kv._has_root(self._store, target, roots):
-            raise UnknownCommitError(f"Commit '{target}' does not exist")
-        return target
+        recover = self._recover
+        found = _kv._call(
+            "resolve_ref", self._store, recover, recover=recover is not None, **given
+        )
+        if roots is not None and found["root"] is not None:
+            roots[found["commit"]] = found["root"]
+        return found["commit"]
+
+
+def _commit(record: dict[str, Any]) -> Commit:
+    """A commit record as the core gives it."""
+    return Commit(
+        hash=record["hash"],
+        parents=tuple(record["parents"]),
+        time=record["time"],
+        info=record["info"],
+        root=record["root"],
+    )
 
 
 class Snapshot(Mapping[str, Any]):

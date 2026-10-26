@@ -5,11 +5,15 @@
 
 use crate::error::Error;
 use crate::head::{self, Notes, Resolved};
+use crate::history;
 use crate::json::Value;
+use crate::keyset;
+use crate::layout::commit_root;
 use crate::machine::{Io, Machine};
-use crate::refs;
-use crate::store::dumps_str;
+use crate::refs::{self, Ref};
+use crate::store::{dumps_str, loads_str};
 use crate::write::{self, CommitArgs, Committed, Done};
+use std::collections::HashMap;
 
 /// What an operation answers with.
 #[derive(Debug)]
@@ -37,6 +41,16 @@ pub type Op = Machine<Done<Out>>;
 /// - `tags {}`: `[name, commit]` pairs, sorted by name.
 /// - `tag_info {name}`: `{name, commit, time, info, dangling}`, or null.
 /// - `create_tag {name, target, info}`, `delete_tag {name}`.
+/// - `resolve_ref {commit | branch | tag, recover}`: `{commit, root}` of
+///   a commit that must be in the store, with a root that is a string.
+/// - `get_commit {commit}`: `{hash, parents, time, info, root}`.
+/// - `log {start, limit, first_parent}`: emits lists of records, newest
+///   first; answers null.
+/// - `diff {a, b}`: `{added, removed, modified}`, each a sorted list of
+///   keys, between two commits in the store.
+/// - `merge_base {a, b, check}`: `{base, generations}`, the base or
+///   null and `[commit, generation]` pairs worked out on the way; with
+///   `check`, both commits must be in the store.
 pub const NAMES: &[&str] = &[
     "resolve_head",
     "head_of",
@@ -52,6 +66,11 @@ pub const NAMES: &[&str] = &[
     "tag_info",
     "create_tag",
     "delete_tag",
+    "resolve_ref",
+    "get_commit",
+    "log",
+    "diff",
+    "merge_base",
 ];
 
 /// Start operation `name` on `args`, an object.
@@ -93,6 +112,24 @@ fn flag(args: &Value, name: &str) -> Result<bool, Error> {
     match arg(args, name)? {
         Value::Bool(b) => Ok(*b),
         _ => Err(Error::Invalid(format!("{name:?} isn't true or false"))),
+    }
+}
+
+fn number(args: &Value, name: &str) -> Result<Option<u64>, Error> {
+    match arg(args, name)? {
+        Value::Null => Ok(None),
+        Value::Int(n) if *n >= 0 => Ok(Some(*n as u64)),
+        _ => Err(Error::Invalid(format!("{name:?} isn't a count"))),
+    }
+}
+
+/// The keyset root of a commit that must be in the store.
+async fn root_of(io: &Io, commit: &str) -> Result<String, Error> {
+    match io.get_one(&commit_root(commit)).await? {
+        Some(raw) => Ok(loads_str(&raw).unwrap_or_else(|| crate::layout::EMPTY_HASH.clone())),
+        None => Err(Error::UnknownCommit {
+            commit: commit.to_string(),
+        }),
     }
 }
 
@@ -177,6 +214,78 @@ async fn run(io: &Io, name: &str, args: &Value, notes: &mut Notes) -> Result<Val
         "delete_tag" => {
             refs::delete_tag(io, text(args, "name")?).await?;
             Value::Null
+        }
+        "resolve_ref" => {
+            let given: Vec<Ref> = [
+                ("commit", Ref::Commit as fn(String) -> Ref),
+                ("branch", Ref::Branch),
+                ("tag", Ref::Tag),
+            ]
+            .into_iter()
+            .filter_map(|(name, make)| args.get(name)?.as_str().map(|s| make(s.to_string())))
+            .collect();
+            let [r] = given.as_slice() else {
+                return Err(Error::Invalid(
+                    "name exactly one of commit, branch or tag".into(),
+                ));
+            };
+            let (commit, root) = refs::resolve_ref(io, r, flag(args, "recover")?, notes).await?;
+            Value::Object(vec![
+                ("commit".into(), Value::Str(commit)),
+                ("root".into(), Value::Str(root)),
+            ])
+        }
+        "get_commit" => history::get_commit(io, text(args, "commit")?)
+            .await?
+            .to_value(),
+        "log" => {
+            let (start, limit) = (text(args, "start")?, number(args, "limit")?);
+            history::log(io, start, limit, flag(args, "first_parent")?).await?;
+            Value::Null
+        }
+        "diff" => {
+            let (a, b) = (
+                root_of(io, text(args, "a")?).await?,
+                root_of(io, text(args, "b")?).await?,
+            );
+            let mut added = Vec::new();
+            let mut removed = Vec::new();
+            let mut modified = Vec::new();
+            for (key, change) in history::changes(io, keyset::shape(), a, b).await? {
+                match (change.old, change.new) {
+                    (None, _) => added.push(key),
+                    (_, None) => removed.push(key),
+                    _ => modified.push(key),
+                }
+            }
+            Value::Object(vec![
+                ("added".into(), strings(added)),
+                ("removed".into(), strings(removed)),
+                ("modified".into(), strings(modified)),
+            ])
+        }
+        "merge_base" => {
+            let (a, b) = (text(args, "a")?, text(args, "b")?);
+            if flag(args, "check")? {
+                root_of(io, a).await?;
+                root_of(io, b).await?;
+            }
+            let mut known = HashMap::new();
+            let base = history::merge_base(io, a, b, &mut known).await?;
+            let mut generations: Vec<(String, u64)> = known.into_iter().collect();
+            generations.sort();
+            Value::Object(vec![
+                ("base".into(), opt_str(base)),
+                (
+                    "generations".into(),
+                    Value::Array(
+                        generations
+                            .into_iter()
+                            .map(|(c, g)| Value::Array(vec![Value::Str(c), Value::Int(g as i64)]))
+                            .collect(),
+                    ),
+                ),
+            ])
         }
         _ => unreachable!("checked against NAMES"),
     })

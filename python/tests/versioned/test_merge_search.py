@@ -11,12 +11,7 @@ from kvgit.versioned.kv import (
     COMMIT_ROOT,
     PARENT_COMMIT,
     PARENT_GENS,
-    ROOT_COMMIT,
     VersionedKV,
-    _generations,
-    _merge_base_by_generation,
-    _merge_base_by_walk,
-    _NoGenerations,
     clean_orphans,
     load_parents,
     merge_base,
@@ -55,6 +50,28 @@ def longest_paths(store):
     return {c: gen(c) for c in commits(store)}
 
 
+def walk_merge_base(store, a, b):
+    """The lowest common ancestor from both whole histories: of the
+    commits both reach, the ones no other such commit descends from,
+    the smallest hash breaking a tie."""
+
+    def ancestors(start):
+        seen, stack = set(), [start]
+        while stack:
+            c = stack.pop()
+            if c not in seen:
+                seen.add(c)
+                stack.extend(load_parents(store, c))
+        return seen
+
+    common = ancestors(a) & ancestors(b)
+    below = set()
+    for c in common:
+        below |= ancestors(c) - {c}
+    best = common - below
+    return min(best) if best else None
+
+
 def random_history(seed, steps=120, branch_count=4):
     """A DAG from random commits and merges across a few branches,
     criss-crosses included. Every commit writes its own key, so no merge
@@ -88,11 +105,6 @@ class TestGenerations:
                 continue
             assert loads(store.get(PARENT_GENS % c)) == [truth[p] for p in parents]
 
-    def test_the_root_commit_is_generation_zero(self):
-        store = Memory()
-        VersionedKV(store)
-        assert _generations(store, [ROOT_COMMIT]) == {ROOT_COMMIT: 0}
-
 
 class TestSearch:
     @pytest.mark.parametrize("seed", range(8))
@@ -102,9 +114,7 @@ class TestSearch:
         rng = random.Random(seed)
         pairs = [tuple(rng.sample(every, 2)) for _ in range(150)]
         for a, b in pairs:
-            expected = _merge_base_by_walk(store, a, b)
-            assert _merge_base_by_generation(store, a, b, None) == expected
-            assert merge_base(store, a, b) == expected
+            assert merge_base(store, a, b) == walk_merge_base(store, a, b)
 
     def test_criss_cross_ties_go_to_the_smallest_hash(self):
         store = Memory()
@@ -118,7 +128,7 @@ class TestSearch:
         dev.merge_heads(m1, fast_forward=False)
         a, b = main.current_commit, dev.current_commit
         assert merge_base(store, a, b) == min(m1, d1)
-        assert _merge_base_by_walk(store, a, b) == min(m1, d1)
+        assert walk_merge_base(store, a, b) == min(m1, d1)
 
     def test_unrelated_histories_have_no_common_ancestor(self):
         store = Memory()
@@ -157,9 +167,7 @@ class TestHistoryWithoutGenerations:
         every = commits(store)
         rng = random.Random(3)
         for a, b in (tuple(rng.sample(every, 2)) for _ in range(100)):
-            with pytest.raises(_NoGenerations):
-                _merge_base_by_generation(store, a, b, None)
-            assert merge_base(store, a, b) == _merge_base_by_walk(store, a, b)
+            assert merge_base(store, a, b) == walk_merge_base(store, a, b)
 
     def test_a_commit_over_old_history_stores_true_generations(self):
         store = Memory()
@@ -190,7 +198,7 @@ class TestHistoryWithoutGenerations:
             dev.commit({f"new-d{i}": b"1"})
         new = [c for c in commits(store) if c not in old]
         for a, b in itertools.combinations(new, 2):
-            assert merge_base(store, a, b) == _merge_base_by_walk(store, a, b)
+            assert merge_base(store, a, b) == walk_merge_base(store, a, b)
 
 
 class TestCollection:
