@@ -59,6 +59,8 @@ const KNOWN: &[&str] = &[
     "apply",
     "cherry_pick",
     "revert",
+    "gc",
+    "reset",
 ];
 
 /// The scenarios it must run: a scenario that gains a step it doesn't
@@ -66,15 +68,23 @@ const KNOWN: &[&str] = &[
 const EXPECTED: &[&str] = &[
     "basics/first-commit",
     "basics/lost-race",
+    "basics/tags-and-gc",
     "format/encoding",
+    "format/legacy-entries-v4",
+    "format/legacy-v3-store",
+    "gc/markers-and-leases",
+    "gc/orphans",
     "history/commit-scan-recovery",
     "history/head-recovery",
     "history/merge-base",
+    "history/on-moved",
     "history/refs",
     "merges/apply",
     "merges/branch-merges",
     "merges/text",
+    "races/lost-at-publish",
     "races/lost-before-batch",
+    "races/sweep-before-publish",
     "regressions/builtin-names",
 ];
 
@@ -174,6 +184,9 @@ struct Wt {
     base: String,
     keys: BTreeMap<String, Entry>,
     pending: BTreeMap<String, Option<Vec<u8>>>,
+    /// The pending keys the commit in progress takes; all of them when
+    /// `None`.
+    committing: Option<Vec<String>>,
     stamped: bool,
 }
 
@@ -192,6 +205,8 @@ struct Run {
     repos: HashMap<String, (bool, Value)>,
     /// Values the scenario's merge functions made, by blob key.
     made: HashMap<String, Vec<u8>>,
+    /// GC leases taken so far, which name each next one.
+    leases: u64,
     store: BTreeMap<String, Vec<u8>>,
     clock: f64,
     vars: HashMap<String, Value>,
@@ -216,6 +231,7 @@ impl Run {
         Run {
             repos: HashMap::new(),
             made: HashMap::new(),
+            leases: 0,
             store,
             clock,
             vars: HashMap::from([("$root".into(), Value::Str(ROOT_COMMIT.into()))]),
@@ -259,6 +275,26 @@ impl Run {
             extra.is_empty(),
             "{name}: keys Python didn't write: {extra:?}"
         );
+    }
+
+    /// `text` with each bound variable in it replaced by its value.
+    fn interpolate(&self, text: &str) -> String {
+        let mut out = String::new();
+        let mut rest = text;
+        while let Some(at) = rest.find('$') {
+            out.push_str(&rest[..at]);
+            let name_len = rest[at + 1..]
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len() - at - 1);
+            let name = &rest[at..at + 1 + name_len];
+            match self.vars.get(name) {
+                Some(Value::Str(bound)) => out.push_str(bound),
+                _ => panic!("{name} is unbound"),
+            }
+            rest = &rest[at + 1 + name_len..];
+        }
+        out.push_str(rest);
+        out
     }
 
     fn arg(&self, step: &Value, field: &str) -> String {
@@ -348,16 +384,21 @@ impl Run {
                     keys: self.keyset(&head),
                     base: head,
                     pending: BTreeMap::new(),
+                    committing: None,
                     stamped: false,
                 };
                 self.wts.insert(self.arg(step, "as"), wt);
                 Ok(Value::Null)
             }
             "snapshot" => {
-                let commit = match step.get("branch") {
-                    Some(_) => self.head_of(&self.arg(step, "branch"), false)?,
-                    None => self.arg(step, "commit"),
-                };
+                let field = ["branch", "commit", "tag"]
+                    .into_iter()
+                    .find(|f| step.get(f).is_some())
+                    .unwrap();
+                let mut fields = vec![(field.to_string(), Value::Str(self.arg(step, field)))];
+                fields.push(("recover".into(), Value::Bool(false)));
+                let found = self.call("resolve_ref", Value::Object(fields), false)?;
+                let commit = found.get("commit").unwrap().as_str().unwrap().to_string();
                 let keys = self.keyset(&commit);
                 self.snapshots.insert(self.arg(step, "as"), keys);
                 Ok(Value::Null)
@@ -589,12 +630,13 @@ impl Run {
                 }
             }
             "store_set" => {
-                let key = self.arg(step, "key");
+                let key = self.interpolate(step.get("key").and_then(Value::as_str).unwrap());
                 self.store.insert(key, bytes_of(step.get("value").unwrap()));
                 Ok(Value::Null)
             }
             "store_delete" => {
-                self.store.remove(&self.arg(step, "key"));
+                let key = self.interpolate(step.get("key").and_then(Value::as_str).unwrap());
+                self.store.remove(&key);
                 Ok(Value::Null)
             }
             "merge" | "apply" | "cherry_pick" | "revert" => {
@@ -664,8 +706,44 @@ impl Run {
                 let done = self.drive(machine, &HashMap::new(), recover);
                 self.finish(&name, done)
             }
+            "reset" => {
+                let name = self.arg(step, "wt");
+                let (branch, target) = (self.wts[&name].branch.clone(), self.arg(step, "commit"));
+                let moved = self.call(
+                    "reset_branch",
+                    args(&[("name", &branch), ("target", &target)]),
+                    false,
+                )?;
+                if moved != Value::Bool(true) {
+                    return Err("UnknownCommitError".into());
+                }
+                let keys = self.keyset(&target);
+                let wt = self.wts.get_mut(&name).unwrap();
+                (wt.base, wt.keys) = (target, keys);
+                wt.pending.clear();
+                Ok(Value::Null)
+            }
+            "gc" => {
+                let number = |name: &str, default: f64| match step.get(name) {
+                    Some(Value::Int(n)) => Value::Float(*n as f64),
+                    Some(Value::Float(x)) => Value::Float(*x),
+                    _ => Value::Float(default),
+                };
+                let flag = |name: &str, default: bool| match step.get(name) {
+                    Some(Value::Bool(b)) => Value::Bool(*b),
+                    _ => Value::Bool(default),
+                };
+                let fields = vec![
+                    ("min_age".to_string(), number("min_age", 3600.0)),
+                    ("deep".to_string(), flag("deep", false)),
+                    ("wait".to_string(), flag("wait", true)),
+                    ("lease_ttl".to_string(), Value::Float(600.0)),
+                ];
+                self.call("gc", Value::Object(fields), false)
+            }
             "commit" => {
                 let name = self.arg(step, "wt");
+                self.wts.get_mut(&name).unwrap().committing = keys_of(step);
                 let (machine, values) = self.start_commit(step, &name);
                 let recover = self.wts[&name].recover;
                 let done = self.drive(machine, &values, recover);
@@ -675,6 +753,7 @@ impl Run {
                 let inner = step.get("step").unwrap().clone();
                 assert_eq!(op(&inner), "commit", "{context}: only commits are held");
                 let name = self.arg(&inner, "wt");
+                self.wts.get_mut(&name).unwrap().committing = keys_of(&inner);
                 let pause = step
                     .get("pause")
                     .and_then(Value::as_str)
@@ -799,7 +878,8 @@ impl Run {
         let mut values = HashMap::new();
         let mut updates = Vec::new();
         let mut removals = Vec::new();
-        for (key, pending) in &wt.pending {
+        let taken = |key: &String| wt.committing.as_ref().is_none_or(|keys| keys.contains(key));
+        for (key, pending) in wt.pending.iter().filter(|(k, _)| taken(k)) {
             match pending {
                 Some(value) => {
                     let blob = blob_key(value);
@@ -927,6 +1007,10 @@ impl Run {
             Request::Recover(_) => Reply::Recovered(None),
             Request::Emit(_) => Reply::Next,
             Request::Check(_) => Reply::Refused(vec![]),
+            Request::Owner => {
+                self.leases += 1;
+                Reply::Owner(format!("lease-{}", self.leases))
+            }
             Request::Now => Reply::Now(self.clock),
         }
     }
@@ -960,7 +1044,10 @@ impl Run {
                 };
             }
             wt.base = c.commit.clone().unwrap();
-            wt.pending.clear();
+            match wt.committing.take() {
+                Some(keys) => wt.pending.retain(|k, _| !keys.contains(k)),
+                None => wt.pending.clear(),
+            }
             wt.stamped = c.stamped;
         }
         Ok(Value::Object(vec![
@@ -1041,9 +1128,22 @@ fn error_name(e: &Error) -> String {
         Error::TagExists { .. } => "TagExistsError",
         Error::Concurrency(_) => "ConcurrencyError",
         Error::MergeConflict { .. } => "MergeConflict",
+        Error::GcBusy(_) => "GcBusy",
         Error::Malformed(_) | Error::Host | Error::Invalid(_) => "invalid",
     }
     .into()
+}
+
+/// The keys a commit step takes, if it names them.
+fn keys_of(step: &Value) -> Option<Vec<String>> {
+    match step.get("keys") {
+        Some(Value::Array(keys)) => Some(
+            keys.iter()
+                .map(|k| k.as_str().unwrap().to_string())
+                .collect(),
+        ),
+        _ => None,
+    }
 }
 
 /// Arguments for an operation, all strings.

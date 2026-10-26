@@ -1,10 +1,13 @@
 """Shared test helpers."""
 
+import time
+
 from kvgit import Repo, Worktree
+from kvgit.encoding import dumps
 from kvgit.kv.base import KVStore
 from kvgit.kv.memory import Memory
 from kvgit.versioned.keyset import Keyset
-from kvgit.versioned.kv import BRANCH_HEAD, _load_root
+from kvgit.versioned.kv import BRANCH_HEAD, GC_LEASE_KEY, _load_root
 
 
 def worktree(
@@ -77,3 +80,18 @@ def fail_reads(store: KVStore, when, error: Exception) -> None:
         return real(keys)
 
     store.get_many = get_many  # type: ignore[method-assign]
+
+
+def hold_lease(store: KVStore, ttl: float) -> bytes:
+    """Take the GC lease as a sweep would, for ``ttl`` seconds, and
+    return the record written: a sweep held open by the test."""
+    raw = store.get(GC_LEASE_KEY)
+    ours = dumps({"owner": "a test's sweep", "expires": time.time() + ttl})
+    assert store.cas(GC_LEASE_KEY, ours, expected=raw), "the lease was taken"
+    return ours
+
+
+def release_lease(store: KVStore, ours: bytes) -> None:
+    """Give up a lease :func:`hold_lease` took, as a sweep does."""
+    expired = dumps({"owner": "a test's sweep", "expires": 0})
+    store.cas(GC_LEASE_KEY, expired, expected=ours)

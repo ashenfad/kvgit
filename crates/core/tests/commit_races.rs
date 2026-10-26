@@ -116,6 +116,7 @@ impl Store {
             Request::Recover(_) => Reply::Recovered(None),
             Request::Emit(_) => Reply::Next,
             Request::Check(_) => Reply::Refused(vec![]),
+            Request::Owner => Reply::Owner("lease-1".into()),
             Request::Now => Reply::Now(self.clock),
         }
     }

@@ -32,6 +32,7 @@ import threading
 import time
 
 import pytest
+from support import race_publish
 
 from kvgit import ConcurrencyError, MergeConflict
 from kvgit.encoding import dumps, loads
@@ -469,17 +470,7 @@ class TestRetryNodeAccounting:
         v1 = VersionedKV(store)
         v1.commit({"base": b"0"})
         v2 = VersionedKV(store)
-        real_cas = v2._cas_head
-        raced = False
-
-        def cas(expected, new_head):
-            nonlocal raced
-            if not raced:
-                raced = True
-                v1.commit({"other": b"1"})
-            return real_cas(expected, new_head)
-
-        v2._cas_head = cas
+        race_publish(store, "main", lambda: v1.commit({"other": b"1"}))
         result = v2.commit({"mine": b"2"})
         assert result.merged
 

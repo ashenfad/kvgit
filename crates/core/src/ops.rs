@@ -4,6 +4,7 @@
 //! with what it committed instead.
 
 use crate::error::Error;
+use crate::gc::{self, Gc};
 use crate::head::{self, Notes, Resolved};
 use crate::history;
 use crate::json::Value;
@@ -51,6 +52,9 @@ pub type Op = Machine<Done<Out>>;
 /// - `merge_base {a, b, check}`: `{base, generations}`, the base or
 ///   null and `[commit, generation]` pairs worked out on the way; with
 ///   `check`, both commits must be in the store.
+/// - `gc {min_age, deep, wait, lease_ttl}`: the number of commits swept.
+/// - `reset_branch {name, target}`: whether the branch moved; false when
+///   `target` isn't in the store.
 pub const NAMES: &[&str] = &[
     "resolve_head",
     "head_of",
@@ -71,6 +75,8 @@ pub const NAMES: &[&str] = &[
     "log",
     "diff",
     "merge_base",
+    "gc",
+    "reset_branch",
 ];
 
 /// Start operation `name` on `args`, an object.
@@ -141,6 +147,14 @@ async fn root_of(io: &Io, commit: &str) -> Result<String, Error> {
         None => Err(Error::UnknownCommit {
             commit: commit.to_string(),
         }),
+    }
+}
+
+fn seconds(args: &Value, name: &str) -> Result<f64, Error> {
+    match arg(args, name)? {
+        Value::Int(n) => Ok(*n as f64),
+        Value::Float(x) => Ok(*x),
+        _ => Err(Error::Invalid(format!("{name:?} isn't a number"))),
     }
 }
 
@@ -297,6 +311,18 @@ async fn run(io: &Io, name: &str, args: &Value, notes: &mut Notes) -> Result<Val
                     ),
                 ),
             ])
+        }
+        "reset_branch" => {
+            Value::Bool(refs::reset_branch(io, text(args, "name")?, text(args, "target")?).await?)
+        }
+        "gc" => {
+            let sweep = Gc {
+                min_age: seconds(args, "min_age")?,
+                deep: flag(args, "deep")?,
+                wait: flag(args, "wait")?,
+                lease_ttl: seconds(args, "lease_ttl")?,
+            };
+            Value::Int(gc::gc(io, keyset::shape(), &sweep, notes).await? as i64)
         }
         _ => unreachable!("checked against NAMES"),
     })

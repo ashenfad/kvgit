@@ -6,7 +6,7 @@ import tempfile
 from collections.abc import Mapping
 
 import pytest
-from support import fork, worktree
+from support import fork, hold_lease, worktree
 
 import kvgit
 from kvgit import (
@@ -35,7 +35,6 @@ from kvgit.versioned.kv import (
     STORAGE_VERSION_KEY,
     TAG_INFO_KEY,
     VersionedKV,
-    _acquire_gc_lease,
 )
 
 
@@ -668,7 +667,7 @@ class TestGc:
 
     def test_wait_false_raises_while_another_sweep_runs(self):
         repo, *_ = repo_with_history()
-        _acquire_gc_lease(repo.store, 60.0)
+        hold_lease(repo.store, 60.0)
         with pytest.raises(GcBusy):
             repo.gc(wait=False)
 

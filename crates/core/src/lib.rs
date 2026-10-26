@@ -4,6 +4,7 @@
 pub mod base64;
 pub mod commit;
 pub mod error;
+pub mod gc;
 pub mod hash;
 pub mod head;
 pub mod history;

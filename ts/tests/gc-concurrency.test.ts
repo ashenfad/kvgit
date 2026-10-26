@@ -57,6 +57,12 @@ class HookedMemory extends Memory {
     return super.get(key)
   }
 
+  override async getMany(keys: Iterable<string>): Promise<Map<string, Uint8Array>> {
+    const wanted = [...keys]
+    for (const key of wanted) await this.fire(this.beforeGet, key)
+    return super.getMany(wanted)
+  }
+
   private async fire(hooks: Map<string, () => Promise<void>>, key: string): Promise<void> {
     const hook = hooks.get(key)
     if (hook === undefined) return

@@ -89,7 +89,6 @@ from ..encoding import dumps, loads, safe_loads
 from ..errors import (
     BranchExistsError,
     CorruptHeadError,
-    GcBusy,
     StorageVersionError,
     UnknownBranchError,
 )
@@ -98,7 +97,6 @@ from ..kv.base import KVStore
 from ..kv.memory import Memory
 from ._drive import drive, steps
 from .base import VersionedBase
-from .helpers import walk_history
 from .keyset import Keyset, KeysetEntry, MetaEntry
 from .merge import Change
 from .protocol import MergeChoice, MergePolicy, MergeResult, PostCheck, TagInfo
@@ -264,34 +262,6 @@ def _assert_supported_version(store: KVStore) -> None:
         )
 
 
-def _stamp_version_at_least(store: KVStore, version: int) -> None:
-    """Raise the store's version stamp to ``version`` if it is lower.
-
-    Called from any path that writes an artifact older layouts cannot
-    handle — currently a chunk, which needs v3.
-
-    The write is a CAS against the exact bytes the decision was made
-    from, not a plain ``set``: read-then-set lets two writers stamping
-    different versions interleave so that the *lower* one lands last,
-    leaving a store whose stamp under-describes what is in it, which is
-    precisely the state older readers are willing to open. A lost CAS
-    means someone else moved the stamp, so the loop re-reads and decides
-    again. It terminates because a stamp is only ever raised: every
-    iteration either returns or observes a strictly higher value.
-    """
-    while True:
-        raw = store.get(STORAGE_VERSION_KEY)
-        current = safe_loads(raw) if raw is not None else None
-        if (
-            isinstance(current, int)
-            and not isinstance(current, bool)
-            and current >= version
-        ):
-            return
-        if store.cas(STORAGE_VERSION_KEY, dumps(version), expected=raw):
-            return
-
-
 def _check_storage_version(store: KVStore) -> None:
     """Verify the store's kvgit version is compatible.
 
@@ -331,6 +301,7 @@ def _call(
         _core.Op(op, args),
         store,
         recoverer=recoverer,
+        owner=lambda: _new_lease_owner(),
         clock=time.time,
         sleep=time.sleep,
     )
@@ -354,30 +325,6 @@ def _stream(
     )
     for part in run:
         yield from part
-
-
-# "Not read yet", for a value the caller may already hold, where None
-# already means "read, and absent".
-_UNREAD: Any = object()
-
-
-def _has_root(store: KVStore, commit_hash: Any, roots: dict[str, str] | None) -> bool:
-    """Whether ``commit_hash`` names a commit whose root is present.
-
-    The root read to answer that is recorded in ``roots`` when given:
-    whoever resolved a head is usually about to open its tree, and a
-    commit's root never changes, so there is no reason to read it twice.
-    """
-    if not isinstance(commit_hash, str):
-        return False
-    raw = store.get(COMMIT_ROOT % commit_hash)
-    if raw is None:
-        return False
-    if roots is not None:
-        root = safe_loads(raw)
-        if isinstance(root, str):
-            roots[commit_hash] = root
-    return True
 
 
 def _load_root(store: KVStore, commit_hash: str) -> str | None:
@@ -490,28 +437,6 @@ def recover_by_commit_scan(store: KVStore, branch: str) -> str | None:
     return _call("recover_by_commit_scan", store, branch=branch)
 
 
-def _heal_head(store: KVStore, branch: str, commit: str) -> bool:
-    """Atomically replace an unresolvable HEAD with a recovered value.
-
-    Returns True only when HEAD was damaged *and* this call is the one
-    that replaced it. Three cases are deliberately left alone:
-
-    * HEAD resolves fine — it did not break, it *moved*, and another
-      writer won a legitimate race. Overwriting it would destroy a good
-      commit to make a losing CAS succeed.
-    * HEAD already names ``commit`` — nothing to do.
-    * HEAD is absent — the branch was deleted. Re-creating the key is
-      exactly the resurrection ``delete_branch`` drops the prev-HEAD
-      backup to prevent.
-
-    The replacement is a CAS against the exact damaged bytes, so two
-    processes healing the same branch cannot both win, and a HEAD that
-    someone else repaired (or advanced) in the meantime is never
-    clobbered.
-    """
-    return _call("heal_head", store, branch=branch, commit=commit)
-
-
 def repair_head(
     store: KVStore,
     branch: str = "main",
@@ -560,26 +485,6 @@ def repair_head(
     )
 
 
-def _validate_tag_name(name: str) -> None:
-    """Reject tag names that cannot be stored, or cannot be read back.
-
-    Branch names are unvalidated, so this is deliberately close to
-    unvalidated too: any non-empty string, ``/`` included, so embedders
-    can namespace their own tags (``pub/v1``). ``%`` is the one
-    exclusion — tag keys are built with ``%``-formatting, and a name
-    carrying its own format specifier turns the key template into
-    something other than a template.
-    """
-    if not isinstance(name, str):
-        raise ValueError("Tag name must be a non-empty string")
-    _core.check_tag_name(name)
-
-
-def _tag_branch(name: str) -> str:
-    """The reserved branch name a tag's commit pointer lives under."""
-    return TAG_BRANCH_PREFIX + name
-
-
 def _reject_reserved_branch(name: str) -> None:
     """Refuse the empty branch name, and names in the reserved tag namespace.
 
@@ -624,136 +529,9 @@ def tag_info(store: KVStore, name: str) -> TagInfo | None:
     return None if found is None else TagInfo(**found)
 
 
-def _lease_expiry(raw: bytes | None) -> float:
-    """Unix time the lease in ``raw`` runs out; 0.0 if there is no lease.
-
-    Bytes that do not decode to a record with a numeric ``expires`` are
-    treated as already expired rather than as an error. A lease is a
-    hint about who is sweeping right now, so garbage under the key must
-    not wedge the store forever — CAS against those exact bytes takes it
-    over.
-    """
-    if raw is None:
-        return 0.0
-    record = safe_loads(raw)
-    if not isinstance(record, dict):
-        return 0.0
-    expires = record.get("expires")
-    if isinstance(expires, (int, float)) and not isinstance(expires, bool):
-        return float(expires)
-    return 0.0
-
-
-def _wait_for_gc(store: KVStore, raw: Any = _UNREAD) -> bytes | None:
-    """Block until no live GC lease is held; return the lease record then.
-
-    The bytes returned are what a write that must not land under a
-    sweep expects the lease key to still hold: absent, or the expired
-    record the last sweep left. A sweep that starts afterwards replaces
-    them with a record of its own — every acquisition writes a fresh
-    owner id — so a ``cas_many`` expecting them fails for as long as that
-    sweep runs, and afterwards too; the writer comes back here and waits.
-
-    Costs one ``get`` when no lease is live, which is the common case,
-    and none when the caller hands in the record (``raw``) it read in a
-    round trip it was making anyway. A record read a little earlier is
-    safe: every write it lets through expects it, so a sweep that has
-    replaced it since fails that write, and the writer comes back here.
-    While a lease is live this polls, sleeping at most until that
-    lease's own expiry, so a holder that died without releasing delays a
-    writer by the remainder of its term and no longer. A fresh lease
-    taken by a different sweep is waited out in turn.
-    """
-    if raw is _UNREAD:
-        raw = store.get(GC_LEASE_KEY)
-    while raw is not None:
-        remaining = _lease_expiry(raw) - time.time()
-        if remaining <= 0:
-            return raw
-        time.sleep(min(GC_WAIT_POLL, remaining))
-        raw = store.get(GC_LEASE_KEY)
-    return None
-
-
-def _try_land(
-    store: KVStore,
-    lease: bytes | None,
-    expected: dict[str, bytes | None],
-    writes: dict[str, bytes],
-    removes: tuple[str, ...] = (),
-) -> bool | None:
-    """Apply a batch unless a sweep has started since ``lease`` was read.
-
-    Returns True when the batch landed, False when one of the caller's
-    own expectations failed, and None when the lease moved — a sweep
-    began (or ran) since, so whatever the caller checked before writing
-    may no longer hold; it waits again, re-checks, and retries.
-    """
-    if store.cas_many({GC_LEASE_KEY: lease, **expected}, writes, removes):
-        return True
-    if store.get(GC_LEASE_KEY) != lease:
-        return None
-    return False
-
-
-def _acquire_gc_lease(store: KVStore, lease_ttl: float) -> tuple[bytes, float, float]:
-    """Take the GC lease by CAS, or raise :class:`GcBusy`.
-
-    The CAS expects exactly the bytes the liveness decision was made
-    from: absent, or an expired/undecodable record. Two sweeps racing
-    the same expired lease therefore cannot both win, and a live lease
-    held by someone else is never overwritten.
-
-    Returns:
-        The lease bytes written, the unix time the lease was taken, and
-        the unix time it expires at.
-    """
-    raw = store.get(GC_LEASE_KEY)
-    now = time.time()
-    expiry = _lease_expiry(raw)
-    if expiry > now:
-        holder = safe_loads(raw)
-        owner = holder.get("owner") if isinstance(holder, dict) else None
-        raise GcBusy(
-            f"A sweep holds the GC lease (owner {owner!r}, "
-            f"expires in {expiry - now:.1f}s)"
-        )
-    expires = now + lease_ttl
-    ours = dumps({"owner": _new_lease_owner(), "expires": expires})
-    if not store.cas(GC_LEASE_KEY, ours, expected=raw):
-        raise GcBusy("Another sweep took the GC lease first")
-    return ours, now, expires
-
-
 def _new_lease_owner() -> str:
     """A name for a lease this process takes, unique among sweepers."""
     return f"{os.getpid()}-{uuid.uuid4().hex[:12]}"
-
-
-def _release_gc_lease(
-    store: KVStore, ours: bytes, expires: float, lease_ttl: float
-) -> None:
-    """Give up a lease this call took, if the store still holds it.
-
-    Release is a CAS overwriting our own bytes with the same record
-    expired (``expires: 0``), never a delete: writers that read the lease
-    before this sweep began expect the bytes they read, and a record
-    carrying this sweep's owner id can never match them again. A failed
-    CAS means the lease under the key is no longer ours — it ran out and
-    another sweep claimed it — and that sweep's lease must not be
-    cleared, so the failure is ignored.
-    """
-    overrun = time.time() - expires
-    if overrun > 0:
-        logging.getLogger("kvgit.orphans").warning(
-            "a sweep ran %.1fs past its %.1fs GC lease; writers were free to "
-            "write during that window. Raise lease_ttl.",
-            overrun,
-            lease_ttl,
-        )
-    record = safe_loads(ours)
-    owner = record.get("owner") if isinstance(record, dict) else None
-    store.cas(GC_LEASE_KEY, dumps({"owner": owner, "expires": 0}), expected=ours)
 
 
 def create_branch(store: KVStore, name: str, target: str) -> None:
@@ -1051,20 +829,14 @@ def gc(
     # leave an expired lease record behind in a store kvgit had no
     # business writing to.
     _assert_supported_version(store)
-    while True:
-        if wait:
-            _wait_for_gc(store)
-        try:
-            ours, _acquired, expires = _acquire_gc_lease(store, lease_ttl)
-        except GcBusy:
-            if wait:
-                continue
-            raise
-        break
-    try:
-        return _sweep(store, min_age, deep=deep)
-    finally:
-        _release_gc_lease(store, ours, expires, lease_ttl)
+    removed = _call(
+        "gc", store, min_age=min_age, deep=deep, wait=wait, lease_ttl=lease_ttl
+    )
+    if removed:
+        logging.getLogger("kvgit.orphans").debug(
+            "Cleaned %d orphaned commit(s)", removed
+        )
+    return removed
 
 
 def clean_orphans(store: KVStore, min_age: float = 3600) -> int:
@@ -1077,202 +849,6 @@ def deep_clean(
 ) -> int:
     """:func:`gc` with the namespace scan, raising on a busy lease."""
     return gc(store, min_age, deep=True, wait=False, lease_ttl=lease_ttl)
-
-
-def _sweep(store: KVStore, min_age: float, *, deep: bool) -> int:
-    """Shared mark-and-sweep behind ``clean_orphans`` / ``deep_clean``.
-
-    The caller holds the GC lease, so no commit batch lands while this
-    runs and nothing this deletes can be rewritten underneath it.
-    """
-    gc_logger = logging.getLogger("kvgit.orphans")
-    now = time.time()
-    cutoff_time = now - min_age
-
-    def _parent_loader(commit_hash: str) -> tuple[str, ...]:
-        parent_bytes = store.get(PARENT_COMMIT % commit_hash)
-        if parent_bytes is None:
-            return ()
-        raw = loads(parent_bytes)
-        if raw is None:
-            return ()
-        if isinstance(raw, str):
-            return (raw,)
-        return tuple(raw)
-
-    # Mark phase: collect reachable commits, blob keys, HAMT node hashes
-    # and chunk references.
-    reachable_commits: set[str] = set()
-    reachable_blobs: set[str] = set()
-    reachable_nodes: set[str] = set()
-    reachable_chunks: set[str] = set()
-
-    def _walk_commit_for_marks(commit_hash: str) -> None:
-        """Walk one commit's keyset, accumulating reachable refs."""
-        root = _load_root(store, commit_hash)
-        if root is None:
-            return
-        # Single batched walk per commit collects HAMT node hashes
-        # and the entries (each carrying blob + optional chunks).
-        # ``skip_nodes`` lets us skip subtrees already seen via
-        # structural sharing — the blobs under those subtrees are
-        # already accounted for.
-        entries, new_nodes = Keyset(store, root=root).walk(skip_nodes=reachable_nodes)
-        for entry in entries.values():
-            reachable_blobs.add(entry.blob)
-            if entry.meta.chunks:
-                reachable_chunks.update(entry.meta.chunks)
-        reachable_nodes.update(new_nodes)
-
-    def _mark_from(tip: str) -> None:
-        for commit in walk_history(tip, _parent_loader, all_parents=True):
-            if commit in reachable_commits:
-                continue
-            reachable_commits.add(commit)
-            _walk_commit_for_marks(commit)
-
-    # In-flight markers first, branch heads second. Publishing a commit
-    # installs its head and drops its marker in one atomic write, so a
-    # commit published after its marker was read is under a head read
-    # later, and one published before has no marker to miss — read the
-    # other way round, a publish landing between the two reads would
-    # leave the commit under neither.
-    stale_markers: list[str] = []
-    in_flight_prefix = IN_FLIGHT_KEY.replace("%s", "")
-    for key in list(store.keys(in_flight_prefix)):
-        commit_hash = key[len(in_flight_prefix) :]
-        expires = safe_loads(store.get(key) or b"null")
-        if isinstance(expires, (int, float)) and expires > now:
-            _mark_from(commit_hash)
-        else:
-            # The writer never published or withdrew it; its commit is
-            # an ordinary orphan now, governed by ``min_age``.
-            stale_markers.append(key)
-
-    # Every root is a branch head, tags included: a tag is a head under
-    # the reserved ``refs/tags/`` name, so it is marked here without the
-    # sweep knowing tags exist. That is the whole compatibility
-    # property — a kvgit that predates tags runs this same loop and
-    # keeps tagged commits alive for the same reason.
-    branch_prefix = BRANCH_HEAD.replace("%s", "")
-    for key in list(store.keys(branch_prefix)):
-        branch_name = key[len(branch_prefix) :]
-        # No ``recover_from_corrupt_head`` here, deliberately, even when
-        # the caller has one wired into their handles. GC must not
-        # decide reachability from a guess. A wrong answer from a
-        # last-resort recoverer marks the wrong commits live — real
-        # garbage survives forever, and a guessed tip gets walked as
-        # though it were this branch's own history, so another branch's
-        # ancestry can be pinned into this one's mark set. The sweep
-        # should see only what the store actually claims: a branch whose
-        # HEAD resolves is marked from its real HEAD, and one whose HEAD
-        # does not resolve marks nothing and keeps its commits as young
-        # orphans until ``min_age`` and an explicit ``repair_head``
-        # settle what it points at. The inconsistency with the read
-        # paths is the point, not an oversight.
-        branch_head = _resolve_head(store, branch_name)
-        if branch_head is not None:
-            _mark_from(branch_head)
-
-    # Sweep phase: find orphaned commits via the __commit_root__ scan,
-    # and set aside the young ones — unreachable, but inside the
-    # ``min_age`` window the caller gave abandoned work to linger. They
-    # are kept whole, so everything they reference is marked too.
-    orphans: list[str] = []
-    young_orphan_commits: list[str] = []
-    root_prefix = COMMIT_ROOT.replace("%s", "")
-
-    for key in list(store.keys(root_prefix)):
-        commit_hash = key[len(root_prefix) :]
-        if not commit_hash or commit_hash in reachable_commits:
-            continue
-        time_bytes = store.get(COMMIT_TIME % commit_hash)
-        if time_bytes is None:
-            # No timestamp recorded — be conservative, leave it alone.
-            continue
-        ts_val = safe_loads(time_bytes)
-        if not isinstance(ts_val, (int, float)) or isinstance(ts_val, bool):
-            continue
-        if float(ts_val) < cutoff_time:
-            orphans.append(commit_hash)
-        else:
-            young_orphan_commits.append(commit_hash)
-
-    for young in young_orphan_commits:
-        _walk_commit_for_marks(young)
-
-    # Collect everything to delete in one batch so the sweep is atomic
-    # at the store level (defends against partial sweeps under crash).
-    all_removals: list[str] = list(stale_markers)
-    keyset_prefix = Keyset.DEFAULT_PREFIX
-
-    # Every deletion candidate on this path comes from walking an
-    # orphan's own keyset. Content is keyed by what it holds, so an
-    # orphan's blob or node may be the very key a live commit uses; the
-    # mark phase saw every live commit — published, in flight, or young
-    # — so "unmarked" is what makes a key safe to take, and no batch can
-    # land to change that while the lease is held.
-    #
-    # ``skip_nodes=reachable_nodes`` prunes subtrees shared with a live
-    # commit: nothing under them is deletable, and shared structure is
-    # walked once, not per orphan. Two orphans sharing a subtree may each
-    # name the same key; ``remove_many`` tolerates duplicates.
-    for orphan_hash in orphans:
-        orphan_root = _load_root(store, orphan_hash)
-        if orphan_root is not None and orphan_root != EMPTY_HASH:
-            try:
-                orphan_entries, orphan_nodes = Keyset(store, root=orphan_root).walk(
-                    skip_nodes=reachable_nodes
-                )
-            except Exception:  # noqa: BLE001 — deliberate: a damaged
-                # orphan must not stall the sweep; drop its payload and
-                # still reclaim its commit metadata. Narrowing this would
-                # let one corrupt keyset block GC for the whole store.
-                orphan_entries, orphan_nodes = {}, set()
-            for entry in orphan_entries.values():
-                if entry.blob not in reachable_blobs:
-                    all_removals.append(entry.blob)
-                for chunk in entry.meta.chunks or ():
-                    if chunk not in reachable_chunks:
-                        all_removals.append(CHUNK_PREFIX + chunk)
-            all_removals.extend(keyset_prefix + node for node in orphan_nodes)
-        all_removals.extend(
-            [
-                COMMIT_ROOT % orphan_hash,
-                PARENT_COMMIT % orphan_hash,
-                PARENT_GENS % orphan_hash,
-                COMMIT_TIME % orphan_hash,
-                INFO_KEY % orphan_hash,
-            ]
-        )
-
-    if deep:
-        # Namespace scans: the way content no orphan keyset points at (a
-        # crash's leftovers, an interrupted write) comes back.
-        for key in store.keys(keyset_prefix):
-            node_hash = key[len(keyset_prefix) :]
-            if node_hash and node_hash not in reachable_nodes:
-                all_removals.append(key)
-        for key in store.keys(CHUNK_PREFIX):
-            chunk_hash = key[len(CHUNK_PREFIX) :]
-            if chunk_hash and chunk_hash not in reachable_chunks:
-                all_removals.append(key)
-        for key in store.keys(BLOB_PREFIX):
-            if key not in reachable_blobs:
-                all_removals.append(key)
-
-    if all_removals:
-        store.remove_many(all_removals)
-
-    if orphans:
-        gc_logger.debug("Cleaned %d orphaned commit(s)", len(orphans))
-
-    return len(orphans)
-
-
-# A commit attempt: the commit it started from, and each changed key's
-# previous blob and meta (None where the key was absent).
-_Attempt = tuple[str, dict[str, tuple[str, MetaEntry] | None]]
 
 
 class VersionedKV(VersionedBase):
@@ -1353,14 +929,6 @@ class VersionedKV(VersionedBase):
         # Stamps only ever rise, so once this handle has seen the store
         # at v4 it never needs to read the stamp again.
         self._blob_version_stamped = False
-        # Commits this handle has written and not yet published, with the
-        # bytes of each one's in-flight marker: the marker stays in the
-        # store until the publishing write removes it, or a failed
-        # attempt withdraws it.
-        self._in_flight: dict[str, bytes] = {}
-        # The lease record this handle's latest batch landed against: a
-        # publish expecting it cannot land while a sweep runs.
-        self._lease_seen: bytes | None = None
         # Generations of commits this handle has written, loaded or
         # searched through. A generation never changes once its commit
         # exists, so nothing here goes stale.
@@ -1369,14 +937,6 @@ class VersionedKV(VersionedBase):
         # resolved a head to. A commit's root never changes, so nothing
         # here goes stale either.
         self._roots: dict[str, str] = {}
-        # The GC lease record read beside HEAD by the latest head read,
-        # for the next batch to land against without reading it again.
-        self._lease_hint: Any = _UNREAD
-
-        # The commit attempt in progress, if any: the commit it started
-        # from, and the entry each key it changed held before (None
-        # where the key was absent), to put back should it fail.
-        self._attempt: _Attempt | None = None
 
         # Materialize keyset + meta from the HAMT
         self._meta: dict[str, MetaEntry] = {}
@@ -1425,16 +985,14 @@ class VersionedKV(VersionedBase):
         One round trip in the common case, where HEAD is still the
         commit this handle is based on. The read that fetches HEAD also
         fetches that commit's root, so the check that HEAD names a
-        commit whose root is present costs nothing extra, and the GC
-        lease record, which a commit on its way to landing a batch has
-        to expect. Any other answer — HEAD moved, or its root is gone —
-        is resolved the full way, recovery tiers and all.
+        commit whose root is present costs nothing extra. Any other
+        answer — HEAD moved, or its root is gone — is resolved the full
+        way, recovery tiers and all.
         """
         branch_key = BRANCH_HEAD % self._branch
         base = self._base_commit
         base_root = COMMIT_ROOT % base
-        found = self.store.get_many(branch_key, GC_LEASE_KEY, base_root)
-        self._lease_hint = found.get(GC_LEASE_KEY)
+        found = self.store.get_many(branch_key, base_root)
         head_bytes = found.get(branch_key)
         if (
             head_bytes is not None
@@ -1788,170 +1346,15 @@ class VersionedKV(VersionedBase):
 
     # -- Abstract method implementations --
 
-    def _snapshot_state(self) -> tuple:
-        """Open a commit attempt: from here the key maps record what
-        they change, so a failure can put it back."""
-        self._attempt = (self._current_commit, {})
-        return self._attempt
-
-    def _restore_state(self, saved: tuple) -> None:
-        """Restore in-memory state after a failed commit attempt.
-
-        Each key the attempt changed gets its old entry back, so this
-        costs what the attempt changed, not the size of the keyset.
-        Only the open attempt is undone: loading another commit closes
-        it, and that state is newer than anything the attempt saved.
-
-        The attempt's commits are abandoned, so their in-flight markers
-        are withdrawn and they become ordinary orphans. Each marker goes
-        only if it still holds the bytes this handle wrote: another
-        writer that produced the same commit (same parents, content,
-        info and time) overwrote the key with its own marker, and that
-        writer's protection must stay until it publishes. Best effort: a
-        marker left behind lapses after :data:`IN_FLIGHT_TTL`.
-        """
-        if self._attempt is saved:
-            current_commit, undo = saved
-            keys = self._owned_keys()
-            for key, prev in undo.items():
-                if prev is None:
-                    keys.pop(key, None)
-                    self._meta.pop(key, None)
-                else:
-                    keys[key], self._meta[key] = prev
-            self._current_commit = current_commit
-            self._attempt = None
-        if self._in_flight:
-            in_flight, self._in_flight = self._in_flight, {}
-            for commit, marker in in_flight.items():
-                key = IN_FLIGHT_KEY % commit
-                self.store.cas_many({key: marker}, {}, (key,))
-
-    def _roll_back_attempt(self) -> None:
-        if self._attempt is not None:
-            self._restore_state(self._attempt)
-
-    def _end_attempt(self) -> None:
-        self._attempt = None
-
     def _set_entry(self, key: str, entry: tuple[str, MetaEntry] | None) -> None:
         """Point ``key`` at a blob and its meta, or remove it (None), in
-        place. The open attempt records the entry the key held first, so
-        a failure can restore it. Called only once a commit's batch has
-        landed, never while the attempt can still fail before it."""
+        place, once a commit or merge has landed."""
         keys = self._owned_keys()
-        if self._attempt is not None:
-            undo = self._attempt[1]
-            if key not in undo:
-                blob = keys.get(key)
-                undo[key] = None if blob is None else (blob, self._meta[key])
         if entry is None:
             keys.pop(key, None)
             self._meta.pop(key, None)
         else:
             keys[key], self._meta[key] = entry
-
-    def _land_batch(self, commit: str, diffs: dict[str, bytes]) -> None:
-        """Write a commit's batch, marked in flight, while no sweep runs.
-
-        The batch is conditional on the lease record read after waiting
-        any live sweep out, so it lands before a sweep starts or after
-        one ends, never during. Landing before is safe because the batch
-        carries the commit's in-flight marker, which every later sweep
-        marks from until the commit is published.
-        """
-        marker = dumps(time.time() + IN_FLIGHT_TTL)
-        diffs[IN_FLIGHT_KEY % commit] = marker
-        seen, self._lease_hint = self._lease_hint, _UNREAD
-        while True:
-            lease = _wait_for_gc(self.store, seen)
-            seen = _UNREAD
-            if self.store.cas_many({GC_LEASE_KEY: lease}, diffs):
-                break
-        self._in_flight[commit] = marker
-        self._lease_seen = lease
-
-    def _create_commit(
-        self,
-        updates: dict[str, bytes] | None = None,
-        removals: set[str] | None = None,
-        *,
-        info: dict | None = None,
-        chunks: dict[str, bytes] | None = None,
-        chunk_refs: dict[str, list[str]] | None = None,
-    ) -> str:
-        """Create a new local commit with the given changes.
-
-        Does not advance HEAD. Use ``commit()`` for the public API.
-
-        Returns:
-            The new commit hash.
-        """
-        updates = updates or {}
-        removals = removals or set()
-        chunks = chunks or {}
-        chunk_refs = chunk_refs or {}
-
-        # Every blob is written, even one whose key is already stored,
-        # so the batch holds everything its commit needs whatever a sweep
-        # took before it landed.
-        diffs: dict[str, bytes] = {}
-        keyset_updates: dict[str, KeysetEntry] = {}
-        for key, value in updates.items():
-            pointer = blob_key(value)
-            diffs[pointer] = value
-            refs = chunk_refs.get(key)
-            keyset_updates[key] = KeysetEntry(
-                blob=pointer,
-                meta=MetaEntry(size=len(value), chunks=list(refs) if refs else None),
-            )
-
-        # Stage chunk writes under their content-addressed namespace.
-        # Like blobs, every chunk is written even when its key is
-        # already stored; the key is the hash, so the rewrite is a no-op
-        # for the data and a guarantee against an earlier sweep.
-        if chunks:
-            _stamp_version_at_least(self.store, CHUNK_STORAGE_VERSION)
-            for chunk_hash, chunk_bytes in chunks.items():
-                diffs[CHUNK_PREFIX + chunk_hash] = chunk_bytes
-
-        # Build the new keyset by applying changes to the parent's HAMT.
-        # Only the explicitly changed keys generate new entries; structural
-        # sharing reuses unchanged subtrees from the parent commit.
-        parent_root = self._root_of(self._current_commit)
-        parent_ks = Keyset(self.store, root=parent_root)
-        new_ks, pending = parent_ks.updated(updates=keyset_updates, removals=removals)
-        diffs.update(pending)
-
-        parent_gens = self._parent_generations((self._current_commit,))
-        created = time.time()
-        new_hash = commit_hash((self._current_commit,), new_ks.root, created, info)
-        diffs[COMMIT_ROOT % new_hash] = dumps(new_ks.root)
-        diffs[PARENT_COMMIT % new_hash] = dumps([self._current_commit])
-        diffs[PARENT_GENS % new_hash] = dumps(parent_gens)
-        diffs[COMMIT_TIME % new_hash] = dumps(created)
-        if info is not None:
-            diffs[INFO_KEY % new_hash] = dumps(info)
-
-        self._stamp_blob_version()
-
-        # Everything this commit writes that a sweep could delete —
-        # chunks, HAMT nodes, blobs, commit metadata — lands in this one
-        # batch. (The version stamp above is not in it and needs no
-        # cover: no sweep deletes it.)
-        self._land_batch(new_hash, diffs)
-        self._remember_root(new_hash, new_ks.root)
-
-        # Landed: change the key maps in place, removals first so an
-        # update to a removed key wins.
-        for key in removals:
-            self._set_entry(key, None)
-        for key, entry in keyset_updates.items():
-            self._set_entry(key, (entry.blob, entry.meta))
-        self._current_commit = new_hash
-        self._remember_generations({new_hash: 1 + max(parent_gens)})
-
-        return new_hash
 
     _GENERATION_CACHE_LIMIT = 10_000
 
@@ -1960,87 +1363,10 @@ class VersionedKV(VersionedBase):
             self._roots.clear()
         self._roots[commit_hash] = root
 
-    def _root_of(self, commit_hash: str) -> str:
-        """A commit's keyset root: remembered, or read and remembered.
-        A commit with no root reads as the empty tree."""
-        root = self._roots.get(commit_hash)
-        if root is None:
-            root = _load_root(self.store, commit_hash)
-            if root is None:
-                return EMPTY_HASH
-            self._remember_root(commit_hash, root)
-        return root
-
     def _remember_generations(self, generations: dict[str, int]) -> None:
         if len(self._generations) + len(generations) > self._GENERATION_CACHE_LIMIT:
             self._generations.clear()
         self._generations.update(generations)
-
-    def _parent_generations(self, parents: tuple[str, ...]) -> list[int]:
-        """The generation of each parent of a commit about to be written."""
-        missing = [p for p in parents if p not in self._generations]
-        if missing:
-            self._remember_generations(_generations(self.store, missing))
-        return [self._generations[p] for p in parents]
-
-    def _stamp_blob_version(self) -> None:
-        """Stamp the store v4 before this handle's first commit batch."""
-        if not self._blob_version_stamped:
-            _stamp_version_at_least(self.store, BLOB_STORAGE_VERSION)
-            self._blob_version_stamped = True
-
-    def _cas_head(self, expected: str, new_head: str) -> bool:
-        """Publish ``new_head`` as this branch's HEAD if HEAD is ``expected``.
-
-        One atomic write moves HEAD, records ``expected`` as the
-        prev-HEAD backup, and removes the in-flight markers of the
-        commits being published. The backup therefore always names the
-        commit HEAD held immediately before, and a published commit
-        never keeps a marker, nor loses it before its head lands.
-
-        The write also expects the GC lease record, so it cannot land
-        while a sweep runs: a sweep decides what to delete from the
-        heads and markers it read at its start, and a head installed
-        before it deletes would name a commit it may still take. The
-        record the latest batch landed against is expected first — no
-        extra read in the common case — and after a sweep the publish
-        waits it out and tries again.
-
-        And it expects each marker to hold the bytes this handle wrote.
-        A marker only disappears early if it lapsed — the writer took
-        longer than :data:`IN_FLIGHT_TTL` to publish — and a sweep reaped
-        it, possibly with the commit; then the publish fails, and the
-        commit surfaces an error rather than a head over a commit that
-        may be gone.
-
-        A CAS that fails against a *damaged* HEAD is retried through
-        :func:`_heal_head`, which repairs it atomically. That is the only
-        place a corrupt HEAD is written back, now that reads do not.
-        """
-        branch_key = BRANCH_HEAD % self._branch
-        expected_bytes = dumps(expected)
-        writes = {
-            branch_key: dumps(new_head),
-            BRANCH_HEAD_PREV % self._branch: expected_bytes,
-        }
-        markers = {IN_FLIGHT_KEY % c: marker for c, marker in self._in_flight.items()}
-        lease = self._lease_seen if self._in_flight else _wait_for_gc(self.store)
-        while True:
-            expect = {GC_LEASE_KEY: lease, branch_key: expected_bytes, **markers}
-            if self.store.cas_many(expect, writes, tuple(markers)):
-                break
-            if self.store.get(GC_LEASE_KEY) != lease:
-                # A sweep ran, or is running: wait it out and try again.
-                # A marker it reaped fails the next attempt on its own.
-                lease = _wait_for_gc(self.store)
-                continue
-            present = self.store.get_many(markers.keys())
-            if any(present.get(key) != marker for key, marker in markers.items()):
-                return False
-            if not _heal_head(self.store, self._branch, expected):
-                return False
-        self._in_flight = {}
-        return True
 
     def _changes(self, commit_a: str | None, commit_b: str) -> dict[str, Change]:
         """Each key whose value differs from commit ``a`` to ``b``; see
@@ -2206,21 +1532,8 @@ class VersionedKV(VersionedBase):
         Raises:
             UnknownBranchError: the branch has no HEAD.
         """
-        branch_key = BRANCH_HEAD % self._branch
-        prev_key = BRANCH_HEAD_PREV % self._branch
-        # The existence check and the write are decided against one
-        # lease record, as in ``create_branch``: this either resets onto
-        # a commit that loads or reports the commit gone.
-        while True:
-            lease = _wait_for_gc(self.store)
-            if self.store.get(COMMIT_ROOT % commit_hash) is None:
-                return False
-            current = self.store.get(branch_key)
-            if current is None:
-                raise UnknownBranchError(f"Branch '{self._branch}' does not exist")
-            writes = {branch_key: dumps(commit_hash), prev_key: current}
-            if _try_land(self.store, lease, {branch_key: current}, writes):
-                break
+        if not _call("reset_branch", self.store, name=self._branch, target=commit_hash):
+            return False
         self._load_commit(commit_hash, update_base=True)
         return True
 
@@ -2414,4 +1727,3 @@ class VersionedKV(VersionedBase):
         self._current_commit = commit_hash
         if update_base:
             self._base_commit = commit_hash
-        self._attempt = None
