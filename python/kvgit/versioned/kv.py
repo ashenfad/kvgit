@@ -238,6 +238,27 @@ def commit_hash(
 logger = logging.getLogger("kvgit")
 
 
+def _on_tree(
+    tree: Any,
+    op: str,
+    store: KVStore,
+    recoverer: Callable[[KVStore, str], Any] | None = None,
+    /,
+    **args: Any,
+) -> Any:
+    """Run the core's operation ``op`` on worktree state ``tree``."""
+    run = _core.Op(op, args)
+    run.use_tree(tree)
+    return drive(
+        run,
+        store,
+        recoverer=recoverer,
+        owner=lambda: _new_lease_owner(),
+        clock=time.time,
+        sleep=time.sleep,
+    )
+
+
 def _check_storage_version(store: KVStore) -> None:
     """Refuse a store stamped with another storage layout, or one with
     branches and no stamp, from before stamps; stamp a fresh one."""
@@ -813,15 +834,8 @@ class VersionedKV(VersionedBase):
 
     def _on_tree(self, op: str, **args: Any) -> Any:
         """Run the core's operation ``op`` on this handle's state."""
-        run = _core.Op(op, args)
-        run.use_tree(self._tree)
-        return drive(
-            run,
-            self.store,
-            recoverer=self._recover_from_corrupt_head,
-            owner=lambda: _new_lease_owner(),
-            clock=time.time,
-            sleep=time.sleep,
+        return _on_tree(
+            self._tree, op, self.store, self._recover_from_corrupt_head, **args
         )
 
     @property
@@ -1338,9 +1352,8 @@ class VersionedKV(VersionedBase):
             CorruptHeadError,
         ):
             return None
-        run = _core.Op("wt_lookup", {"keys": [key]})
-        run.use_tree(_core.WorktreeState(found["root"]))
-        entries = drive(run, self.store, clock=time.time, sleep=time.sleep)
+        tree = _core.WorktreeState(found["root"])
+        entries = _on_tree(tree, "wt_lookup", self.store, keys=[key])
         if not entries:
             return None
         _key, (blob, _size, _chunks) = entries[0]

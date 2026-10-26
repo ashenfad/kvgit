@@ -6,6 +6,7 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from . import _core
 from ._codec import Codec, CodecSpec
 from .cache import (
     DEFAULT_CACHE_BYTES,
@@ -14,17 +15,15 @@ from .cache import (
     ContentCache,
 )
 from .content_types import MergeFn
-from .encoding import loads
 from .errors import (
     BranchExistsError,
     UnknownCommitError,
 )
+from .hamt import EMPTY_HASH
 from .kv.base import KVStore
 from .refs import Branches, Tags
 from .versioned import kv as _kv
-from .versioned.keyset import Keyset
 from .versioned.kv import (
-    COMMIT_ROOT,
     GC_LEASE_TTL,
     ROOT_COMMIT,
     CorruptHeadRecoverer,
@@ -335,66 +334,37 @@ class Snapshot(Mapping[str, Any]):
     def __init__(self, repo: Repo, commit: str, *, root: str | None = None) -> None:
         self._repo = repo
         self.commit = commit
-        # The keyset root, when whoever made this snapshot already read it.
-        self._root = root
-        self._keyset: Keyset | None = None
-        # The whole keyset as key -> blob pointer, once something iterates
-        # it; until then, reads look keys up in the tree one batch at a
-        # time and remember what they found (None: absent).
-        self._pointers: dict[str, str] | None = None
-        self._looked_up: dict[str, str | None] = {}
+        # The keyset's root and the key index the first listing builds,
+        # held by the core; made on first use when whoever made this
+        # snapshot didn't already read the root.
+        self._tree = None if root is None else _core.WorktreeState(root)
 
     def __repr__(self) -> str:
         return f"Snapshot(commit={self.commit[:8]}...)"
 
-    def _tree(self) -> Keyset:
-        if self._keyset is None:
-            root = self._root
-            if root is None:
-                root_raw = self._repo._store.get(COMMIT_ROOT % self.commit)
-                if root_raw is None:
-                    raise UnknownCommitError(f"Commit '{self.commit}' does not exist")
-                root = loads(root_raw)
-            self._keyset = Keyset(self._repo._store, root=root)
-        return self._keyset
-
-    def _index(self) -> dict[str, str]:
-        """The whole keyset, read once, for iteration and length."""
-        if self._pointers is None:
-            entries = self._tree().materialize()
-            self._pointers = {key: entry.blob for key, entry in entries.items()}
-        return self._pointers
-
-    def _pointers_of(self, keys: tuple[str, ...]) -> dict[str, str]:
-        """The blob pointers of those keys that exist.
-
-        Once the whole keyset has been read, from that; before, by looking
-        just these keys up in the tree — its depth in batched reads, not
-        the whole keyset — so reading a few keys at a commit stays cheap
-        however many the commit holds.
-        """
-        if self._pointers is not None:
-            return {k: self._pointers[k] for k in keys if k in self._pointers}
-        unknown = [k for k in dict.fromkeys(keys) if k not in self._looked_up]
-        if unknown:
-            found = self._tree().get_many(unknown)
-            for key in unknown:
-                entry = found.get(key)
-                self._looked_up[key] = None if entry is None else entry.blob
-        return {
-            key: pointer
-            for key in keys
-            if (pointer := self._looked_up.get(key)) is not None
-        }
+    def _on_tree(self, op: str, **args: Any) -> Any:
+        if self._tree is None:
+            tree = _core.WorktreeState(EMPTY_HASH)
+            found = _kv._on_tree(
+                tree, "wt_checkout", self._repo._store, commit=self.commit
+            )
+            if found["root"] is None:
+                raise UnknownCommitError(f"Commit '{self.commit}' does not exist")
+            self._tree = tree
+        return _kv._on_tree(self._tree, op, self._repo._store, **args)
 
     def _raw_many(self, keys: tuple[str, ...]) -> dict[str, bytes]:
+        # Keys holding equal bytes share one blob, which answers for
+        # every key that points at it.
         wanted: dict[str, list[str]] = {}
-        for key, pointer in self._pointers_of(keys).items():
-            wanted.setdefault(pointer, []).append(key)
+        for key, (blob, _size, _chunks) in self._on_tree(
+            "wt_lookup", keys=list(dict.fromkeys(keys))
+        ):
+            wanted.setdefault(blob, []).append(key)
         if not wanted:
             return {}
         found = self._repo._store.get_many(wanted.keys())
-        return {key: raw for pointer, raw in found.items() for key in wanted[pointer]}
+        return {key: raw for blob, raw in found.items() for key in wanted[blob]}
 
     def __getitem__(self, key: str) -> Any:
         found = self._raw_many((key,))
@@ -408,13 +378,13 @@ class Snapshot(Mapping[str, Any]):
         return {key: decode(raw) for key, raw in self._raw_many(keys).items()}
 
     def __iter__(self) -> Iterator[str]:
-        return iter(self._index())
+        return iter(self._on_tree("wt_keys"))
 
     def __len__(self) -> int:
-        return len(self._index())
+        return len(self._on_tree("wt_keys"))
 
     def __contains__(self, key: object) -> bool:
-        return isinstance(key, str) and bool(self._pointers_of((key,)))
+        return isinstance(key, str) and self._on_tree("wt_contains", key=key)
 
     @property
     def raw(self) -> RawSnapshot:

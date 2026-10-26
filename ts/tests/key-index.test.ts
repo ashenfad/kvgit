@@ -102,6 +102,18 @@ describe('the key index', () => {
     expect(await ours.has('swept')).toBe(false)
   })
 
+  it('serves a snapshot too', async () => {
+    const { store, repo } = await seeded()
+    const snap = await repo.snapshot({ branch: 'main' })
+    store.reads = []
+    expect((await snap.keys()).length).toBe(300)
+    expect(store.nodeReads().length).toBeGreaterThan(0)
+    store.reads = []
+    expect((await snap.keys()).length).toBe(300)
+    expect(await snap.has('k/nothing')).toBe(false)
+    expect(store.nodeReads()).toEqual([])
+  })
+
   it('answers that a key is absent without reading the tree', async () => {
     const { store, repo } = await seeded()
     const wt = await repo.worktree('main')

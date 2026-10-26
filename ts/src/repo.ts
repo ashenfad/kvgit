@@ -10,11 +10,11 @@
  * collections.
  */
 
+import type { WorktreeState } from '../wasm/kvgit_wasm.js'
 import { type Codec, type CodecName, bytesCodec, resolveCodec } from './codec'
 import { core } from './core'
 import { BranchExistsError, UnknownTagError } from './errors'
 import { NodeCache } from './hamt'
-import { Keyset } from './keyset'
 import type { CommitInfo, DiffResult, KVStore } from './types'
 import { cacheOf, cacheStore, callCore, streamCore } from './versioned/drive'
 import {
@@ -291,7 +291,7 @@ export class Repo<V = Uint8Array> {
    */
   async snapshot(ref: Ref): Promise<Snapshot<V>> {
     const { commit, root } = await this.resolve(ref)
-    return new Snapshot(this, commit, root)
+    return new Snapshot(this, commit, new (await core()).WorktreeState(root))
   }
 
   // --- Maintenance ---
@@ -458,25 +458,27 @@ export class Tags {
  * values. {@link raw} is the same state as stored bytes.
  *
  * Reads look keys up in the tree a batch at a time, so reading a few
- * keys stays cheap however many the commit holds; listing the keys
- * reads the whole keyset once.
+ * keys stays cheap however many the commit holds; the first listing
+ * builds a key index the later ones read.
  */
 export class Snapshot<V = Uint8Array> {
   readonly commit: string
   readonly raw: RawSnapshot
   readonly #repo: Repo<V>
-  readonly #keyset: Keyset
-  /** The whole keyset (key → blob), once something has listed it. */
-  #index: Map<string, string> | null = null
-  /** Keys looked up one batch at a time (null: absent). */
-  readonly #lookedUp = new Map<string, string | null>()
+  /** The keyset's root and its key index, held by the core. */
+  readonly #state: WorktreeState
 
   /** @internal Made by {@link Repo.snapshot}. */
-  constructor(repo: Repo<V>, commit: string, root: string) {
+  constructor(repo: Repo<V>, commit: string, state: WorktreeState) {
     this.#repo = repo
     this.commit = commit
-    this.#keyset = Keyset.fromRoot(repo.store, root)
+    this.#state = state
     this.raw = new RawSnapshot(this)
+  }
+
+  /** Run the core's operation `name` on this snapshot's state. */
+  #onTree(name: string, args: object): Promise<unknown> {
+    return callCore(name, args, { store: this.#repo.store, now: this.#repo.now, tree: this.#state })
   }
 
   /** The value of `key`, or undefined if absent. */
@@ -493,63 +495,37 @@ export class Snapshot<V = Uint8Array> {
   }
 
   async has(key: string): Promise<boolean> {
-    return (await this.pointersOf([key])).has(key)
+    return (await this.#onTree('wt_contains', { key })) as boolean
   }
 
   /** Every key, sorted. */
   async keys(): Promise<string[]> {
-    return [...(await this.index()).keys()].sort()
+    return (await this.#onTree('wt_keys', {})) as string[]
   }
 
   async size(): Promise<number> {
-    return (await this.index()).size
+    return (await this.keys()).length
   }
 
   /** @internal */
   async rawMany(keys: Iterable<string>): Promise<Map<string, Uint8Array>> {
+    // Keys holding equal bytes share one blob, which answers for every
+    // key that points at it.
+    const found = (await this.#onTree('wt_lookup', { keys: [...new Set(keys)] })) as Array<
+      [string, [string, number, string[]]]
+    >
     const wanted = new Map<string, string[]>()
-    for (const [key, pointer] of await this.pointersOf(keys)) {
-      const at = wanted.get(pointer) ?? []
+    for (const [key, [blob]] of found) {
+      const at = wanted.get(blob) ?? []
       at.push(key)
-      wanted.set(pointer, at)
+      wanted.set(blob, at)
     }
     const out = new Map<string, Uint8Array>()
     if (wanted.size === 0) return out
-    for (const [pointer, raw] of await this.#repo.store.getMany(wanted.keys())) {
-      for (const key of wanted.get(pointer) ?? []) out.set(key, raw)
+    for (const [blob, raw] of await this.#repo.store.getMany(wanted.keys())) {
+      for (const key of wanted.get(blob) ?? []) out.set(key, raw)
     }
     return out
-  }
-
-  private async pointersOf(keys: Iterable<string>): Promise<Map<string, string>> {
-    const asked = [...new Set(keys)]
-    const out = new Map<string, string>()
-    if (this.#index !== null) {
-      for (const k of asked) {
-        const p = this.#index.get(k)
-        if (p !== undefined) out.set(k, p)
-      }
-      return out
-    }
-    const unknown = asked.filter((k) => !this.#lookedUp.has(k))
-    if (unknown.length > 0) {
-      const found = await this.#keyset.getMany(unknown)
-      for (const k of unknown) this.#lookedUp.set(k, found.get(k)?.blob ?? null)
-    }
-    for (const k of asked) {
-      const p = this.#lookedUp.get(k)
-      if (p !== undefined && p !== null) out.set(k, p)
-    }
-    return out
-  }
-
-  private async index(): Promise<Map<string, string>> {
-    if (this.#index === null) {
-      const index = new Map<string, string>()
-      for (const [k, entry] of await this.#keyset.materialize()) index.set(k, entry.blob)
-      this.#index = index
-    }
-    return this.#index
   }
 }
 
