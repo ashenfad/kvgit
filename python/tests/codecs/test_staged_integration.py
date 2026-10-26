@@ -6,7 +6,7 @@ import pytest
 
 np = pytest.importorskip("numpy")
 
-from support import worktree
+from support import entries, worktree
 
 from kvgit.codecs import compose
 from kvgit.codecs.numpy import NumpyCodec
@@ -106,7 +106,7 @@ class TestMergeWithChunkedCodec:
         result = s2.commit()
         assert result.strategy == "three_way"
 
-        assert not s2._engine._meta["arr"].chunks
+        assert not entries(s2.repo.store, s2.head)["arr"].meta.chunks
 
 
 class TestRoundTripThroughStore:
@@ -206,7 +206,7 @@ class TestMetaEntryChunks:
         s, _ = chunked
         s["x"] = np.arange(2048, dtype="float64")
         s.commit()
-        meta = s._engine._meta["x"]
+        meta = entries(s.repo.store, s.head)["x"].meta
         assert meta.chunks
         assert isinstance(meta.chunks, list)
         assert all(isinstance(r, str) for r in meta.chunks)
@@ -216,5 +216,5 @@ class TestMetaEntryChunks:
         s = worktree(store)
         s["x"] = "hello"
         s.commit()
-        meta = s._engine._meta["x"]
+        meta = entries(s.repo.store, s.head)["x"].meta
         assert meta.chunks is None

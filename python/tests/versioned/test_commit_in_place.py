@@ -1,11 +1,6 @@
-"""A commit changes the handle's key maps in place, and a failed attempt
-puts back exactly what it changed.
-
-These pin the rollback on every failure path, and the stable view that
-``keys()`` keeps across a commit.
+"""A commit that fails leaves the handle as it found it, on every
+failure path, and ``keys()`` keeps what it returned across a commit.
 """
-
-import gc
 
 import pytest
 from support import fail_reads, race_publish
@@ -37,13 +32,12 @@ class FailingMemory(Memory):
 
 
 def _state(v: Versioned) -> dict:
-    """Everything a failed attempt must restore: the commit, the base,
-    and both key maps entry for entry."""
+    """Everything a failed attempt must leave as it was: the commit, the
+    base, and every key's value."""
     return {
         "commit": v.current_commit,
         "base": v.base_commit,
-        "keys": dict(v._commit_keys),
-        "meta": dict(v._meta),
+        "values": v.get_many(*v.keys()),
     }
 
 
@@ -184,13 +178,6 @@ class TestRetry:
 
 
 class TestKeysView:
-    def test_commit_without_live_view_keeps_the_same_dict(self):
-        _, _, v = _setup()
-        keys = v._commit_keys
-        list(v.keys())  # a view that is dropped at once pins nothing
-        _change(v)
-        assert v._commit_keys is keys
-
     def test_view_keeps_its_keys_across_a_commit(self):
         _, _, v = _setup()
         view = v.keys()
@@ -224,15 +211,6 @@ class TestKeysView:
         with pytest.raises(RuntimeError):
             _change(v)
         assert sorted(view) == ["change", "drop", "keep"]
-
-    def test_a_dropped_view_stops_pinning(self):
-        _, _, v = _setup()
-        view = v.keys()
-        del view
-        gc.collect()
-        keys = v._commit_keys
-        _change(v)
-        assert v._commit_keys is keys
 
     def test_view_compares_as_a_set(self):
         _, _, v = _setup()

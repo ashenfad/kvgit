@@ -20,6 +20,7 @@ pub mod refs;
 pub mod store;
 pub mod text;
 pub mod tree;
+pub mod worktree;
 pub mod write;
 
 /// The version of the core, which is the version of both packages.

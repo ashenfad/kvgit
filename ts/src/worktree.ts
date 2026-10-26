@@ -104,15 +104,15 @@ export class Worktree<V = Uint8Array> {
     this.#engine = engine
   }
 
-  /** Whether this worktree reads its keyset on demand (see
-   *  `Repo.worktree`). */
+  /** Every worktree reads its keyset on demand. */
   get lazy(): boolean {
-    return this.#engine.isLazy
+    return true
   }
 
-  /** A lazy worktree's node cache; null for an eager one. */
+  /** A worktree reads through its repository's content cache, so has
+   *  no node cache of its own. */
   get nodeCache(): NodeCache | null {
-    return this.#engine.keysetCache
+    return null
   }
 
   /** The branch this worktree is bound to. */
@@ -139,9 +139,7 @@ export class Worktree<V = Uint8Array> {
     const raw = await this.#engine.get(key)
     if (raw === null) return undefined
     const value = this.repo.codec.decode(raw)
-    // A lazy worktree's keyset may be far larger than memory; it keeps
-    // no values, leaving caching to its caller.
-    if (!this.#engine.isLazy) this.#cache.set(key, value)
+    this.#cache.set(key, value)
     return value
   }
 
@@ -156,10 +154,9 @@ export class Worktree<V = Uint8Array> {
       else fetch.push(key)
     }
     if (fetch.length > 0) {
-      const keep = !this.#engine.isLazy
       for (const [key, raw] of await this.#engine.getMany(fetch)) {
         const value = this.repo.codec.decode(raw)
-        if (keep) this.#cache.set(key, value)
+        this.#cache.set(key, value)
         out.set(key, value)
       }
     }

@@ -8,9 +8,7 @@
 use kvgit_core::json::{Value, write_string};
 use kvgit_core::machine::{Machine, Reply, Request, Step};
 use kvgit_core::tree::{self, Memo, Shape, TreeDiff, TreeError, Updated};
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 
 mod op;
@@ -158,6 +156,39 @@ impl ContentCache {
     }
 }
 
+/// A worktree's committed state: the root its keyset is at, and the key
+/// index the first listing builds. Operations given it read from it and
+/// move it.
+#[wasm_bindgen]
+pub struct WorktreeState {
+    inner: kvgit_core::worktree::Shared,
+}
+
+#[wasm_bindgen]
+impl WorktreeState {
+    #[wasm_bindgen(constructor)]
+    pub fn new(root: String) -> WorktreeState {
+        WorktreeState {
+            inner: kvgit_core::worktree::Tree::shared(root),
+        }
+    }
+
+    pub fn root(&self) -> String {
+        self.inner.lock().unwrap().root().to_string()
+    }
+
+    /// Whether a listing has built the key index.
+    pub fn indexed(&self) -> bool {
+        self.inner.lock().unwrap().indexed()
+    }
+}
+
+impl WorktreeState {
+    pub(crate) fn shared(&self) -> kvgit_core::worktree::Shared {
+        self.inner.clone()
+    }
+}
+
 fn to_js(e: impl std::fmt::Display) -> JsError {
     JsError::new(&e.to_string())
 }
@@ -237,7 +268,7 @@ pub struct TreeOp {
 
 /// A memo with no room holds nothing, and so stands for none.
 fn shape(prefix: String, bucket_max: usize, memo: &NodeMemo) -> Shape {
-    let memo = (memo.0.borrow().max_bytes() > 0).then(|| memo.0.clone());
+    let memo = (memo.0.lock().unwrap().max_bytes() > 0).then(|| memo.0.clone());
     Shape {
         prefix,
         bucket_max,
@@ -254,12 +285,14 @@ pub struct NodeMemo(Memo);
 impl NodeMemo {
     #[wasm_bindgen(constructor)]
     pub fn new(max_bytes: usize) -> NodeMemo {
-        NodeMemo(Rc::new(RefCell::new(tree::NodeMemo::new(max_bytes))))
+        NodeMemo(std::sync::Arc::new(std::sync::Mutex::new(
+            tree::NodeMemo::new(max_bytes),
+        )))
     }
 
     /// `{hits, misses, evictions, entries, bytes}`, as JSON.
     pub fn stats(&self) -> String {
-        let s = self.0.borrow().stats();
+        let s = self.0.lock().unwrap().stats();
         format!(
             "{{\"hits\":{},\"misses\":{},\"evictions\":{},\"entries\":{},\"bytes\":{}}}",
             s.hits, s.misses, s.evictions, s.entries, s.bytes
@@ -268,16 +301,16 @@ impl NodeMemo {
 
     /// Hold a node the host has stored, from its bytes.
     pub fn hold(&self, hash: &str, raw: &[u8]) -> Result<(), JsError> {
-        self.0.borrow_mut().hold(hash, raw).map_err(to_js)
+        self.0.lock().unwrap().hold(hash, raw).map_err(to_js)
     }
 
     #[wasm_bindgen(js_name = resetStats)]
     pub fn reset_stats(&self) {
-        self.0.borrow_mut().reset_stats();
+        self.0.lock().unwrap().reset_stats();
     }
 
     pub fn clear(&self) {
-        self.0.borrow_mut().clear();
+        self.0.lock().unwrap().clear();
     }
 }
 

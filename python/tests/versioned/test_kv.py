@@ -1284,7 +1284,6 @@ class TestErgonomics:
         v.commit({"a": b"1", "b": b"2"})
         r = repr(v)
         assert "main" in r
-        assert "keys=2" in r
         assert v.current_commit[:8] in r
 
     def test_repr_different_branch(self):

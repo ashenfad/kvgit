@@ -1,14 +1,13 @@
 /**
- * A commit changes the handle's key maps in place, and a failed attempt
- * puts back exactly what it changed. These pin the rollback on every
- * failure path, the stable view an iteration keeps across a commit, and
- * the serialization of state-changing calls on one handle.
+ * A commit that fails leaves the handle as it found it, on every failure
+ * path; an iteration keeps the keys it started on across a commit; and
+ * state-changing calls on one handle are serialized.
  */
 
 import { describe, expect, it } from 'vitest'
 import { Memory } from '../src/backends/memory'
 import { ConcurrencyError, MergeConflict, VersionedKV } from '../src/index'
-import { IN_FLIGHT_KEY } from '../src/versioned/layout'
+import { COMMIT_ROOT, IN_FLIGHT_KEY } from '../src/versioned/layout'
 import { failReads, racePublish } from './races'
 
 const enc = new TextEncoder()
@@ -16,22 +15,10 @@ const dec = new TextDecoder()
 const bytes = (s: string): Uint8Array => enc.encode(s)
 const text = (b: Uint8Array | null): string | null => (b === null ? null : dec.decode(b))
 
-interface Internals {
-  commitKeys: Map<string, string>
-  meta: Map<string, unknown>
-}
-const internals = (vk: VersionedKV): Internals => vk as unknown as Internals
-
-/** Everything a failed attempt must restore: the commit, the base, and
- *  both key maps entry for entry. */
-function stateOf(vk: VersionedKV): unknown {
-  const i = internals(vk)
-  return {
-    commit: vk.currentCommit,
-    base: vk.baseCommit,
-    keys: [...i.commitKeys].sort(),
-    meta: [...i.meta].sort(),
-  }
+/** Everything a failed attempt must leave as it was: the commit, the
+ *  base, and every key's value. */
+async function stateOf(vk: VersionedKV): Promise<unknown> {
+  return { commit: vk.currentCommit, base: vk.baseCommit, values: await valuesOf(vk) }
 }
 
 async function valuesOf(vk: VersionedKV): Promise<Record<string, string | null>> {
@@ -95,26 +82,26 @@ const change = () => ({
 describe('a failed commit attempt restores the key maps exactly', () => {
   it('when the fast-forward batch fails to land', async () => {
     const { store, vk } = await setup()
-    const before = stateOf(vk)
+    const before = await stateOf(vk)
     store.arm(1)
     await expect(vk.commit(change())).rejects.toThrow('landing write failed')
-    expect(stateOf(vk)).toEqual(before)
+    expect(await stateOf(vk)).toEqual(before)
   })
 
   it('when the merge batch after a lost race fails to land', async () => {
     const { store, writer, vk } = await setup()
-    const before = stateOf(vk)
+    const before = await stateOf(vk)
     raceOnce(vk, async () => {
       await writer.commit({ updates: new Map([['other', bytes('o1')]]) })
       store.arm(1)
     })
     await expect(vk.commit(change())).rejects.toThrow('landing write failed')
-    expect(stateOf(vk)).toEqual(before)
+    expect(await stateOf(vk)).toEqual(before)
   })
 
   it('when the merge publish loses a second race', async () => {
     const { store, writer, vk } = await setup()
-    const before = stateOf(vk)
+    const before = await stateOf(vk)
     let n = 0
     racePublish(
       store,
@@ -123,20 +110,20 @@ describe('a failed commit attempt restores the key maps exactly', () => {
       null,
     )
     await expect(vk.commit(change())).rejects.toThrow(ConcurrencyError)
-    expect(stateOf(vk)).toEqual(before)
+    expect(await stateOf(vk)).toEqual(before)
   })
 
   it('when the merge after a lost race conflicts', async () => {
     const { writer, vk } = await setup()
-    const before = stateOf(vk)
+    const before = await stateOf(vk)
     raceOnce(vk, () => writer.commit({ updates: new Map([['change', bytes('theirs')]]) }))
     await expect(vk.commit(change())).rejects.toThrow(MergeConflict)
-    expect(stateOf(vk)).toEqual(before)
+    expect(await stateOf(vk)).toEqual(before)
   })
 
   it('when reading for the merge after a lost race fails', async () => {
     const { store, writer, vk } = await setup()
-    const before = stateOf(vk)
+    const before = await stateOf(vk)
     raceOnce(vk, async () => {
       await writer.commit({ updates: new Map([['other', bytes('o1')]]) })
       // The merge's first read of history: the two heads' parents.
@@ -147,7 +134,7 @@ describe('a failed commit attempt restores the key maps exactly', () => {
       )
     })
     await expect(vk.commit(change())).rejects.toThrow('store read failed')
-    expect(stateOf(vk)).toEqual(before)
+    expect(await stateOf(vk)).toEqual(before)
   })
 
   it('when a merge of another head fails to land', async () => {
@@ -155,10 +142,10 @@ describe('a failed commit attempt restores the key maps exactly', () => {
     const side = (await vk.createBranch('side')) as VersionedKV
     await side.commit({ updates: new Map([['side', bytes('s1')]]) })
     await vk.commit({ updates: new Map([['main', bytes('m1')]]) })
-    const before = stateOf(vk)
+    const before = await stateOf(vk)
     store.arm(1)
     await expect(vk.mergeHeads(side.currentCommit)).rejects.toThrow('landing write failed')
-    expect(stateOf(vk)).toEqual(before)
+    expect(await stateOf(vk)).toEqual(before)
   })
 
   it('when an apply fails to land', async () => {
@@ -167,10 +154,10 @@ describe('a failed commit attempt restores the key maps exactly', () => {
     await vk.commit({ updates: new Map([['picked', bytes('p1')]]) })
     const target = vk.currentCommit
     await vk.commit({ removals: new Set(['picked']) })
-    const before = stateOf(vk)
+    const before = await stateOf(vk)
     store.arm(1)
     await expect(vk.applyChange(parent, target)).rejects.toThrow('landing write failed')
-    expect(stateOf(vk)).toEqual(before)
+    expect(await stateOf(vk)).toEqual(before)
   })
 })
 
@@ -188,7 +175,7 @@ describe('a retry after a failed attempt', () => {
     expect(result.strategy).toBe('three_way')
     expect(vk.currentCommit).toBe(await vk.latestHead())
     const fresh = await VersionedKV.open(store)
-    expect(stateOf(vk)).toEqual(stateOf(fresh))
+    expect(await stateOf(vk)).toEqual(await stateOf(fresh))
     expect(await valuesOf(vk)).toEqual({
       keep: 'k0',
       change: 'c1',
@@ -203,18 +190,11 @@ describe('a retry after a failed attempt', () => {
     const result = await vk.commit(change())
     expect(result.strategy).toBe('three_way')
     const fresh = await VersionedKV.open(store)
-    expect(stateOf(vk)).toEqual(stateOf(fresh))
+    expect(await stateOf(vk)).toEqual(await stateOf(fresh))
   })
 })
 
-describe('the key maps change in place', () => {
-  it('a commit with no iteration running keeps the same map', async () => {
-    const { vk } = await setup()
-    const map = internals(vk).commitKeys
-    await vk.commit(change())
-    expect(internals(vk).commitKeys).toBe(map)
-  })
-
+describe('an iteration over the keys', () => {
   it('an iteration keeps the keys it started with across a commit', async () => {
     const { vk } = await setup()
     const it = vk.keys()[Symbol.asyncIterator]()
@@ -232,8 +212,7 @@ describe('the key maps change in place', () => {
     const { store, vk } = await setup()
     const it = vk.keys()[Symbol.asyncIterator]()
     const seen = [(await it.next()).value as string]
-    // The first batch lands and changes the maps; the merge after the
-    // lost race fails and puts them back.
+    // The first batch lands; the merge after the lost race fails.
     raceOnce(vk, async () => {
       const other = await VersionedKV.open(store)
       await other.commit({ updates: new Map([['other', bytes('o1')]]) })
@@ -257,7 +236,7 @@ describe('state-changing calls on one handle are serialized', () => {
     expect(results.map((r) => r.strategy)).toEqual(Array(5).fill('fast_forward'))
     expect(vk.currentCommit).toBe(await vk.latestHead())
     const fresh = await VersionedKV.open(store)
-    expect(stateOf(vk)).toEqual(stateOf(fresh))
+    expect(await stateOf(vk)).toEqual(await stateOf(fresh))
     expect(Object.keys(await valuesOf(vk)).sort()).toEqual(['k0', 'k1', 'k2', 'k3', 'k4'])
   })
 
@@ -266,7 +245,7 @@ describe('state-changing calls on one handle are serialized', () => {
     await writer.commit({ updates: new Map([['other', bytes('o1')]]) })
     await Promise.all([vk.commit(change()), vk.refresh()])
     const fresh = await VersionedKV.open(store)
-    expect(stateOf(vk)).toEqual(stateOf(fresh))
+    expect(await stateOf(vk)).toEqual(await stateOf(fresh))
   })
 
   it('a failed commit does not block the next one', async () => {
@@ -284,5 +263,64 @@ describe('state-changing calls on one handle are serialized', () => {
       drop: 'd0',
       later: 'l1',
     })
+  })
+})
+
+/** A memory store that, after each write lands, notes in each of the
+ *  turns that follow the commit a handle is at and the root its keys
+ *  are read from, both in the one turn. */
+class Probing extends Memory {
+  vk: VersionedKV | null = null
+  readonly seen: Array<{ commit: string; root: string }> = []
+
+  override async casMany(
+    expected: ReadonlyMap<string, Uint8Array | null>,
+    writes: ReadonlyMap<string, Uint8Array>,
+    removes: Iterable<string> = [],
+  ): Promise<boolean> {
+    const landed = await super.casMany(expected, writes, removes)
+    const vk = this.vk
+    if (vk !== null) {
+      const state = (vk as unknown as { state: { root(): string } }).state
+      let turn = Promise.resolve()
+      for (let i = 0; i < 30; i++) {
+        turn = turn.then(() => {
+          this.seen.push({ commit: vk.currentCommit, root: state.root() })
+        })
+      }
+    }
+    return landed
+  }
+
+  /** Whether each turn noted read the keys of the commit it was at. */
+  async consistent(): Promise<boolean> {
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    for (const { commit, root } of this.seen) {
+      const stored = await this.get(COMMIT_ROOT(commit))
+      if (stored === null || JSON.parse(dec.decode(stored)) !== root) return false
+    }
+    return this.seen.length > 0
+  }
+}
+
+describe('a read beside a state-changing call', () => {
+  it('finds a commit and its keys moved together', async () => {
+    const store = new Probing()
+    const vk = await VersionedKV.open(store)
+    await vk.commit({ updates: new Map([['old', bytes('o')]]) })
+    store.vk = vk
+    await vk.commit({ updates: new Map([['new', bytes('n')]]) })
+    expect(await store.consistent()).toBe(true)
+  })
+
+  it('finds a reset move its commit and keys together', async () => {
+    const store = new Probing()
+    const vk = await VersionedKV.open(store)
+    await vk.commit({ updates: new Map([['old', bytes('o')]]) })
+    const before = vk.currentCommit
+    await vk.commit({ updates: new Map([['new', bytes('n')]]) })
+    store.vk = vk
+    await vk.resetTo(before)
+    expect(await store.consistent()).toBe(true)
   })
 })

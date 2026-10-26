@@ -249,6 +249,26 @@ class TestDiscardResetRefresh:
         assert wt["from_other"] == "data"
         assert not wt.status()
 
+    def test_refresh_from_a_swept_commit_lists_only_the_new_tip(self):
+        # A listed worktree whose commit another process reset away and
+        # swept: its old tree can't be read, so its keys can't be
+        # diffed out, and the listing must start again.
+        store = Memory()
+        repo = Repo(store)
+        wt = repo.worktree("main", create=True)
+        wt["kept"] = 1
+        wt.commit()
+        base = wt.head
+        wt["swept"] = 2
+        wt.commit()
+        ours = Repo(store, cache_bytes=0).worktree("main")
+        assert ours.keys() == {"kept", "swept"}
+        Repo(store).worktree("main").reset(base)
+        Repo(store).gc(min_age=0)
+        ours.refresh()
+        assert ours.keys() == {"kept"}
+        assert "swept" not in ours
+
     def test_refresh_of_a_deleted_branch_raises(self):
         wt = worktree()
         dev = fork(wt, "dev")

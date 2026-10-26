@@ -240,13 +240,14 @@ So a worktree also keeps a key index, as a cache over the same model:
 - The first `keys()`, listing or iteration builds it with one walk;
   nothing builds it at open, so a worktree that never lists pays
   nothing.
-- It holds the sorted keys and nothing else, and pending changes are
-  applied to it as they are made.
-- A commit carries it to the new root with the commit's own changes.
-  Moving the worktree to a root it did not write (a merge, a checkout,
-  a refresh) updates it by a structural diff of the two roots, which
-  reads only the subtrees that differ.
-- Reads never consult it; a lookup is a tree path through the cache.
+- It holds the sorted keys and nothing else. Pending changes are
+  values, so they stay with the host, which lays them over the index.
+- A commit or merge carries it to the new root with its own changes.
+  Moving the worktree to a root it did not write (a checkout, a
+  refresh, a reset) updates it by a structural diff of the two roots,
+  which reads only the subtrees that differ.
+- A lookup is a tree path through the cache. The index answers only
+  that a key is absent, without a read.
 
 Worktree state lives in the core, owned by the host object. TypeScript
 objects holding core state are freed by a `FinalizationRegistry`

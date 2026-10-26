@@ -39,7 +39,6 @@ export abstract class VersionedBase implements Versioned {
   protected branch: string
   protected currentCommitHash: string
   protected baseCommitHash: string
-  protected commitKeys: Map<string, string>
   protected mergeFns: Map<string, MergePolicy>
   protected mergePrefixes: Map<string, MergePolicy>
   protected defaultMergeFn: MergePolicy | null
@@ -47,10 +46,6 @@ export abstract class VersionedBase implements Versioned {
 
   /** Cached on first access; the root commit walking back from HEAD. */
   private cachedInitialCommit: string | null = null
-  /** Iterations still reading the current `commitKeys` map. A change
-   *  made while one runs goes to a copy, so each iteration sees one
-   *  commit's keys from start to finish. */
-  private keyReaders = 0
   /** Settles when the latest state-changing call on this handle does. */
   private opTail: Promise<void> = Promise.resolve()
 
@@ -58,7 +53,6 @@ export abstract class VersionedBase implements Versioned {
     this.branch = opts.branch
     this.currentCommitHash = opts.commitHash
     this.baseCommitHash = opts.commitHash
-    this.commitKeys = new Map()
     this.mergeFns = new Map()
     this.mergePrefixes = new Map()
     this.defaultMergeFn = null
@@ -98,56 +92,12 @@ export abstract class VersionedBase implements Versioned {
     return last
   }
 
-  // --- Reads (in-memory keyset) ---
+  // --- Reads ---
 
-  async get(key: string): Promise<Uint8Array | null> {
-    const blob = this.commitKeys.get(key)
-    if (blob === undefined) return null
-    return this.readBlob(blob)
-  }
-
-  async getMany(keys: Iterable<string>): Promise<Map<string, Uint8Array>> {
-    const out = new Map<string, Uint8Array>()
-    for (const key of keys) {
-      const v = await this.get(key)
-      if (v !== null) out.set(key, v)
-    }
-    return out
-  }
-
-  async has(key: string): Promise<boolean> {
-    return this.commitKeys.has(key)
-  }
-
-  async *keys(): AsyncIterable<string> {
-    const map = this.commitKeys
-    this.keyReaders++
-    try {
-      for (const k of map.keys()) yield k
-    } finally {
-      if (this.commitKeys === map) this.keyReaders--
-    }
-  }
-
-  /**
-   * `commitKeys`, ready to change in place. A commit changes the map
-   * rather than rebuilding it, so its cost follows the size of the
-   * change; when an iteration is reading the map, the change goes to a
-   * copy instead and the iteration keeps the map it started on.
-   */
-  protected ownedKeys(): Map<string, string> {
-    if (this.keyReaders > 0) {
-      this.commitKeys = new Map(this.commitKeys)
-      this.keyReaders = 0
-    }
-    return this.commitKeys
-  }
-
-  /** Replace `commitKeys` wholesale, as when loading another commit. */
-  protected replaceKeys(map: Map<string, string>): void {
-    this.commitKeys = map
-    this.keyReaders = 0
-  }
+  abstract get(key: string): Promise<Uint8Array | null>
+  abstract getMany(keys: Iterable<string>): Promise<Map<string, Uint8Array>>
+  abstract has(key: string): Promise<boolean>
+  abstract keys(): AsyncIterable<string>
 
   // --- Merge registry ---
 

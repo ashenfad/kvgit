@@ -59,7 +59,9 @@ class ContentCache:
 
     Shared by every worktree and snapshot of one :class:`~kvgit.Repo`,
     and safe to use from several threads. The core holds it, and every
-    operation the repository runs reads and writes through it.
+    operation the repository runs reads and writes through it. Tree
+    nodes are held decoded, and charged what they take in memory, so
+    the budget bounds nodes and commit records together.
     """
 
     def __init__(self, max_bytes: int = DEFAULT_CACHE_BYTES) -> None:

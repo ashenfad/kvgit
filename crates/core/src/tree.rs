@@ -21,15 +21,16 @@ use crate::hash::sha256_hex;
 use crate::json::{self, Value, write_string};
 use crate::layout::EMPTY_HASH;
 use crate::machine::Io;
-use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 /// Hex digits in a key's hash, and so the deepest a tree can go.
 const HASH_LEN: usize = 64;
 
 /// Where a tree's nodes are stored, how full a leaf may get, and the
-/// memo stored nodes are read through, if any.
+/// memo stored nodes are read through, if any. Without one, a keyset
+/// tree's nodes are held in the repository's content cache, if the
+/// operation has one.
 #[derive(Clone, Debug)]
 pub struct Shape {
     /// The prefix of each node's store key, before its hash.
@@ -40,7 +41,7 @@ pub struct Shape {
 }
 
 /// A [`NodeMemo`] the host shares between operations.
-pub type Memo = Rc<RefCell<NodeMemo>>;
+pub type Memo = Arc<Mutex<NodeMemo>>;
 
 /// What a [`NodeMemo`] has done since its counts were last reset.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -61,7 +62,7 @@ pub struct MemoStats {
 #[derive(Debug)]
 pub struct NodeMemo {
     max_bytes: usize,
-    held: HashMap<String, (Rc<Node>, usize, u64)>,
+    held: HashMap<String, (Arc<Node>, usize, u64)>,
     order: BTreeMap<u64, String>,
     tick: u64,
     stats: MemoStats,
@@ -79,7 +80,7 @@ impl NodeMemo {
     }
 
     /// The node, marked most recently used.
-    fn get(&mut self, hash: &str) -> Option<Rc<Node>> {
+    fn get(&mut self, hash: &str) -> Option<Arc<Node>> {
         let Some((node, _, tick)) = self.held.get_mut(hash) else {
             self.stats.misses += 1;
             return None;
@@ -92,7 +93,7 @@ impl NodeMemo {
         Some(node.clone())
     }
 
-    fn put(&mut self, hash: &str, node: Rc<Node>, size: usize) {
+    fn put(&mut self, hash: &str, node: Arc<Node>, size: usize) {
         if let Some((_, old_size, old_tick)) = self.held.remove(hash) {
             self.order.remove(&old_tick);
             self.stats.bytes -= old_size;
@@ -112,9 +113,14 @@ impl NodeMemo {
         }
     }
 
+    /// Hold a node just stored, with the size of its bytes.
+    pub fn hold_decoded(&mut self, hash: &str, node: Arc<Node>, size: usize) {
+        self.put(hash, node, size);
+    }
+
     /// Hold a stored node from its bytes, as if it had just been read.
     pub fn hold(&mut self, hash: &str, raw: &[u8]) -> Result<(), TreeError> {
-        let node = Rc::new(Node::decode(raw, hash)?);
+        let node = Arc::new(Node::decode(raw, hash)?);
         self.put(hash, node, raw.len());
         Ok(())
     }
@@ -205,6 +211,19 @@ impl Node {
         out.into_bytes()
     }
 
+    /// An estimate of the memory the node takes, decoded: its strings,
+    /// their headers, and the map's slots.
+    pub fn footprint(&self) -> usize {
+        let map = match self {
+            Node::Leaf(items) => items,
+            Node::Branch(children) => children,
+        };
+        64 + map
+            .iter()
+            .map(|(k, v)| k.len() + v.len() + 64)
+            .sum::<usize>()
+    }
+
     /// Read a stored node; `hash` names it in the error.
     pub fn decode(raw: &[u8], hash: &str) -> Result<Node, TreeError> {
         let bad = |why: &str| TreeError::Malformed {
@@ -256,21 +275,24 @@ fn decode_value(key: &str, encoded: &str) -> Result<Vec<u8>, TreeError> {
 
 /// A node lookup within an operation.
 enum Found {
-    Node(Rc<Node>),
+    Node(Arc<Node>),
     /// The store doesn't have it.
     Missing,
     /// Not read yet.
     Unknown,
 }
 
+/// A node made and not yet stored, with its bytes.
+type Made = (Arc<Node>, Vec<u8>);
+
 /// The nodes one operation has read or made.
 struct Nodes {
     io: Io,
     shape: Shape,
-    read: HashMap<String, Option<Rc<Node>>>,
+    read: HashMap<String, Option<Arc<Node>>>,
     /// Nodes this operation made, and the caller's unwritten ones, by
     /// hash, with their bytes.
-    unwritten: HashMap<String, (Rc<Node>, Vec<u8>)>,
+    unwritten: HashMap<String, Made>,
 }
 
 impl Nodes {
@@ -280,7 +302,7 @@ impl Nodes {
         }
         let unwritten = unwritten
             .into_iter()
-            .map(|(hash, raw)| Ok((hash.clone(), (Rc::new(Node::decode(&raw, &hash)?), raw))))
+            .map(|(hash, raw)| Ok((hash.clone(), (Arc::new(Node::decode(&raw, &hash)?), raw))))
             .collect::<Result<_, TreeError>>()?;
         Ok(Nodes {
             io,
@@ -292,7 +314,7 @@ impl Nodes {
 
     fn find(&self, hash: &str) -> Found {
         if hash == EMPTY_HASH.as_str() {
-            return Found::Node(Rc::new(Node::empty()));
+            return Found::Node(Arc::new(Node::empty()));
         }
         if let Some((node, _)) = self.unwritten.get(hash) {
             return Found::Node(node.clone());
@@ -302,6 +324,15 @@ impl Nodes {
             Some(None) => Found::Missing,
             None => Found::Unknown,
         }
+    }
+
+    /// Whether decoded nodes are held in the repository's content
+    /// cache, which holds only keyset nodes, rather than in the
+    /// shape's own memo.
+    fn in_cache(&self) -> bool {
+        self.shape.memo.is_none()
+            && self.io.has_cache()
+            && crate::cache::is_node(&self.shape.prefix)
     }
 
     fn known(&self, hash: &str) -> bool {
@@ -320,9 +351,11 @@ impl Nodes {
                 wanted.push(hash.clone());
             }
         }
-        if let Some(memo) = &self.shape.memo {
-            let mut memo = memo.borrow_mut();
-            wanted.retain(|hash| match memo.get(hash) {
+        let memo = self.shape.memo.clone();
+        let in_cache = self.in_cache();
+        if let Some(memo) = &memo {
+            let mut held = memo.lock().unwrap();
+            wanted.retain(|hash| match held.get(hash) {
                 Some(node) => {
                     self.read.insert(hash.clone(), Some(node));
                     false
@@ -330,30 +363,55 @@ impl Nodes {
                 None => true,
             });
         }
-        if wanted.is_empty() {
-            return Ok(());
-        }
-        let keys: Vec<String> = wanted
+        let mut keys: Vec<String> = wanted
             .iter()
             .map(|h| format!("{}{h}", self.shape.prefix))
             .collect();
+        if in_cache && !keys.is_empty() {
+            let mut held = self.io.cached_nodes(&keys);
+            let mut rest = (Vec::new(), Vec::new());
+            for (hash, key) in wanted.into_iter().zip(keys) {
+                match held.remove(&key) {
+                    Some(node) => {
+                        self.read.insert(hash, Some(node));
+                    }
+                    None => {
+                        rest.0.push(hash);
+                        rest.1.push(key);
+                    }
+                }
+            }
+            (wanted, keys) = rest;
+        }
+        if wanted.is_empty() {
+            return Ok(());
+        }
         let mut got = self
             .io
             .get(keys.clone())
             .await
             .map_err(|_| TreeError::Host)?;
+        let mut decoded = Vec::new();
         for (hash, key) in wanted.into_iter().zip(keys) {
             let node = match got.remove(&key) {
                 Some(raw) => {
-                    let node = Rc::new(Node::decode(&raw, &hash)?);
-                    if let Some(memo) = &self.shape.memo {
-                        memo.borrow_mut().put(&hash, node.clone(), raw.len());
+                    let node = Arc::new(Node::decode(&raw, &hash)?);
+                    if let Some(memo) = &memo
+                        && !self.io.passing_cache()
+                    {
+                        memo.lock().unwrap().put(&hash, node.clone(), raw.len());
+                    }
+                    if in_cache {
+                        decoded.push((key, node.clone()));
                     }
                     Some(node)
                 }
                 None => None,
             };
             self.read.insert(hash, node);
+        }
+        if !decoded.is_empty() {
+            self.io.remember_nodes(decoded);
         }
         Ok(())
     }
@@ -364,7 +422,7 @@ impl Nodes {
         let hash = sha256_hex(&raw);
         self.unwritten
             .entry(hash.clone())
-            .or_insert((Rc::new(node), raw));
+            .or_insert((Arc::new(node), raw));
         hash
     }
 
@@ -378,7 +436,7 @@ impl Nodes {
 
     /// The unwritten nodes `root` reaches without passing through a
     /// stored one: what a write of the new tree must store.
-    fn unwritten_under(&self, root: &str) -> Vec<(String, Vec<u8>)> {
+    fn unwritten_under(&self, root: &str) -> Vec<(String, Made)> {
         let mut out = BTreeMap::new();
         let mut queue = vec![root.to_string()];
         while let Some(hash) = queue.pop() {
@@ -388,7 +446,7 @@ impl Nodes {
             let Some((node, raw)) = self.unwritten.get(&hash) else {
                 continue;
             };
-            out.insert(hash, raw.clone());
+            out.insert(hash, (node.clone(), raw.clone()));
             if let Node::Branch(children) = node.as_ref() {
                 queue.extend(children.values().cloned());
             }
@@ -570,8 +628,30 @@ enum Side {
 /// subtrees are never read, so the cost follows the size of the change;
 /// both trees are read a level at a time.
 pub async fn diff(io: Io, shape: Shape, a: String, b: String) -> Result<TreeDiff, TreeError> {
+    Ok(diff_noting_missing(io, shape, a, b).await?.0)
+}
+
+/// What changed from `a` to `b`, or `None` if the store lacks a node of
+/// either that the diff reached, so that what it found is incomplete.
+pub async fn diff_whole(
+    io: Io,
+    shape: Shape,
+    a: String,
+    b: String,
+) -> Result<Option<TreeDiff>, TreeError> {
+    let (diff, missing) = diff_noting_missing(io, shape, a, b).await?;
+    Ok((!missing).then_some(diff))
+}
+
+async fn diff_noting_missing(
+    io: Io,
+    shape: Shape,
+    a: String,
+    b: String,
+) -> Result<(TreeDiff, bool), TreeError> {
     let mut nodes = Nodes::new(io, shape, HashMap::new())?;
     let mut out = TreeDiff::default();
+    let mut missing = false;
     let mut level: Vec<(Side, Side, usize)> = if a == b {
         vec![]
     } else {
@@ -589,8 +669,8 @@ pub async fn diff(io: Io, shape: Shape, a: String, b: String) -> Result<TreeDiff
         nodes.fetch(&hashes).await?;
         let mut next = Vec::new();
         for (a, b, depth) in level {
-            let a_node = side_node(&nodes, a);
-            let b_node = side_node(&nodes, b);
+            let a_node = side_node(&nodes, a, &mut missing);
+            let b_node = side_node(&nodes, b, &mut missing);
             match (&a_node, &b_node) {
                 (Node::Leaf(a_items), Node::Leaf(b_items)) => {
                     diff_items(a_items, b_items, &mut out)?
@@ -624,16 +704,20 @@ pub async fn diff(io: Io, shape: Shape, a: String, b: String) -> Result<TreeDiff
     out.added.sort();
     out.removed.sort();
     out.modified.sort();
-    Ok(out)
+    Ok((out, missing))
 }
 
-/// A side's node; one the store lacks reads as empty.
-fn side_node(nodes: &Nodes, side: Side) -> Node {
+/// A side's node; one the store lacks reads as empty, and sets
+/// `missing`.
+fn side_node(nodes: &Nodes, side: Side, missing: &mut bool) -> Node {
     match side {
         Side::Items(items) => Node::Leaf(items),
         Side::Hash(hash) => match nodes.find(&hash) {
             Found::Node(node) => node.as_ref().clone(),
-            _ => Node::empty(),
+            _ => {
+                *missing = true;
+                Node::empty()
+            }
         },
     }
 }
@@ -693,6 +777,8 @@ pub struct Updated {
     pub root: String,
     /// Node hash and bytes, by hash; store each under the shape's prefix.
     pub nodes: Vec<(String, Vec<u8>)>,
+    /// The same nodes, decoded, in the same order.
+    pub decoded: Vec<Arc<Node>>,
 }
 
 /// The tree at `root` with `updates` set and then `removals` removed,
@@ -738,14 +824,19 @@ pub async fn update(
             }
         };
     }
-    let written = nodes.unwritten_under(&current);
+    let (nodes, decoded) = nodes
+        .unwritten_under(&current)
+        .into_iter()
+        .map(|(hash, (node, raw))| ((hash, raw), node))
+        .unzip();
     Ok(Updated {
         root: current,
-        nodes: written,
+        nodes,
+        decoded,
     })
 }
 
-fn found_or_need(nodes: &Nodes, hash: &str) -> Result<Option<Rc<Node>>, Need> {
+fn found_or_need(nodes: &Nodes, hash: &str) -> Result<Option<Arc<Node>>, Need> {
     match nodes.find(hash) {
         Found::Node(node) => Ok(Some(node)),
         Found::Missing => Ok(None),
@@ -1151,6 +1242,24 @@ mod tests {
     }
 
     #[test]
+    fn a_whole_diff_says_when_it_reached_a_missing_node() {
+        let store = Store::default();
+        let a = store.update(&EMPTY_HASH, &[("x", "1"), ("y", "2")], &[]);
+        let b = store.update(&EMPTY_HASH, &[("x", "1")], &[]);
+        let (ra, rb) = (a.clone(), b.clone());
+        let d = store
+            .run(Machine::new(move |io| diff_whole(io, shape(), ra, rb)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(d.removed, vec![("y".to_string(), b"2".to_vec())]);
+        store.data.borrow_mut().remove(&format!("t:{a}"));
+        let d = store
+            .run(Machine::new(move |io| diff_whole(io, shape(), a, b)))
+            .unwrap();
+        assert!(d.is_none());
+    }
+
+    #[test]
     fn a_walk_skips_what_it_was_told_it_has_seen() {
         let store = Store::default();
         let all = keys(20);
@@ -1230,7 +1339,7 @@ mod tests {
         let all = keys(30);
         let pairs: Vec<(&str, &str)> = all.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         let root = store.update(&EMPTY_HASH, &pairs, &[]);
-        let memo: Memo = Rc::new(RefCell::new(NodeMemo::new(1 << 20)));
+        let memo: Memo = Arc::new(Mutex::new(NodeMemo::new(1 << 20)));
         let walk_with = |memo: &Memo| {
             let (root, shape) = (
                 root.clone(),
@@ -1246,18 +1355,18 @@ mod tests {
         *store.reads.borrow_mut() = 0;
         let (first, nodes) = walk_with(&memo);
         assert!(*store.reads.borrow() > 0);
-        assert_eq!(memo.borrow().stats().entries, nodes.len());
+        assert_eq!(memo.lock().unwrap().stats().entries, nodes.len());
         *store.reads.borrow_mut() = 0;
         let (second, _) = walk_with(&memo);
         assert_eq!(*store.reads.borrow(), 0);
         assert_eq!(first, second);
-        assert_eq!(memo.borrow().stats().hits as usize, nodes.len());
+        assert_eq!(memo.lock().unwrap().stats().hits as usize, nodes.len());
     }
 
     #[test]
     fn a_memo_evicts_the_least_recently_used() {
         let mut memo = NodeMemo::new(300);
-        let node = Rc::new(Node::empty());
+        let node = Arc::new(Node::empty());
         memo.put("a", node.clone(), 100);
         memo.put("b", node.clone(), 100);
         memo.put("c", node.clone(), 100);

@@ -27,11 +27,13 @@
 use crate::cache::{self, Shared};
 use crate::layout::GC_LEASE_KEY;
 use crate::merge::{MergeAnswer, MergeAsk};
+use crate::tree::Node;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
 /// What an operation needs from the host before it can go on.
@@ -128,6 +130,8 @@ struct Channel {
     cache: Option<Shared>,
     /// Whether reads leave what they fetch in the cache.
     passing: bool,
+    /// The worktree the operation reads from and moves, if any.
+    tree: Option<crate::worktree::Shared>,
 }
 
 /// An operation's line to its host.
@@ -196,8 +200,58 @@ impl Io {
         self.channel.borrow().cache.clone()
     }
 
+    /// The worktree the operation was given, if any.
+    pub fn tree(&self) -> Option<crate::worktree::Shared> {
+        self.channel.borrow().tree.clone()
+    }
+
     fn passing(&self) -> bool {
         self.channel.borrow().passing
+    }
+
+    /// Whether reads leave what they fetch out of the cache.
+    pub fn passing_cache(&self) -> bool {
+        self.passing()
+    }
+
+    /// Hold the tree nodes a commit just landed in the content cache,
+    /// decoded, unless they would fill much of it: an import, most of
+    /// which would be pushed out again unread. `bytes` is what they
+    /// take stored, keys and all.
+    pub fn remember_landed_nodes(&self, nodes: Vec<(String, Arc<Node>)>, bytes: usize) {
+        if let Some(cache) = self.cache() {
+            let mut c = cache.lock().unwrap();
+            if bytes <= c.max_bytes() / 4 {
+                c.remember_nodes(nodes);
+            }
+        }
+    }
+
+    /// Whether the operation reads through a content cache.
+    pub fn has_cache(&self) -> bool {
+        self.cache().is_some()
+    }
+
+    /// The decoded tree nodes the content cache holds of `keys`, each
+    /// counted a hit.
+    pub fn cached_nodes(&self, keys: &[String]) -> HashMap<String, Arc<Node>> {
+        let Some(cache) = self.cache() else {
+            return HashMap::new();
+        };
+        let mut c = cache.lock().unwrap();
+        let found = c.nodes(keys.iter().map(String::as_str));
+        c.count(found.len() as u64, 0);
+        found
+    }
+
+    /// Hold tree nodes just read and decoded in the content cache,
+    /// unless reads are passing it.
+    pub fn remember_nodes(&self, nodes: Vec<(String, Arc<Node>)>) {
+        if let Some(cache) = self.cache()
+            && !self.passing()
+        {
+            cache.lock().unwrap().remember_nodes(nodes);
+        }
     }
 
     /// Read past the content cache, or not: still answered from what it
@@ -234,7 +288,8 @@ impl Io {
     pub async fn cas(&self, cas: Cas) -> Result<bool, HostFailed> {
         let cache = self.cache();
         // What the cache takes from the batch, kept back before it goes:
-        // never a blob, which the cache doesn't hold, and nothing of a
+        // never a blob, which the cache doesn't hold, nor a tree node,
+        // which the commit that made it holds decoded, and nothing of a
         // batch that would fill much of it, an import, most of which
         // would be pushed out again unread. The lease record always.
         let touched = cache.as_ref().map(|cache| {
@@ -251,7 +306,10 @@ impl Io {
                 .writes
                 .iter()
                 .filter_map(|(k, w)| match w {
-                    Write::Bytes(b) if (keep && cache::cacheable(k)) || k == GC_LEASE_KEY => {
+                    Write::Bytes(b)
+                        if (keep && cache::cacheable(k) && !cache::is_node(k))
+                            || k == GC_LEASE_KEY =>
+                    {
                         Some((k.clone(), b.clone()))
                     }
                     _ => None,
@@ -379,11 +437,12 @@ impl Io {
     }
 }
 
-/// The write-once keys among values read.
+/// The write-once keys among values read, but tree nodes: the tree
+/// read that asked for them holds them once it has decoded them.
 fn cacheable_of(found: &HashMap<String, Vec<u8>>) -> impl Iterator<Item = (&str, &[u8])> {
     found
         .iter()
-        .filter(|(k, _)| cache::cacheable(k))
+        .filter(|(k, _)| cache::cacheable(k) && !cache::is_node(k))
         .map(|(k, v)| (k.as_str(), v.as_slice()))
 }
 
@@ -469,6 +528,12 @@ impl<T: 'static> Machine<T> {
     /// Given before the machine first runs.
     pub fn use_cache(&mut self, cache: Shared) {
         self.io.channel.borrow_mut().cache = Some(cache);
+    }
+
+    /// Read from, and move, a worktree's state. Given before the machine
+    /// first runs.
+    pub fn use_tree(&mut self, tree: crate::worktree::Shared) {
+        self.io.channel.borrow_mut().tree = Some(tree);
     }
 
     /// [`resume`](Self::resume), telling the wall time first. An

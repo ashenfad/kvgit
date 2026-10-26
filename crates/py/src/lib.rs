@@ -646,6 +646,35 @@ mod _core {
         }
     }
 
+    /// A worktree's committed state: the root its keyset is at, and the
+    /// key index the first listing builds. Operations given it read from
+    /// it and move it.
+    #[pyclass(module = "kvgit._core", frozen)]
+    struct WorktreeState {
+        inner: kvgit_core::worktree::Shared,
+    }
+
+    #[pymethods]
+    impl WorktreeState {
+        #[new]
+        fn new(root: String) -> WorktreeState {
+            WorktreeState {
+                inner: kvgit_core::worktree::Tree::shared(root),
+            }
+        }
+
+        #[getter]
+        fn root(&self) -> String {
+            self.inner.lock().unwrap().root().to_string()
+        }
+
+        /// Whether a listing has built the key index.
+        #[getter]
+        fn indexed(&self) -> bool {
+            self.inner.lock().unwrap().indexed()
+        }
+    }
+
     /// Whether `key` is one the store never rewrites.
     #[pyfunction]
     fn cacheable(key: &str) -> bool {
@@ -1044,6 +1073,15 @@ mod _core {
                 .as_mut()
                 .ok_or_else(|| PyValueError::new_err("the operation is done"))?
                 .use_cache(cache.inner.clone());
+            Ok(())
+        }
+
+        /// Read from, and move, `state`; given before the first `resume`.
+        fn use_tree(&mut self, state: &WorktreeState) -> PyResult<()> {
+            self.machine
+                .as_mut()
+                .ok_or_else(|| PyValueError::new_err("the operation is done"))?
+                .use_tree(state.inner.clone());
             Ok(())
         }
 
