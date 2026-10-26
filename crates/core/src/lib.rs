@@ -2,6 +2,7 @@
 //! Python and TypeScript packages.
 
 pub mod base64;
+pub mod cache;
 pub mod commit;
 pub mod error;
 pub mod gc;

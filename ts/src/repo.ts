@@ -16,7 +16,7 @@ import { BranchExistsError, UnknownTagError } from './errors'
 import { NodeCache } from './hamt'
 import { Keyset } from './keyset'
 import type { CommitInfo, DiffResult, KVStore } from './types'
-import { callCore, streamCore } from './versioned/drive'
+import { cacheOf, cacheStore, callCore, streamCore } from './versioned/drive'
 import {
   type CorruptHeadRecoverer,
   type GcOptions,
@@ -72,7 +72,16 @@ export interface RepoOptions<V> {
   /** The clock commits and tags are stamped with, in seconds. Default:
    *  wall time. */
   now?: () => number
+  /** Memory for tree nodes and commit records read from the store, in
+   *  bytes: what the store never rewrites, answered from memory (32 MB
+   *  by default; 0 turns the cache off). A sweep by any writer empties
+   *  it before the next commit builds. Repositories opened over one
+   *  store share the first one's. */
+  cacheBytes?: number
 }
+
+/** The default budget for a repository's content cache. */
+export const DEFAULT_CACHE_BYTES = 32 * 1024 * 1024
 
 const wallClock = (): number => Date.now() / 1000
 
@@ -132,7 +141,14 @@ export class Repo<V = Uint8Array> {
   ): Promise<Repo<V>>
   static open<V>(store: KVStore, opts: RepoOptions<V> & { codec: Codec<V> }): Promise<Repo<V>>
   static async open<V>(store: KVStore, opts: RepoOptions<V> = {}): Promise<Repo<V>> {
-    await Promise.all([core(), checkStorageVersion(store)])
+    const [c] = await Promise.all([core(), checkStorageVersion(store)])
+    const budget = opts.cacheBytes ?? DEFAULT_CACHE_BYTES
+    if (budget < 0 || !Number.isInteger(budget)) {
+      throw new RangeError(`cacheBytes must be a whole number, 0 or more; got ${budget}`)
+    }
+    if (budget > 0 && cacheOf(store) === undefined) {
+      cacheStore(store, new c.ContentCache(budget))
+    }
     return new Repo(store, opts)
   }
 

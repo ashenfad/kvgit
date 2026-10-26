@@ -32,15 +32,9 @@ from collections import OrderedDict
 from collections.abc import Iterable, Mapping
 from typing import Any
 
+from . import _core
 from .kv.base import KVStore
-from .versioned.keyset import Keyset
-from .versioned.kv import (
-    COMMIT_TIME,
-    GC_LEASE_KEY,
-    INFO_KEY,
-    PARENT_COMMIT,
-    PARENT_GENS,
-)
+from .versioned.kv import GC_LEASE_KEY
 
 DEFAULT_CACHE_BYTES = 32 * 1024 * 1024
 """The default budget: tens of thousands of tree nodes."""
@@ -48,121 +42,92 @@ DEFAULT_CACHE_BYTES = 32 * 1024 * 1024
 DEFAULT_VALUE_CACHE_BYTES = 32 * 1024 * 1024
 """The default budget for each worktree's decoded values."""
 
-_CACHEABLE_PREFIXES = (
-    Keyset.DEFAULT_PREFIX,
-    PARENT_COMMIT.replace("%s", ""),
-    PARENT_GENS.replace("%s", ""),
-    COMMIT_TIME.replace("%s", ""),
-    INFO_KEY.replace("%s", ""),
-)
 
 # What an entry costs beyond its bytes: the key, the dict slot, the
 # object headers. An estimate, so the budget bounds memory rather than
 # just payload.
 _ENTRY_OVERHEAD = 96
 
-_UNSEEN: Any = object()
-
 
 def cacheable(key: str) -> bool:
     """Whether ``key`` is one the store never rewrites."""
-    return key.startswith(_CACHEABLE_PREFIXES)
+    return _core.cacheable(key)
 
 
 class ContentCache:
     """Least-recently-used memory of write-once keys, bounded in bytes.
 
     Shared by every worktree and snapshot of one :class:`~kvgit.Repo`,
-    and safe to use from several threads.
+    and safe to use from several threads. The core holds it, and every
+    operation the repository runs reads and writes through it.
     """
 
     def __init__(self, max_bytes: int = DEFAULT_CACHE_BYTES) -> None:
         if max_bytes <= 0:
             raise ValueError(f"max_bytes must be positive, got {max_bytes}")
-        self.max_bytes = max_bytes
-        self._entries: OrderedDict[str, bytes] = OrderedDict()
-        self._bytes = 0
-        self._lock = threading.Lock()
-        self._lease: Any = _UNSEEN
-        self.hits = 0
-        """Reads answered from memory."""
-        self.misses = 0
-        """Reads of cacheable keys that went to the store."""
-        self.clears = 0
-        """How often a sweep emptied the cache."""
+        self._core = _core.ContentCache(max_bytes)
 
     def __repr__(self) -> str:
         return (
-            f"ContentCache({len(self._entries)} entries, "
-            f"{self._bytes}/{self.max_bytes} bytes)"
+            f"ContentCache({len(self)} entries, "
+            f"{self.size_bytes}/{self.max_bytes} bytes)"
         )
 
     def __len__(self) -> int:
-        return len(self._entries)
+        return len(self._core)
+
+    @property
+    def max_bytes(self) -> int:
+        return self._core.max_bytes
 
     @property
     def size_bytes(self) -> int:
         """What the entries held now cost, by the budget's estimate."""
-        return self._bytes
+        return self._core.size_bytes
+
+    @property
+    def hits(self) -> int:
+        """Reads answered from memory."""
+        return self._core.hits
+
+    @property
+    def misses(self) -> int:
+        """Reads of cacheable keys that went to the store."""
+        return self._core.misses
+
+    @property
+    def clears(self) -> int:
+        """How often a sweep emptied the cache."""
+        return self._core.clears
 
     def clear(self) -> None:
-        with self._lock:
-            self._clear()
-
-    def _clear(self) -> None:
-        self._entries.clear()
-        self._bytes = 0
+        self._core.clear()
 
     def lookup(self, keys: Iterable[str]) -> dict[str, bytes]:
         """The cached values of those ``keys`` held here."""
-        found: dict[str, bytes] = {}
-        with self._lock:
-            for key in keys:
-                value = self._entries.get(key)
-                if value is not None:
-                    self._entries.move_to_end(key)
-                    found[key] = value
-        return found
+        return self._core.lookup(list(keys))
 
     def count(self, hits: int, misses: int) -> None:
-        with self._lock:
-            self.hits += hits
-            self.misses += misses
+        self._core.count(hits, misses)
 
     def remember(self, items: Mapping[str, bytes]) -> None:
         """Hold these values, evicting the least recently used to fit."""
-        with self._lock:
-            for key, value in items.items():
-                if not isinstance(value, bytes | bytearray | memoryview):
-                    continue
-                cost = len(value) + len(key) + _ENTRY_OVERHEAD
-                if cost > self.max_bytes:
-                    continue
-                old = self._entries.pop(key, None)
-                if old is not None:
-                    self._bytes -= len(old) + len(key) + _ENTRY_OVERHEAD
-                self._entries[key] = bytes(value)
-                self._bytes += cost
-            while self._bytes > self.max_bytes and self._entries:
-                key, value = self._entries.popitem(last=False)
-                self._bytes -= len(value) + len(key) + _ENTRY_OVERHEAD
+        held = {
+            k: bytes(v)
+            for k, v in items.items()
+            if isinstance(v, bytes | bytearray | memoryview)
+        }
+        if held:
+            self._core.remember(held)
 
     def forget(self, keys: Iterable[str]) -> None:
-        with self._lock:
-            for key in keys:
-                value = self._entries.pop(key, None)
-                if value is not None:
-                    self._bytes -= len(value) + len(key) + _ENTRY_OVERHEAD
+        self._core.forget(list(keys))
 
     def saw_lease(self, record: bytes | None) -> None:
         """Note the GC lease record a read found; a different one than
         last time means a sweep has run, and what it removed may be
         held here."""
-        with self._lock:
-            if self._lease is not _UNSEEN and record != self._lease:
-                self._clear()
-                self.clears += 1
-            self._lease = record
+        self._core.saw_lease(record)
 
 
 class CachedStore(KVStore):
@@ -179,6 +144,12 @@ class CachedStore(KVStore):
     def __init__(self, backend: KVStore, cache: ContentCache) -> None:
         self.backend = backend
         self.cache = cache
+
+    @property
+    def _core_cache(self) -> Any:
+        """The cache as the core holds it: an operation of the core reads
+        through it itself, and performs its requests on the backend."""
+        return self.cache._core
 
     def __repr__(self) -> str:
         return f"CachedStore({self.backend!r})"

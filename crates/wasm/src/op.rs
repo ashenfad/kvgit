@@ -278,6 +278,16 @@ impl Op {
         }
     }
 
+    /// Read and write through `cache`; given before `start`.
+    #[wasm_bindgen(js_name = useCache)]
+    pub fn use_cache(&mut self, cache: &super::ContentCache) -> Result<(), JsError> {
+        self.machine
+            .as_mut()
+            .ok_or_else(|| JsError::new("the operation is done"))?
+            .use_cache(cache.shared());
+        Ok(())
+    }
+
     pub fn start(&mut self, wall: f64) -> Result<String, JsError> {
         self.step(wall, None)
     }

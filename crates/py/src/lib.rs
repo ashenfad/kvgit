@@ -4,6 +4,7 @@ use pyo3::prelude::*;
 
 #[pymodule]
 mod _core {
+    use kvgit_core::cache::{self, Cache, Shared};
     use kvgit_core::error::Error;
     use kvgit_core::head::Note;
     use kvgit_core::json::Value;
@@ -497,6 +498,11 @@ mod _core {
             })
         }
 
+        /// Read through `cache`; given before the first `resume`.
+        fn use_cache(&mut self, cache: &ContentCache) {
+            self.machine.use_cache(cache.inner.clone());
+        }
+
         #[pyo3(signature = (reply=None))]
         fn resume<'py>(
             &mut self,
@@ -546,6 +552,104 @@ mod _core {
                 }
             }
         }
+    }
+
+    /// A repository's memory of write-once keys (tree nodes, commit
+    /// records), least recently used first out, bounded in bytes, and
+    /// emptied when a read finds the GC lease record changed. Shared by
+    /// every operation that is given it, from any thread.
+    #[pyclass(module = "kvgit._core", frozen)]
+    struct ContentCache {
+        inner: Shared,
+    }
+
+    #[pymethods]
+    impl ContentCache {
+        #[new]
+        fn new(max_bytes: usize) -> ContentCache {
+            ContentCache {
+                inner: Cache::shared(max_bytes),
+            }
+        }
+
+        #[getter]
+        fn max_bytes(&self) -> usize {
+            self.inner.lock().unwrap().max_bytes()
+        }
+
+        #[getter]
+        fn size_bytes(&self) -> usize {
+            self.inner.lock().unwrap().size_bytes()
+        }
+
+        #[getter]
+        fn hits(&self) -> u64 {
+            self.inner.lock().unwrap().hits
+        }
+
+        #[getter]
+        fn misses(&self) -> u64 {
+            self.inner.lock().unwrap().misses
+        }
+
+        #[getter]
+        fn clears(&self) -> u64 {
+            self.inner.lock().unwrap().clears
+        }
+
+        fn __len__(&self) -> usize {
+            self.inner.lock().unwrap().len()
+        }
+
+        fn clear(&self) {
+            self.inner.lock().unwrap().clear();
+        }
+
+        /// The values held of those `keys`.
+        fn lookup<'py>(&self, py: Python<'py>, keys: Vec<String>) -> PyResult<Bound<'py, PyDict>> {
+            let found = self
+                .inner
+                .lock()
+                .unwrap()
+                .lookup(keys.iter().map(String::as_str));
+            let out = PyDict::new(py);
+            for (k, v) in found {
+                out.set_item(k, PyBytes::new(py, &v))?;
+            }
+            Ok(out)
+        }
+
+        fn count(&self, hits: u64, misses: u64) {
+            self.inner.lock().unwrap().count(hits, misses);
+        }
+
+        /// Hold these values, the least recently used going to fit.
+        fn remember(&self, items: &Bound<'_, PyDict>) -> PyResult<()> {
+            let items = bytes_of(items)?;
+            self.inner
+                .lock()
+                .unwrap()
+                .remember(items.iter().map(|(k, v)| (k.as_str(), v.as_slice())));
+            Ok(())
+        }
+
+        fn forget(&self, keys: Vec<String>) {
+            self.inner
+                .lock()
+                .unwrap()
+                .forget(keys.iter().map(String::as_str));
+        }
+
+        /// Note the lease record a read or write found.
+        fn saw_lease(&self, record: Option<&[u8]>) {
+            self.inner.lock().unwrap().saw_lease(record);
+        }
+    }
+
+    /// Whether `key` is one the store never rewrites.
+    #[pyfunction]
+    fn cacheable(key: &str) -> bool {
+        cache::cacheable(key)
     }
 
     /// An operation of the core in progress, started by name (see
@@ -931,6 +1035,16 @@ mod _core {
                 machine: Some(ops::merge(args)),
                 asked: None,
             })
+        }
+
+        /// Read and write through `cache`; given before the first
+        /// `resume`.
+        fn use_cache(&mut self, cache: &ContentCache) -> PyResult<()> {
+            self.machine
+                .as_mut()
+                .ok_or_else(|| PyValueError::new_err("the operation is done"))?
+                .use_cache(cache.inner.clone());
+            Ok(())
         }
 
         #[pyo3(signature = (wall, reply=None, failed=false))]

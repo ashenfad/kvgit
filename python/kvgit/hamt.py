@@ -98,14 +98,22 @@ class Hamt(Generic[V]):
         self.pending = pending if pending is not None else {}
 
     def _read(self, keys: list[str]) -> dict[str, bytes]:
-        """Nodes by prefixed key: unwritten ones first, then the store."""
+        """Nodes by prefixed key: unwritten ones first, then the store
+        underneath any content cache, which the operation reads through
+        itself."""
         found = {k: self.pending[k] for k in keys if k in self.pending}
         rest = [k for k in keys if k not in found]
         if rest:
-            found.update(self.store.get_many(rest))
+            store = self.store
+            if getattr(store, "_core_cache", None) is not None:
+                store = store.backend  # type: ignore[attr-defined]
+            found.update(store.get_many(rest))
         return found
 
     def _run(self, op: Any) -> Any:
+        cache = getattr(self.store, "_core_cache", None)
+        if cache is not None:
+            op.use_cache(cache)
         return _drive(op, self._read)
 
     # ---- reads ----

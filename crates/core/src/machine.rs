@@ -24,6 +24,8 @@
 //! what it can, and finishes with an error the host maps back to the
 //! reason it kept.
 
+use crate::cache::{self, Shared};
+use crate::layout::GC_LEASE_KEY;
 use crate::merge::{MergeAnswer, MergeAsk};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -122,6 +124,10 @@ struct Channel {
     request: Option<Request>,
     reply: Option<Reply>,
     wall: Option<f64>,
+    /// The repository's content cache, if the host gave one.
+    cache: Option<Shared>,
+    /// Whether reads leave what they fetch in the cache.
+    passing: bool,
 }
 
 /// An operation's line to its host.
@@ -133,15 +139,73 @@ pub struct Io {
 impl Io {
     /// The stored values of `keys`, keyed by key; absent keys are left
     /// out. Keys are asked for in the order given.
+    ///
+    /// With a content cache, a write-once key it holds is answered from
+    /// it and one it doesn't is remembered once read. A read of the
+    /// lease may reveal a sweep, so nothing the cache held before it is
+    /// answered beside it: the whole read goes to the store, and the
+    /// record is noted before anything it brought back is remembered.
     pub async fn get(&self, keys: Vec<String>) -> Result<HashMap<String, Vec<u8>>, HostFailed> {
         if keys.is_empty() {
             return Ok(HashMap::new());
         }
+        let Some(cache) = self.cache() else {
+            return self.fetch(keys).await;
+        };
+        let wanted = keys.iter().filter(|k| cache::cacheable(k)).count() as u64;
+        if keys.iter().any(|k| k == GC_LEASE_KEY) {
+            let found = self.fetch(keys).await?;
+            let mut c = cache.lock().unwrap();
+            c.saw_lease(found.get(GC_LEASE_KEY).map(Vec::as_slice));
+            c.count(0, wanted);
+            if !self.passing() {
+                c.remember(cacheable_of(&found));
+            }
+            return Ok(found);
+        }
+        let held = cache.lock().unwrap().lookup(
+            keys.iter()
+                .filter(|k| cache::cacheable(k))
+                .map(String::as_str),
+        );
+        let rest: Vec<String> = keys.into_iter().filter(|k| !held.contains_key(k)).collect();
+        let mut found = if rest.is_empty() {
+            HashMap::new()
+        } else {
+            self.fetch(rest).await?
+        };
+        let mut c = cache.lock().unwrap();
+        c.count(held.len() as u64, wanted - held.len() as u64);
+        if !self.passing() {
+            c.remember(cacheable_of(&found));
+        }
+        drop(c);
+        found.extend(held);
+        Ok(found)
+    }
+
+    async fn fetch(&self, keys: Vec<String>) -> Result<HashMap<String, Vec<u8>>, HostFailed> {
         match self.ask(Request::Get(keys)).await {
             Reply::Values(values) => Ok(values),
             Reply::Failed => Err(HostFailed),
             other => panic!("a read answered with {other:?}"),
         }
+    }
+
+    fn cache(&self) -> Option<Shared> {
+        self.channel.borrow().cache.clone()
+    }
+
+    fn passing(&self) -> bool {
+        self.channel.borrow().passing
+    }
+
+    /// Read past the content cache, or not: still answered from what it
+    /// holds, without leaving what is fetched in it. For a read of the
+    /// whole store, which would only push out what the rest of the work
+    /// uses.
+    pub fn pass_cache(&self, passing: bool) {
+        self.channel.borrow_mut().passing = passing;
     }
 
     /// The stored value of one key.
@@ -165,13 +229,62 @@ impl Io {
         }
     }
 
-    /// Whether the batch landed.
+    /// Whether the batch landed. With a content cache, a batch that
+    /// lands is remembered in it and evicts what it removed.
     pub async fn cas(&self, cas: Cas) -> Result<bool, HostFailed> {
-        match self.ask(Request::Cas(cas)).await {
-            Reply::Landed(landed) => Ok(landed),
-            Reply::Failed => Err(HostFailed),
+        let cache = self.cache();
+        // What the cache takes from the batch, kept back before it goes:
+        // never a blob, which the cache doesn't hold, and nothing of a
+        // batch that would fill much of it, an import, most of which
+        // would be pushed out again unread. The lease record always.
+        let touched = cache.as_ref().map(|cache| {
+            let size: usize = cas
+                .writes
+                .iter()
+                .filter_map(|(k, w)| match w {
+                    Write::Bytes(b) if cache::cacheable(k) => Some(k.len() + b.len()),
+                    _ => None,
+                })
+                .sum();
+            let keep = size <= cache.lock().unwrap().max_bytes() / 4;
+            let writes: Vec<(String, Vec<u8>)> = cas
+                .writes
+                .iter()
+                .filter_map(|(k, w)| match w {
+                    Write::Bytes(b) if (keep && cache::cacheable(k)) || k == GC_LEASE_KEY => {
+                        Some((k.clone(), b.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let removes: Vec<String> = cas
+                .removes
+                .iter()
+                .filter(|k| cache::cacheable(k))
+                .cloned()
+                .collect();
+            (writes, removes)
+        });
+        let landed = match self.ask(Request::Cas(cas)).await {
+            Reply::Landed(landed) => landed,
+            Reply::Failed => return Err(HostFailed),
             other => panic!("a write answered with {other:?}"),
+        };
+        if let (true, Some(cache), Some((writes, removes))) = (landed, cache, touched) {
+            let mut c = cache.lock().unwrap();
+            c.forget(removes.iter().map(String::as_str));
+            c.remember(
+                writes
+                    .iter()
+                    .filter(|(k, _)| k != GC_LEASE_KEY)
+                    .map(|(k, v)| (k.as_str(), v.as_slice())),
+            );
+            if let Some((_, record)) = writes.iter().find(|(k, _)| k == GC_LEASE_KEY) {
+                // This process's own sweep taking or giving up the lease.
+                c.saw_lease(Some(record));
+            }
         }
+        Ok(landed)
     }
 
     pub async fn wait(&self, seconds: f64) -> Result<(), HostFailed> {
@@ -266,6 +379,14 @@ impl Io {
     }
 }
 
+/// The write-once keys among values read.
+fn cacheable_of(found: &HashMap<String, Vec<u8>>) -> impl Iterator<Item = (&str, &[u8])> {
+    found
+        .iter()
+        .filter(|(k, _)| cache::cacheable(k))
+        .map(|(k, v)| (k.as_str(), v.as_slice()))
+}
+
 /// One request and its reply: pending until the host has answered.
 struct Exchange<'a> {
     io: &'a Io,
@@ -342,6 +463,12 @@ impl<T: 'static> Machine<T> {
                 Step::Request(request.expect("an operation waits only on its host"))
             }
         }
+    }
+
+    /// Read through, and write through, the repository's content cache.
+    /// Given before the machine first runs.
+    pub fn use_cache(&mut self, cache: Shared) {
+        self.io.channel.borrow_mut().cache = Some(cache);
     }
 
     /// [`resume`](Self::resume), telling the wall time first. An
