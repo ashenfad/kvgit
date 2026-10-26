@@ -15,7 +15,7 @@ import pickle
 from pathlib import Path
 
 import pytest
-from support import pointers
+from support import pointers, root_of
 
 from kvgit import Repo, Worktree, text_merge
 from kvgit.encoding import dumps, safe_loads
@@ -31,7 +31,6 @@ from kvgit.versioned.kv import (
     ROOT_COMMIT,
     STORAGE_VERSION_KEY,
     VersionedKV,
-    _load_root,
     blob_key,
     commit_hash,
     gc,
@@ -63,7 +62,7 @@ def content_blobs(store) -> set[str]:
 
 
 def entries(store, commit: str) -> dict:
-    return dict(Keyset(store, root=_load_root(store, commit)).items())
+    return dict(Keyset(store, root=root_of(store, commit)).items())
 
 
 def values(mapping) -> dict:

@@ -3,11 +3,11 @@
 import time
 
 from kvgit import Repo, Worktree
-from kvgit.encoding import dumps
+from kvgit.encoding import dumps, safe_loads
 from kvgit.kv.base import KVStore
 from kvgit.kv.memory import Memory
 from kvgit.versioned.keyset import Keyset
-from kvgit.versioned.kv import BRANCH_HEAD, GC_LEASE_KEY, _load_root
+from kvgit.versioned.kv import BRANCH_HEAD, COMMIT_ROOT, GC_LEASE_KEY
 
 
 def worktree(
@@ -27,9 +27,16 @@ def fork(wt: Worktree, name: str, at: str | None = None) -> Worktree:
     return wt.repo.worktree(name)
 
 
+def root_of(store, commit: str) -> str | None:
+    """A commit's keyset root as stored, or None."""
+    raw = store.get(COMMIT_ROOT % commit)
+    root = safe_loads(raw) if raw is not None else None
+    return root if isinstance(root, str) else None
+
+
 def entries(store, commit: str) -> dict:
     """A commit's keyset as key -> its stored entry."""
-    root = _load_root(store, commit)
+    root = root_of(store, commit)
     if root is None:
         return {}
     return Keyset(store, root=root).materialize()

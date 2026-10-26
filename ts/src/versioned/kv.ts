@@ -51,10 +51,8 @@ import {
   COMMIT_ROOT,
   INFO_KEY,
   PARENT_COMMIT,
-  PARENT_GENS,
   ROOT_COMMIT,
   blobKey,
-  generationOf,
   loads,
   loadsInfo,
   safeLoads,
@@ -495,14 +493,16 @@ export class VersionedKV extends VersionedBase {
     }
 
     const c = await core()
-    return new VersionedKV({
+    const kv = new VersionedKV({
       store,
       branch,
       commitHash,
       recoverFromCorruptHead: opts.recoverFromCorruptHead,
       now: opts.now ?? wallClock,
-      state: new c.WorktreeState(await rootOfCommit(store, commitHash)),
+      state: new c.WorktreeState(EMPTY_HASH),
     })
+    await kv.loadCommitInto(commitHash, true)
+    return kv
   }
 
   // --- Reads ---
@@ -543,12 +543,16 @@ export class VersionedKV extends VersionedBase {
 
   // --- VersionedBase abstract methods ---
 
+  /** The branch's head as the store has it: one read in the common
+   *  case, where it is still the commit this handle is based on. */
   async latestHead(): Promise<string | null> {
-    return resolveHead(this.store, this.branch, {
-      ...(this.recoverFromCorruptHead !== undefined && {
-        recoverFromCorruptHead: this.recoverFromCorruptHead,
-      }),
-    })
+    const recover = this.recoverFromCorruptHead
+    const args = { branch: this.branch, base: this.baseCommitHash, recover: recover !== undefined }
+    return (await callCore('latest_head', args, {
+      store: this.store,
+      recover,
+      now: this.now,
+    })) as string | null
   }
 
   /**
@@ -703,42 +707,6 @@ export class VersionedKV extends VersionedBase {
     return this.finish(result)
   }
 
-  /** The generation of each of a new commit's parents. */
-  private async parentGenerations(parents: readonly string[]): Promise<number[]> {
-    const out: number[] = []
-    for (const parent of parents) {
-      let gen = this.generations.get(parent)
-      if (gen === undefined) {
-        gen = await this.generationFromStore(parent)
-        this.generations.set(parent, gen)
-      }
-      out.push(gen)
-    }
-    return out
-  }
-
-  /** A commit's generation, from its own records: 0 for a commit with no
-   *  parents, else one more than its highest parent's. */
-  private async generationFromStore(commit: string): Promise<number> {
-    const parents = await this.loadParents(commit)
-    if (parents.length === 0) return 0
-    const raw = await this.store.get(PARENT_GENS(commit))
-    const gens = raw === null ? null : safeLoads(raw)
-    if (
-      Array.isArray(gens) &&
-      gens.length === parents.length &&
-      gens.every((g) => Number.isInteger(g) && g >= 0)
-    ) {
-      return generationOf(gens as number[])
-    }
-    // A commit with no recorded generations: count from its parents.
-    let highest = 0
-    for (const parent of parents) {
-      highest = Math.max(highest, (await this.parentGenerations([parent]))[0] as number)
-    }
-    return highest + 1
-  }
-
   protected async changes(commitA: string | null, commitB: string): Promise<Map<string, Change>> {
     return commitChanges(this.store, commitA, commitB)
   }
@@ -830,19 +798,34 @@ export class VersionedKV extends VersionedBase {
   }
 
   async peek(key: string, opts: { branch: string }): Promise<Uint8Array | null> {
-    const head = await resolveHead(this.store, opts.branch, {
-      ...(this.recoverFromCorruptHead !== undefined && {
-        recoverFromCorruptHead: this.recoverFromCorruptHead,
-      }),
-    })
-    if (head === null) return null
-    const rootBytes = await this.store.get(COMMIT_ROOT(head))
-    if (rootBytes === null) return null
-    const root = loads(rootBytes) as string
-    const ks = Keyset.fromRoot(this.store, root)
-    const entry = await ks.get(key)
-    if (entry === null) return null
-    return this.store.get(entry.blob)
+    const recover = this.recoverFromCorruptHead
+    const env = { store: this.store, recover, now: this.now }
+    let root: string
+    try {
+      const args = { branch: opts.branch, recover: recover !== undefined }
+      root = ((await callCore('resolve_ref', args, env)) as { root: string }).root
+    } catch (e) {
+      if (
+        e instanceof UnknownBranchError ||
+        e instanceof CorruptHeadError ||
+        e instanceof UnknownCommitError
+      ) {
+        return null
+      }
+      throw e
+    }
+    const state = new (await core()).WorktreeState(root)
+    try {
+      const found = (await callCore(
+        'wt_lookup',
+        { keys: [key] },
+        { ...env, tree: state },
+      )) as Array<[string, [string, number, string[]]]>
+      const entry = found[0]
+      return entry === undefined ? null : this.store.get(entry[1][0])
+    } finally {
+      state.free()
+    }
   }
 
   /**
@@ -958,16 +941,14 @@ export class VersionedKV extends VersionedBase {
 
   private async loadCommitInto(commitHash: string, updateBase: boolean): Promise<void> {
     // The commit moves in the turn the root does, so no reader sees one
-    // commit's hash over another's keys.
-    await this.onTree('wt_move', { root: await rootOfCommit(this.store, commitHash) }, () => {
+    // commit's hash over another's keys. The read of the root brings the
+    // commit's records, so the handle knows the generation its next
+    // commit builds on.
+    await this.onTree('wt_checkout', { commit: commitHash }, (found) => {
+      const { generation } = found as { generation: number | null }
+      if (generation !== null) this.generations.set(commitHash, generation)
       this.currentCommitHash = commitHash
       if (updateBase) this.baseCommitHash = commitHash
     })
   }
-}
-
-/** A commit's keyset root, or the empty tree's for a commit with none. */
-async function rootOfCommit(store: KVStore, commit: string): Promise<string> {
-  const raw = await store.get(COMMIT_ROOT(commit))
-  return raw === null ? EMPTY_HASH : (loads(raw) as string)
 }

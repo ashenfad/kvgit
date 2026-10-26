@@ -23,6 +23,8 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from support import root_of
+
 from kvgit.encoding import loads
 from kvgit.kv.disk import Disk
 from kvgit.versioned.keyset import Keyset
@@ -31,7 +33,6 @@ from kvgit.versioned.kv import (
     COMMIT_ROOT,
     PARENT_COMMIT,
     VersionedKV,
-    _load_root,
 )
 
 
@@ -79,7 +80,7 @@ def verify_store(backend: Disk) -> list[str]:
                 continue
 
             # Walk the keyset HAMT and verify every entry's blob exists
-            root = _load_root(backend, commit_hash)
+            root = root_of(backend, commit_hash)
             if root is None:
                 errors.append(
                     f"[{branch}] commit {commit_hash[:12]} root pointer corrupt"

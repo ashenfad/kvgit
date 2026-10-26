@@ -30,10 +30,12 @@ import time
 # Make `kvgit` importable from the repo root
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from support import root_of
+
 from kvgit.kv.disk import Disk
 from kvgit.kv.memory import Memory
 from kvgit.versioned.keyset import Keyset
-from kvgit.versioned.kv import VersionedKV, _load_root
+from kvgit.versioned.kv import VersionedKV
 
 
 class _LatencyMemory(Memory):
@@ -199,7 +201,7 @@ def run_latency(n_keys: int, latency_ms: float) -> None:
     for k, val in slow_store.memory.items():
         slow_store_b.memory[k] = val
     t0 = time.perf_counter()
-    root = _load_root(slow_store_b, seed_root_commit)
+    root = root_of(slow_store_b, seed_root_commit)
     ks = Keyset(slow_store_b, root=root)
     materialized_via_items = dict(ks.items())
     t_items = time.perf_counter() - t0
