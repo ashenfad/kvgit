@@ -22,13 +22,14 @@ import {
   type GcOptions,
   type LazyKeysetOptions,
   VersionedKV,
+  checkStorageVersion,
   createBranchHead,
   deleteBranchHead,
   gcStore,
   headOf,
   repairHead,
 } from './versioned/kv'
-import { ROOT_COMMIT, checkStorageVersion } from './versioned/layout'
+import { ROOT_COMMIT } from './versioned/layout'
 import {
   type TagInfo,
   createTag,
@@ -141,7 +142,8 @@ export class Repo<V = Uint8Array> {
   ): Promise<Repo<V>>
   static open<V>(store: KVStore, opts: RepoOptions<V> & { codec: Codec<V> }): Promise<Repo<V>>
   static async open<V>(store: KVStore, opts: RepoOptions<V> = {}): Promise<Repo<V>> {
-    const [c] = await Promise.all([core(), checkStorageVersion(store)])
+    const c = await core()
+    await checkStorageVersion(store)
     const budget = opts.cacheBytes ?? DEFAULT_CACHE_BYTES
     if (budget < 0 || !Number.isInteger(budget)) {
       throw new RangeError(`cacheBytes must be a whole number, 0 or more; got ${budget}`)

@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **TypeScript gains the commit-scan recoverer.** `recoverByCommitScan`, passed as `recoverFromCorruptHead`, guesses a damaged branch's head as Python's `recover_by_commit_scan` does, from the same code.
 
 ### Changed
+- **Breaking (Python): stores stamped v2 or v3 are refused.** Opening or sweeping one raises `StorageVersionError`, as TypeScript did; the objects an older kvgit wrote still read once a store's stamp is v4.
 - **A worktree opens without loading its keyset.** Opening reads the head's root alone, reads walk the tree through the content cache, and the first listing builds a key index the later ones read.
 - **TypeScript's `lazy` option does nothing.** Every worktree reads on demand now, so `Worktree.lazy` is always true and `nodeCache` null, and a worktree keeps the values it reads, as an eager one did.
 - **Breaking (TypeScript): an empty tag name throws `RangeError`.** It threw `TypeError`; every name the branch and tag calls refuse now throws `RangeError`.

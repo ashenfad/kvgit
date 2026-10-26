@@ -59,21 +59,22 @@ branch heads. So every live commit — published, in flight, or younger
 than ``min_age`` — is marked, and everything an orphan alone held goes
 with it.
 
-Every layout reads the ones before it, and a store is stamped up only
-when something newer is actually written:
+This code reads one layout, v4, and refuses a store stamped with any
+other, or with branches and no stamp; a fresh store is stamped v4 when
+it is opened:
 
-* v3 added chunks. The first chunked write stamps v3.
-* v4 changed how new blobs, entries and commits are keyed. The first
-  commit written by this code stamps v4. Nothing already stored is
-  rewritten: existing commit hashes, branch heads and tags stay valid,
-  and one keyset may hold blobs of both kinds.
+* v3 added chunks.
+* v4 changed how new blobs, entries and commits are keyed. Nothing
+  already stored is rewritten: existing commit hashes, branch heads
+  and tags stay valid, and one keyset may hold blobs of both kinds. A
+  store an older kvgit wrote reads once its stamp is raised to v4,
+  which is what the 0.4.x backfill does.
 * A stamp locks out older code, deliberately. An older sweep deletes
   by rules that are wrong for content it did not write, so it must not
-  run; every sweep and every handle refuses a store stamped above what
-  it reads.
+  run; every sweep and every handle refuses a store of another layout.
 
-The pre-v2 layout is **not** supported. Stores written by an earlier
-version raise on open and need to be rebuilt fresh.
+The pre-v2 layout, from before stamps, is **not** supported: such a
+store raises on open and needs to be rebuilt fresh.
 """
 
 import hashlib
@@ -85,11 +86,10 @@ from collections.abc import Callable, Iterable, Iterator, KeysView
 from typing import Any
 
 from .. import _core
-from ..encoding import dumps, loads, safe_loads
+from ..encoding import loads, safe_loads
 from ..errors import (
     BranchExistsError,
     CorruptHeadError,
-    StorageVersionError,
     UnknownBranchError,
 )
 from ..hamt import EMPTY_HASH
@@ -199,10 +199,6 @@ Stamped before a handle's first commit batch lands, so no v4 object is
 ever visible to code that would sweep it by the older rules.
 """
 
-# Lower versions accepted as input, read as they are; the stamp moves
-# only when a write needs a newer layout.
-SUPPORTED_READ_VERSIONS = frozenset({2, 3, 4})
-
 BLOB_PREFIX = "kvgit:blob:"
 
 ROOT_COMMIT = "821bf06b4dcb406ea508a4a992eadc22f29850cd"
@@ -240,53 +236,10 @@ def commit_hash(
 logger = logging.getLogger("kvgit")
 
 
-def _assert_supported_version(store: KVStore) -> None:
-    """Raise if the store's version stamp is one this code cannot read.
-
-    Read-only, and silent on an unstamped store — it answers "may this
-    code touch what is here", not "is this store initialized". Every
-    entry point that mutates a store it did not open through
-    ``VersionedKV`` calls it first, the sweep above all: a store stamped
-    higher than this code understands may hold roots this code cannot
-    see, and sweeping it would delete live data.
-    """
-    raw = store.get(STORAGE_VERSION_KEY)
-    if raw is None:
-        return
-    version = safe_loads(raw)
-    if version not in SUPPORTED_READ_VERSIONS:
-        raise StorageVersionError(
-            f"Store has kvgit storage version {version!r}, "
-            f"this code supports {sorted(SUPPORTED_READ_VERSIONS)}. "
-            "Use a fresh store."
-        )
-
-
 def _check_storage_version(store: KVStore) -> None:
-    """Verify the store's kvgit version is compatible.
-
-    Stamps the version on a fresh store. Accepts any version listed in
-    :data:`SUPPORTED_READ_VERSIONS`; the on-disk stamp is left
-    untouched on open so that opening a v2 store with v3 code does not
-    silently upgrade it to v3 (which would lock out older readers).
-    The upgrade happens lazily, the first time a chunked write or a tag
-    write actually occurs.
-    """
-    raw = store.get(STORAGE_VERSION_KEY)
-    if raw is not None:
-        _assert_supported_version(store)
-        return
-
-    # No version sentinel. Either fresh, or pre-v2.
-    branch_prefix = BRANCH_HEAD.replace("%s", "")
-    has_existing = any(True for _ in store.keys(branch_prefix))
-    if has_existing:
-        raise StorageVersionError(
-            "Store appears to use an older kvgit storage format. "
-            f"This version requires storage v{min(SUPPORTED_READ_VERSIONS)} "
-            "or higher. Use a fresh store."
-        )
-    store.set(STORAGE_VERSION_KEY, dumps(STORAGE_VERSION))
+    """Refuse a store stamped with another storage layout, or one with
+    branches and no stamp, from before stamps; stamp a fresh one."""
+    _call("check_version", store, stamp=True)
 
 
 def _call(
@@ -821,14 +774,10 @@ def gc(
 
     Raises:
         GcBusy: with ``wait=False``, if another sweep holds the lease.
-        StorageVersionError: if the store is stamped above the layout
-            this code reads. Nothing is written, the lease key included.
+        StorageVersionError: if the store is stamped with another layout
+            than the one this code reads. Nothing is written, the lease
+            key included.
     """
-    # Before the lease, not after: a store this code must not touch has
-    # to come out of the call untouched, and an acquire-then-fail would
-    # leave an expired lease record behind in a store kvgit had no
-    # business writing to.
-    _assert_supported_version(store)
     removed = _call(
         "gc", store, min_age=min_age, deep=deep, wait=wait, lease_ttl=lease_ttl
     )
@@ -1716,8 +1665,9 @@ class VersionedKV(VersionedBase):
 
         Raises:
             GcBusy: if another sweep holds a live lease.
-            ValueError: if the store is stamped above the layout this
-                code reads. Nothing is written, the lease key included.
+            StorageVersionError: if the store is stamped with another
+                layout than the one this code reads. Nothing is written,
+                the lease key included.
         """
         return deep_clean(self.store, min_age, lease_ttl=lease_ttl)
 

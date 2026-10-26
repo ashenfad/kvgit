@@ -20,6 +20,7 @@ pub mod refs;
 pub mod store;
 pub mod text;
 pub mod tree;
+pub mod version;
 pub mod worktree;
 pub mod write;
 

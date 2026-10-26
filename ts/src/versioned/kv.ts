@@ -53,9 +53,7 @@ import {
   PARENT_COMMIT,
   PARENT_GENS,
   ROOT_COMMIT,
-  assertStorageVersion,
   blobKey,
-  checkStorageVersion,
   generationOf,
   loads,
   loadsInfo,
@@ -121,6 +119,17 @@ interface Resolved {
 }
 
 const wallClock = (): number => Date.now() / 1000
+
+/**
+ * Refuse a store stamped with another storage layout, or one with
+ * branches and no stamp, from before stamps; stamp a fresh one. Every
+ * entry point that writes a store it didn't open calls this first.
+ *
+ * @throws StorageVersionError for a store of another layout.
+ */
+export async function checkStorageVersion(store: KVStore): Promise<void> {
+  await callCore('check_version', { stamp: true }, { store, now: wallClock })
+}
 
 /** {@link resolveHead}, with the root of the commit it resolves to. */
 async function resolveWithRoot(
@@ -362,9 +371,6 @@ export interface GcOptions {
  *   written to it, the lease included.
  */
 export async function gcStore(store: KVStore, opts: GcOptions = {}): Promise<number> {
-  // Before the lease, so a store this code mustn't touch comes out of
-  // the call untouched.
-  await assertStorageVersion(store)
   const args = {
     min_age: opts.minAge ?? 3600,
     deep: opts.deep ?? false,

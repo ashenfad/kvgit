@@ -13,6 +13,7 @@ use crate::layout::commit_root;
 use crate::machine::{Io, Machine};
 use crate::refs::{self, Ref};
 use crate::store::{dumps_str, loads_str};
+use crate::version;
 use crate::worktree;
 use crate::write::{self, CommitArgs, Committed, Done, MergeArgs};
 use std::collections::HashMap;
@@ -53,7 +54,10 @@ pub type Op = Machine<Done<Out>>;
 /// - `merge_base {a, b, check}`: `{base, generations}`, the base or
 ///   null and `[commit, generation]` pairs worked out on the way; with
 ///   `check`, both commits must be in the store.
-/// - `gc {min_age, deep, wait, lease_ttl}`: the number of commits swept.
+/// - `check_version {stamp}`: refuse a store of another storage layout;
+///   with `stamp`, stamp a fresh one. Null.
+/// - `gc {min_age, deep, wait, lease_ttl}`: the number of commits swept,
+///   after the same check, which stamps nothing.
 /// - `reset_branch {name, target}`: whether the branch moved; false when
 ///   `target` isn't in the store.
 ///
@@ -84,6 +88,7 @@ pub const NAMES: &[&str] = &[
     "log",
     "diff",
     "merge_base",
+    "check_version",
     "gc",
     "reset_branch",
     "wt_lookup",
@@ -382,7 +387,15 @@ async fn run(io: &Io, name: &str, args: &Value, notes: &mut Notes) -> Result<Val
                 }
             }
         }
+        "check_version" => {
+            version::check(io, flag(args, "stamp")?).await?;
+            Value::Null
+        }
         "gc" => {
+            // Before the lease, not after: a store this code must not
+            // touch comes out of the call untouched, where taking the
+            // lease and then failing would leave a record behind.
+            version::check(io, false).await?;
             let sweep = Gc {
                 min_age: seconds(args, "min_age")?,
                 deep: flag(args, "deep")?,
