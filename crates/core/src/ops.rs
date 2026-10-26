@@ -40,6 +40,8 @@ pub type Op = Machine<Done<Out>>;
 /// - `branches {}`: the names, sorted.
 /// - `branch_exists {name}`, `create_branch {name, target}`,
 ///   `delete_branch {name}`.
+/// - `latest_head {branch, base, recover}`: the commit the branch's head
+///   resolves to, or null; one read when it is still `base`.
 /// - `resolve_tag {name}`: the commit, or null.
 /// - `tags {}`: `[name, commit]` pairs, sorted by name.
 /// - `tag_info {name}`: `{name, commit, time, info, dangling}`, or null.
@@ -68,6 +70,9 @@ pub type Op = Machine<Done<Out>>;
 /// - `wt_contains {key}`: whether it holds the key.
 /// - `wt_keys {}`: every key, sorted.
 /// - `wt_move {root}`: move it to a root it didn't write; null.
+/// - `wt_checkout {commit}`: move it to a commit, reading the commit's
+///   root and records in one read; `{root, generation}`, either null
+///   when the store holds none.
 pub const NAMES: &[&str] = &[
     "resolve_head",
     "head_of",
@@ -95,6 +100,8 @@ pub const NAMES: &[&str] = &[
     "wt_contains",
     "wt_keys",
     "wt_move",
+    "wt_checkout",
+    "latest_head",
 ];
 
 /// Start operation `name` on `args`, an object.
@@ -344,7 +351,7 @@ async fn run(io: &Io, name: &str, args: &Value, notes: &mut Notes) -> Result<Val
         "reset_branch" => {
             Value::Bool(refs::reset_branch(io, text(args, "name")?, text(args, "target")?).await?)
         }
-        "wt_lookup" | "wt_contains" | "wt_keys" | "wt_move" => {
+        "wt_lookup" | "wt_contains" | "wt_keys" | "wt_move" | "wt_checkout" => {
             let tree = io
                 .tree()
                 .ok_or_else(|| Error::Invalid(format!("{name} needs a worktree")))?;
@@ -380,6 +387,18 @@ async fn run(io: &Io, name: &str, args: &Value, notes: &mut Notes) -> Result<Val
                     Value::Bool(worktree::contains(io, shape, &tree, text(args, "key")?).await?)
                 }
                 "wt_keys" => strings(worktree::keys(io, shape, &tree).await?),
+                "wt_checkout" => {
+                    let found = worktree::checkout(io, shape, &tree, text(args, "commit")?).await?;
+                    Value::Object(vec![
+                        ("root".into(), found.root.map_or(Value::Null, Value::Str)),
+                        (
+                            "generation".into(),
+                            found
+                                .generation
+                                .map_or(Value::Null, |g| Value::Int(g as i64)),
+                        ),
+                    ])
+                }
                 _ => {
                     let root = text(args, "root")?.to_string();
                     worktree::move_to(io, shape, &tree, root).await?;
@@ -387,6 +406,18 @@ async fn run(io: &Io, name: &str, args: &Value, notes: &mut Notes) -> Result<Val
                 }
             }
         }
+        "latest_head" => opt_str(
+            head::latest_head(
+                io,
+                text(args, "branch")?,
+                text(args, "base")?,
+                flag(args, "recover")?,
+                vec![],
+                notes,
+            )
+            .await?
+            .head,
+        ),
         "check_version" => {
             version::check(io, flag(args, "stamp")?).await?;
             Value::Null

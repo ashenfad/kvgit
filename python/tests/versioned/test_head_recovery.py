@@ -32,7 +32,7 @@ import threading
 import time
 
 import pytest
-from support import race_publish
+from support import race_publish, root_of
 
 from kvgit import ConcurrencyError, MergeConflict
 from kvgit.encoding import dumps, loads
@@ -46,7 +46,6 @@ from kvgit.versioned.kv import (
     COMMIT_TIME,
     PARENT_COMMIT,
     VersionedKV,
-    _load_root,
     _resolve_head,
     blob_key,
     clean_orphans,
@@ -176,7 +175,7 @@ def age_commits(store, seconds: float) -> None:
 
 def node_hashes(store, commit_hash: str) -> set[str]:
     """Every HAMT node hash reachable from a commit's keyset root."""
-    root = _load_root(store, commit_hash)
+    root = root_of(store, commit_hash)
     if root is None:
         return set()
     _, nodes = Keyset(store, root=root).walk()
@@ -665,7 +664,7 @@ class TestRedoMintsANewCommit:
         v.reset_to(first)
         v.commit({"a": b"2"})
         assert v.current_commit != second
-        assert _load_root(store, v.current_commit) == _load_root(store, second)
+        assert root_of(store, v.current_commit) == root_of(store, second)
 
     def test_a_redo_under_a_sweep_loses_nothing(self):
         """A writer that starts mid-sweep waits for it, then lands whole."""

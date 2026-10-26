@@ -24,7 +24,7 @@ import threading
 import time
 
 import pytest
-from support import fork, hold_lease, release_lease, worktree
+from support import fork, hold_lease, release_lease, root_of, worktree
 
 from kvgit import ConcurrencyError, GcBusy, MergeConflict
 from kvgit.encoding import dumps, loads
@@ -41,7 +41,6 @@ from kvgit.versioned.kv import (
     IN_FLIGHT_KEY,
     STORAGE_VERSION_KEY,
     VersionedKV,
-    _load_root,
     _resolve_head,
     clean_orphans,
     deep_clean,
@@ -401,7 +400,7 @@ class TestCommitsBetweenWriteAndPublish:
             "the sweep deleted a commit whose writer had not published it yet"
         )
         assert not missing_nodes(store, commit, landed["nodes"])  # type: ignore[arg-type]
-        Keyset(store, root=str(_load_root(store, commit))).walk()
+        Keyset(store, root=str(root_of(store, commit))).walk()
         assert [k for k in landed["chunks"] if store.get(k) is None] == []  # type: ignore[union-attr]
 
         reader = worktree(store, codec=(chunky_encoder, chunky_decoder))
@@ -751,7 +750,7 @@ class TestSweepsBesideWriters:
         for b in branches:
             v = VersionedKV(store, branch=b)
             for commit in v.history(all_parents=True):
-                root = _load_root(store, commit)
+                root = root_of(store, commit)
                 assert root is not None, f"{b}: commit {commit} lost its root"
                 for entry in Keyset(store, root=root).materialize().values():
                     assert store.get(entry.blob) is not None, f"{b}: blob gone"
@@ -824,7 +823,7 @@ class TestBranchRootWrites:
             resolved = _resolve_head(store, "revive")
             assert resolved == orphan, "branch 'revive' does not resolve"
             assert store.get(COMMIT_ROOT % orphan) is not None
-            Keyset(store, root=str(_load_root(store, orphan))).walk()
+            Keyset(store, root=str(root_of(store, orphan))).walk()
         assert worktree(store)["live"] == "keep me"
 
     def test_reset_to_a_swept_commit_reports_it_rather_than_dangling(self):

@@ -1,7 +1,7 @@
 """Tests for the Versioned commit log."""
 
 import pytest
-from support import fail_reads, race_publish
+from support import fail_reads, race_publish, root_of
 
 from kvgit import ConcurrencyError, MergeChoice, MergeConflict, MergeResult
 from kvgit.encoding import dumps
@@ -17,7 +17,6 @@ from kvgit.versioned.kv import (
     BRANCH_HEAD,
     GC_LEASE_KEY,
     VersionedKV as Versioned,
-    _load_root,
     blob_key,
 )
 
@@ -78,7 +77,7 @@ class TestVersionedBasic:
         r1 = Versioned(store1).commit({"k": b"v"})
         r2 = Versioned(store2).commit({"k": b"v"})
         assert r1.commit != r2.commit
-        assert _load_root(store1, r1.commit) == _load_root(store2, r2.commit)
+        assert root_of(store1, r1.commit) == root_of(store2, r2.commit)
         assert blob_key(b"v") in store1.keys() and blob_key(b"v") in store2.keys()
 
 
@@ -1506,9 +1505,9 @@ class TestMergeCommitMeta:
 
     @staticmethod
     def _entry(store, commit, key):
-        from kvgit.versioned.kv import Keyset, _load_root
+        from kvgit.versioned.kv import Keyset
 
-        return dict(Keyset(store, root=_load_root(store, commit)).items())[key]
+        return dict(Keyset(store, root=root_of(store, commit)).items())[key]
 
     def test_their_side_key_keeps_their_size(self):
         store = Memory()

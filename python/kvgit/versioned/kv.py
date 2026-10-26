@@ -82,7 +82,7 @@ import logging
 import os
 import time
 import uuid
-from collections.abc import Callable, Iterable, Iterator, KeysView
+from collections.abc import Callable, Iterator, KeysView
 from typing import Any
 
 from .. import _core
@@ -91,6 +91,8 @@ from ..errors import (
     BranchExistsError,
     CorruptHeadError,
     UnknownBranchError,
+    UnknownCommitError,
+    UnknownTagError,
 )
 from ..hamt import EMPTY_HASH
 from ..kv.base import KVStore
@@ -278,15 +280,6 @@ def _stream(
     )
     for part in run:
         yield from part
-
-
-def _load_root(store: KVStore, commit_hash: str) -> str | None:
-    """Load the keyset HAMT root hash for a commit, or None if missing."""
-    raw = store.get(COMMIT_ROOT % commit_hash)
-    if raw is None:
-        return None
-    val = safe_loads(raw)
-    return val if isinstance(val, str) else None
 
 
 CorruptHeadRecoverer = Callable[[KVStore, str], "str | None"]
@@ -637,91 +630,6 @@ def load_parents(store: KVStore, commit_hash: str) -> tuple[str, ...]:
     return _decode_parents(store.get(PARENT_COMMIT % commit_hash))
 
 
-_Record = tuple[tuple[str, ...], "tuple[int, ...] | None"]
-"""A commit's parents, and their generations if the commit stores them."""
-
-
-def _load_records(store: KVStore, commits: Iterable[str]) -> dict[str, _Record]:
-    """Parents and parent generations of several commits, in one read."""
-    commits = list(dict.fromkeys(commits))
-    keys = [key % c for c in commits for key in (PARENT_COMMIT, PARENT_GENS)]
-    found = store.get_many(*keys)
-    return {
-        c: _decode_record(found.get(PARENT_COMMIT % c), found.get(PARENT_GENS % c))
-        for c in commits
-    }
-
-
-def _decode_record(parents_raw: bytes | None, gens_raw: bytes | None) -> _Record:
-    parents = _decode_parents(parents_raw)
-    gens = safe_loads(gens_raw) if gens_raw is not None else None
-    if (
-        isinstance(gens, list)
-        and len(gens) == len(parents)
-        and all(type(g) is int and g >= 0 for g in gens)
-    ):
-        return parents, tuple(gens)
-    return parents, None
-
-
-def _generation(record: _Record) -> int | None:
-    """A commit's generation from its record; None if it stores none."""
-    parents, gens = record
-    if not parents:
-        return 0
-    if gens is None:
-        return None
-    return 1 + max(gens)
-
-
-def _generations(
-    store: KVStore,
-    commits: Iterable[str],
-    known: dict[str, int] | None = None,
-) -> dict[str, int]:
-    """The generation of each commit, reading as little as it can.
-
-    A commit that stores its parents' generations costs its own record.
-    One written before generations were stored costs a walk down its
-    history to commits that do store them (or to roots), one read per
-    level of the walk. ``known`` supplies and collects generations
-    already worked out.
-    """
-    memo: dict[str, int] = known if known is not None else {}
-    commits = list(commits)
-    records: dict[str, _Record] = {}
-    frontier = [c for c in commits if c not in memo]
-    while frontier:
-        records.update(_load_records(store, frontier))
-        next_frontier: list[str] = []
-        for c in frontier:
-            g = _generation(records[c])
-            if g is not None:
-                memo[c] = g
-                continue
-            for parent in records[c][0]:
-                if parent not in memo and parent not in records:
-                    next_frontier.append(parent)
-        frontier = list(dict.fromkeys(next_frontier))
-    # What is left is history without stored generations: fill it in
-    # from the parents up, deepest first.
-    for c in commits:
-        stack = [c]
-        while stack:
-            node = stack[-1]
-            if node in memo:
-                stack.pop()
-                continue
-            parents = records[node][0]
-            missing = [p for p in parents if p not in memo]
-            if missing:
-                stack.extend(missing)
-                continue
-            memo[node] = 1 + max(memo[p] for p in parents) if parents else 0
-            stack.pop()
-    return {c: memo[c] for c in commits}
-
-
 def merge_base(
     store: KVStore,
     commit_a: str,
@@ -889,38 +797,19 @@ class VersionedKV(VersionedBase):
 
         # The committed state is the keyset's root, held by the core,
         # with the key index the first listing builds.
-        self._tree: _core.WorktreeState | None = None
+        self._tree = _core.WorktreeState(EMPTY_HASH)
         self._populate_state(commit_hash)
 
     def _populate_state(self, commit_hash: str) -> None:
-        """Move to a commit's keyset root: read it, and nothing of the
-        tree under it. A key index already built follows the move."""
-        # The commit's parent record rides along with its root, so the
-        # handle knows the generation its next commit builds on without
-        # another read.
-        found = self.store.get_many(
-            COMMIT_ROOT % commit_hash,
-            PARENT_COMMIT % commit_hash,
-            PARENT_GENS % commit_hash,
-        )
-        generation = _generation(
-            _decode_record(
-                found.get(PARENT_COMMIT % commit_hash),
-                found.get(PARENT_GENS % commit_hash),
-            )
-        )
-        if generation is not None and COMMIT_ROOT % commit_hash in found:
-            self._remember_generations({commit_hash: generation})
-        root_raw = found.get(COMMIT_ROOT % commit_hash)
-        root = safe_loads(root_raw) if root_raw is not None else None
-        if not isinstance(root, str):
-            root = EMPTY_HASH
-        else:
-            self._remember_root(commit_hash, root)
-        if self._tree is None:
-            self._tree = _core.WorktreeState(root)
-        else:
-            self._on_tree("wt_move", root=root)
+        """Move to a commit's keyset root, reading nothing of the tree
+        under it; a key index already built follows the move. The read
+        of the root brings the commit's records with it, so the handle
+        knows the generation its next commit builds on."""
+        found = self._on_tree("wt_checkout", commit=commit_hash)
+        if found["root"] is not None:
+            self._remember_root(commit_hash, found["root"])
+        if found["generation"] is not None:
+            self._remember_generations({commit_hash: found["generation"]})
 
     def _on_tree(self, op: str, **args: Any) -> Any:
         """Run the core's operation ``op`` on this handle's state."""
@@ -946,22 +835,13 @@ class VersionedKV(VersionedBase):
         answer — HEAD moved, or its root is gone — is resolved the full
         way, recovery tiers and all.
         """
-        branch_key = BRANCH_HEAD % self._branch
-        base = self._base_commit
-        base_root = COMMIT_ROOT % base
-        found = self.store.get_many(branch_key, base_root)
-        head_bytes = found.get(branch_key)
-        if (
-            head_bytes is not None
-            and safe_loads(head_bytes) == base
-            and found.get(base_root) is not None
-        ):
-            return base
-        return _resolve_head(
+        return _call(
+            "latest_head",
             self.store,
-            self._branch,
-            recover_from_corrupt_head=self._recover_from_corrupt_head,
-            roots=self._roots,
+            self._recover_from_corrupt_head,
+            branch=self._branch,
+            base=self._base_commit,
+            recover=self._recover_from_corrupt_head is not None,
         )
 
     # -- Read operations --
@@ -1373,13 +1253,12 @@ class VersionedKV(VersionedBase):
         """
         if (commit_hash is None) == (tag is None):
             raise ValueError("Pass exactly one of commit_hash or tag")
-        if tag is not None:
-            tagged = _resolve_tag(self.store, tag)
-            if tagged is None or self.store.get(COMMIT_ROOT % tagged) is None:
-                return None
-            commit_hash = tagged
-        elif self.store.get(COMMIT_ROOT % commit_hash) is None:
+        ref = {"tag": tag} if tag is not None else {"commit": commit_hash}
+        try:
+            found = _call("resolve_ref", self.store, recover=False, **ref)
+        except (UnknownCommitError, UnknownTagError):
             return None
+        commit_hash = found["commit"]
         return VersionedKV(
             self.store,
             commit_hash=commit_hash,
@@ -1444,32 +1323,28 @@ class VersionedKV(VersionedBase):
         """
         if (branch is None) == (tag is None):
             raise ValueError("Pass exactly one of branch or tag")
-        commit_hash: str | None
         if branch is not None:
             _reject_reserved_branch(branch)
-            commit_hash = _resolve_head(
-                self.store,
-                branch,
-                recover_from_corrupt_head=self._recover_from_corrupt_head,
+        ref = {"branch": branch} if branch is not None else {"tag": tag}
+        recover = self._recover_from_corrupt_head
+        try:
+            found = _call(
+                "resolve_ref", self.store, recover, recover=recover is not None, **ref
             )
-        else:
-            tagged = _resolve_tag(self.store, tag or "")
-            commit_hash = (
-                tagged
-                if tagged is not None
-                and self.store.get(COMMIT_ROOT % tagged) is not None
-                else None
-            )
-        if commit_hash is None:
+        except (
+            UnknownBranchError,
+            UnknownTagError,
+            UnknownCommitError,
+            CorruptHeadError,
+        ):
             return None
-        root = _load_root(self.store, commit_hash)
-        if root is None:
+        run = _core.Op("wt_lookup", {"keys": [key]})
+        run.use_tree(_core.WorktreeState(found["root"]))
+        entries = drive(run, self.store, clock=time.time, sleep=time.sleep)
+        if not entries:
             return None
-        ks = Keyset(self.store, root=root)
-        entry = ks.get(key)
-        if entry is None:
-            return None
-        return self.store.get(entry.blob)
+        _key, (blob, _size, _chunks) = entries[0]
+        return self.store.get(blob)
 
     def reset_to(self, commit_hash: str) -> bool:
         """Reset HEAD to a specific commit.

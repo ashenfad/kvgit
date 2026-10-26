@@ -17,8 +17,11 @@
 //! lays them over what this answers.
 
 use crate::error::Error;
+use crate::history::decode_record;
 use crate::keyset::Entry;
+use crate::layout::{EMPTY_HASH, commit_root, parent_commit, parent_gens};
 use crate::machine::Io;
+use crate::store::loads_str;
 use crate::tree::{self, Shape};
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -166,4 +169,48 @@ pub async fn move_to(io: &Io, shape: Shape, tree: &Shared, root: String) -> Resu
     }
     t.root = root;
     Ok(())
+}
+
+/// What a checkout found of the commit it moved to.
+pub struct CheckedOut {
+    /// The commit's root; `None` for a commit the store doesn't hold,
+    /// which the worktree reads as the empty tree.
+    pub root: Option<String>,
+    /// The commit's generation, if it stores one.
+    pub generation: Option<u64>,
+}
+
+/// Move to `commit`: its root, its parents and their generations in one
+/// read, then [`move_to`] its root.
+pub async fn checkout(
+    io: &Io,
+    shape: Shape,
+    tree: &Shared,
+    commit: &str,
+) -> Result<CheckedOut, Error> {
+    let (root_key, parents_key, gens_key) = (
+        commit_root(commit),
+        parent_commit(commit),
+        parent_gens(commit),
+    );
+    let found = io
+        .get(vec![
+            root_key.clone(),
+            parents_key.clone(),
+            gens_key.clone(),
+        ])
+        .await?;
+    let root = found.get(&root_key).and_then(|raw| loads_str(raw));
+    // A record that doesn't parse costs the generation, not the move.
+    let generation = root.as_ref().and_then(|_| {
+        decode_record(
+            found.get(&parents_key).map(Vec::as_slice),
+            found.get(&gens_key).map(Vec::as_slice),
+        )
+        .ok()?
+        .generation()
+    });
+    let to = root.clone().unwrap_or_else(|| EMPTY_HASH.clone());
+    move_to(io, shape, tree, to).await?;
+    Ok(CheckedOut { root, generation })
 }

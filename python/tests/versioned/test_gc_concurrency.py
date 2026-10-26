@@ -20,7 +20,7 @@ from __future__ import annotations
 import threading
 import time
 
-from support import fork, pointers, worktree
+from support import fork, pointers, root_of, worktree
 
 from kvgit.encoding import dumps
 from kvgit.hamt import EMPTY_HASH
@@ -31,7 +31,6 @@ from kvgit.versioned.kv import (
     COMMIT_ROOT,
     COMMIT_TIME,
     GC_LEASE_KEY,
-    _load_root,
     _resolve_head,
     clean_orphans,
     deep_clean,
@@ -91,7 +90,7 @@ def in_a_thread(fn):
 
 def node_hashes(store, commit_hash: str) -> set[str]:
     """Every HAMT node hash in a commit's keyset."""
-    root = _load_root(store, commit_hash)
+    root = root_of(store, commit_hash)
     if root is None or root == EMPTY_HASH:
         return set()
     _, nodes = Keyset(store, root=root).walk()
@@ -164,7 +163,7 @@ class TestNodeRace:
         gone = missing_nodes(store, head, landed["nodes"])  # type: ignore[arg-type]
         assert not gone, (
             f"live HEAD {head} on branch 'main' lost keyset nodes {gone} "
-            f"(root {_load_root(store, head)}) — committed state is corrupt"
+            f"(root {root_of(store, head)}) — committed state is corrupt"
         )
 
         reader = worktree(store)
@@ -301,7 +300,7 @@ class TestDamagedOrphans:
         for i in range(40):
             dev[f"dev{i:03d}"] = i
         dev_commit = dev.commit().commit
-        dev_root = _load_root(store, dev_commit)
+        dev_root = root_of(store, dev_commit)
         s.repo.branches.delete("dev")
 
         # Blow a hole in the orphan's keyset before the sweep sees it.
@@ -322,7 +321,7 @@ class TestDamagedOrphans:
         for i in range(40):
             dev[f"dev{i:03d}"] = i
         dev_commit = dev.commit().commit
-        dev_root = _load_root(store, dev_commit)
+        dev_root = root_of(store, dev_commit)
         s.repo.branches.delete("dev")
 
         store.set(NODE_PREFIX + str(dev_root), b"not json at all")
@@ -350,7 +349,7 @@ class TestOrdinaryGarbage:
         dev = fork(s, "dev")  # inherits the chunked codec
         dev["dev_only"] = "throw me away"
         dev_commit = dev.commit().commit
-        dev_root = _load_root(store, dev_commit)
+        dev_root = root_of(store, dev_commit)
         dev_nodes = node_hashes(store, dev_commit) - node_hashes(store, s.head)
         dev_chunks = set(chunk_keys(store)) - live_chunks
         dev_blob = pointers(dev.repo.store, dev.head)["dev_only"]
@@ -418,7 +417,7 @@ class TestDeepClean:
             dev[f"dev{i:03d}"] = i
         dev_commit = dev.commit().commit
         dev_nodes = node_hashes(store, dev_commit) - live_nodes
-        dev_root = str(_load_root(store, dev_commit))
+        dev_root = str(root_of(store, dev_commit))
         s.repo.branches.delete("dev")
         store.remove(NODE_PREFIX + dev_root)
 
