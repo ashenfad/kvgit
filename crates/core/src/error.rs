@@ -50,6 +50,9 @@ pub enum Error {
     },
     /// Something read from the store that should be a record isn't.
     Malformed(String),
+    /// The store is stamped with a storage layout this code doesn't
+    /// read, or is from before stamps.
+    StorageVersion(String),
 }
 
 impl Error {
@@ -77,6 +80,7 @@ impl Error {
             Error::Malformed(_) => "malformed",
             Error::Invalid(_) => "invalid",
             Error::GcBusy(_) => "gc_busy",
+            Error::StorageVersion(_) => "storage_version",
         }
     }
 
@@ -117,7 +121,8 @@ impl fmt::Display for Error {
             Error::Concurrency(message)
             | Error::Malformed(message)
             | Error::Invalid(message)
-            | Error::GcBusy(message) => f.write_str(message),
+            | Error::GcBusy(message)
+            | Error::StorageVersion(message) => f.write_str(message),
             Error::MergeConflict { keys, .. } => {
                 write!(f, "Merge conflict on keys: {}", keys.join(", "))
             }

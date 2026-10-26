@@ -18,6 +18,7 @@ from ..errors import (
     CorruptHeadError,
     GcBusy,
     MergeConflict,
+    StorageVersionError,
     TagExistsError,
     UnknownBranchError,
     UnknownCommitError,
@@ -180,6 +181,7 @@ _ERRORS: dict[str, Callable[[str], Exception]] = {
     "tag_exists": TagExistsError,
     "concurrency": ConcurrencyError,
     "gc_busy": GcBusy,
+    "storage_version": StorageVersionError,
 }
 
 

@@ -13,7 +13,7 @@ use kvgit_core::cache::{Cache, DEFAULT_CACHE_BYTES, Shared};
 use kvgit_core::error::Error;
 use kvgit_core::json::{Value, loads};
 use kvgit_core::keyset::{Entry, shape};
-use kvgit_core::layout::{ROOT_COMMIT, STORAGE_VERSION_KEY, blob_key, branch_head, commit_root};
+use kvgit_core::layout::{ROOT_COMMIT, blob_key, branch_head, commit_root};
 use kvgit_core::machine::{Cas, Machine, Reply, Request, Step, Write};
 use kvgit_core::merge::{MergeAnswer, MergeAsk, Rule, Rules};
 use kvgit_core::ops::{self, Out};
@@ -353,9 +353,8 @@ impl Run {
     fn step(&mut self, step: &Value, context: &str) -> Result<Value, String> {
         match op(step) {
             "open" => {
-                if !self.store.contains_key(STORAGE_VERSION_KEY) {
-                    self.store.insert(STORAGE_VERSION_KEY.into(), b"4".to_vec());
-                }
+                let stamp = Value::Object(vec![("stamp".into(), Value::Bool(true))]);
+                self.call("check_version", stamp, false)?;
                 let scan = step.get("recover").and_then(Value::as_str) == Some("commit_scan");
                 self.repos
                     .insert(self.arg(step, "as"), (scan, step.clone()));
@@ -1138,6 +1137,7 @@ fn error_name(e: &Error) -> String {
         Error::Concurrency(_) => "ConcurrencyError",
         Error::MergeConflict { .. } => "MergeConflict",
         Error::GcBusy(_) => "GcBusy",
+        Error::StorageVersion(_) => "StorageVersionError",
         Error::Malformed(_) | Error::Host | Error::Invalid(_) => "invalid",
     }
     .into()

@@ -92,7 +92,7 @@ repo = Repo(
 | `cache_bytes` | `int` | 32 MB | Memory for what the store never rewrites; `0` turns it off. See [The cache](#the-cache) |
 | `value_cache_bytes` | `int` | 32 MB | Memory for the values each worktree reads; `0` holds none. See [The read cache](#the-read-cache) |
 
-None of these settings is written to the store: they belong to the process that opens it. Opening reads the store's version stamp once and raises [`StorageVersionError`](#errors) for a layout this code does not read; it never writes.
+None of these settings is written to the store: they belong to the process that opens it. Opening reads the store's version stamp once and raises [`StorageVersionError`](#errors) for a layout this code does not read. It stamps a fresh store, and writes nothing else.
 
 A `Repo` is a context manager; `close()` closes the backend.
 
@@ -427,7 +427,7 @@ What an older version sees is a branch named `refs/tags/<name>`. It will list it
 
 The `__tag_info__<name>` record is a separate key kind, and nothing collects it: every sweep, this version's and older ones', deletes only commit metadata keyed by commit hash, orphan-owned blobs and HAMT nodes, and — in a deep sweep — the `kvgit:keyset:` and `kvgit:chunk:` namespaces.
 
-Storage version checks are what lock older kvgit out of a [v4 store](#storage-versions): `Repo` refuses a store stamped above what it reads when it is opened, and `gc()` checks again before removing anything. They are not what protects tags.
+Storage version checks are what lock older kvgit out of a [v4 store](#storage-versions): `Repo` refuses a store stamped with any layout but the one it reads when it is opened, and `gc()` checks again before removing anything. They are not what protects tags.
 
 ---
 
@@ -750,9 +750,9 @@ class Codec(Protocol):
 
 `ChunkSink.put(data) -> str` registers a chunk and returns its content-addressed reference. `ChunkReader.get(ref) -> bytes` and `get_many(refs)` fetch chunks during decode.
 
-### Storage layout (v3)
+### Storage layout (chunks)
 
-The first chunked write lazily upgrades a store from v2 to v3:
+Chunks, which arrived in v3, are stored as:
 
 | Key pattern | Contents |
 |-------------|----------|
@@ -766,20 +766,20 @@ Chunks are reclaimed like all content: a sweep marks `MetaEntry.chunks` from eve
 
 ### Storage versions
 
-The `__kvgit_version__` key records the newest layout a store holds. Every layout reads the ones before it, and a store is stamped up only when something newer is actually written — opening a store never changes its stamp.
+The `__kvgit_version__` key records a store's layout. This code reads v4: a store stamped v2 or v3 is refused with `StorageVersionError`, as is a store with branches and no stamp, and a fresh store is stamped v4 when it is opened. A store an older kvgit wrote reads once its stamp is raised to v4, which is what the 0.4.x backfill does; everything it holds is read as it was stored.
 
 | Version | Stamped by | What it added |
 |---------|------------|---------------|
 | 2 | — | The HAMT keyset layout. |
 | 3 | the first chunked write | `kvgit:chunk:<hash>` and `MetaEntry.chunks`. |
-| 4 | the first commit written by this code | Blobs keyed by content (`kvgit:blob:<sha256>`), keyset entries without a timestamp, a commit hash over the parents, keyset root, time and info, and each commit's parents' [generations](#generations) (`__parent_gens__<commit>`). |
+| 4 | opening a fresh store; the backfill, for an older one | Blobs keyed by content (`kvgit:blob:<sha256>`), keyset entries without a timestamp, a commit hash over the parents, keyset root, time and info, and each commit's parents' [generations](#generations) (`__parent_gens__<commit>`). |
 
 v4 changes how *new* objects are keyed; nothing already stored is rewritten. Every existing commit hash, branch head and tag stays valid, a keyset may hold blobs of both kinds (`<commit_hash>:<key>` from before v4, `kvgit:blob:<sha256>` after), and an untouched entry keeps the bytes it was stored as. Two consequences follow from content keys:
 
 * **Equal bytes are one blob**, across keys, commits and branches, and the two sides of a merge agree about a key exactly when they point at the same blob. Keys that both sides changed to equal bytes still merge cleanly when one side's blob predates v4.
 * **A commit hash names one root.** Because the time is part of the hash, two writers making the same change mint two commits rather than one hash over two different keysets, and every key under `__commit_*__<hash>` is written once and never rewritten.
 
-A stamp locks older code out, deliberately: an older sweep deletes by rules that are wrong for content it did not write. `Repo` and `gc()` refuse a store stamped above what they read with `StorageVersionError`, before writing anything. kvgit releases whose admin paths predate that check refuse to open such a store, and their sweeps fail on the first v4 entry they decode.
+A stamp locks older code out, deliberately: an older sweep deletes by rules that are wrong for content it did not write. `Repo` and `gc()` refuse a store stamped with any other layout with `StorageVersionError`, before writing anything. kvgit releases whose admin paths predate that check refuse to open such a store, and their sweeps fail on the first v4 entry they decode.
 
 ### Generations
 
@@ -872,7 +872,7 @@ The lease lives in one reserved key, `__gc_lease__`, holding `{"owner": <opaque 
 
 | Step | What happens |
 |------|--------------|
-| Version check | Refuse a store stamped above the layout this code reads, *before* touching the lease key, so such a store comes out of the call with nothing written to it. |
+| Version check | Refuse a store stamped with another layout than the one this code reads, *before* touching the lease key, so such a store comes out of the call with nothing written to it. |
 | Acquire | CAS the lease key. On a live lease held by someone else, wait it out — or, with `wait=False`, raise [`GcBusy`](#gcbusy). |
 | Sweep | Mark from in-flight markers, then branch heads, then young orphans; delete the rest. |
 | Release | In a `finally`: CAS our own bytes to an expired record carrying our owner id. A failed release means the lease was already reclaimed by someone else, and theirs is left alone. |

@@ -1,9 +1,8 @@
-"""Tests for opening v2 stores and for chunked entries.
+"""Tests for v2 stores and for chunked entries.
 
 The contract:
 
-* Current code opens a v2 store transparently, and opening writes
-  nothing: the stamp moves only when a commit lands (see
+* A store stamped v2 is refused, and opening it writes nothing (see
   ``tests/test_storage_v4.py`` for stores written by a released kvgit).
 * Chunked entries and plain entries coexist in the same store.
 * Importing values from a store without chunks into one with a chunked
@@ -36,29 +35,20 @@ def chunked_pair():
     return compose(NumpyCodec(min_bytes=64))
 
 
-class TestV2StoreOpenedByV3Code:
-    def test_open_existing_v2_store_no_stamp_change(self):
+class TestStoresOfEveryKind:
+    def test_a_v2_store_is_refused_and_left_as_it_was(self):
         store = Memory()
         store.set(STORAGE_VERSION_KEY, dumps(2))
+        with pytest.raises(StorageVersionError, match="storage version 2"):
+            worktree(store)
+        assert dict(store.items()) == {STORAGE_VERSION_KEY: dumps(2)}
 
-        s = worktree(store)
-        assert safe_loads(store.get(STORAGE_VERSION_KEY)) == 2
-        assert list(s.keys()) == []
-
-    def test_first_commit_stamps_v4_and_chunks_keep_it(self):
-        store = Memory()
-        store.set(STORAGE_VERSION_KEY, dumps(2))
-
-        s = worktree(store)
-        s["x"] = "plain"
-        s.commit()
-        assert safe_loads(store.get(STORAGE_VERSION_KEY)) == BLOB_STORAGE_VERSION
-
+    def test_chunks_keep_the_stamp_at_v4(self):
         encoder, decoder = chunked_pair()
-        s2 = worktree(store, codec=(encoder, decoder))
-        s2["arr"] = np.arange(2048, dtype="float64")
-        s2.commit()
-        assert safe_loads(store.get(STORAGE_VERSION_KEY)) == BLOB_STORAGE_VERSION
+        s = worktree(Memory(), codec=(encoder, decoder))
+        s["arr"] = np.arange(2048, dtype="float64")
+        s.commit()
+        assert safe_loads(s.repo.store.get(STORAGE_VERSION_KEY)) == BLOB_STORAGE_VERSION
         assert BLOB_STORAGE_VERSION >= CHUNK_STORAGE_VERSION
 
     def test_mixed_pickle_and_chunked_entries_coexist(self):

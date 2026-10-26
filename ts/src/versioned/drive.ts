@@ -18,6 +18,7 @@ import {
   CorruptHeadError,
   GcBusy,
   MergeConflict,
+  StorageVersionError,
   TagExistsError,
   UnknownBranchError,
   UnknownCommitError,
@@ -381,6 +382,8 @@ function toError(f: Failure, causes: Map<string, unknown>): Error {
       return new RangeError(f.message)
     case 'gc_busy':
       return new GcBusy(f.message)
+    case 'storage_version':
+      return new StorageVersionError(f.message)
     case 'concurrency':
       return new ConcurrencyError(f.message)
     case 'merge_conflict': {

@@ -31,6 +31,8 @@ def build(path: str) -> None:
     data = json.loads(fixture.read_text())
     disk = Disk(path)
     disk.set_many({k: base64.b64decode(v) for k, v in data["store"].items()})
+    # Stamped v4, as the backfill leaves a store an older kvgit wrote.
+    disk.set("__kvgit_version__", b"4")
     wt = kvgit.Repo(disk).worktree("main")
     wt["count"] = 3
     wt.commit()

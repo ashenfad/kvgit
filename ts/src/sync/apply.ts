@@ -28,6 +28,7 @@ import { UnknownBranchError } from '../errors'
 import { EMPTY_HASH } from '../hamt'
 import { Keyset } from '../keyset'
 import type { KVStore, KeysetEntry, WireCommit } from '../types'
+import { checkStorageVersion } from '../versioned/kv'
 import {
   BRANCH_HEAD,
   BRANCH_HEAD_PREV,
@@ -42,7 +43,6 @@ import {
   SYNC_HEAD_AT,
   SYNC_MARK,
   blobKey,
-  checkStorageVersion,
   commitHash,
   commitRecords,
   dumps,

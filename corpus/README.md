@@ -84,7 +84,7 @@ Each step has an `op` and the fields below. Any step may carry an
 error, named as both packages name it (`BranchMovedError`,
 `MergeConflict`, `UnknownBranchError`, `UnknownCommitError`,
 `UnknownTagError`, `BranchExistsError`, `TagExistsError`,
-`ConcurrencyError`, `GcBusy`, `CantMark`). A caller's mistake, which
+`ConcurrencyError`, `GcBusy`, `StorageVersionError`, `CantMark`). A caller's mistake, which
 each language reports in its own idiom (`ValueError` or `TypeError` in
 Python, a plain `Error`, `TypeError` or `RangeError` in TypeScript), is
 `invalid`. A `MergeConflict` may also give `"keys"`, the conflicting

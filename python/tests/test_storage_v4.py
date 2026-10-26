@@ -4,7 +4,9 @@
 ``fixtures/make_v3_store.py``): blobs keyed ``<commit>:<key>``, keyset
 entries carrying ``created_at``, commit hashes from the old scheme, a
 tag, a merge, a chunked branch, and the orphaned commits of a deleted
-branch. Everything here opens that store with this code.
+branch. Stamped v3 as written, it is refused; everything else here
+opens it with its stamp raised to v4, as the backfill leaves a store,
+and reads the older objects as they are.
 """
 
 import base64
@@ -16,7 +18,8 @@ import pytest
 from support import pointers
 
 from kvgit import Repo, Worktree, text_merge
-from kvgit.encoding import safe_loads
+from kvgit.encoding import dumps, safe_loads
+from kvgit.errors import StorageVersionError
 from kvgit.kv.memory import Memory
 from kvgit.versioned.keyset import Keyset
 from kvgit.versioned.kv import (
@@ -31,15 +34,19 @@ from kvgit.versioned.kv import (
     _load_root,
     blob_key,
     commit_hash,
+    gc,
 )
 
 FIXTURE = Path(__file__).parent / "fixtures" / "v3_store.json"
 
 
-def load_v3() -> tuple[Memory, dict]:
+def load_v3(*, stamp: int = BLOB_STORAGE_VERSION) -> tuple[Memory, dict]:
+    """The fixture's store, stamped ``stamp``: v4 unless a test asks for
+    the stamp it was written with."""
     data = json.loads(FIXTURE.read_text())
     store = Memory()
     store.set_many({k: base64.b64decode(v) for k, v in data["store"].items()})
+    store.set(STORAGE_VERSION_KEY, dumps(stamp))
     return store, data["manifest"]
 
 
@@ -81,13 +88,33 @@ def pickled(value) -> bytes:
 
 class TestTheFixture:
     def test_it_is_what_an_older_kvgit_wrote(self):
-        store, manifest = load_v3()
+        store, manifest = load_v3(stamp=3)
         assert manifest["kvgit"] == "0.3.9"
-        assert version(store) == 3
+        data = json.loads(FIXTURE.read_text())
+        assert safe_loads(base64.b64decode(data["store"][STORAGE_VERSION_KEY])) == 3
         assert legacy_blobs(store)
         assert not content_blobs(store)
         main = manifest["branches"]["main"]["head"]
         assert all(e.meta.created_at is not None for e in entries(store, main).values())
+
+
+class TestTheStamp:
+    @pytest.mark.parametrize("stamp", [2, 3])
+    def test_a_store_stamped_before_v4_is_refused(self, stamp):
+        store, _ = load_v3(stamp=stamp)
+        before = dict(store.items())
+        with pytest.raises(StorageVersionError, match="storage version"):
+            Repo(store)
+        with pytest.raises(StorageVersionError, match="storage version"):
+            VersionedKV(store)
+        assert dict(store.items()) == before
+
+    def test_a_sweep_of_a_store_stamped_before_v4_is_refused(self):
+        store, _ = load_v3(stamp=3)
+        before = dict(store.items())
+        with pytest.raises(StorageVersionError, match="storage version"):
+            gc(store, min_age=0)
+        assert dict(store.items()) == before
 
 
 class TestReading:
@@ -139,7 +166,7 @@ class TestReading:
 
 
 class TestWriting:
-    def test_first_commit_stamps_v4_and_extends_the_old_history(self):
+    def test_a_commit_extends_the_old_history(self):
         store, manifest = load_v3()
         main = main_of(store)
         main["count"] = 3
