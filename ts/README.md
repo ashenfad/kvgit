@@ -149,13 +149,11 @@ reader of a store has to use the codec its writers did. Pass a codec
 
 ## Storage format
 
-Stores use kvgit storage v4, the format Python kvgit 0.4 writes, byte
-for byte: a store either one writes, the other reads, and a commit
-either one makes gets the same hash in both. Blobs are keyed by the
-SHA-256 of their bytes (`kvgit:blob:<sha256>`), HAMT nodes by their
-entries, and a commit hash covers its parents, keyset root, time and
-info. Records are JSON as Python's `json.dumps` writes it, which
-[`src/pyjson.ts`](./src/pyjson.ts) reproduces.
+Stores use kvgit storage v4, shared with the Python package byte for
+byte: a store either one writes, the other reads, and a commit either
+one makes gets the same hash in both. [`docs/storage.md`](../docs/storage.md)
+describes every key. Records are JSON as Python's `json.dumps` writes
+it, which [`src/pyjson.ts`](./src/pyjson.ts) reproduces.
 
 Two consequences for callers:
 

@@ -23,7 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking (Python): `kvgit.versioned` and `kvgit.hamt` are gone.** `VersionedKV`, `VersionedBase`, `Keyset`, `Hamt`, `resolve_merge` and `pick_merge_policy` leave with them; `Repo` and `Worktree` are the API, and `MergeChoice`, `MergeResult`, `DiffResult`, `TagInfo` and `MergePolicy` are imported from `kvgit`.
 - **Breaking (Python): stores stamped v2 or v3 are refused.** Opening or sweeping one raises `StorageVersionError`, as TypeScript did; the objects an older kvgit wrote still read once a store's stamp is v4.
 - **A worktree opens without loading its keyset.** Opening reads the head's root alone, reads walk the tree through the content cache, and the first listing builds a key index the later ones read. A snapshot reads the same way.
-- **TypeScript's `lazy` option does nothing.** Every worktree reads on demand now, so `Worktree.lazy` is always true and `nodeCache` null, and a worktree keeps the values it reads, as an eager one did.
+- **TypeScript's `lazy` option does nothing.** Every worktree reads on demand now, so `Worktree.lazy` is always true.
 - **Breaking (TypeScript): an empty tag name throws `RangeError`.** It threw `TypeError`; every name the branch and tag calls refuse now throws `RangeError`.
 - **A log reads a level of history at a time.** `log` reads every commit queued in one batch, where it read each commit's records on its own.
 - **Python reads a damaged commit record without raising.** `get_commit` and `log` treat parents, a time or info that don't parse as absent, as TypeScript did.
@@ -31,9 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The commit scan breaks ties by hash.** Of two unclaimed tips made at the same time, it recovers to the smaller hash, where Python picked either.
 - **Breaking (TypeScript): the text merge needs the core loaded.** `text`, `textMergeResult` and the functions `makeTextMerge` builds run the core's merge, which `Repo.open` loads; code that merges text before opening any repository awaits the new `loadCore()` first.
 - **Breaking (Python): commit info keys must be strings.** Other keys raise `TypeError`, since `json.dumps` writes them as strings and they wouldn't read back as the keys the commit hash covers.
-- **TypeScript's `ancestryDelta` throws `UnknownCommitError` for a commit it can't send.** It threw a plain `Error`; the search now runs in the core.
-- **TypeScript's `publishHead` refuses what a branch can't be.** A head that isn't in the store throws `UnknownCommitError`, and a name the branch calls refuse throws `RangeError`.
-- **TypeScript's pull and push decide in the core.** `pushBranch` on a branch that isn't there throws `UnknownBranchError`, and a pull whose fetch brings nothing throws `IntegrityError`; both threw a plain `Error`.
+- **Breaking (TypeScript): `ancestryDelta` throws `UnknownCommitError` for a commit it can't send.** It threw a plain `Error`; the search now runs in the core.
+- **Breaking (TypeScript): `publishHead` refuses what a branch can't be.** A head that isn't in the store throws `UnknownCommitError`, and a name the branch calls refuse throws `RangeError`.
+- **Breaking (TypeScript): pull and push decide in the core.** `pushBranch` on a branch that isn't there throws `UnknownBranchError`, and a pull whose fetch brings nothing throws `IntegrityError`; both threw a plain `Error`.
 
 ## [0.4.3] - 2026-10-16
 
