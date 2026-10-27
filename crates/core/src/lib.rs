@@ -1,6 +1,7 @@
 //! The kvgit core: everything that is bytes or protocol, shared by the
 //! Python and TypeScript packages.
 
+pub mod ancestry;
 pub mod base64;
 pub mod cache;
 pub mod commit;
