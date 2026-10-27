@@ -11,7 +11,8 @@ import logging
 from collections.abc import Callable, Generator, Sequence
 from typing import Any
 
-from ..errors import (
+from ._types import MergeChoice
+from .errors import (
     BranchExistsError,
     BranchMovedError,
     ConcurrencyError,
@@ -25,8 +26,7 @@ from ..errors import (
     UnknownCommitError,
     UnknownTagError,
 )
-from ..kv.base import KVStore
-from .protocol import MergeChoice
+from .kv.base import KVStore
 
 logger = logging.getLogger("kvgit")
 
@@ -196,7 +196,7 @@ def _error(
     if kind in _ERRORS:
         return _ERRORS[kind](fields["message"])
     if kind == "merge_conflict":
-        from ..merges import CantMark
+        from .merges import CantMark
 
         failures = {
             key: errors.get(key) or CantMark(reason)

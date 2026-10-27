@@ -17,9 +17,9 @@ from kvgit import (
     UnknownCommitError,
     text_merge,
 )
+from kvgit._store import BRANCH_HEAD, BRANCH_HEAD_PREV, ROOT_COMMIT
 from kvgit.encoding import dumps
 from kvgit.kv.memory import Memory
-from kvgit.versioned.kv import BRANCH_HEAD, BRANCH_HEAD_PREV, ROOT_COMMIT
 
 
 class TestReads:

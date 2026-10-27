@@ -15,14 +15,10 @@ import pickle
 from pathlib import Path
 
 import pytest
-from support import pointers, root_of
+from support import entries, pointers
 
-from kvgit import Repo, Worktree, text_merge
-from kvgit.encoding import dumps, safe_loads
-from kvgit.errors import StorageVersionError
-from kvgit.kv.memory import Memory
-from kvgit.versioned.keyset import Keyset
-from kvgit.versioned.kv import (
+from kvgit import Repo, Worktree, _core, text_merge
+from kvgit._store import (
     BLOB_PREFIX,
     BLOB_STORAGE_VERSION,
     BRANCH_HEAD,
@@ -30,11 +26,12 @@ from kvgit.versioned.kv import (
     COMMIT_ROOT,
     ROOT_COMMIT,
     STORAGE_VERSION_KEY,
-    VersionedKV,
     blob_key,
-    commit_hash,
     gc,
 )
+from kvgit.encoding import dumps, safe_loads
+from kvgit.errors import StorageVersionError
+from kvgit.kv.memory import Memory
 
 FIXTURE = Path(__file__).parent / "fixtures" / "v3_store.json"
 
@@ -61,16 +58,21 @@ def content_blobs(store) -> set[str]:
     return {k for k in store.keys() if k.startswith(BLOB_PREFIX)}
 
 
-def entries(store, commit: str) -> dict:
-    return dict(Keyset(store, root=root_of(store, commit)).items())
-
-
 def values(mapping) -> dict:
     return {k: mapping[k] for k in sorted(mapping.keys())}
 
 
 def main_of(store, **repo_options) -> Worktree:
     return Repo(store, **repo_options).worktree("main")
+
+
+def raw_main(store) -> Worktree:
+    """``main`` with values stored as the bytes given."""
+    return Repo(store, codec="bytes").worktree("main", create=True)
+
+
+def commit_hash(parents, root: str, time: float, info: dict | None) -> str:
+    return _core.commit_hash(list(parents), root, time, info)
 
 
 def check_every_branch(store, manifest) -> None:
@@ -105,7 +107,7 @@ class TestTheStamp:
         with pytest.raises(StorageVersionError, match="storage version"):
             Repo(store)
         with pytest.raises(StorageVersionError, match="storage version"):
-            VersionedKV(store)
+            Repo(store, codec="bytes")
         assert dict(store.items()) == before
 
     def test_a_sweep_of_a_store_stamped_before_v4_is_refused(self):
@@ -135,7 +137,7 @@ class TestReading:
         _, manifest = load_v3()
         for expected in manifest["branches"].values():
             assert ROOT_COMMIT in expected["history"]
-        assert VersionedKV(Memory()).current_commit == ROOT_COMMIT
+        assert raw_main(Memory()).head == ROOT_COMMIT
 
     def test_tags(self):
         store, manifest = load_v3()
@@ -229,9 +231,10 @@ class TestKeysSharingABlob:
     """Keys holding equal bytes point at one blob; every read path must
     still answer for each key."""
 
-    def test_versioned_get_many_answers_every_key(self):
-        v = VersionedKV(Memory())
-        v.commit({"a": b"x", "b": b"x", "c": b"y"})
+    def test_raw_get_many_answers_every_key(self):
+        v = raw_main(Memory())
+        v.update({"a": b"x", "b": b"x", "c": b"y"})
+        v.commit()
         assert v.get_many("a", "b", "c", "missing") == {
             "a": b"x",
             "b": b"x",
@@ -287,13 +290,14 @@ class TestMergingAcrossFormats:
         """
         store, manifest = load_v3()
         dev_head = manifest["branches"]["dev"]["head"]
-        main = VersionedKV(store)
-        theirs = pointers(main.store, dev_head)["notes"]
-        main.commit({"notes": store.get(theirs)})
-        ours = pointers(main.store, main.current_commit)["notes"]
+        main = raw_main(store)
+        theirs = pointers(store, dev_head)["notes"]
+        main["notes"] = store.get(theirs)
+        main.commit()
+        ours = pointers(store, main.head)["notes"]
         assert ours.startswith(BLOB_PREFIX) and not theirs.startswith(BLOB_PREFIX)
 
-        result = main.merge_heads(dev_head)
+        result = main.merge(commit=dev_head)
         assert result.merged
         assert "notes" not in result.auto_merged_keys
         merged = main_of(store)
@@ -312,15 +316,17 @@ class TestMergingAcrossFormats:
 
     def test_two_writers_making_the_same_change_merge_on_pointers(self):
         store, _ = load_v3()
-        first = VersionedKV(store)
-        second = VersionedKV(store)
-        first.commit({"same": b"bytes"})
-        result = second.commit({"same": b"bytes"})
+        first = raw_main(store)
+        second = raw_main(store)
+        first["same"] = b"bytes"
+        first.commit()
+        second["same"] = b"bytes"
+        result = second.commit()
 
         assert result.merged
         assert result.strategy == "three_way"
         assert "same" not in result.auto_merged_keys
-        assert VersionedKV(store).get("same") == b"bytes"
+        assert raw_main(store).get("same") == b"bytes"
 
 
 class TestHonestCommitHash:
@@ -356,16 +362,19 @@ class TestHonestCommitHash:
         """Every key a commit writes is new or holds the bytes it had, so
         everything but branch heads can be cached forever."""
         store, _ = load_v3()
-        main = VersionedKV(store)
-        main.commit({"k": b"v"})
-        base = main.current_commit
+        main = raw_main(store)
+        main["k"] = b"v"
+        main.commit()
+        base = main.head
         before = dict(store.items())
 
         # The same change on the same parent, twice over.
-        main.reset_to(base)
-        main.commit({"k": b"v"})
-        other = VersionedKV(store, commit_hash=base)
-        other.commit({"k": b"v"}, on_conflict="abandon")
+        main.reset(base)
+        other = raw_main(store)
+        main["k"] = b"v"
+        main.commit()
+        other["k"] = b"v"
+        other.commit(on_conflict="abandon")
 
         mutable = (BRANCH_HEAD.replace("%s", ""), BRANCH_HEAD_PREV.replace("%s", ""))
         changed = [
@@ -376,9 +385,10 @@ class TestHonestCommitHash:
         assert changed == []
 
     def test_new_entries_carry_no_timestamp(self):
-        v = VersionedKV(Memory())
-        v.commit({"k": b"v"})
-        (entry,) = entries(v.store, v.current_commit).values()
+        v = raw_main(Memory())
+        v["k"] = b"v"
+        v.commit()
+        (entry,) = entries(v.repo.store, v.head).values()
         assert entry.meta.created_at is None
 
 

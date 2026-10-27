@@ -1,6 +1,14 @@
 """kvgit: versioned key-value store."""
 
 from ._open import open
+from ._store import ROOT_COMMIT, CorruptHeadRecoverer, recover_by_commit_scan
+from ._types import (
+    DiffResult,
+    MergeChoice,
+    MergePolicy,
+    MergeResult,
+    TagInfo,
+)
 from .content_types import MergeFn, counter, last_writer_wins, text_merge
 from .errors import (
     BranchExistsError,
@@ -29,14 +37,6 @@ from .merges import (
 from .namespaced import Namespaced
 from .refs import Branches, Tags
 from .repo import Commit, RawSnapshot, Repo, Snapshot
-from .versioned.kv import ROOT_COMMIT, CorruptHeadRecoverer, recover_by_commit_scan
-from .versioned.protocol import (
-    DiffResult,
-    MergeChoice,
-    MergePolicy,
-    MergeResult,
-    TagInfo,
-)
 from .worktree import Status, Worktree
 
 __all__ = [

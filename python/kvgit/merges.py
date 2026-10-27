@@ -19,7 +19,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from . import _core
-from .versioned.protocol import BytesMergeFn, MergeChoice
+from ._types import BytesMergeFn, MergeChoice
 
 #: Inputs whose combined size exceeds this are refused with
 #: :class:`CantMark` rather than merged. Line-diffing is quadratic-ish

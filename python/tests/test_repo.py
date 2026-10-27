@@ -24,18 +24,17 @@ from kvgit import (
     UnknownCommitError,
     UnknownTagError,
 )
-from kvgit.encoding import dumps
-from kvgit.kv.disk import Disk
-from kvgit.kv.memory import Memory
-from kvgit.versioned.kv import (
+from kvgit._store import (
     BRANCH_HEAD,
     BRANCH_HEAD_PREV,
     COMMIT_ROOT,
     ROOT_COMMIT,
     STORAGE_VERSION_KEY,
     TAG_INFO_KEY,
-    VersionedKV,
 )
+from kvgit.encoding import dumps
+from kvgit.kv.disk import Disk
+from kvgit.kv.memory import Memory
 
 
 def repo_with_history():
@@ -309,7 +308,6 @@ class TestEmptyBranchName:
             lambda: repo.branches[""],
             lambda: repo.repair_head(""),
             lambda: repo.snapshot(branch=""),
-            lambda: VersionedKV(repo.store, branch=""),
         ):
             with pytest.raises(ValueError, match="non-empty"):
                 attempt()
@@ -322,7 +320,7 @@ class TestEmptyBranchName:
         repo, wt, *_ = repo_with_history()
         repo.store.set(BRANCH_HEAD % "", dumps(wt.head))
         assert "" not in repo.branches
-        assert not VersionedKV.exists(repo.store, "")
+        assert "" not in list(repo.branches)
 
 
 class DeleteRaceMemory(Memory):
@@ -711,7 +709,7 @@ class TestReadsAHandleAlreadyHas:
         return store, repo, wt
 
     def test_a_commit_reads_head_lease_and_root_together(self):
-        from kvgit.versioned.kv import BRANCH_HEAD, COMMIT_ROOT, GC_LEASE_KEY
+        from kvgit._store import BRANCH_HEAD, COMMIT_ROOT, GC_LEASE_KEY
 
         store, _, wt = self._repo()
         parent = wt.head
@@ -727,7 +725,7 @@ class TestReadsAHandleAlreadyHas:
         assert store.read(COMMIT_ROOT % parent) == 1
 
     def test_back_to_back_commits_stay_that_cheap(self):
-        from kvgit.versioned.kv import COMMIT_ROOT
+        from kvgit._store import COMMIT_ROOT
 
         store, _, wt = self._repo()
         for n in range(3):
@@ -738,7 +736,7 @@ class TestReadsAHandleAlreadyHas:
             assert store.read(COMMIT_ROOT % parent) == 1
 
     def test_a_head_another_writer_moved_is_checked_as_before(self):
-        from kvgit.versioned.kv import COMMIT_ROOT
+        from kvgit._store import COMMIT_ROOT
 
         store, repo, wt = self._repo()
         other = repo.worktree("main")
@@ -760,7 +758,7 @@ class TestReadsAHandleAlreadyHas:
         whether it still holds that commit: a root lost under a
         long-lived handle sends the head read down the recovery tiers,
         as it would for a fresh one, rather than trusting memory."""
-        from kvgit.versioned.kv import COMMIT_ROOT
+        from kvgit._store import COMMIT_ROOT
 
         store, repo, wt = self._repo()
         backup = wt.head
@@ -769,7 +767,7 @@ class TestReadsAHandleAlreadyHas:
         tip = wt.head
         store.remove(COMMIT_ROOT % tip)
 
-        assert wt._engine.latest_head == backup
+        assert wt._engine._resolve() == backup
         assert repo.branches["main"] == backup
 
     def test_a_lease_that_changed_after_the_head_read_is_read_again(self):
@@ -777,8 +775,8 @@ class TestReadsAHandleAlreadyHas:
         lands. A sweep that has come and gone in between leaves a
         different record: the landing write expecting the old one fails,
         and the commit reads the lease again and lands."""
+        from kvgit._store import GC_LEASE_KEY
         from kvgit.encoding import dumps
-        from kvgit.versioned.kv import GC_LEASE_KEY
 
         store, repo, wt = self._repo()
         real = store.get_many
@@ -797,7 +795,7 @@ class TestReadsAHandleAlreadyHas:
         assert repo.snapshot(branch="main")["k1"] == "after a sweep"
 
     def test_a_snapshot_reads_its_root_once(self):
-        from kvgit.versioned.kv import COMMIT_ROOT
+        from kvgit._store import COMMIT_ROOT
 
         store, repo, wt = self._repo()
         for snap in (

@@ -10,7 +10,7 @@ MergeFn = Callable[[Any | None, Any, Any], Any]
 
 Any argument can be None (key absent or removed on that side).
 
-Returning a :class:`~kvgit.versioned.protocol.MergeChoice` instead of a
+Returning a :class:`~kvgit.MergeChoice` instead of a
 value keeps that side's committed value as it stands: no value is
 encoded and the merge writes no new blob for the key.
 """

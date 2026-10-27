@@ -13,9 +13,11 @@ The fixture is what kvgit-ts must reproduce byte for byte:
   one of the steps, and so are a branch merge (a merge function, a
   prefix ``MergeChoice``), a fast-forward, a cherry-pick and a revert.
 
-Regenerate (kvgit 0.4.x):
+Regenerate with kvgit 0.4.3, the last release with ``VersionedKV``,
+from outside the repository so its source can't shadow the release:
 
-    uv run --project ~/git/kvgit python scripts/golden-v4.py > tests/fixtures/golden-v4.json
+    cd /tmp && uv run --isolated --no-project --with 'kvgit==0.4.3' \
+        python "$REPO/ts/scripts/golden-v4.py" > "$REPO/ts/tests/fixtures/golden-v4.json"
 """
 
 import base64
@@ -25,9 +27,10 @@ import sys
 from importlib.metadata import version
 
 import kvgit.versioned.kv as kv_module
-from kvgit.kv.memory import Memory
 from kvgit.versioned.kv import VersionedKV, create_tag
 from kvgit.versioned.protocol import MergeChoice
+
+from kvgit.kv.memory import Memory
 
 
 class Clock:

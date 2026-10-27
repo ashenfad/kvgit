@@ -6,8 +6,8 @@ import dataclasses
 import pytest
 
 from kvgit import IntegrityError, Repo, UnknownBranchError, _sync as sync
+from kvgit._store import ROOT_COMMIT
 from kvgit.kv.memory import Memory
-from kvgit.versioned.kv import ROOT_COMMIT
 
 
 def device(**values: bytes) -> Memory:

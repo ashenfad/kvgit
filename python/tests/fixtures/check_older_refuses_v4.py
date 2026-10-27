@@ -23,7 +23,6 @@ from pathlib import Path
 
 import kvgit
 from kvgit.kv.disk import Disk
-from kvgit.versioned.kv import clean_orphans, deep_clean
 
 
 def build(path: str) -> None:
@@ -52,6 +51,10 @@ def digest(path: str) -> tuple[str, int]:
 
 
 def probe(path: str) -> None:
+    # The sweeps of a release before the Repo API; this checkout has no
+    # such module, so only ``probe`` imports it.
+    from kvgit.versioned.kv import clean_orphans, deep_clean
+
     print("kvgit", version("kvgit"), "from", kvgit.__file__)
     before = digest(path)
     attempts = {

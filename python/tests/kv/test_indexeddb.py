@@ -388,10 +388,10 @@ async def test_chunked_codec_round_trip(selenium_jspi):
     import numpy as np
 
     from kvgit import Repo
+    from kvgit._store import CHUNK_PREFIX
     from kvgit.codecs import compose
     from kvgit.codecs.numpy import NumpyCodec
     from kvgit.kv.indexeddb import IndexedDB
-    from kvgit.versioned.kv import CHUNK_PREFIX
 
     codec = compose(NumpyCodec(min_bytes=64))
     backend = IndexedDB(db_name="test_chunked_codec")
@@ -486,17 +486,22 @@ async def test_versioned_commits_and_sweeps(selenium_jspi):
     whl = (await resp.string()).strip()
     await micropip.install(f"./{whl}", deps=False)
 
+    from kvgit import Repo
+    from kvgit._store import blob_key
     from kvgit.kv.indexeddb import IndexedDB
-    from kvgit.versioned.kv import VersionedKV, blob_key, clean_orphans
 
     backend = IndexedDB(db_name="test_versioned_sweeps")
-    main = VersionedKV(backend)
-    main.commit({"live": b"keep me"})
-    dev = main.create_branch("dev")
-    dev.commit({"tmp": b"throwaway"})
-    main.delete_branch("dev")
+    repo = Repo(backend, codec="bytes")
+    main = repo.worktree("main", create=True)
+    main["live"] = b"keep me"
+    main.commit()
+    repo.branches.create("dev", at=main.head)
+    dev = repo.worktree("dev")
+    dev["tmp"] = b"throwaway"
+    dev.commit()
+    repo.branches.delete("dev")
 
-    assert clean_orphans(backend, min_age=0) >= 1
+    assert repo.gc(min_age=0) >= 1
     assert backend.get(blob_key(b"throwaway")) is None
     assert list(backend.keys("__inflight__")) == []
-    assert VersionedKV(backend).get("live") == b"keep me"
+    assert Repo(backend, codec="bytes").worktree("main").get("live") == b"keep me"

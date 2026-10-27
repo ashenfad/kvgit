@@ -2,12 +2,11 @@
 
 import time
 
-from kvgit import Repo, Worktree
+from kvgit import Repo, Worktree, _core
+from kvgit._store import BRANCH_HEAD, COMMIT_ROOT, EMPTY_HASH, GC_LEASE_KEY, gc
 from kvgit.encoding import dumps, safe_loads
 from kvgit.kv.base import KVStore
 from kvgit.kv.memory import Memory
-from kvgit.versioned.keyset import Keyset
-from kvgit.versioned.kv import BRANCH_HEAD, COMMIT_ROOT, GC_LEASE_KEY
 
 
 def worktree(
@@ -37,9 +36,13 @@ def root_of(store, commit: str) -> str | None:
 def entries(store, commit: str) -> dict:
     """A commit's keyset as key -> its stored entry."""
     root = root_of(store, commit)
-    if root is None:
+    if root is None or root == EMPTY_HASH:
         return {}
-    return Keyset(store, root=root).materialize()
+    op = _core.TreeOp.walk("kvgit:keyset:", 8, root, set(), True)
+    kind, payload = op.resume()
+    while kind == "get":
+        kind, payload = op.resume(dict(store.get_many(payload)))
+    return payload[0]
 
 
 def pointers(store, commit: str) -> dict[str, str]:
@@ -107,3 +110,13 @@ def release_lease(store: KVStore, ours: bytes) -> None:
     """Give up a lease :func:`hold_lease` took, as a sweep does."""
     expired = dumps({"owner": "a test's sweep", "expires": 0})
     store.cas(GC_LEASE_KEY, expired, expected=ours)
+
+
+def clean_orphans(store: KVStore, min_age: float = 3600) -> int:
+    """A sweep without the namespace scan, waiting out a busy lease."""
+    return gc(store, min_age)
+
+
+def deep_clean(store: KVStore, min_age: float = 3600) -> int:
+    """A sweep with the namespace scan, raising on a busy lease."""
+    return gc(store, min_age, deep=True, wait=False)

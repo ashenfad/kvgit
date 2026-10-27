@@ -3,14 +3,14 @@
 Usage:
     python tests/stress_kill.py [--rounds 500] [--branches 6] [--writers 4]
 
-Models the real uvicorn failure mode: multiple request handlers sharing
-a disk-backed store, where one handler calls delete_branch (which triggers
-clean_orphans with min_age=0) while others are actively committing.
+Models multiple request handlers sharing a disk-backed store, where one
+handler deletes branches and sweeps with ``gc(min_age=0)`` while others
+are actively committing.
 
-The mark-and-sweep in clean_orphans is NOT atomic across all its store
-operations. Between the mark phase and sweep phase, another thread can
-create new commits that get incorrectly swept because min_age=0 skips
-the age guard.
+With ``min_age=0`` the age guard keeps nothing, so only the GC lease and
+the in-flight markers stand between a concurrent commit and the sweep.
+After each round every branch's full history must still read: each
+commit has its root, and every entry of its keyset has its blob.
 """
 
 import argparse
@@ -23,17 +23,21 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from support import root_of
+from support import entries, root_of
 
-from kvgit.encoding import loads
-from kvgit.kv.disk import Disk
-from kvgit.versioned.keyset import Keyset
-from kvgit.versioned.kv import (
+from kvgit import Repo
+from kvgit._store import (
     BRANCH_HEAD,
     COMMIT_ROOT,
     PARENT_COMMIT,
-    VersionedKV,
 )
+from kvgit.encoding import loads
+from kvgit.kv.disk import Disk
+
+
+def open_repo(backend: Disk) -> Repo:
+    """A repository over ``backend`` storing values as the bytes given."""
+    return Repo(backend, codec="bytes")
 
 
 def verify_store(backend: Disk) -> list[str]:
@@ -79,7 +83,7 @@ def verify_store(backend: Disk) -> list[str]:
                 )
                 continue
 
-            # Walk the keyset HAMT and verify every entry's blob exists
+            # Walk the keyset and verify every entry's blob exists
             root = root_of(backend, commit_hash)
             if root is None:
                 errors.append(
@@ -88,8 +92,7 @@ def verify_store(backend: Disk) -> list[str]:
                 continue
 
             try:
-                ks = Keyset(backend, root=root)
-                for user_key, entry in ks.items():
+                for user_key, entry in entries(backend, commit_hash).items():
                     if backend.get(entry.blob) is None:
                         errors.append(
                             f"[{branch}] commit {commit_hash[:12]} "
@@ -122,9 +125,9 @@ def writer_thread(
     """Continuously commit to a branch until told to stop."""
     while not stop.is_set():
         try:
-            worker = VersionedKV(backend, branch=branch)
-            data = {f"key-{random.randint(0, 20)}": os.urandom(64)}
-            worker.commit(updates=data, on_conflict="abandon")
+            worker = open_repo(backend).worktree(branch)
+            worker[f"key-{random.randint(0, 20)}"] = os.urandom(64)
+            worker.commit(on_conflict="abandon")
         except (ValueError, Exception):
             pass
         # Tiny sleep to avoid pure busy-loop but keep pressure high
@@ -134,13 +137,14 @@ def writer_thread(
 def deleter_thread(
     backend: Disk, branches_to_delete: list[str], stop: threading.Event, error_log: list
 ) -> None:
-    """Delete branches (triggering clean_orphans min_age=0)."""
+    """Delete branches, sweeping with min_age=0 after each."""
     for branch in branches_to_delete:
         if stop.is_set():
             break
         try:
-            worker = VersionedKV(backend, branch="main")
-            worker.delete_branch(branch)
+            repo = open_repo(backend)
+            repo.branches.delete(branch)
+            repo.gc(min_age=0)
         except (ValueError, Exception):
             pass
 
@@ -150,12 +154,13 @@ def run_one_round(store_dir: str, num_branches: int, num_writers: int) -> list[s
     backend = Disk(store_dir)
 
     # Ensure we have enough branches
+    repo = open_repo(backend)
     try:
-        vkv = VersionedKV(backend, branch="main")
+        fork_point = repo.branches["main"]
     except ValueError:
         return ["Cannot open main branch"]
 
-    existing = set(vkv.list_branches())
+    existing = set(repo.branches)
 
     # Create branches for this round
     write_branches = []
@@ -164,14 +169,12 @@ def run_one_round(store_dir: str, num_branches: int, num_writers: int) -> list[s
         name = f"wb-{random.randint(0, 10000)}"
         if name not in existing:
             try:
-                vkv.create_branch(name)
+                repo.branches.create(name, at=fork_point)
                 # Add some commit history
-                w = VersionedKV(backend, branch=name)
+                w = repo.worktree(name)
                 for c in range(3):
-                    w.commit(
-                        updates={f"key-{c}": os.urandom(64)},
-                        on_conflict="abandon",
-                    )
+                    w[f"key-{c}"] = os.urandom(64)
+                    w.commit(on_conflict="abandon")
                 existing.add(name)
             except (ValueError, Exception):
                 pass
@@ -181,13 +184,11 @@ def run_one_round(store_dir: str, num_branches: int, num_writers: int) -> list[s
         name = f"db-{random.randint(0, 10000)}"
         if name not in existing:
             try:
-                vkv.create_branch(name)
-                w = VersionedKV(backend, branch=name)
+                repo.branches.create(name, at=fork_point)
+                w = repo.worktree(name)
                 for c in range(3):
-                    w.commit(
-                        updates={f"key-{c}": os.urandom(64)},
-                        on_conflict="abandon",
-                    )
+                    w[f"key-{c}"] = os.urandom(64)
+                    w.commit(on_conflict="abandon")
                 existing.add(name)
             except (ValueError, Exception):
                 pass
@@ -212,7 +213,7 @@ def run_one_round(store_dir: str, num_branches: int, num_writers: int) -> list[s
         )
         threads.append(t)
 
-    # Deleter thread deletes branches (triggers clean_orphans min_age=0)
+    # Deleter thread deletes branches and sweeps with min_age=0
     dt = threading.Thread(
         target=deleter_thread,
         args=(backend, delete_branches, stop, error_log),
@@ -246,10 +247,10 @@ def run_stress(rounds: int, num_branches: int, num_writers: int) -> bool:
 
             # Create fresh store
             backend = Disk(store_dir)
-            VersionedKV(backend, branch="main").commit(
-                updates={"init": b"seed"}, on_conflict="abandon"
-            )
-            del backend
+            main = open_repo(backend).worktree("main", create=True)
+            main["init"] = b"seed"
+            main.commit(on_conflict="abandon")
+            del main, backend
 
             errors = run_one_round(store_dir, num_branches, num_writers)
 

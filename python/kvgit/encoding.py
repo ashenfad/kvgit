@@ -1,4 +1,4 @@
-"""JSON byte helpers used by the versioned storage layer.
+"""JSON byte helpers used by the storage layer.
 
 Thin wrappers around ``json.dumps``/``json.loads`` that fix the byte
 encoding to a deterministic compact form. Centralized here so that

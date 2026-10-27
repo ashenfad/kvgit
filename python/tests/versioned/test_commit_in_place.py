@@ -1,13 +1,14 @@
-"""A commit that fails leaves the handle as it found it, on every
-failure path, and ``keys()`` keeps what it returned across a commit.
+"""A commit, merge or apply that fails leaves the worktree as it found
+it, on every failure path: its head, its pending changes and every
+value it reads. ``keys()`` keeps what it returned across a commit.
 """
 
 import pytest
-from support import fail_reads, race_publish
+from support import fail_reads, fork, race_publish
 
-from kvgit import ConcurrencyError, MergeConflict
+from kvgit import ConcurrencyError, MergeConflict, Repo, Worktree
+from kvgit._store import IN_FLIGHT_KEY
 from kvgit.kv.memory import Memory
-from kvgit.versioned.kv import IN_FLIGHT_KEY, VersionedKV as Versioned
 
 
 class FailingMemory(Memory):
@@ -31,85 +32,109 @@ class FailingMemory(Memory):
         return super().cas_many(expected, writes, removes)
 
 
-def _state(v: Versioned) -> dict:
-    """Everything a failed attempt must leave as it was: the commit, the
-    base, and every key's value."""
+def _main(store) -> Worktree:
+    """A worktree on ``main`` storing values as the bytes given."""
+    return Repo(store, codec="bytes").worktree("main", create=True)
+
+
+def _commit(wt: Worktree, updates: dict, removals=(), **options):
+    wt.update(updates)
+    for key in removals:
+        del wt[key]
+    return wt.commit(**options)
+
+
+def _state(wt: Worktree) -> dict:
+    """Everything a failed attempt must leave as it was: the head, the
+    pending changes, and every key's value."""
     return {
-        "commit": v.current_commit,
-        "base": v.base_commit,
-        "values": v.get_many(*v.keys()),
+        "commit": wt.head,
+        "pending": wt.status(),
+        "values": wt.get_many(*wt.keys()),
     }
 
 
-def _race_once(loser: Versioned, advance) -> None:
+def _race_once(loser: Worktree, advance) -> None:
     """Make ``loser``'s next HEAD swap lose: run ``advance`` first."""
-    race_publish(loser.store, loser.current_branch, advance)
+    race_publish(loser.repo.store, loser.branch, advance)
 
 
 def _setup():
     """A branch with keys to update, keep and remove, and a second
-    handle on it."""
+    worktree on it."""
     store = FailingMemory()
-    writer = Versioned(store)
-    writer.commit({"keep": b"k0", "change": b"c0", "drop": b"d0"})
-    return store, writer, Versioned(store)
+    writer = _main(store)
+    _commit(writer, {"keep": b"k0", "change": b"c0", "drop": b"d0"})
+    return store, writer, _main(store)
 
 
-def _change(v: Versioned):
-    return v.commit({"change": b"c1", "add": b"a1"}, {"drop"})
+def _stage(wt: Worktree) -> None:
+    wt.update({"change": b"c1", "add": b"a1"})
+    if "drop" in wt:
+        del wt["drop"]
+
+
+def _change(wt: Worktree):
+    _stage(wt)
+    return wt.commit()
 
 
 class TestRollback:
     def test_fast_forward_batch_fails_to_land(self):
         store, _, v = _setup()
+        _stage(v)
         before = _state(v)
         store.arm(1)
         with pytest.raises(RuntimeError, match="landing write failed"):
-            _change(v)
+            v.commit()
         assert _state(v) == before
 
     def test_merge_batch_after_lost_race_fails_to_land(self):
         store, writer, v = _setup()
+        _stage(v)
         before = _state(v)
 
         def advance():
-            writer.commit({"other": b"o1"})
+            _commit(writer, {"other": b"o1"})
             store.arm(1)
 
         _race_once(v, advance)
         with pytest.raises(RuntimeError, match="landing write failed"):
-            _change(v)
+            v.commit()
         assert _state(v) == before
 
     def test_merge_publish_loses_a_second_race(self):
         store, writer, v = _setup()
+        _stage(v)
         before = _state(v)
         n = 0
 
         def always_race():
             nonlocal n
-            writer.commit({f"other{n}": b"o"})
+            _commit(writer, {f"other{n}": b"o"})
             n += 1
 
         race_publish(store, "main", always_race, times=None)
         with pytest.raises(ConcurrencyError):
-            _change(v)
+            v.commit()
         assert _state(v) == before
 
     def test_merge_after_lost_race_conflicts(self):
         _, writer, v = _setup()
+        _stage(v)
         before = _state(v)
-        _race_once(v, lambda: writer.commit({"change": b"theirs"}))
+        _race_once(v, lambda: _commit(writer, {"change": b"theirs"}))
         with pytest.raises(MergeConflict):
-            _change(v)
+            v.commit()
         assert _state(v) == before
 
     def test_read_for_merge_after_lost_race_fails(self):
         store, writer, v = _setup()
+        _stage(v)
         before = _state(v)
 
         def advance():
-            writer.commit({"other": b"o1"})
+            _commit(writer, {"other": b"o1"})
             # The merge's first read of history: the two heads' parents.
             fail_reads(
                 store,
@@ -119,30 +144,30 @@ class TestRollback:
 
         _race_once(v, advance)
         with pytest.raises(RuntimeError, match="store read failed"):
-            _change(v)
+            v.commit()
         assert _state(v) == before
 
     def test_merge_of_another_head_fails_to_land(self):
         store, _, v = _setup()
-        side = v.create_branch("side")
-        side.commit({"side": b"s1"})
-        v.commit({"main": b"m1"})
+        side = fork(v, "side")
+        _commit(side, {"side": b"s1"})
+        _commit(v, {"main": b"m1"})
         before = _state(v)
         store.arm(1)
         with pytest.raises(RuntimeError, match="landing write failed"):
-            v.merge_heads(side.current_commit)
+            v.merge(commit=side.head)
         assert _state(v) == before
 
     def test_apply_fails_to_land(self):
         store, _, v = _setup()
-        parent = v.current_commit
-        v.commit({"picked": b"p1"})
-        target = v.current_commit
-        v.commit(removals={"picked"})
+        parent = v.head
+        _commit(v, {"picked": b"p1"})
+        target = v.head
+        _commit(v, {}, {"picked"})
         before = _state(v)
         store.arm(1)
         with pytest.raises(RuntimeError, match="landing write failed"):
-            v.apply_change(parent, target)
+            v.apply(parent, target)
         assert _state(v) == before
 
 
@@ -151,7 +176,7 @@ class TestRetry:
         store, writer, v = _setup()
 
         def advance():
-            writer.commit({"other": b"o1"})
+            _commit(writer, {"other": b"o1"})
             store.arm(1)
 
         _race_once(v, advance)
@@ -161,8 +186,8 @@ class TestRetry:
         result = _change(v)
         assert result.merged
         assert result.strategy == "three_way"
-        assert v.current_commit == v.latest_head
-        assert _state(v) == _state(Versioned(store))
+        assert v.head == v.repo.branches["main"]
+        assert _state(v) == _state(_main(store))
         assert {k: v.get(k) for k in v.keys()} == {
             "keep": b"k0",
             "change": b"c1",
@@ -172,9 +197,9 @@ class TestRetry:
 
     def test_lost_race_keeps_state_in_step_with_head(self):
         store, writer, v = _setup()
-        _race_once(v, lambda: writer.commit({"other": b"o1"}))
+        _race_once(v, lambda: _commit(writer, {"other": b"o1"}))
         assert _change(v).strategy == "three_way"
-        assert _state(v) == _state(Versioned(store))
+        assert _state(v) == _state(_main(store))
 
 
 class TestKeysView:
@@ -195,7 +220,7 @@ class TestKeysView:
         seen = []
         for key in v.keys():
             seen.append(key)
-            v.commit({f"{key}-copy": b"x"}, {key})
+            _commit(v, {f"{key}-copy": b"x"}, {key})
         assert sorted(seen) == ["change", "drop", "keep"]
         assert sorted(v.keys()) == ["change-copy", "drop-copy", "keep-copy"]
 
@@ -204,7 +229,7 @@ class TestKeysView:
         view = v.keys()
 
         def advance():
-            writer.commit({"other": b"o1"})
+            _commit(writer, {"other": b"o1"})
             store.arm(1)
 
         _race_once(v, advance)

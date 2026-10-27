@@ -33,8 +33,8 @@ from collections.abc import Iterable, Mapping
 from typing import Any
 
 from . import _core
+from ._store import GC_LEASE_KEY
 from .kv.base import KVStore
-from .versioned.kv import GC_LEASE_KEY
 
 DEFAULT_CACHE_BYTES = 32 * 1024 * 1024
 """The default budget: tens of thousands of tree nodes."""

@@ -6,9 +6,9 @@ import pytest
 from support import fork, pointers, worktree
 
 from kvgit import MergeChoice, MergeConflict, Repo
+from kvgit._store import blob_key
 from kvgit.kv.memory import Memory
 from kvgit.merges import ours, theirs
-from kvgit.versioned.kv import VersionedKV as Versioned, blob_key
 
 
 def _mark(tag: bytes):
@@ -16,20 +16,28 @@ def _mark(tag: bytes):
     return lambda old, our, their: tag
 
 
-def _branched_versioned(base: dict[str, bytes] | None = None):
-    """Main + worker VersionedKV pair sharing one store (raw bytes)."""
-    main = Versioned(Memory())
-    main.commit(base if base is not None else {"seed": b"0"})
-    worker = main.create_branch("worker")
+def _commit(wt, updates=None, removals=(), **options):
+    """Stage ``updates`` and ``removals`` on ``wt``, then commit them."""
+    wt.update(updates or {})
+    for key in removals:
+        del wt[key]
+    return wt.commit(**options)
+
+
+def _branched_bytes(base: dict[str, bytes] | None = None, **repo_options):
+    """Main + worker worktrees of one repository storing raw bytes."""
+    main = worktree(codec="bytes", **repo_options)
+    _commit(main, base if base is not None else {"seed": b"0"})
+    worker = fork(main, "worker")
     return main, worker
 
 
-def _concurrent_versioned(base: dict[str, bytes] | None = None):
-    """Two VersionedKV writers on one branch, both at the same base commit."""
-    kv = Memory()
-    first = Versioned(kv)
-    first.commit(base if base is not None else {"seed": b"0"})
-    second = Versioned(kv)
+def _concurrent_bytes(base: dict[str, bytes] | None = None):
+    """Two worktrees on one branch storing raw bytes, both at the same
+    base commit."""
+    first = worktree(codec="bytes")
+    _commit(first, base if base is not None else {"seed": b"0"})
+    second = first.repo.worktree("main")
     return first, second
 
 
@@ -54,82 +62,82 @@ def _concurrent_staged(base_key: str = "seed", base_value=0):
 
 class TestMergePrefix:
     def test_prefix_resolves_key_registered_by_no_exact_fn(self):
-        main, worker = _branched_versioned()
+        main, worker = _branched_bytes()
         main.set_merge_prefix("runs/", _mark(b"by-prefix"))
-        main.commit({"runs/1": b"ours"})
-        worker.commit({"runs/1": b"theirs"})
+        _commit(main, {"runs/1": b"ours"})
+        _commit(worker, {"runs/1": b"theirs"})
 
-        result = main.merge_heads(worker.current_commit)
+        result = main.merge(commit=worker.head)
         assert result.merged
         assert main.get("runs/1") == b"by-prefix"
 
     def test_exact_key_beats_prefix(self):
-        main, worker = _branched_versioned()
+        main, worker = _branched_bytes()
         main.set_merge_prefix("runs/", _mark(b"by-prefix"))
         main.set_merge_fn("runs/1", _mark(b"by-key"))
-        main.commit({"runs/1": b"ours", "runs/2": b"ours"})
-        worker.commit({"runs/1": b"theirs", "runs/2": b"theirs"})
+        _commit(main, {"runs/1": b"ours", "runs/2": b"ours"})
+        _commit(worker, {"runs/1": b"theirs", "runs/2": b"theirs"})
 
-        result = main.merge_heads(worker.current_commit)
+        result = main.merge(commit=worker.head)
         assert result.merged
         assert main.get("runs/1") == b"by-key"
         assert main.get("runs/2") == b"by-prefix"
 
     def test_longest_prefix_wins(self):
-        main, worker = _branched_versioned()
+        main, worker = _branched_bytes()
         main.set_merge_prefix("runs/", _mark(b"short"))
         main.set_merge_prefix("runs/hot/", _mark(b"long"))
-        main.commit({"runs/hot/1": b"ours", "runs/cold/1": b"ours"})
-        worker.commit({"runs/hot/1": b"theirs", "runs/cold/1": b"theirs"})
+        _commit(main, {"runs/hot/1": b"ours", "runs/cold/1": b"ours"})
+        _commit(worker, {"runs/hot/1": b"theirs", "runs/cold/1": b"theirs"})
 
-        result = main.merge_heads(worker.current_commit)
+        result = main.merge(commit=worker.head)
         assert result.merged
         assert main.get("runs/hot/1") == b"long"
         assert main.get("runs/cold/1") == b"short"
 
     def test_prefix_beats_default(self):
-        main, worker = _branched_versioned()
+        main, worker = _branched_bytes()
         main.set_default_merge(_mark(b"by-default"))
         main.set_merge_prefix("runs/", _mark(b"by-prefix"))
-        main.commit({"runs/1": b"ours", "other": b"ours"})
-        worker.commit({"runs/1": b"theirs", "other": b"theirs"})
+        _commit(main, {"runs/1": b"ours", "other": b"ours"})
+        _commit(worker, {"runs/1": b"theirs", "other": b"theirs"})
 
-        result = main.merge_heads(worker.current_commit)
+        result = main.merge(commit=worker.head)
         assert result.merged
         assert main.get("runs/1") == b"by-prefix"
         assert main.get("other") == b"by-default"
 
     def test_no_matching_prefix_conflicts_without_default(self):
-        main, worker = _branched_versioned()
+        main, worker = _branched_bytes()
         main.set_merge_prefix("runs/", _mark(b"by-prefix"))
-        main.commit({"other": b"ours"})
-        worker.commit({"other": b"theirs"})
+        _commit(main, {"other": b"ours"})
+        _commit(worker, {"other": b"theirs"})
 
         with pytest.raises(MergeConflict) as exc_info:
-            main.merge_heads(worker.current_commit)
+            main.merge(commit=worker.head)
         assert exc_info.value.conflicting_keys == {"other"}
 
     def test_per_call_prefixes_override_instance_registration(self):
-        main, worker = _branched_versioned()
+        main, worker = _branched_bytes()
         main.set_merge_prefix("runs/", _mark(b"instance"))
-        main.commit({"runs/1": b"ours"})
-        worker.commit({"runs/1": b"theirs"})
+        _commit(main, {"runs/1": b"ours"})
+        _commit(worker, {"runs/1": b"theirs"})
 
-        result = main.merge_heads(
-            worker.current_commit,
+        result = main.merge(
+            commit=worker.head,
             merge_prefixes={"runs/": _mark(b"per-call")},
         )
         assert result.merged
         assert main.get("runs/1") == b"per-call"
 
     def test_per_call_prefixes_layer_over_instance_registration(self):
-        main, worker = _branched_versioned()
+        main, worker = _branched_bytes()
         main.set_merge_prefix("runs/", _mark(b"instance"))
-        main.commit({"runs/1": b"ours", "logs/1": b"ours"})
-        worker.commit({"runs/1": b"theirs", "logs/1": b"theirs"})
+        _commit(main, {"runs/1": b"ours", "logs/1": b"ours"})
+        _commit(worker, {"runs/1": b"theirs", "logs/1": b"theirs"})
 
-        result = main.merge_heads(
-            worker.current_commit,
+        result = main.merge(
+            commit=worker.head,
             merge_prefixes={"logs/": _mark(b"per-call")},
         )
         assert result.merged
@@ -137,20 +145,21 @@ class TestMergePrefix:
         assert main.get("logs/1") == b"per-call"
 
     def test_prefix_applies_on_the_concurrent_commit_path(self):
-        first, second = _concurrent_versioned()
+        first, second = _concurrent_bytes()
         second.set_merge_prefix("runs/", _mark(b"by-prefix"))
-        first.commit({"runs/1": b"theirs"})
+        _commit(first, {"runs/1": b"theirs"})
 
-        result = second.commit({"runs/1": b"ours"})
+        result = _commit(second, {"runs/1": b"ours"})
         assert result.merged
         assert second.get("runs/1") == b"by-prefix"
 
     def test_per_call_prefixes_on_the_concurrent_commit_path(self):
-        first, second = _concurrent_versioned()
+        first, second = _concurrent_bytes()
         second.set_merge_prefix("runs/", _mark(b"instance"))
-        first.commit({"runs/1": b"theirs"})
+        _commit(first, {"runs/1": b"theirs"})
 
-        result = second.commit(
+        result = _commit(
+            second,
             {"runs/1": b"ours"},
             merge_prefixes={"runs/": _mark(b"per-call")},
         )
@@ -158,161 +167,161 @@ class TestMergePrefix:
         assert second.get("runs/1") == b"per-call"
 
     def test_empty_prefix_matches_every_key(self):
-        main, worker = _branched_versioned()
+        main, worker = _branched_bytes()
         main.set_merge_prefix("", _mark(b"catch-all"))
-        main.commit({"anything": b"ours"})
-        worker.commit({"anything": b"theirs"})
+        _commit(main, {"anything": b"ours"})
+        _commit(worker, {"anything": b"theirs"})
 
-        result = main.merge_heads(worker.current_commit)
+        result = main.merge(commit=worker.head)
         assert result.merged
         assert main.get("anything") == b"catch-all"
 
 
 class TestOursTheirs:
     def test_theirs_keeps_their_pointer_and_writes_no_blob(self):
-        main, worker = _branched_versioned()
-        main.commit({"k": b"our-value"})
-        worker.commit({"k": b"their-value"})
-        their_pointer = pointers(worker.store, worker.current_commit)["k"]
+        main, worker = _branched_bytes()
+        _commit(main, {"k": b"our-value"})
+        _commit(worker, {"k": b"their-value"})
+        their_pointer = pointers(worker.repo.store, worker.head)["k"]
 
-        result = main.merge_heads(worker.current_commit, default_merge=theirs)
+        result = main.merge(commit=worker.head, default_merge=theirs)
         assert result.merged
         assert main.get("k") == b"their-value"
-        assert pointers(main.store, result.commit)["k"] == their_pointer
+        assert pointers(main.repo.store, result.commit)["k"] == their_pointer
 
     def test_ours_keeps_our_pointer_and_writes_no_blob(self):
-        main, worker = _branched_versioned()
-        main.commit({"k": b"our-value"})
-        worker.commit({"k": b"their-value"})
-        our_pointer = pointers(main.store, main.current_commit)["k"]
+        main, worker = _branched_bytes()
+        _commit(main, {"k": b"our-value"})
+        _commit(worker, {"k": b"their-value"})
+        our_pointer = pointers(main.repo.store, main.head)["k"]
 
-        result = main.merge_heads(worker.current_commit, default_merge=ours)
+        result = main.merge(commit=worker.head, default_merge=ours)
         assert result.merged
         assert main.get("k") == b"our-value"
-        assert pointers(main.store, result.commit)["k"] == our_pointer
+        assert pointers(main.repo.store, result.commit)["k"] == our_pointer
 
     def test_side_pick_counts_as_auto_merged(self):
-        main, worker = _branched_versioned()
-        main.commit({"k": b"our-value"})
-        worker.commit({"k": b"their-value"})
+        main, worker = _branched_bytes()
+        _commit(main, {"k": b"our-value"})
+        _commit(worker, {"k": b"their-value"})
 
-        result = main.merge_heads(worker.current_commit, default_merge=ours)
+        result = main.merge(commit=worker.head, default_merge=ours)
         assert result.auto_merged_keys == ("k",)
 
     def test_ours_removes_the_key_when_we_removed_it(self):
-        main, worker = _branched_versioned({"k": b"base"})
-        main.commit(removals={"k"})
-        worker.commit({"k": b"their-value"})
+        main, worker = _branched_bytes({"k": b"base"})
+        _commit(main, removals={"k"})
+        _commit(worker, {"k": b"their-value"})
 
-        result = main.merge_heads(worker.current_commit, default_merge=ours)
+        result = main.merge(commit=worker.head, default_merge=ours)
         assert result.merged
         assert "k" not in main
         assert main.get("k") is None
         assert result.auto_merged_keys == ("k",)
 
     def test_theirs_removes_the_key_when_they_removed_it(self):
-        main, worker = _branched_versioned({"k": b"base"})
-        main.commit({"k": b"our-value"})
-        worker.commit(removals={"k"})
+        main, worker = _branched_bytes({"k": b"base"})
+        _commit(main, {"k": b"our-value"})
+        _commit(worker, removals={"k"})
 
-        result = main.merge_heads(worker.current_commit, default_merge=theirs)
+        result = main.merge(commit=worker.head, default_merge=theirs)
         assert result.merged
         assert "k" not in main
         assert main.get("k") is None
 
     def test_ours_keeps_our_value_when_they_removed_it(self):
-        main, worker = _branched_versioned({"k": b"base"})
-        main.commit({"k": b"our-value"})
-        worker.commit(removals={"k"})
+        main, worker = _branched_bytes({"k": b"base"})
+        _commit(main, {"k": b"our-value"})
+        _commit(worker, removals={"k"})
 
-        result = main.merge_heads(worker.current_commit, default_merge=ours)
+        result = main.merge(commit=worker.head, default_merge=ours)
         assert result.merged
         assert main.get("k") == b"our-value"
 
     def test_side_pick_by_prefix_on_the_concurrent_commit_path(self):
-        first, second = _concurrent_versioned()
+        first, second = _concurrent_bytes()
         second.set_merge_prefix("keep/", ours)
-        first.commit({"keep/1": b"theirs"})
+        _commit(first, {"keep/1": b"theirs"})
 
-        result = second.commit({"keep/1": b"ours"})
+        result = _commit(second, {"keep/1": b"ours"})
         assert result.merged
         assert second.get("keep/1") == b"ours"
-        assert pointers(second.store, result.commit)["keep/1"] == blob_key(b"ours")
+        assert pointers(second.repo.store, result.commit)["keep/1"] == blob_key(b"ours")
 
 
 class TestByteEqualContested:
     def test_identical_bytes_merge_clean_across_branches(self):
-        main, worker = _branched_versioned()
+        main, worker = _branched_bytes()
         # Both sides write the same bytes to "k" in commits that differ
         # otherwise; equal bytes are one blob, so the pointers agree.
-        main.commit({"k": b"same", "a": b"1"})
-        worker.commit({"k": b"same", "b": b"2"})
+        _commit(main, {"k": b"same", "a": b"1"})
+        _commit(worker, {"k": b"same", "b": b"2"})
         assert (
-            pointers(main.store, main.current_commit)["k"]
-            == pointers(worker.store, worker.current_commit)["k"]
+            pointers(main.repo.store, main.head)["k"]
+            == pointers(worker.repo.store, worker.head)["k"]
             == blob_key(b"same")
         )
 
-        result = main.merge_heads(worker.current_commit)
+        result = main.merge(commit=worker.head)
         assert result.merged
         assert main.get("k") == b"same"
         assert "k" not in result.auto_merged_keys
         assert (
-            pointers(main.store, result.commit)["k"]
-            == pointers(worker.store, worker.current_commit)["k"]
+            pointers(main.repo.store, result.commit)["k"]
+            == pointers(worker.repo.store, worker.head)["k"]
         )
 
     def test_identical_bytes_merge_clean_on_the_concurrent_commit_path(self):
-        first, second = _concurrent_versioned()
-        first.commit({"k": b"same", "a": b"1"})
+        first, second = _concurrent_bytes()
+        _commit(first, {"k": b"same", "a": b"1"})
 
-        result = second.commit({"k": b"same", "b": b"2"})
+        result = _commit(second, {"k": b"same", "b": b"2"})
         assert result.merged
         assert second.get("k") == b"same"
         assert second.get("a") == b"1"
         assert second.get("b") == b"2"
 
     def test_identical_bytes_do_not_call_the_merge_fn(self):
-        main, worker = _branched_versioned()
+        main, worker = _branched_bytes()
         calls: list[str] = []
 
         def spy(old, our, their):
             calls.append("called")
             return b"merged"
 
-        main.commit({"k": b"same", "a": b"1"})
-        worker.commit({"k": b"same", "b": b"2"})
+        _commit(main, {"k": b"same", "a": b"1"})
+        _commit(worker, {"k": b"same", "b": b"2"})
 
-        result = main.merge_heads(worker.current_commit, default_merge=spy)
+        result = main.merge(commit=worker.head, default_merge=spy)
         assert result.merged
         assert calls == []
         assert main.get("k") == b"same"
 
     def test_differing_bytes_still_conflict(self):
-        main, worker = _branched_versioned()
-        main.commit({"k": b"ours", "a": b"1"})
-        worker.commit({"k": b"theirs", "b": b"2"})
+        main, worker = _branched_bytes()
+        _commit(main, {"k": b"ours", "a": b"1"})
+        _commit(worker, {"k": b"theirs", "b": b"2"})
 
         with pytest.raises(MergeConflict) as exc_info:
-            main.merge_heads(worker.current_commit)
+            main.merge(commit=worker.head)
         assert exc_info.value.conflicting_keys == {"k"}
 
     def test_removed_versus_modified_still_conflicts(self):
-        main, worker = _branched_versioned({"k": b"base"})
-        main.commit(removals={"k"})
-        worker.commit({"k": b"their-value"})
+        main, worker = _branched_bytes({"k": b"base"})
+        _commit(main, removals={"k"})
+        _commit(worker, {"k": b"their-value"})
 
         with pytest.raises(MergeConflict) as exc_info:
-            main.merge_heads(worker.current_commit)
+            main.merge(commit=worker.head)
         assert exc_info.value.conflicting_keys == {"k"}
 
     def test_modified_versus_removed_still_conflicts(self):
-        main, worker = _branched_versioned({"k": b"base"})
-        main.commit({"k": b"our-value"})
-        worker.commit(removals={"k"})
+        main, worker = _branched_bytes({"k": b"base"})
+        _commit(main, {"k": b"our-value"})
+        _commit(worker, removals={"k"})
 
         with pytest.raises(MergeConflict) as exc_info:
-            main.merge_heads(worker.current_commit)
+            main.merge(commit=worker.head)
         assert exc_info.value.conflicting_keys == {"k"}
 
 
@@ -475,86 +484,87 @@ class TestMergeChoicePolicy:
     """A registered MergeChoice governs every key either side changed."""
 
     def test_their_added_key_is_dropped_under_an_ours_prefix(self):
-        main, worker = _branched_versioned()
+        main, worker = _branched_bytes()
         main.set_merge_prefix("runs/", MergeChoice.OURS)
-        main.commit({"runs/mine": b"ours"})
-        worker.commit({"runs/theirs": b"theirs"})
+        _commit(main, {"runs/mine": b"ours"})
+        _commit(worker, {"runs/theirs": b"theirs"})
 
-        result = main.merge_heads(worker.current_commit)
+        result = main.merge(commit=worker.head)
         assert result.merged
         assert "runs/theirs" not in main
         assert main.get("runs/mine") == b"ours"
         assert "runs/theirs" in result.auto_merged_keys
 
     def test_their_removed_key_survives_under_an_ours_prefix(self):
-        main, worker = _branched_versioned({"runs/1": b"base"})
+        main, worker = _branched_bytes({"runs/1": b"base"})
         main.set_merge_prefix("runs/", MergeChoice.OURS)
-        main.commit({"other": b"1"})
-        worker.commit(removals={"runs/1"})
+        _commit(main, {"other": b"1"})
+        _commit(worker, removals={"runs/1"})
 
-        result = main.merge_heads(worker.current_commit)
+        result = main.merge(commit=worker.head)
         assert result.merged
         assert main.get("runs/1") == b"base"
 
     def test_their_modified_key_is_ignored_under_an_ours_prefix(self):
-        main, worker = _branched_versioned({"runs/1": b"base"})
+        main, worker = _branched_bytes({"runs/1": b"base"})
         main.set_merge_prefix("runs/", MergeChoice.OURS)
-        main.commit({"other": b"1"})
-        worker.commit({"runs/1": b"theirs"})
+        _commit(main, {"other": b"1"})
+        _commit(worker, {"runs/1": b"theirs"})
 
-        result = main.merge_heads(worker.current_commit)
+        result = main.merge(commit=worker.head)
         assert result.merged
         assert main.get("runs/1") == b"base"
 
     def test_our_removal_stays_removed_under_an_ours_prefix(self):
-        main, worker = _branched_versioned({"runs/1": b"base"})
+        main, worker = _branched_bytes({"runs/1": b"base"})
         main.set_merge_prefix("runs/", MergeChoice.OURS)
-        main.commit(removals={"runs/1"})
-        worker.commit({"runs/1": b"theirs"})
+        _commit(main, removals={"runs/1"})
+        _commit(worker, {"runs/1": b"theirs"})
 
-        result = main.merge_heads(worker.current_commit)
+        result = main.merge(commit=worker.head)
         assert result.merged
         assert "runs/1" not in main
 
     def test_our_added_key_is_dropped_under_a_theirs_prefix(self):
-        main, worker = _branched_versioned()
+        main, worker = _branched_bytes()
         main.set_merge_prefix("runs/", MergeChoice.THEIRS)
-        main.commit({"runs/mine": b"ours"})
-        worker.commit({"runs/theirs": b"theirs"})
+        _commit(main, {"runs/mine": b"ours"})
+        _commit(worker, {"runs/theirs": b"theirs"})
 
-        result = main.merge_heads(worker.current_commit)
+        result = main.merge(commit=worker.head)
         assert result.merged
         assert "runs/mine" not in main
         assert main.get("runs/theirs") == b"theirs"
 
     def test_their_removal_removes_under_a_theirs_prefix(self):
-        main, worker = _branched_versioned({"runs/1": b"base"})
+        main, worker = _branched_bytes({"runs/1": b"base"})
         main.set_merge_prefix("runs/", MergeChoice.THEIRS)
-        main.commit({"runs/1": b"ours"})
-        worker.commit(removals={"runs/1"})
+        _commit(main, {"runs/1": b"ours"})
+        _commit(worker, removals={"runs/1"})
 
-        result = main.merge_heads(worker.current_commit)
+        result = main.merge(commit=worker.head)
         assert result.merged
         assert "runs/1" not in main
 
     def test_our_modification_is_discarded_under_a_theirs_prefix(self):
-        main, worker = _branched_versioned({"runs/1": b"base"})
+        main, worker = _branched_bytes({"runs/1": b"base"})
         main.set_merge_prefix("runs/", MergeChoice.THEIRS)
-        main.commit({"runs/1": b"ours"})
-        worker.commit({"other": b"1"})
+        _commit(main, {"runs/1": b"ours"})
+        _commit(worker, {"other": b"1"})
 
-        result = main.merge_heads(worker.current_commit)
+        result = main.merge(commit=worker.head)
         assert result.merged
         assert main.get("runs/1") == b"base"
 
     def test_policy_keys_are_never_read(self):
-        main, worker = _branched_versioned()
+        # No content cache, so every read the merge makes reaches the store.
+        main, worker = _branched_bytes(cache_bytes=0)
         main.set_merge_prefix("runs/", MergeChoice.OURS)
-        main.commit({"runs/1": b"ours"})
-        worker.commit({"runs/1": b"theirs", "runs/2": b"theirs"})
+        _commit(main, {"runs/1": b"ours"})
+        _commit(worker, {"runs/1": b"theirs", "runs/2": b"theirs"})
 
         reads: list[str] = []
-        store = main.store
+        store = main.repo.store
         get, get_many = store.get, store.get_many
 
         def counted_get(key):
@@ -567,122 +577,122 @@ class TestMergeChoicePolicy:
 
         store.get, store.get_many = counted_get, counted_get_many
         try:
-            result = main.merge_heads(worker.current_commit)
+            result = main.merge(commit=worker.head)
         finally:
             store.get, store.get_many = get, get_many
         assert result.merged
         assert [k for k in reads if k.startswith("kvgit:blob:")] == []
 
     def test_policy_writes_no_blob_and_keeps_our_pointer(self):
-        main, worker = _branched_versioned()
+        main, worker = _branched_bytes()
         main.set_merge_prefix("runs/", MergeChoice.OURS)
-        main.commit({"runs/1": b"ours"})
-        worker.commit({"runs/1": b"theirs"})
-        our_pointer = pointers(main.store, main.current_commit)["runs/1"]
+        _commit(main, {"runs/1": b"ours"})
+        _commit(worker, {"runs/1": b"theirs"})
+        our_pointer = pointers(main.repo.store, main.head)["runs/1"]
 
-        result = main.merge_heads(worker.current_commit)
-        assert pointers(main.store, result.commit)["runs/1"] == our_pointer
+        result = main.merge(commit=worker.head)
+        assert pointers(main.repo.store, result.commit)["runs/1"] == our_pointer
 
     def test_untouched_keys_outside_the_prefix_are_unaffected(self):
-        main, worker = _branched_versioned({"kept": b"base"})
+        main, worker = _branched_bytes({"kept": b"base"})
         main.set_merge_prefix("runs/", MergeChoice.OURS)
-        main.commit({"runs/1": b"ours"})
-        worker.commit({"outside": b"theirs"})
+        _commit(main, {"runs/1": b"ours"})
+        _commit(worker, {"outside": b"theirs"})
 
-        result = main.merge_heads(worker.current_commit)
+        result = main.merge(commit=worker.head)
         assert result.merged
         assert main.get("kept") == b"base"
         assert main.get("outside") == b"theirs"
 
     def test_exact_key_choice_beats_prefix_fn(self):
-        main, worker = _branched_versioned()
+        main, worker = _branched_bytes()
         main.set_merge_prefix("runs/", _mark(b"by-prefix"))
         main.set_merge_fn("runs/1", MergeChoice.OURS)
-        main.commit({"runs/1": b"ours", "runs/2": b"ours"})
-        worker.commit({"runs/1": b"theirs", "runs/2": b"theirs"})
+        _commit(main, {"runs/1": b"ours", "runs/2": b"ours"})
+        _commit(worker, {"runs/1": b"theirs", "runs/2": b"theirs"})
 
-        result = main.merge_heads(worker.current_commit)
+        result = main.merge(commit=worker.head)
         assert main.get("runs/1") == b"ours"
         assert main.get("runs/2") == b"by-prefix"
         assert result.merged
 
     def test_longer_fn_prefix_beats_shorter_choice_prefix(self):
-        main, worker = _branched_versioned()
+        main, worker = _branched_bytes()
         main.set_merge_prefix("runs/", MergeChoice.OURS)
         main.set_merge_prefix("runs/hot/", _mark(b"by-fn"))
-        main.commit({"runs/cold/1": b"ours", "runs/hot/1": b"ours"})
-        worker.commit({"runs/cold/1": b"theirs", "runs/hot/1": b"theirs"})
+        _commit(main, {"runs/cold/1": b"ours", "runs/hot/1": b"ours"})
+        _commit(worker, {"runs/cold/1": b"theirs", "runs/hot/1": b"theirs"})
 
-        result = main.merge_heads(worker.current_commit)
+        result = main.merge(commit=worker.head)
         assert result.merged
         assert main.get("runs/cold/1") == b"ours"
         assert main.get("runs/hot/1") == b"by-fn"
 
     def test_longer_choice_prefix_beats_shorter_fn_prefix(self):
-        main, worker = _branched_versioned()
+        main, worker = _branched_bytes()
         main.set_merge_prefix("runs/", _mark(b"by-fn"))
         main.set_merge_prefix("runs/hot/", MergeChoice.THEIRS)
-        main.commit({"runs/cold/1": b"ours", "runs/hot/1": b"ours"})
-        worker.commit({"runs/cold/1": b"theirs", "runs/hot/1": b"theirs"})
+        _commit(main, {"runs/cold/1": b"ours", "runs/hot/1": b"ours"})
+        _commit(worker, {"runs/cold/1": b"theirs", "runs/hot/1": b"theirs"})
 
-        result = main.merge_heads(worker.current_commit)
+        result = main.merge(commit=worker.head)
         assert result.merged
         assert main.get("runs/cold/1") == b"by-fn"
         assert main.get("runs/hot/1") == b"theirs"
 
     def test_a_longer_fn_prefix_still_sees_only_contested_keys(self):
-        main, worker = _branched_versioned()
+        main, worker = _branched_bytes()
         main.set_merge_prefix("runs/", MergeChoice.OURS)
         main.set_merge_prefix("runs/hot/", _mark(b"by-fn"))
-        main.commit({"other": b"1"})
-        worker.commit({"runs/hot/new": b"theirs"})
+        _commit(main, {"other": b"1"})
+        _commit(worker, {"runs/hot/new": b"theirs"})
 
-        result = main.merge_heads(worker.current_commit)
+        result = main.merge(commit=worker.head)
         assert result.merged
         # Their-only add under a fn prefix lands as it always has.
         assert main.get("runs/hot/new") == b"theirs"
 
     def test_per_call_prefixes_accept_a_choice(self):
-        main, worker = _branched_versioned()
-        main.commit({"other": b"1"})
-        worker.commit({"runs/1": b"theirs"})
+        main, worker = _branched_bytes()
+        _commit(main, {"other": b"1"})
+        _commit(worker, {"runs/1": b"theirs"})
 
-        result = main.merge_heads(
-            worker.current_commit,
+        result = main.merge(
+            commit=worker.head,
             merge_prefixes={"runs/": MergeChoice.OURS},
         )
         assert result.merged
         assert "runs/1" not in main
 
     def test_per_call_choice_overrides_an_instance_fn(self):
-        main, worker = _branched_versioned()
+        main, worker = _branched_bytes()
         main.set_merge_prefix("runs/", _mark(b"by-fn"))
-        main.commit({"runs/1": b"ours"})
-        worker.commit({"runs/1": b"theirs"})
+        _commit(main, {"runs/1": b"ours"})
+        _commit(worker, {"runs/1": b"theirs"})
 
-        result = main.merge_heads(
-            worker.current_commit,
+        result = main.merge(
+            commit=worker.head,
             merge_prefixes={"runs/": MergeChoice.THEIRS},
         )
         assert result.merged
         assert main.get("runs/1") == b"theirs"
 
     def test_choice_as_default_merge_hands_over_every_changed_key(self):
-        main, worker = _branched_versioned()
-        main.commit({"mine": b"ours"})
-        worker.commit({"theirs": b"theirs"})
+        main, worker = _branched_bytes()
+        _commit(main, {"mine": b"ours"})
+        _commit(worker, {"theirs": b"theirs"})
 
-        result = main.merge_heads(worker.current_commit, default_merge=MergeChoice.OURS)
+        result = main.merge(commit=worker.head, default_merge=MergeChoice.OURS)
         assert result.merged
         assert main.get("mine") == b"ours"
         assert "theirs" not in main
 
     def test_policy_applies_on_the_concurrent_commit_path(self):
-        first, second = _concurrent_versioned()
+        first, second = _concurrent_bytes()
         second.set_merge_prefix("runs/", MergeChoice.OURS)
-        first.commit({"runs/1": b"theirs", "elsewhere": b"theirs"})
+        _commit(first, {"runs/1": b"theirs", "elsewhere": b"theirs"})
 
-        result = second.commit({"other": b"1"})
+        result = _commit(second, {"other": b"1"})
         assert result.merged
         assert "runs/1" not in second
         assert second.get("elsewhere") == b"theirs"

@@ -24,15 +24,25 @@ import threading
 import time
 
 import pytest
-from support import fork, hold_lease, release_lease, root_of, worktree
+from support import (
+    clean_orphans,
+    deep_clean,
+    entries,
+    fork,
+    hold_lease,
+    release_lease,
+    root_of,
+    worktree,
+)
 
-from kvgit import ConcurrencyError, GcBusy, MergeConflict
-from kvgit.encoding import dumps, loads
-from kvgit.errors import StorageVersionError, UnknownCommitError
-from kvgit.kv.memory import Memory
-from kvgit.versioned import kv as kv_module
-from kvgit.versioned.keyset import Keyset
-from kvgit.versioned.kv import (
+from kvgit import (
+    ConcurrencyError,
+    GcBusy,
+    MergeConflict,
+    Repo,
+    _engine as engine_module,
+)
+from kvgit._store import (
     BRANCH_HEAD,
     CHUNK_PREFIX,
     COMMIT_ROOT,
@@ -40,11 +50,12 @@ from kvgit.versioned.kv import (
     GC_WAIT_POLL,
     IN_FLIGHT_KEY,
     STORAGE_VERSION_KEY,
-    VersionedKV,
     _resolve_head,
-    clean_orphans,
-    deep_clean,
+    gc,
 )
+from kvgit.encoding import dumps, loads
+from kvgit.errors import StorageVersionError, UnknownCommitError
+from kvgit.kv.memory import Memory
 
 from .test_gc_concurrency import (
     AFTER_COMMIT_ROOT_SCAN,
@@ -287,7 +298,7 @@ class TestLeaseArithmetic:
     def test_an_overrun_lease_is_reported_not_extended(self, caplog):
         store = Memory()
         with caplog.at_level("WARNING", logger="kvgit.orphans"):
-            deep_clean(store, min_age=0, lease_ttl=0.0)
+            gc(store, 0, deep=True, wait=False, lease_ttl=0.0)
         assert any("past its" in r.message for r in caplog.records), (
             "a sweep that outlives its lease must say so"
         )
@@ -303,8 +314,8 @@ class TestLeaseArithmetic:
         assert not lease_is_live(store)
 
     def test_the_routine_sweep_waits_for_a_busy_lease(self):
-        """``clean_orphans`` runs inside ``delete_branch``, so meeting
-        another sweep it waits rather than failing the delete."""
+        """Meeting another sweep, the routine sweep waits it out rather
+        than failing."""
         store = Memory()
         ours = hold_lease(store, 60.0)
         done = threading.Event()
@@ -400,7 +411,7 @@ class TestCommitsBetweenWriteAndPublish:
             "the sweep deleted a commit whose writer had not published it yet"
         )
         assert not missing_nodes(store, commit, landed["nodes"])  # type: ignore[arg-type]
-        Keyset(store, root=str(root_of(store, commit))).walk()
+        node_hashes(store, commit)
         assert [k for k in landed["chunks"] if store.get(k) is None] == []  # type: ignore[union-attr]
 
         reader = worktree(store, codec=(chunky_encoder, chunky_decoder))
@@ -454,7 +465,7 @@ class TestCommitsBetweenWriteAndPublish:
 class TestInFlightMarkers:
     def test_a_batch_carries_a_marker_and_the_publish_removes_it(self):
         store = Memory()
-        v = VersionedKV(store)
+        wt = worktree(store, codec="bytes")
         seen: list[bytes | None] = []
         real = store.cas_many
 
@@ -465,7 +476,8 @@ class TestInFlightMarkers:
             return real(expected, writes, removes)
 
         store.cas_many = spy  # type: ignore[method-assign]
-        commit = v.commit({"k": b"v"}).commit
+        wt["k"] = b"v"
+        commit = wt.commit().commit
         assert seen == [IN_FLIGHT_KEY % commit]
         assert store.get(IN_FLIGHT_KEY % commit) is None
         assert list(store.keys("__inflight__")) == []
@@ -473,11 +485,13 @@ class TestInFlightMarkers:
     def test_an_abandoned_attempt_withdraws_its_marker(self):
         store = Memory()
         worktree(store).commit()
-        first = VersionedKV(store)
-        second = VersionedKV(store)
-        first.commit({"k": b"ours"})
+        first = worktree(store, codec="bytes")
+        second = worktree(store, codec="bytes")
+        first["k"] = b"ours"
+        first.commit()
+        second["k"] = b"theirs"
         with pytest.raises(MergeConflict):
-            second.commit({"k": b"theirs"})
+            second.commit()
         assert list(store.keys("__inflight__")) == []
 
     def test_a_withdrawal_leaves_a_marker_another_writer_rewrote(self):
@@ -501,10 +515,12 @@ class TestInFlightMarkers:
 
         store = RewriteBeforeWithdrawal()
         worktree(store).commit()
-        first = VersionedKV(store)
-        second = VersionedKV(store)
-        first.commit({"k": b"ours"})
-        result = second.commit({"k": b"theirs"}, on_conflict="abandon")
+        first = worktree(store, codec="bytes")
+        second = worktree(store, codec="bytes")
+        first["k"] = b"ours"
+        first.commit()
+        second["k"] = b"theirs"
+        result = second.commit(on_conflict="abandon")
 
         assert not result.merged
         assert rewritten, "the withdrawal never ran"
@@ -518,11 +534,10 @@ class TestInFlightMarkers:
         store = PausingMemory()
         worktree(store).commit()
         reached, release = threading.Event(), threading.Event()
-        dead = VersionedKV(store)
+        dead = worktree(store, codec="bytes")
+        dead["k"] = b"never published"
         store.pause_after_batch(reached, release)
-        writer = threading.Thread(
-            target=quietly(dead.commit, {"k": b"never published"})
-        )
+        writer = threading.Thread(target=quietly(dead.commit))
         writer.start()
         try:
             assert reached.wait(5), "the writer never wrote its batch"
@@ -568,9 +583,10 @@ class TestALapsedMarker:
         worktree(store).commit()
         head_before = _resolve_head(store, "main")
 
-        slow = VersionedKV(store)
+        slow = worktree(store, codec="bytes")
+        slow["k"] = b"too slow"
         with pytest.raises((ConcurrencyError, MergeConflict, ValueError)):
-            slow.commit({"k": b"too slow"})
+            slow.commit()
 
         head = _resolve_head(store, "main")
         assert head == head_before, "a head was published over a reaped commit"
@@ -615,15 +631,17 @@ def quietly(fn, *args):
 class TestPublishingUnderASweep:
     def test_a_publish_waits_for_a_running_sweep(self):
         store = PausingMemory()
-        v = VersionedKV(store)
-        v.commit({"base": b"1"})
+        v = worktree(store, codec="bytes")
+        v["base"] = b"1"
+        v.commit()
+        v["late"] = b"before the sweep"
         reached, release = threading.Event(), threading.Event()
         store.pause_after_batch(reached, release)
         done = threading.Event()
         landed: dict[str, str | None] = {}
         publisher = threading.Thread(
             target=lambda: (
-                landed.update(commit=v.commit({"late": b"before the sweep"}).commit),
+                landed.update(commit=v.commit().commit),
                 done.set(),
             )
         )
@@ -647,18 +665,17 @@ class TestPublishingUnderASweep:
         branch's root; a publish landing after those reads and before the
         sweep deletes would install a head over a commit about to go."""
         store = PausingScanStore()
-        v = VersionedKV(store)
-        v.commit({"base": b"1"})
-        base = v.current_commit
+        v = worktree(store, codec="bytes")
+        v["base"] = b"1"
+        v.commit()
+        base = v.head
+        v["late"] = b"a very slow writer"
         # The writer's clock runs behind, so the marker its batch writes
         # has lapsed by the sweep's: a writer slower than its marker.
-        monkeypatch.setattr(kv_module, "time", ThreadClock("slow writer", 700.0))
+        monkeypatch.setattr(engine_module, "time", ThreadClock("slow writer", 700.0))
         reached, release = threading.Event(), threading.Event()
         store.pause_after_batch(reached, release)
-        writer = threading.Thread(
-            target=quietly(v.commit, {"late": b"a very slow writer"}),
-            name="slow writer",
-        )
+        writer = threading.Thread(target=quietly(v.commit), name="slow writer")
         writer.start()
         try:
             assert reached.wait(5), "the writer never wrote its batch"
@@ -675,16 +692,17 @@ class TestPublishingUnderASweep:
 class TestTagTimes:
     def test_a_tag_records_when_it_landed_not_when_it_began_waiting(self):
         store = Memory()
-        v = VersionedKV(store)
-        v.commit({"k": b"v"})
+        v = worktree(store, codec="bytes")
+        v["k"] = b"v"
+        v.commit()
         ours = hold_lease(store, 60.0)
-        tagger = threading.Thread(target=lambda: v.tag("v1"))
+        tagger = threading.Thread(target=lambda: v.repo.tags.create("v1", v.head))
         tagger.start()
         time.sleep(0.3)
         released_at = time.time()
         release_lease(store, ours)
         tagger.join(timeout=10)
-        assert v.tag_info("v1").time >= released_at
+        assert v.repo.tags.info("v1").time >= released_at
 
 
 class TestSweepsBesideWriters:
@@ -695,25 +713,27 @@ class TestSweepsBesideWriters:
         store = Memory()
         branches = ["main", "b1", "b2"]
         for b in branches:
-            VersionedKV(store, branch=b)
+            worktree(store, b, codec="bytes")
         stop = threading.Event()
         counts: dict[tuple[int, str], int] = {}
         errors: list[BaseException] = []
 
         def writer(wid: int) -> None:
             try:
-                handles = {b: VersionedKV(store, branch=b) for b in branches}
+                repo = Repo(store, codec="bytes")
+                handles = {b: repo.worktree(b) for b in branches}
                 i = 0
                 while not stop.is_set():
                     b = branches[i % len(branches)]
                     n = counts.get((wid, b), 0) + 1
                     try:
-                        handles[b].commit(
+                        handles[b].update(
                             {
                                 f"w{wid}": str(n).encode(),
                                 f"w{wid}/blob{i % 5}": b"x" * (i % 7),
                             }
                         )
+                        handles[b].commit()
                     except ConcurrencyError:
                         # A lost race on the merge path; what an
                         # application does is refresh and try again.
@@ -747,16 +767,18 @@ class TestSweepsBesideWriters:
 
         assert not errors, errors
         assert sweeps > 1 and sum(counts.values()) > 10
+        repo = Repo(store, codec="bytes")
         for b in branches:
-            v = VersionedKV(store, branch=b)
-            for commit in v.history(all_parents=True):
+            for record in repo.log(branch=b):
+                commit = record.hash
                 root = root_of(store, commit)
                 assert root is not None, f"{b}: commit {commit} lost its root"
-                for entry in Keyset(store, root=root).materialize().values():
+                for entry in entries(store, commit).values():
                     assert store.get(entry.blob) is not None, f"{b}: blob gone"
+            tip = repo.snapshot(branch=b)
             for (wid, wb), n in counts.items():
                 if wb == b:
-                    assert v.get(f"w{wid}") == str(n).encode()
+                    assert tip.get(f"w{wid}") == str(n).encode()
 
 
 class SlowRemovalStore(LeaseHookStore):
@@ -823,7 +845,7 @@ class TestBranchRootWrites:
             resolved = _resolve_head(store, "revive")
             assert resolved == orphan, "branch 'revive' does not resolve"
             assert store.get(COMMIT_ROOT % orphan) is not None
-            Keyset(store, root=str(root_of(store, orphan))).walk()
+            node_hashes(store, orphan)
         assert worktree(store)["live"] == "keep me"
 
     def test_reset_to_a_swept_commit_reports_it_rather_than_dangling(self):

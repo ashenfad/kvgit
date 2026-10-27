@@ -122,7 +122,7 @@ class Op:
     """An operation of the core in progress, started by name with its
     arguments as a dict, or by ``Op.commit``. ``resume`` returns the next
     request as a tuple, to be answered by the next call, until it
-    returns ``("done", outcome, notes)``; see ``kvgit.versioned._drive``."""
+    returns ``("done", outcome, notes)``; see ``kvgit._drive``."""
 
     def __init__(self, name: str, args: dict[str, Any]) -> None: ...
     @staticmethod

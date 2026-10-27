@@ -5,9 +5,9 @@ import pickle
 from collections.abc import Callable
 from typing import Any
 
+from ._store import CHUNK_PREFIX
 from .codecs._hash import hash_bytes
 from .kv.base import KVStore
-from .versioned.kv import CHUNK_PREFIX
 
 CodecSpec = str | tuple[Callable[..., bytes], Callable[..., Any]]
 """``"pickle"``, ``"scientific"``, ``"bytes"``, or an ``(encoder, decoder)`` pair."""

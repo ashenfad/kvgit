@@ -17,18 +17,18 @@ np = pytest.importorskip("numpy")
 
 from support import worktree
 
+from kvgit import Repo
+from kvgit._store import (
+    BLOB_STORAGE_VERSION,
+    CHUNK_PREFIX,
+    CHUNK_STORAGE_VERSION,
+    STORAGE_VERSION_KEY,
+)
 from kvgit.codecs import compose
 from kvgit.codecs.numpy import NumpyCodec
 from kvgit.encoding import dumps, safe_loads
 from kvgit.errors import StorageVersionError
 from kvgit.kv.memory import Memory
-from kvgit.versioned.kv import (
-    BLOB_STORAGE_VERSION,
-    CHUNK_PREFIX,
-    CHUNK_STORAGE_VERSION,
-    STORAGE_VERSION_KEY,
-    VersionedKV,
-)
 
 
 def chunked_pair():
@@ -76,7 +76,7 @@ class TestUnsupportedVersion:
         store = Memory()
         store.set(STORAGE_VERSION_KEY, dumps(1))
         with pytest.raises(StorageVersionError, match="storage version"):
-            VersionedKV(store)
+            Repo(store, codec="bytes")
 
 
 class TestImportMigration:

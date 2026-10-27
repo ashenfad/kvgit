@@ -20,10 +20,10 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
 from . import _core
+from ._drive import drive
+from ._store import _call, _new_lease_owner, _stream, blob_key
 from .errors import BranchExistsError
 from .kv.base import KVStore
-from .versioned._drive import drive
-from .versioned.kv import _call, _new_lease_owner, _stream, blob_key
 
 SyncStatus = Literal[
     "up-to-date", "fast-forwarded", "pushed", "created", "diverged", "remote-gone"
