@@ -14,6 +14,7 @@ import {
   type MergeResult,
   type PostCheck,
 } from './types'
+import { ValueCache } from './valueCache'
 import { ROOT_COMMIT } from './versioned/layout'
 
 /** What a merge registration holds at the value level: a merge
@@ -92,7 +93,7 @@ export class Worktree<V = Uint8Array> {
   readonly #engine: Engine
   readonly #updates = new Map<string, V>()
   readonly #removals = new Set<string>()
-  readonly #cache = new Map<string, V>()
+  readonly #cache: ValueCache<V>
   readonly #mergeFns = new Map<string, MergeRule<V>>()
   readonly #mergePrefixes = new Map<string, MergeRule<V>>()
   #defaultMerge: MergeRule<V> | undefined
@@ -101,6 +102,17 @@ export class Worktree<V = Uint8Array> {
   constructor(repo: Repo<V>, engine: Engine) {
     this.repo = repo
     this.#engine = engine
+    this.#cache = new ValueCache<V>(repo.valueCacheBytes)
+  }
+
+  /**
+   * The values read at {@link head} that this worktree remembers, up
+   * to the repository's `valueCacheBytes`. Emptied whenever the head
+   * moves and by {@link discard}; `cache.clear()` lets them go without
+   * either. Pending changes are never held here.
+   */
+  get cache(): ValueCache<V> {
+    return this.#cache
   }
 
   /** Every worktree reads its keyset on demand. */
@@ -132,7 +144,7 @@ export class Worktree<V = Uint8Array> {
     const raw = (await this.#engine.getMany([key])).get(key)
     if (raw === undefined) return undefined
     const value = this.repo.codec.decode(raw)
-    this.#cache.set(key, value)
+    this.#cache.remember(key, value, raw.length)
     return value
   }
 
@@ -149,7 +161,7 @@ export class Worktree<V = Uint8Array> {
     if (fetch.length > 0) {
       for (const [key, raw] of await this.#engine.getMany(fetch)) {
         const value = this.repo.codec.decode(raw)
-        this.#cache.set(key, value)
+        this.#cache.remember(key, value, raw.length)
         out.set(key, value)
       }
     }

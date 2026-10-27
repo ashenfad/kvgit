@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **TypeScript's worktree values are bounded in bytes.** `valueCacheBytes` (32 MB per worktree by default, `0` holds none) bounds the decoded values each worktree remembers, least recently used first out, as Python's `value_cache_bytes` does; `wt.cache` is the `ValueCache`.
 - **Python resolves values it names.** `Repo.resolve(base, ours, theirs)` runs a branch merge's three-way resolve over caller-supplied values, and `Repo.merge_rule(key)` says which rule governs a key; `EMPTY_ROOT` is the root of an empty keyset.
 - **Python's `Repo` takes `now`.** The clock commit and tag times are read from and a sweep's `min_age` is measured by, as TypeScript's `now` is.
 - **TypeScript repositories cache what the store never rewrites.** Tree nodes and commit records are answered from a cache of `cacheBytes` (32 MB by default, 0 turns it off), as Python's are, and any writer's sweep empties it before the next commit builds.

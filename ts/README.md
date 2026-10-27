@@ -84,6 +84,12 @@ for await (const c of repo.log({ branch: 'main' })) console.log(c.hash, c.info)
   repository's content cache, and a commit rewrites only the paths it
   changes. The first `keys()` builds an index the later ones read.
   `lazy` is accepted and does nothing.
+- **Caches.** A repository remembers what its store never rewrites
+  (tree nodes, commit records) in a content cache of `cacheBytes`, and
+  each worktree remembers the values it reads in `wt.cache`, a
+  `ValueCache` of `valueCacheBytes` (32 MB each by default; `0` turns
+  either off). A value costing more than a quarter of its worktree's
+  budget is never held, and a worktree's values go when its head moves.
 - **`Snapshot`** is a read-only view pinned to one commit. It looks
   keys up in the tree a batch at a time, so reading a few keys stays
   cheap however many the commit holds; `raw` gives the stored bytes.

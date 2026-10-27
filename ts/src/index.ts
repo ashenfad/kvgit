@@ -17,6 +17,7 @@ export {
 } from './merges'
 export { type Opcode, type OpcodeTag, SequenceMatcher } from './sequenceMatcher'
 export { loadCore } from './core'
+export { DEFAULT_VALUE_CACHE_BYTES, ValueCache } from './valueCache'
 export { walkDelta, type WalkDeltaOptions } from './sync/walk'
 export {
   applyWire,
