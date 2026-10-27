@@ -13,7 +13,7 @@ import { writeFileSync } from 'node:fs'
 import { cpus, release, type } from 'node:os'
 import { parseArgs } from 'node:util'
 import { Memory } from '../ts/dist/backends/memory.js'
-import { Repo } from '../ts/dist/index.js'
+import { MemoryRemote, Repo, pullBranch, pushBranch } from '../ts/dist/index.js'
 
 const HOST = 'ts'
 
@@ -252,6 +252,49 @@ async function kvsql(results, entries, chunks, rounds) {
   results.add('kvsql.gc', [gcMs], { removed })
 }
 
+// --- Sync: a branch's history through a reference remote ---
+
+async function sync(results, files, commits, rounds) {
+  const origin = new Memory()
+  const wt = await (await Repo.open(origin)).worktree('main', { create: true })
+  for (let i = 0; i < files; i++) wt.set(filePath(i), fileBody(i))
+  await wt.commit({ info: { message: 'import' } })
+  for (let n = 0; n < commits; n++) {
+    wt.set(filePath(n % files), fileBody(n % files, 1 + n))
+    await wt.commit()
+  }
+
+  const pushes = []
+  const pulls = []
+  // Each round's remote has an id of its own: remotes without one share
+  // the branch's sync head, and the next would read as one it vanished
+  // from.
+  for (let r = 0; r < 3; r++) {
+    const remote = new MemoryRemote(new Memory(), { id: `history-${r}` })
+    pushes.push((await timed(() => pushBranch(origin, remote, 'main')))[0])
+    pulls.push((await timed(() => pullBranch(new Memory(), remote, 'main')))[0])
+  }
+  results.add('sync.push_history', pushes, { keys: files, commits: commits + 2 })
+  results.add('sync.pull_history', pulls)
+
+  // One commit at a time: pushed from the origin, pulled by a device
+  // that has the rest.
+  const remote = new MemoryRemote(new Memory(), { id: 'one' })
+  await pushBranch(origin, remote, 'main')
+  const device = new Memory()
+  await pullBranch(device, remote, 'main')
+  const pushOne = []
+  const pullOne = []
+  for (let n = 0; n < rounds * 4; n++) {
+    wt.set(filePath(n), fileBody(n, commits + 1 + n))
+    await wt.commit()
+    pushOne.push((await timed(() => pushBranch(origin, remote, 'main')))[0])
+    pullOne.push((await timed(() => pullBranch(device, remote, 'main')))[0])
+  }
+  results.add('sync.push_one', pushOne)
+  results.add('sync.pull_one', pullOne)
+}
+
 // --- The run ---
 
 function machine() {
@@ -272,6 +315,9 @@ if (args.only === undefined || args.only === 'world') {
 }
 if (args.only === undefined || args.only === 'kvsql') {
   await kvsql(results, args.quick ? 50 : 3_000, args.quick ? 2 : 8, rounds)
+}
+if (args.only === undefined || args.only === 'sync') {
+  await sync(results, args.quick ? 200 : 10_000, args.quick ? 20 : 500, rounds)
 }
 const report = {
   host: HOST,

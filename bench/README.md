@@ -20,7 +20,8 @@ uv run --extra dev python bench/kvgit_bench.py --json python.json
 python bench/table.py bench/baseline/python.json python.json
 ```
 
-`--only world` or `--only kvsql` runs one shape; `--quick` shrinks
+`--only world`, `--only kvsql` or `--only sync` runs one shape (sync
+is TypeScript's alone); `--quick` shrinks
 every workload to check a script runs.
 
 ## Workloads
@@ -63,6 +64,17 @@ hundred keys, beside a database snapshot in 8 MB chunks.
 | `kvsql.replay` | Reading every entry back along the log's first parents. |
 | `kvsql.merge` | A three-way merge of a branch that changed one key. |
 | `kvsql.gc` | A sweep reclaiming the deleted log: 3,000 commits and the snapshot. |
+
+**Sync's shape:** a branch of 10,000 files and 502 commits (the root,
+an import, and 500 commits changing one file each), through the
+reference remote. TypeScript only; Python's sync is internal.
+
+| workload | measures |
+|---|---|
+| `sync.push_history` | Pushing the whole branch to a remote that has none of it. |
+| `sync.pull_history` | Pulling it all into an empty store. |
+| `sync.push_one` | Pushing one more commit to a remote that has the rest. |
+| `sync.pull_one` | Pulling that commit into a store that has the rest. |
 
 ## Baseline
 
@@ -344,3 +356,32 @@ What it costs:
 
 Both measured the same way (`gzip -9`); the core now also carries refs,
 history, merges, GC, the content cache and the worktree model.
+
+## Sync
+
+Recorded with the sync stage's last PR: the wire walk and replay, sync
+heads and each pull's and push's decisions run in the core
+(`bench/sync/`). Each build was run twice, back to back with the
+write-protocol stage's, and each column is the faster of its two runs.
+
+**TypeScript** (`sync/ts.json`):
+
+| workload | before ms | after ms | after ÷ before |
+|---|---|---|---|
+| `sync.push_history` | 515.943 | 535.267 | 1.04× |
+| `sync.pull_history` | 521.766 | 564.747 | 1.08× |
+| `sync.push_one` | 0.367 | 0.408 | 1.11× |
+| `sync.pull_one` | 0.358 | 0.442 | 1.23× |
+
+Sync costs about what it did: a whole history moves 4 to 8% slower, and
+one commit takes a few hundredths of a millisecond more, the fixed
+cost of the calls into wasm that each pull and push now makes for its
+decisions and each commit for its replay.
+
+| | before | after |
+|---|---|---|
+| the wasm, bytes | 648,654 | 739,807 |
+| the wasm, gzipped | 221 KB | 241 KB |
+
+"Before" here is the engine stage's wasm; the core now also carries
+the ancestry searches, the wire walk and replay, and sync heads.

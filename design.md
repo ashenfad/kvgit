@@ -419,10 +419,16 @@ Made 2026-10-23:
   rewritten.
 - No Pyodide build of the Python package.
 
+Made 2026-10-26, with sync:
+
+- Python's sync stays internal in 0.5.0 (`kvgit._sync`, with a
+  reference remote), until a Python transport wants it.
+- Pre-v4 history doesn't sync. The replay recomputes every commit's
+  hash by v4's formula and refuses one that differs, and a pre-v4
+  commit carries 0.3's hash, made another way.
+
 ## Open questions
 
-- **Python sync API:** expose the wire walk and replay publicly in
-  0.5.0, or keep them internal until a transport wants them.
 - **Python's Composite backend** caches mutable keys per tier and has
   been a source of stale-HEAD bugs; it stays a host backend, but whether
   the content cache now covers its purpose is worth asking.

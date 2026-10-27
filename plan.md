@@ -133,8 +133,11 @@ own engine code; both suites and the corpus pass.
   heads and marks, `ancestryDelta`, `isAncestor` — in the core.
 - `PackRemote`, the pack format and `FakeGithub` stay in the TypeScript
   host, on the core's primitives.
-- Python gets the primitives; whether they are public in 0.5.0 is the
-  open question in the design.
+- Each pull's and push's decisions (fast-forward, created, diverged,
+  gone) are in the core too, as steps the host calls the remote
+  between.
+- Python gets the primitives, a reference remote and pull and push,
+  internal in 0.5.0 (`kvgit._sync`).
 - What TypeScript's sync still does itself goes with it: the lease
   helpers (`tryLand`, `waitForGc`, `inFlightMarker`), the ancestry
   walk, and the entry encoding its replay builds trees with.
@@ -142,6 +145,9 @@ own engine code; both suites and the corpus pass.
 **Exit:** the TypeScript sync suites and the corpus's sync scenarios
 pass, the latter in both hosts, and the live GitHub test against the
 scratch repository passes.
+
+Left for C7: TypeScript's `Keyset` and `Hamt` classes, with the entry
+encoding, are reached now only through `VersionedKV`, and go with it.
 
 ## C7. Public surface
 
