@@ -24,6 +24,7 @@ from kvgit import (
     Repo,
     Snapshot,
     Worktree,
+    _sync,
     recover_by_commit_scan,
 )
 from kvgit.kv.memory import Memory
@@ -180,6 +181,8 @@ class Run:
         self.scenario = scenario
         self.path = path
         self.store = PausableMemory()
+        self.stores: dict[str, PausableMemory] = {}
+        self.remotes: dict[str, _sync.MemoryRemote] = {}
         self.jobs: dict[str, _Job] = {}
         for key, value in (scenario.get("store") or {}).items():
             self.store.set(key, decode_bytes(value))
@@ -223,6 +226,14 @@ class Run:
     def match_sorted(self, what: str, expected: list, actual: Any) -> None:
         self.match(what, sorted(self.arg(e) for e in expected), sorted(actual))
 
+    def match_fields(self, what: str, expected: dict, actual: dict) -> None:
+        for field, want in expected.items():
+            got = actual[field]
+            if isinstance(want, dict) and got is not None:
+                self.match_fields(f"{what}.{field}", want, got)
+            else:
+                self.match(f"{what}.{field}", want, got)
+
     def match_map(self, what: str, expected: dict, actual: dict) -> None:
         if sorted(expected) != sorted(actual):
             raise ScenarioFailure(
@@ -232,6 +243,18 @@ class Run:
             self.match(f"{what} {name!r}", value, actual[name])
 
     # Handles
+
+    def store_of(self, step: dict) -> PausableMemory:
+        if "store" not in step:
+            return self.store
+        if step["store"] not in self.stores:
+            raise ScenarioFailure(f"no store {step['store']}")
+        return self.stores[step["store"]]
+
+    def remote(self, step: dict) -> _sync.MemoryRemote:
+        if step["remote"] not in self.remotes:
+            raise ScenarioFailure(f"no remote {step['remote']}")
+        return self.remotes[step["remote"]]
 
     def repo(self, step: dict) -> Repo:
         return self.repos[step["repo"]]
@@ -336,7 +359,9 @@ class Run:
                     )
                 for n, (e, a) in enumerate(zip(expected, actual, strict=True)):
                     self.match(f"log[{n}]", e, a)
-        elif op in ("branches", "tags"):
+        elif op in ("push", "pull", "sync", "delete_remote_branch"):
+            self.match_fields(op, expected, actual)
+        elif op in ("branches", "tags", "remote_refs"):
             self.match_map(op, expected, actual)
         elif op == "get_commit":
             for field in expected:
@@ -411,7 +436,7 @@ class Run:
                 raise ScenarioFailure(f"unknown recoverer {step['recover']!r}")
             options["recover_from_corrupt_head"] = recover_by_commit_scan
         self.repos[step["as"]] = Repo(
-            self.store, codec="bytes", **options, **rules(step)
+            self.store_of(step), codec="bytes", **options, **rules(step)
         )
 
     def op_worktree(self, step: dict) -> None:
@@ -547,11 +572,60 @@ class Run:
             wait=step.get("wait", True),
         )
 
+    def op_store(self, step: dict) -> None:
+        self.stores[step["as"]] = PausableMemory()
+
+    def op_remote(self, step: dict) -> None:
+        self.remotes[step["as"]] = _sync.MemoryRemote(Memory(), id=step.get("id"))
+
+    def op_push(self, step: dict) -> dict[str, Any]:
+        return _sync_result(
+            _sync.push_branch(self.store_of(step), self.remote(step), step["branch"])
+        )
+
+    def op_pull(self, step: dict) -> dict[str, Any]:
+        return _sync_result(
+            _sync.pull_branch(self.store_of(step), self.remote(step), step["branch"])
+        )
+
+    def op_sync(self, step: dict) -> dict[str, Any]:
+        outcome = _sync.sync_branch(
+            self.store_of(step), self.remote(step), step["branch"]
+        )
+        return {
+            "status": outcome.status,
+            "pull": _sync_result(outcome.pull),
+            "push": None if outcome.push is None else _sync_result(outcome.push),
+        }
+
+    def op_delete_remote_branch(self, step: dict) -> dict[str, Any]:
+        expected = self.arg(step["expected"]) if "expected" in step else None
+        result = _sync.delete_remote_branch(
+            self.store_of(step), self.remote(step), step["branch"], expected=expected
+        )
+        return {"status": result.status, "remote_head": result.remote_head}
+
+    def op_remote_refs(self, step: dict) -> dict[str, str]:
+        return {r.branch: r.head for r in self.remote(step).list_refs()}
+
     def op_store_set(self, step: dict) -> None:
-        self.store.set(self.interpolate(step["key"]), decode_bytes(step["value"]))
+        self.store_of(step).set(
+            self.interpolate(step["key"]), decode_bytes(step["value"])
+        )
 
     def op_store_delete(self, step: dict) -> None:
-        self.store.remove(self.interpolate(step["key"]))
+        self.store_of(step).remove(self.interpolate(step["key"]))
+
+
+def _sync_result(r: _sync.SyncResult) -> dict[str, Any]:
+    """A sync result as a scenario names its fields."""
+    return {
+        "status": r.status,
+        "branch": r.branch,
+        "local_head": r.local_head,
+        "remote_head": r.remote_head,
+        "transferred": r.transferred,
+    }
 
 
 def load(path: Path) -> dict:

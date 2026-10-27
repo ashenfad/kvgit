@@ -14,7 +14,7 @@ use crate::layout::commit_root;
 use crate::machine::{Io, Machine};
 use crate::refs::{self, Ref};
 use crate::store::{dumps_str, loads_str};
-use crate::synced::{self, Owner};
+use crate::synced::{self, Owner, PullPlan, PushPlan};
 use crate::version;
 use crate::wire;
 use crate::worktree;
@@ -77,6 +77,15 @@ pub type Op = Machine<Done<Out>>;
 /// - `publish_head {branch, expected, head, in_flight}`: whether the
 ///   branch moved from `expected` (null: was created) to `head`, a
 ///   commit that must be in the store.
+/// - `pull_plan {branch, remote, remote_head}`: `{local_head, status,
+///   have}`, with `status` null when the pull fetches against `have`.
+/// - `pull_finish {branch, remote, remote_head, local_head, in_flight}`:
+///   `{status, local_head}` once the fetch has landed.
+/// - `push_start {branch, remote}`: `{local_head, sync_head}` of a
+///   branch that must exist, marked syncing.
+/// - `push_plan {branch, remote, local_head, sync_head, remote_head}`:
+///   `{status, expected, have}`, with `status` null when the push sends
+///   against `have`, moving the remote's ref from `expected`.
 /// - `wire_walk {want, have}`: emits the commits reachable from `want`
 ///   and from none of `have`, parents first, each as `{hash, parents,
 ///   parent_gens, time, info, updates, removals}` (see [`wire::walk`]);
@@ -133,6 +142,10 @@ pub const NAMES: &[&str] = &[
     "has_sync_head",
     "delete_branch_unless_synced",
     "publish_head",
+    "pull_plan",
+    "pull_finish",
+    "push_start",
+    "push_plan",
     "wire_walk",
     "wire_replay",
     "check_version",
@@ -245,6 +258,14 @@ fn resolved(r: Resolved) -> Value {
         ("commit".into(), Value::Str(r.commit)),
         ("root".into(), opt_str(r.root)),
     ])
+}
+
+/// A string argument that may be null.
+fn opt_text<'a>(args: &'a Value, name: &str) -> Result<Option<&'a str>, Error> {
+    match arg(args, name)? {
+        Value::Null => Ok(None),
+        _ => text(args, name).map(Some),
+    }
 }
 
 fn texts(args: &Value, name: &str) -> Result<Vec<String>, Error> {
@@ -572,10 +593,7 @@ async fn run(io: &Io, name: &str, args: &Value, notes: &mut Notes) -> Result<Val
             Value::Bool(synced::delete_branch_unless_synced(io, text(args, "name")?).await?)
         }
         "publish_head" => {
-            let expected = match arg(args, "expected")? {
-                Value::Null => None,
-                _ => Some(text(args, "expected")?),
-            };
+            let expected = opt_text(args, "expected")?;
             Value::Bool(
                 synced::publish_head(
                     io,
@@ -586,6 +604,64 @@ async fn run(io: &Io, name: &str, args: &Value, notes: &mut Notes) -> Result<Val
                 )
                 .await?,
             )
+        }
+        "pull_plan" => {
+            let remote_head = opt_text(args, "remote_head")?;
+            let branch = text(args, "branch")?;
+            let (local, plan) =
+                synced::pull_plan(io, branch, owner(args, "remote")?, remote_head).await?;
+            let (status, have) = match plan {
+                PullPlan::Done(status) => (Value::Str(status.into()), vec![]),
+                PullPlan::Fetch { have } => (Value::Null, have),
+            };
+            Value::Object(vec![
+                ("local_head".into(), opt_str(local)),
+                ("status".into(), status),
+                ("have".into(), strings(have)),
+            ])
+        }
+        "pull_finish" => {
+            let (status, local) = synced::pull_finish(
+                io,
+                text(args, "branch")?,
+                owner(args, "remote")?,
+                text(args, "remote_head")?,
+                opt_text(args, "local_head")?,
+                &texts(args, "in_flight")?,
+            )
+            .await?;
+            Value::Object(vec![
+                ("status".into(), Value::Str(status.into())),
+                ("local_head".into(), opt_str(local)),
+            ])
+        }
+        "push_start" => {
+            let (local, synced) =
+                synced::push_start(io, text(args, "branch")?, owner(args, "remote")?).await?;
+            Value::Object(vec![
+                ("local_head".into(), Value::Str(local)),
+                ("sync_head".into(), opt_str(synced)),
+            ])
+        }
+        "push_plan" => {
+            let plan = synced::push_plan(
+                io,
+                text(args, "branch")?,
+                owner(args, "remote")?,
+                text(args, "local_head")?,
+                opt_text(args, "sync_head")?,
+                opt_text(args, "remote_head")?,
+            )
+            .await?;
+            let (status, expected, have) = match plan {
+                PushPlan::Done(status) => (Value::Str(status.into()), None, vec![]),
+                PushPlan::Send { expected, have } => (Value::Null, expected, have),
+            };
+            Value::Object(vec![
+                ("status".into(), status),
+                ("expected".into(), opt_str(expected)),
+                ("have".into(), strings(have)),
+            ])
         }
         "wire_walk" => {
             wire::walk(io, text(args, "want")?, &texts(args, "have")?).await?;

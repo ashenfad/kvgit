@@ -10,7 +10,15 @@
 //!
 //! A branch's sync mark says it syncs somewhere: a push sets it before
 //! reading the branch, and it goes with the branch's last sync head.
+//!
+//! Pulls and pushes move a ref only along its own history: local on a
+//! pull, the remote's on a push. When both sides hold commits the other
+//! lacks, the branch is diverged, and no ref moves; merging is a local
+//! act, after which the branch syncs again. A remote ref that vanished
+//! after a sync is reported, not recreated. The host calls the remote
+//! between the steps here.
 
+use crate::ancestry;
 use crate::error::Error;
 use crate::json::Value;
 use crate::layout::{
@@ -254,5 +262,186 @@ pub async fn publish_head(
         if let Some(landed) = try_land(io, lease, cas).await? {
             return Ok(landed);
         }
+    }
+}
+
+/// The commit a branch's head names, read plainly: no backup, no
+/// recovery, and `None` for a head that isn't a string. A sync reports
+/// a damaged head rather than repairing it.
+async fn read_branch_head(io: &Io, branch: &str) -> Result<Option<String>, Error> {
+    read_head(io, &branch_head(branch)).await
+}
+
+async fn is_present(io: &Io, commit: &str) -> Result<bool, Error> {
+    Ok(io.get_one(&commit_root(commit)).await?.is_some())
+}
+
+/// Whether the remote's head is here, with its root, and in `local`'s
+/// history: a commit whose root is gone isn't shared, whatever its
+/// parent records say, so a pull fetches the remote's copy.
+async fn in_history(io: &Io, remote_head: &str, local: &str) -> Result<bool, Error> {
+    Ok(is_present(io, remote_head).await? && ancestry::is_ancestor(io, remote_head, local).await?)
+}
+
+/// What a pull does after reading the remote's head.
+#[derive(Debug, PartialEq)]
+pub enum PullPlan {
+    /// Nothing to fetch: the pull's status.
+    Done(&'static str),
+    /// Fetch the commits reachable from the remote's head and from none
+    /// of `have`, then finish.
+    Fetch { have: Vec<String> },
+}
+
+/// Decide a pull of `branch` from the remote `owner`, whose head for it
+/// is `remote_head`. With no remote head, the branch is gone there if
+/// it ever synced, else there is nothing to pull. A remote head that is
+/// the local one, or in its history, is up to date, and recorded as
+/// shared. Otherwise the remote's commits are fetched against what this
+/// store can claim: its head, and the sync head while its commits are
+/// still here.
+pub async fn pull_plan(
+    io: &Io,
+    branch: &str,
+    owner: Owner<'_>,
+    remote_head: Option<&str>,
+) -> Result<(Option<String>, PullPlan), Error> {
+    check_branch_name(branch)?;
+    let local = read_branch_head(io, branch).await?;
+    let synced = claim_sync_head(io, branch, owner).await?;
+    let Some(remote_head) = remote_head else {
+        let status = if synced.is_some() {
+            "remote-gone"
+        } else {
+            "up-to-date"
+        };
+        return Ok((local, PullPlan::Done(status)));
+    };
+    let shared = match &local {
+        Some(local) => local == remote_head || in_history(io, remote_head, local).await?,
+        None => false,
+    };
+    if shared {
+        if synced.as_deref() != Some(remote_head) {
+            set_sync_head(io, branch, remote_head, owner).await?;
+        }
+        return Ok((local, PullPlan::Done("up-to-date")));
+    }
+    let mut have: Vec<String> = local.iter().cloned().collect();
+    if let Some(synced) = synced
+        && local.as_ref() != Some(&synced)
+        && is_present(io, &synced).await?
+    {
+        have.push(synced);
+    }
+    Ok((local, PullPlan::Fetch { have }))
+}
+
+/// Finish a pull once the remote's commits are here: create the branch
+/// at the remote's head, or fast-forward it there when its head is in
+/// the remote head's history, publishing `in_flight` with it. A branch
+/// that moved meanwhile, or that both sides moved, is diverged and
+/// stays put. The status and the branch's head after.
+pub async fn pull_finish(
+    io: &Io,
+    branch: &str,
+    owner: Owner<'_>,
+    remote_head: &str,
+    local: Option<&str>,
+    in_flight: &[String],
+) -> Result<(&'static str, Option<String>), Error> {
+    // A fetch checks every commit it brings, but one that brings
+    // nothing checks nothing: the head must be here before a ref names
+    // it.
+    if !is_present(io, remote_head).await? {
+        return Err(Error::Integrity(format!(
+            "the fetched head {remote_head} is not present after the fetch"
+        )));
+    }
+    let status = match local {
+        None => Some("created"),
+        Some(local) if ancestry::is_ancestor(io, local, remote_head).await? => {
+            Some("fast-forwarded")
+        }
+        Some(_) => None,
+    };
+    // Diverged, or another writer moved the branch first: report where
+    // the branch is now.
+    let Some(status) = status else {
+        return Ok(("diverged", read_branch_head(io, branch).await?));
+    };
+    if !publish_head(io, branch, local, remote_head, in_flight).await? {
+        return Ok(("diverged", read_branch_head(io, branch).await?));
+    }
+    set_sync_head(io, branch, remote_head, owner).await?;
+    Ok((status, Some(remote_head.to_string())))
+}
+
+/// Begin a push of `branch` to `owner`: mark it syncing, then read its
+/// head, so a delete unless synced either lands first and there is no
+/// branch to push, or sees the mark and keeps it. The head and the
+/// sync head.
+pub async fn push_start(
+    io: &Io,
+    branch: &str,
+    owner: Owner<'_>,
+) -> Result<(String, Option<String>), Error> {
+    check_branch_name(branch)?;
+    let gone = || Error::UnknownBranch {
+        branch: branch.to_string(),
+    };
+    if read_branch_head(io, branch).await?.is_none() {
+        return Err(gone());
+    }
+    mark_syncing(io, branch).await?;
+    let local = read_branch_head(io, branch).await?.ok_or_else(gone)?;
+    let synced = claim_sync_head(io, branch, owner).await?;
+    Ok((local, synced))
+}
+
+/// What a push does after reading the remote's head.
+#[derive(Debug, PartialEq)]
+pub enum PushPlan {
+    /// Nothing to send: the push's status.
+    Done(&'static str),
+    /// Send the commits reachable from the local head and from none of
+    /// `have`, moving the remote's ref from `expected` (`None`: create
+    /// it).
+    Send {
+        expected: Option<String>,
+        have: Vec<String>,
+    },
+}
+
+/// Decide a push of `local`, the branch's head, to the remote `owner`,
+/// whose head for it is `remote_head`. A remote at the local head is up
+/// to date; one without the branch gets it, unless it had it once (it
+/// was deleted there); one whose head is in the local head's history
+/// is moved along it. Any other remote head is diverged.
+pub async fn push_plan(
+    io: &Io,
+    branch: &str,
+    owner: Owner<'_>,
+    local: &str,
+    synced: Option<&str>,
+    remote_head: Option<&str>,
+) -> Result<PushPlan, Error> {
+    match remote_head {
+        Some(remote_head) if remote_head == local => {
+            if synced != Some(local) {
+                set_sync_head(io, branch, local, owner).await?;
+            }
+            Ok(PushPlan::Done("up-to-date"))
+        }
+        None if synced.is_some() => Ok(PushPlan::Done("remote-gone")),
+        None => Ok(PushPlan::Send {
+            expected: None,
+            have: vec![],
+        }),
+        Some(remote_head) if in_history(io, remote_head, local).await? => Ok(PushPlan::Send {
+            expected: Some(remote_head.to_string()),
+            have: vec![remote_head.to_string()],
+        }),
+        Some(_) => Ok(PushPlan::Done("diverged")),
     }
 }

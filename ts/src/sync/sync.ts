@@ -27,18 +27,13 @@
  */
 
 import type { KVStore, WireCommit } from '../types'
-import { isAncestor } from '../versioned/ancestry'
-import { COMMIT_ROOT, readBranchHead } from '../versioned/layout'
-import {
-  applyWire,
-  claimSyncHead,
-  clearSyncHead,
-  markSyncing,
-  publishHead,
-  setSyncHead,
-} from './apply'
+import { callCore } from '../versioned/drive'
+import { rejectReservedBranch } from '../versioned/refs'
+import { applyWire, claimSyncHead, clearSyncHead, setSyncHead } from './apply'
 import type { Remote } from './remote'
 import { walkDelta } from './walk'
+
+const wallClock = (): number => Date.now() / 1000
 
 export type SyncStatus =
   | 'up-to-date'
@@ -51,7 +46,8 @@ export type SyncStatus =
 export interface SyncResult {
   status: SyncStatus
   branch: string
-  /** Local branch head after the operation (null = branch absent). */
+  /** A pull's local head after it (null = branch absent); a push's,
+   *  the head it read and sent, whatever a local writer did since. */
   localHead: string | null
   /** Remote branch head as last observed (null = ref absent). */
   remoteHead: string | null
@@ -68,6 +64,15 @@ export interface SyncOutcome {
   push: SyncResult | null
 }
 
+/** The remote a sync head belongs to, as the core takes it. */
+function remoteArg(remote: Remote): { id: string | null } {
+  return { id: remote.id ?? null }
+}
+
+async function call(op: string, store: KVStore, args: object): Promise<unknown> {
+  return callCore(op, args, { store, now: wallClock })
+}
+
 /**
  * Pull `branch` from `remote`: fetch missing commits and fast-forward
  * (or create) the local branch ref.
@@ -78,171 +83,75 @@ export async function pullBranch(
   branch: string,
 ): Promise<SyncResult> {
   const remoteHead = await readRemoteHead(remote, branch)
-  const localHead = await readBranchHead(store, branch)
-  const syncHead = await claimSyncHead(store, branch, remote)
-  const result = (status: SyncStatus, transferred = 0): SyncResult => ({
-    status,
+  const plan = (await call('pull_plan', store, {
     branch,
-    localHead,
+    remote: remoteArg(remote),
+    remote_head: remoteHead,
+  })) as { local_head: string | null; status: SyncStatus | null; have: string[] }
+  const localHead = plan.local_head
+  if (plan.status !== null || remoteHead === null) {
+    return { status: plan.status ?? 'up-to-date', branch, localHead, remoteHead, transferred: 0 }
+  }
+  const applied = await applyWire(store, remote.fetch(remoteHead, plan.have))
+  const done = (await call('pull_finish', store, {
+    branch,
+    remote: remoteArg(remote),
+    remote_head: remoteHead,
+    local_head: localHead,
+    in_flight: [...applied.inFlight],
+  })) as { status: SyncStatus; local_head: string | null }
+  return {
+    status: done.status,
+    branch,
+    localHead: done.local_head,
     remoteHead,
-    transferred,
-  })
-
-  if (remoteHead === null) {
-    // Nothing remote: a prior sync means the ref was deleted/archived
-    // elsewhere; otherwise there's simply nothing to pull.
-    return syncHead !== null ? result('remote-gone') : result('up-to-date')
+    transferred: applied.applied,
   }
-  if (remoteHead === localHead) {
-    if (syncHead !== remoteHead) await setSyncHead(store, branch, remoteHead, remote)
-    return result('up-to-date')
-  }
-
-  // Local strictly ahead (remote head already in our ancestry):
-  // nothing to pull — advancing the remote is pushBranch's job. The
-  // remote head is observably shared, so the tracking state may
-  // advance to it.
-  if (
-    localHead !== null &&
-    (await store.get(COMMIT_ROOT(remoteHead))) !== null &&
-    (await isAncestor(store, remoteHead, localHead))
-  ) {
-    if (syncHead !== remoteHead) await setSyncHead(store, branch, remoteHead, remote)
-    return result('up-to-date')
-  }
-
-  // Fetch the delta relative to everything we can claim: not the sync
-  // head of a branch deleted here, once a sweep took its commits.
-  const have: string[] = []
-  if (localHead !== null) have.push(localHead)
-  if (
-    syncHead !== null &&
-    syncHead !== localHead &&
-    (await store.get(COMMIT_ROOT(syncHead))) !== null
-  ) {
-    have.push(syncHead)
-  }
-  const applied = await applyWire(store, remote.fetch(remoteHead, have))
-
-  // applyWire verifies every commit IN the stream, but an empty or
-  // truncated stream verifies vacuously — guard the head's presence
-  // before any ref moves, or a hollow fetch would mint a branch
-  // pointing at nothing (mirrors MemoryRemote.push's guard).
-  if ((await store.get(COMMIT_ROOT(remoteHead))) === null) {
-    throw new Error(`pullBranch: fetched head ${remoteHead} not present after apply`)
-  }
-
-  const publish = { inFlight: applied.inFlight }
-  if (localHead === null) {
-    const ok = await publishHead(store, branch, null, remoteHead, publish)
-    if (!ok) return result('diverged', applied.applied) // local creation race
-    await setSyncHead(store, branch, remoteHead, remote)
-    return { ...result('created', applied.applied), localHead: remoteHead }
-  }
-
-  if (await isAncestor(store, localHead, remoteHead)) {
-    // Fast-forward: HEAD and its backup in one conditional write, as
-    // VersionedKV's casHead does, so a pull that loses the race to a
-    // local writer changes nothing.
-    const ok = await publishHead(store, branch, localHead, remoteHead, publish)
-    if (!ok) return result('diverged', applied.applied) // local writer race
-    await setSyncHead(store, branch, remoteHead, remote)
-    return { ...result('fast-forwarded', applied.applied), localHead: remoteHead }
-  }
-
-  // Both sides advanced. Objects are stored (handy for a later
-  // merge); refs and sync head stay put.
-  return result('diverged', applied.applied)
 }
 
 /**
  * Push `branch` to `remote`: send missing commits and fast-forward
  * (or create) the remote branch ref via CAS.
+ *
+ * @throws UnknownBranchError if there is no such local branch.
  */
 export async function pushBranch(
   store: KVStore,
   remote: Remote,
   branch: string,
 ): Promise<SyncResult> {
-  if ((await readBranchHead(store, branch)) === null) {
-    throw new Error(`pushBranch: local branch '${branch}' does not exist`)
+  const start = (await call('push_start', store, { branch, remote: remoteArg(remote) })) as {
+    local_head: string
+    sync_head: string | null
   }
-  // marked before the head is read: a delete unless synced lands before
-  // (and the branch is gone) or keeps it
-  await markSyncing(store, branch)
-  const localHead = await readBranchHead(store, branch)
-  if (localHead === null) {
-    throw new Error(`pushBranch: local branch '${branch}' was deleted`)
-  }
-  const syncHead = await claimSyncHead(store, branch, remote)
-
+  const localHead = start.local_head
   // One retry: a lost CAS means the remote moved under us; re-observe
-  // and re-classify once before declaring divergence. Hoisted so the
-  // exhausted-retries return reuses the last observation instead of a
-  // third listRefs round trip (slightly stale is fine for a report).
+  // and re-classify once before declaring divergence. The last
+  // observation stands in the report after that.
   let remoteHead: string | null = null
+  // Commits sent, over every attempt: a remote may keep what a push
+  // that lost its compare-and-swap sent.
+  const counter = { n: 0 }
   for (let attempt = 0; attempt < 2; attempt++) {
     remoteHead = await readRemoteHead(remote, branch)
-    const result = (status: SyncStatus, transferred = 0): SyncResult => ({
-      status,
+    const plan = (await call('push_plan', store, {
       branch,
-      localHead,
-      remoteHead,
-      transferred,
-    })
-
-    if (remoteHead === localHead) {
-      if (syncHead !== localHead) await setSyncHead(store, branch, localHead, remote)
-      return result('up-to-date')
+      remote: remoteArg(remote),
+      local_head: localHead,
+      sync_head: start.sync_head,
+      remote_head: remoteHead,
+    })) as { status: SyncStatus | null; expected: string | null; have: string[] }
+    if (plan.status !== null) {
+      return { status: plan.status, branch, localHead, remoteHead, transferred: counter.n }
     }
-
-    if (remoteHead === null) {
-      if (syncHead !== null) return result('remote-gone')
-      const counter = { n: 0 }
-      const ok = await remote.push(
-        branch,
-        null,
-        localHead,
-        counted(walkDelta(store, { want: localHead }), counter),
-      )
-      if (ok) {
-        await setSyncHead(store, branch, localHead, remote)
-        return result('created', counter.n)
-      }
-      continue // creation race — re-classify
+    const commits = counted(walkDelta(store, { want: localHead, have: plan.have }), counter)
+    if (await remote.push(branch, plan.expected, localHead, commits)) {
+      await setSyncHead(store, branch, localHead, remote)
+      const status = plan.expected === null ? 'created' : 'pushed'
+      return { status, branch, localHead, remoteHead, transferred: counter.n }
     }
-
-    // Remote moved past our tracking: safe only if its head is
-    // already in our ancestry (e.g. another device pushed, we pulled,
-    // then committed on top — or a sibling tab pushed for us).
-    if (
-      (await store.get(COMMIT_ROOT(remoteHead))) !== null &&
-      (await isAncestor(store, remoteHead, localHead))
-    ) {
-      const counter = { n: 0 }
-      const ok = await remote.push(
-        branch,
-        remoteHead,
-        localHead,
-        counted(walkDelta(store, { want: localHead, have: [remoteHead] }), counter),
-      )
-      if (ok) {
-        await setSyncHead(store, branch, localHead, remote)
-        return result('pushed', counter.n)
-      }
-      continue // CAS race — re-classify
-    }
-
-    return result('diverged')
   }
-
-  return {
-    status: 'diverged',
-    branch,
-    localHead,
-    remoteHead,
-    transferred: 0,
-  }
+  return { status: 'diverged', branch, localHead, remoteHead, transferred: counter.n }
 }
 
 /**
@@ -286,8 +195,9 @@ export interface DeleteResult {
  * name creates it afresh rather than reporting `'remote-gone'`. The
  * local branch is left alone.
  *
- * @throws if the remote can't delete branches, or the branch never
- *   synced with it and no `expected` is given.
+ * @throws RangeError for a name a branch can't have; Error if the
+ *   remote can't delete branches, or the branch never synced with it and
+ *   no `expected` is given.
  */
 export async function deleteRemoteBranch(
   store: KVStore,
@@ -295,6 +205,7 @@ export async function deleteRemoteBranch(
   branch: string,
   opts: { expected?: string } = {},
 ): Promise<DeleteResult> {
+  await rejectReservedBranch(branch)
   if (remote.deleteBranch === undefined) {
     throw new Error("deleteRemoteBranch: this remote can't delete branches")
   }

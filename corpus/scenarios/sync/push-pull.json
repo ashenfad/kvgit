@@ -1,6 +1,5 @@
 {
   "description": "Two devices sharing a branch through a remote (a result's remote_head is the head seen before it moved, and a first transfer carries the root commit too): a push that creates the remote branch, a pull that creates it on the other device, a push from there, a fast-forwarding pull back, and syncs with nothing to do.",
-  "only": ["ts"],
   "clock": 1700004000.5,
   "steps": [
     { "op": "remote", "as": "origin", "id": "origin" },

@@ -1,6 +1,5 @@
 {
   "description": "Deleting a remote branch only if nobody pushed since this device last synced: refused once another device moved it, done after pulling, already gone the second time; pushing the name again creates it afresh.",
-  "only": ["ts"],
   "clock": 1700004200.75,
   "steps": [
     { "op": "remote", "as": "origin", "id": "origin" },
