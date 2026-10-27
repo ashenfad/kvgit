@@ -9,7 +9,7 @@ import {
   UnknownCommitError,
   jsonCodec,
 } from '../src/index'
-import { VersionedKV, mergeBase } from '../src/versioned/kv'
+import { mergeBase } from '../src/versioned/kv'
 import { PARENT_GENS } from '../src/versioned/layout'
 
 /** A JSON repo with `main` holding `seed`, and a clock the test moves. */
@@ -260,17 +260,19 @@ describe('Worktree.apply, cherryPick and revert', () => {
 describe('the engine checks the commits it is handed', () => {
   it('refuses an unknown commit to apply or merge, rather than reading it as empty', async () => {
     const store = new Memory()
-    const engine = await VersionedKV.open(store)
-    await engine.commit({ updates: new Map([['k', new Uint8Array([1])]]) })
-    const known = engine.currentCommit
+    const repo = await Repo.open(store)
+    const wt = await repo.worktree('main', { create: true })
+    wt.set('k', new Uint8Array([1]))
+    await wt.commit()
+    const known = wt.head
     const missing = 'f'.repeat(40)
 
-    await expect(engine.applyChange(known, missing)).rejects.toThrow(UnknownCommitError)
-    await expect(engine.applyChange(missing, known)).rejects.toThrow(UnknownCommitError)
-    await expect(engine.mergeHeads(missing)).rejects.toThrow(UnknownCommitError)
+    await expect(wt.apply(known, missing)).rejects.toThrow(UnknownCommitError)
+    await expect(wt.apply(missing, known)).rejects.toThrow(UnknownCommitError)
+    await expect(wt.merge({ commit: missing })).rejects.toThrow(UnknownCommitError)
     // Nothing was published.
-    expect(await engine.latestHead()).toBe(known)
-    expect(await engine.get('k')).toEqual(new Uint8Array([1]))
+    expect(await repo.branches.get('main')).toBe(known)
+    expect(await wt.get('k')).toEqual(new Uint8Array([1]))
   })
 })
 

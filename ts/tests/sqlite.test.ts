@@ -114,30 +114,29 @@ describe('Sqlite — bulk ops are transactional', () => {
   })
 })
 
-describe('Sqlite — end-to-end VersionedKV over Sqlite (file-backed)', () => {
-  it('VersionedKV state survives close + reopen', async () => {
-    const { VersionedKV } = await import('../src/versioned/kv')
-    const { Staged } = await import('../src/staged')
+describe('Sqlite — end-to-end Repo over Sqlite (file-backed)', () => {
+  it('repository state survives close + reopen', async () => {
+    const { Repo } = await import('../src/repo')
 
     const path = await freshTempPath()
     const db1 = await Sqlite.open({ path })
     openHandles.push(db1)
 
-    const vk1 = await VersionedKV.open(db1)
-    const s1 = new Staged(vk1)
-    s1.set('greeting', 'hello sqlite')
-    await s1.commit({ info: { author: 'a' } })
-    const head = vk1.currentCommit
+    const repo1 = await Repo.open<string>(db1, { codec: 'json' })
+    const wt1 = await repo1.worktree('main', { create: true })
+    wt1.set('greeting', 'hello sqlite')
+    await wt1.commit({ info: { author: 'a' } })
+    const head = wt1.head
     db1.close()
     openHandles.length = 0
 
     const db2 = await Sqlite.open({ path })
     openHandles.push(db2)
-    const vk2 = await VersionedKV.open(db2)
-    expect(vk2.currentCommit).toBe(head)
-    const s2 = new Staged(vk2)
-    expect(await s2.get<string>('greeting')).toBe('hello sqlite')
-    expect(await vk2.commitInfo()).toEqual({ author: 'a' })
+    const repo2 = await Repo.open<string>(db2, { codec: 'json' })
+    const wt2 = await repo2.worktree('main')
+    expect(wt2.head).toBe(head)
+    expect(await wt2.get('greeting')).toBe('hello sqlite')
+    expect((await repo2.getCommit(wt2.head)).info).toEqual({ author: 'a' })
   })
 })
 

@@ -3,8 +3,8 @@
  * writes them.
  *
  * The single source of truth for the reserved keys, how blobs and
- * commits are named, and how records are encoded. `VersionedKV` writes
- * commits through it and the sync layer moves them through it, so a
+ * commits are named, and how records are encoded. The core writes
+ * commits by the same rules and the sync layer moves them through it, so a
  * layout change breaks loudly in one place.
  *
  *   `__kvgit_version__`              — storage version sentinel (4)
@@ -18,7 +18,7 @@
  *   `__tag_info__<tag>`              — a tag's creation time and info
  *   `__gc_lease__`                   — the lease a sweep runs under
  *   `__inflight__<commit>`           — a written, not yet published commit
- *   `kvgit:keyset:<node_hash>`       — HAMT node bytes (via Keyset)
+ *   `kvgit:keyset:<node_hash>`       — HAMT node bytes
  *   `kvgit:blob:<sha256>`            — blob bytes, keyed by content
  *
  * Everything below a commit is keyed by content: a blob by the SHA-256
@@ -72,6 +72,10 @@ export const TAG_BRANCH_PREFIX = 'refs/tags/'
 
 /** Length of a commit hash in hex chars (sha-256 truncated to 40). */
 export const COMMIT_HASH_LEN = 40
+
+/** The root of an empty keyset: the hash of the empty leaf,
+ *  `{"items":{},"kind":"leaf"}`, which is never itself written. */
+export const EMPTY_HASH = 'a01262f23a252767acf71bcd9d1ca8deca5fda1519228657ef7d44990698fd30'
 
 /** Hash of every branch's initial empty commit. Fixed rather than
  *  derived, so any two branches share it as an ancestor whichever
@@ -187,8 +191,7 @@ export function generationOf(parentGens: readonly number[]): number {
 /**
  * Read a branch's HEAD commit hash, or null if absent/malformed.
  *
- * Plain read — no prev-HEAD recovery (that's `VersionedKV.open`'s
- * job). For the sync layer, a corrupt head reads as "no head" and the
+ * Plain read — no prev-HEAD recovery (that's the worktree's job). For the sync layer, a corrupt head reads as "no head" and the
  * orchestration surfaces it rather than repairing it.
  */
 export async function readBranchHead(store: KVStore, branch: string): Promise<string | null> {

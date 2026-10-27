@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Python syncs, internally.** `kvgit._sync` pushes, pulls and syncs branches with a remote as TypeScript does, from the same core, with a reference `MemoryRemote`; it isn't public API yet.
 
 ### Changed
+- **Breaking (TypeScript): the engine layer leaves the exports.** `VersionedKV`, `VersionedBase`, `Staged`, `jsonEncoder`/`jsonDecoder`, `Hamt`, `Keyset`, `NodeCache`, `encodeEntry`/`decodeEntry`, `resolveMerge`, `pickMergePolicy`, `diffKeysets` and `walkHistory` go with their types; so do `Repo.nodeCache` and `Worktree.nodeCache`, and `lazy` takes only a boolean.
+- **Breaking (TypeScript): `Namespaced` wraps a worktree.** Its `delete`, `keys` and `descendantKeys` are async (`Promise<boolean>`, `Promise<string[]>`), as a `Worktree`'s are.
 - **Breaking (Python): the IndexedDB backend is gone.** `kvgit.kv.indexeddb`, `kvgit.open("indexeddb")` and its `db_name` go, with the Pyodide guide; browsers use the TypeScript package.
 - **Breaking (Python): `kvgit.versioned` and `kvgit.hamt` are gone.** `VersionedKV`, `VersionedBase`, `Keyset`, `Hamt`, `resolve_merge` and `pick_merge_policy` leave with them; `Repo` and `Worktree` are the API, and `MergeChoice`, `MergeResult`, `DiffResult`, `TagInfo` and `MergePolicy` are imported from `kvgit`.
 - **Breaking (Python): stores stamped v2 or v3 are refused.** Opening or sweeping one raises `StorageVersionError`, as TypeScript did; the objects an older kvgit wrote still read once a store's stamp is v4.

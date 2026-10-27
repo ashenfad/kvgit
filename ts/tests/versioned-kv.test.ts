@@ -3,13 +3,16 @@ import { Memory } from '../src/backends/memory'
 import {
   type BytesMergeFn,
   ConcurrencyError,
+  type KVStore,
   MergeConflict,
+  type MergeResult,
+  Repo,
   UnknownBranchError,
-  VersionedKV,
+  type Worktree,
+  type WorktreeCommitOptions,
 } from '../src/index'
-import { Keyset } from '../src/keyset'
 import { PyFloat } from '../src/pyjson'
-import { BRANCH_HEAD, COMMIT_ROOT, GC_LEASE_KEY, loads } from '../src/versioned/layout'
+import { BRANCH_HEAD, COMMIT_ROOT, EMPTY_HASH, GC_LEASE_KEY, loads } from '../src/versioned/layout'
 import { failReads, racePublish } from './races'
 
 const enc = new TextEncoder()
@@ -17,43 +20,90 @@ const dec = new TextDecoder()
 const bytes = (s: string): Uint8Array => enc.encode(s)
 const text = (b: Uint8Array): string => dec.decode(b)
 
-describe('VersionedKV — open', () => {
-  it('creates an initial empty commit on a fresh store', async () => {
+/** A key's value as text, or undefined if absent. */
+async function read(
+  from: { get(key: string): Promise<Uint8Array | undefined> },
+  key: string,
+): Promise<string | undefined> {
+  const value = await from.get(key)
+  return value === undefined ? undefined : text(value)
+}
+
+/** Write `key` and commit. */
+function put(
+  wt: Worktree,
+  key: string,
+  value: string,
+  opts: WorktreeCommitOptions<Uint8Array> = {},
+): Promise<MergeResult> {
+  wt.set(key, bytes(value))
+  return wt.commit(opts)
+}
+
+/** A repository over `store` and a worktree on `branch`, created if
+ *  missing. */
+async function open(
+  store: KVStore,
+  branch = 'main',
+): Promise<{ repo: Repo<Uint8Array>; wt: Worktree }> {
+  const repo = await Repo.open(store)
+  const wt = await repo.worktree(branch, { create: true })
+  return { repo, wt }
+}
+
+/** A worktree on a new branch `name` at `at`. */
+async function fork(repo: Repo<Uint8Array>, name: string, at: string): Promise<Worktree> {
+  await repo.branches.create(name, at)
+  return repo.worktree(name)
+}
+
+/** Commit hashes from a ref's log, newest first. */
+async function history(
+  repo: Repo<Uint8Array>,
+  branch: string,
+  opts: { firstParent?: boolean } = {},
+): Promise<string[]> {
+  const seen: string[] = []
+  for await (const c of repo.log({ branch }, opts)) seen.push(c.hash)
+  return seen
+}
+
+describe('Repo and Worktree — open', () => {
+  it('starts a fresh store at the empty root commit', async () => {
     const store = new Memory()
-    const vk = await VersionedKV.open(store)
-    expect(vk.currentBranch).toBe('main')
-    expect(vk.currentCommit).toBeTypeOf('string')
-    expect(vk.currentCommit.length).toBe(40)
-    expect(vk.currentCommit).toBe(vk.baseCommit)
-    expect(await vk.get('any')).toBeNull()
+    const { wt } = await open(store)
+    expect(wt.branch).toBe('main')
+    expect(wt.head).toBeTypeOf('string')
+    expect(wt.head.length).toBe(40)
+    expect(await wt.get('any')).toBeUndefined()
   })
 
   it('reopens an existing store at HEAD', async () => {
     const store = new Memory()
-    const vk1 = await VersionedKV.open(store)
-    await vk1.commit({ updates: new Map([['k', bytes('v')]]) })
-    const head = vk1.currentCommit
+    const { wt: wt1 } = await open(store)
+    await put(wt1, 'k', 'v')
+    const head = wt1.head
 
-    const vk2 = await VersionedKV.open(store)
-    expect(vk2.currentCommit).toBe(head)
-    expect(text((await vk2.get('k')) as Uint8Array)).toBe('v')
+    const { wt: wt2 } = await open(store)
+    expect(wt2.head).toBe(head)
+    expect(await read(wt2, 'k')).toBe('v')
   })
 
   it('rejects an existing store with the wrong storage version', async () => {
     const store = new Memory()
     await store.set('__kvgit_version__', enc.encode('999'))
     await store.set('__branch_head__main', enc.encode('"deadbeef"'))
-    await expect(VersionedKV.open(store)).rejects.toThrow(/storage version/)
+    await expect(Repo.open(store)).rejects.toThrow(/storage version/)
   })
 
   it('opens a different branch independently', async () => {
     const store = new Memory()
-    const main = await VersionedKV.open(store, { branch: 'main' })
-    await main.commit({ updates: new Map([['k', bytes('main-v')]]) })
+    const { repo, wt: main } = await open(store)
+    await put(main, 'k', 'main-v')
 
-    const otherBranch = (await main.createBranch('feature')) as VersionedKV
-    expect(otherBranch.currentBranch).toBe('feature')
-    expect(text((await otherBranch.get('k')) as Uint8Array)).toBe('main-v')
+    const otherBranch = await fork(repo, 'feature', main.head)
+    expect(otherBranch.branch).toBe('feature')
+    expect(await read(otherBranch, 'k')).toBe('main-v')
   })
 
   it("opens at the winner's head when another writer creates the branch first", async () => {
@@ -75,274 +125,249 @@ describe('VersionedKV — open', () => {
       }
     }
     const store = new RacingMemory()
-    const main = await VersionedKV.open(store)
-    await main.commit({ updates: new Map([['k', bytes('v')]]) })
+    const { repo, wt: main } = await open(store)
+    await put(main, 'k', 'v')
     store.beforeCreate = async () => {
-      await main.createBranch('dev')
+      await repo.branches.create('dev', main.head)
     }
 
-    const dev = await VersionedKV.open(store, { branch: 'dev' })
-    expect(dev.currentCommit).toBe(main.currentCommit)
-    expect(text((await dev.get('k')) as Uint8Array)).toBe('v')
+    const dev = await repo.worktree('dev', { create: true })
+    expect(dev.head).toBe(main.head)
+    expect(await read(dev, 'k')).toBe('v')
   })
 })
 
-describe('VersionedKV — commit info', () => {
+describe('Repo and Worktree — commit info', () => {
   it('reads back integers past the safe range exactly, and floats as numbers', async () => {
-    const vk = await VersionedKV.open(new Memory())
+    const { repo, wt } = await open(new Memory())
     const big = 2n ** 64n + 1n
-    await vk.commit({
-      updates: new Map([['k', bytes('v')]]),
+    await put(wt, 'k', 'v', {
       info: { big, whole: new PyFloat(2), half: 0.5, list: [new PyFloat(1.5), 3] },
     })
-    expect(await vk.commitInfo()).toEqual({ big, whole: 2, half: 0.5, list: [1.5, 3] })
+    expect((await repo.getCommit(wt.head)).info).toEqual({
+      big,
+      whole: 2,
+      half: 0.5,
+      list: [1.5, 3],
+    })
   })
 })
 
-describe('VersionedKV — open without creating', () => {
-  it('mints a missing branch by default', async () => {
+describe('Repo and Worktree — open without creating', () => {
+  it('worktree with create mints a missing branch', async () => {
     const store = new Memory()
-    const vk = await VersionedKV.open(store, { branch: 'dev' })
-    expect(vk.currentBranch).toBe('dev')
-    expect(await vk.listBranches()).toContain('dev')
+    const { repo, wt } = await open(store, 'dev')
+    expect(wt.branch).toBe('dev')
+    expect(await repo.branches.list()).toContain('dev')
   })
 
-  it('open with create:false throws and lists no branch', async () => {
+  it('worktree without create throws and lists no branch', async () => {
     const store = new Memory()
-    await expect(VersionedKV.open(store, { branch: 'dev', create: false })).rejects.toThrow(
-      UnknownBranchError,
-    )
-    expect(await VersionedKV.exists(store, 'dev')).toBe(false)
-    const vk = await VersionedKV.open(store)
-    expect(await vk.listBranches()).not.toContain('dev')
+    const repo = await Repo.open(store)
+    await expect(repo.worktree('dev')).rejects.toThrow(UnknownBranchError)
+    expect(await repo.branches.has('dev')).toBe(false)
+    expect(await repo.branches.list()).not.toContain('dev')
   })
 
-  it('open with create:false opens an existing branch', async () => {
+  it('worktree without create opens an existing branch', async () => {
     const store = new Memory()
-    const vk = await VersionedKV.open(store)
-    await vk.commit({ updates: new Map([['k', bytes('v')]]) })
-    const vk2 = await VersionedKV.open(store, { branch: 'main', create: false })
-    expect(text((await vk2.get('k')) as Uint8Array)).toBe('v')
+    const { wt } = await open(store)
+    await put(wt, 'k', 'v')
+    const repo2 = await Repo.open(store)
+    const wt2 = await repo2.worktree('main')
+    expect(await read(wt2, 'k')).toBe('v')
   })
 
-  it('exists and branchExists track branches without writing', async () => {
+  it('branches.has tracks branches without writing', async () => {
     const store = new Memory()
-    expect(await VersionedKV.exists(store, 'dev')).toBe(false)
-    await VersionedKV.open(store, { branch: 'dev' })
-    expect(await VersionedKV.exists(store, 'dev')).toBe(true)
-    expect(await VersionedKV.exists(store, 'nope')).toBe(false)
-    const vk = await VersionedKV.open(store)
-    expect(await vk.branchExists('main')).toBe(true)
-    expect(await vk.branchExists('dev')).toBe(true)
-    expect(await vk.branchExists('nope')).toBe(false)
+    const repo = await Repo.open(store)
+    expect(await repo.branches.has('dev')).toBe(false)
+    await repo.worktree('dev', { create: true })
+    expect(await repo.branches.has('dev')).toBe(true)
+    expect(await repo.branches.has('nope')).toBe(false)
+    await repo.worktree('main', { create: true })
+    const repo2 = await Repo.open(store)
+    expect(await repo2.branches.has('main')).toBe(true)
+    expect(await repo2.branches.has('dev')).toBe(true)
+    expect(await repo2.branches.has('nope')).toBe(false)
   })
 
   it('delete then open does not resurrect or block recreate', async () => {
     const store = new Memory()
-    const vk = await VersionedKV.open(store)
-    await vk.createBranch('dev')
-    await vk.deleteBranch('dev')
-    expect(await VersionedKV.exists(store, 'dev')).toBe(false)
-    await expect(VersionedKV.open(store, { branch: 'dev', create: false })).rejects.toThrow(
-      UnknownBranchError,
-    )
-    expect(await VersionedKV.exists(store, 'dev')).toBe(false)
-    await vk.createBranch('dev')
-    expect(await VersionedKV.exists(store, 'dev')).toBe(true)
-  })
-
-  it('switchBranch throws UnknownBranchError for a missing branch', async () => {
-    const store = new Memory()
-    const vk = await VersionedKV.open(store)
-    await expect(vk.switchBranch('nope')).rejects.toThrow(UnknownBranchError)
+    const { repo, wt } = await open(store)
+    await repo.branches.create('dev', wt.head)
+    await repo.branches.delete('dev')
+    expect(await repo.branches.has('dev')).toBe(false)
+    await expect(repo.worktree('dev')).rejects.toThrow(UnknownBranchError)
+    expect(await repo.branches.has('dev')).toBe(false)
+    await repo.branches.create('dev', wt.head)
+    expect(await repo.branches.has('dev')).toBe(true)
   })
 })
 
-describe('VersionedKV — fast-forward commit', () => {
+describe('Worktree — fast-forward commit', () => {
   it('commits a single update and advances HEAD', async () => {
     const store = new Memory()
-    const vk = await VersionedKV.open(store)
-    const initial = vk.currentCommit
-    const r = await vk.commit({ updates: new Map([['k', bytes('v')]]) })
+    const { wt } = await open(store)
+    const initial = wt.head
+    const r = await put(wt, 'k', 'v')
     expect(r.merged).toBe(true)
     expect(r.strategy).toBe('fast_forward')
     expect(r.commit).not.toBe(initial)
-    expect(vk.currentCommit).toBe(r.commit)
-    expect(text((await vk.get('k')) as Uint8Array)).toBe('v')
+    expect(wt.head).toBe(r.commit)
+    expect(await read(wt, 'k')).toBe('v')
   })
 
   it('treats an empty commit as a no-op', async () => {
     const store = new Memory()
-    const vk = await VersionedKV.open(store)
-    const r = await vk.commit()
+    const { wt } = await open(store)
+    const r = await wt.commit()
     expect(r.merged).toBe(true)
     expect(r.strategy).toBe('no_op')
-    expect(r.commit).toBe(vk.currentCommit)
+    expect(r.commit).toBe(wt.head)
   })
 
   it('removes a key', async () => {
     const store = new Memory()
-    const vk = await VersionedKV.open(store)
-    await vk.commit({ updates: new Map([['k', bytes('v')]]) })
-    await vk.commit({ removals: new Set(['k']) })
-    expect(await vk.get('k')).toBeNull()
+    const { wt } = await open(store)
+    await put(wt, 'k', 'v')
+    await wt.delete('k')
+    await wt.commit()
+    expect(await wt.get('k')).toBeUndefined()
   })
 
   it('round-trips an info dict', async () => {
     const store = new Memory()
-    const vk = await VersionedKV.open(store)
-    await vk.commit({
-      updates: new Map([['k', bytes('v')]]),
-      info: { author: 'alice', message: 'add k' },
-    })
-    expect(await vk.commitInfo()).toEqual({ author: 'alice', message: 'add k' })
+    const { repo, wt } = await open(store)
+    await put(wt, 'k', 'v', { info: { author: 'alice', message: 'add k' } })
+    expect((await repo.getCommit(wt.head)).info).toEqual({ author: 'alice', message: 'add k' })
   })
 
   it('history walks newest to oldest', async () => {
     const store = new Memory()
-    const vk = await VersionedKV.open(store)
-    const c0 = vk.currentCommit
-    await vk.commit({ updates: new Map([['k', bytes('v1')]]) })
-    const c1 = vk.currentCommit
-    await vk.commit({ updates: new Map([['k', bytes('v2')]]) })
-    const c2 = vk.currentCommit
+    const { repo, wt } = await open(store)
+    const c0 = wt.head
+    await put(wt, 'k', 'v1')
+    const c1 = wt.head
+    await put(wt, 'k', 'v2')
+    const c2 = wt.head
 
-    const seen: string[] = []
-    for await (const c of vk.history()) seen.push(c)
-    expect(seen).toEqual([c2, c1, c0])
+    expect(await history(repo, 'main')).toEqual([c2, c1, c0])
   })
 })
 
-describe('VersionedKV — branches', () => {
+describe('Repo — branches', () => {
   it('writes on a fork do not leak to parent', async () => {
     const store = new Memory()
-    const main = await VersionedKV.open(store)
-    await main.commit({ updates: new Map([['shared', bytes('original')]]) })
+    const { repo, wt: main } = await open(store)
+    await put(main, 'shared', 'original')
 
-    const feature = (await main.createBranch('feature')) as VersionedKV
-    await feature.commit({ updates: new Map([['shared', bytes('forked')]]) })
+    const feature = await fork(repo, 'feature', main.head)
+    await put(feature, 'shared', 'forked')
 
     // main's view didn't change in-memory
-    expect(text((await main.get('shared')) as Uint8Array)).toBe('original')
-    // and a fresh handle on main also sees the original
-    const main2 = await VersionedKV.open(store, { branch: 'main' })
-    expect(text((await main2.get('shared')) as Uint8Array)).toBe('original')
+    expect(await read(main, 'shared')).toBe('original')
+    // and a fresh worktree on main also sees the original
+    const main2 = await repo.worktree('main')
+    expect(await read(main2, 'shared')).toBe('original')
   })
 
-  it('peek reads a key from another branch without switching', async () => {
+  it('a snapshot reads a key from another branch', async () => {
     const store = new Memory()
-    const main = await VersionedKV.open(store)
-    await main.commit({ updates: new Map([['k', bytes('main-v')]]) })
+    const { repo, wt: main } = await open(store)
+    await put(main, 'k', 'main-v')
 
-    const feature = (await main.createBranch('feature')) as VersionedKV
-    await feature.commit({ updates: new Map([['k', bytes('feature-v')]]) })
+    const feature = await fork(repo, 'feature', main.head)
+    await put(feature, 'k', 'feature-v')
 
-    expect(text((await main.peek('k', { branch: 'feature' })) as Uint8Array)).toBe('feature-v')
-    // main itself didn't switch
-    expect(main.currentBranch).toBe('main')
-    expect(text((await main.get('k')) as Uint8Array)).toBe('main-v')
+    expect(await read(await repo.snapshot({ branch: 'feature' }), 'k')).toBe('feature-v')
+    // main itself didn't move
+    expect(main.branch).toBe('main')
+    expect(await read(main, 'k')).toBe('main-v')
   })
 
-  it('switchBranch updates state in place', async () => {
+  it('branches.list returns sorted names', async () => {
     const store = new Memory()
-    const main = await VersionedKV.open(store)
-    await main.commit({ updates: new Map([['k', bytes('main')]]) })
-    const feature = (await main.createBranch('feature')) as VersionedKV
-    await feature.commit({ updates: new Map([['k', bytes('feature')]]) })
-
-    await main.switchBranch('feature')
-    expect(main.currentBranch).toBe('feature')
-    expect(text((await main.get('k')) as Uint8Array)).toBe('feature')
-  })
-
-  it('listBranches returns sorted names', async () => {
-    const store = new Memory()
-    const vk = await VersionedKV.open(store)
-    await vk.createBranch('zeta')
-    await vk.createBranch('alpha')
-    await vk.createBranch('mu')
-    expect(await vk.listBranches()).toEqual(['alpha', 'main', 'mu', 'zeta'])
+    const { repo, wt } = await open(store)
+    await repo.branches.create('zeta', wt.head)
+    await repo.branches.create('alpha', wt.head)
+    await repo.branches.create('mu', wt.head)
+    expect(await repo.branches.list()).toEqual(['alpha', 'main', 'mu', 'zeta'])
   })
 
   it('rejects creating a branch that already exists', async () => {
     const store = new Memory()
-    const vk = await VersionedKV.open(store)
-    await vk.createBranch('feature')
-    await expect(vk.createBranch('feature')).rejects.toThrow(/already exists/)
+    const { repo, wt } = await open(store)
+    await repo.branches.create('feature', wt.head)
+    await expect(repo.branches.create('feature', wt.head)).rejects.toThrow(/already exists/)
   })
 
-  it('deleteBranch removes a branch', async () => {
+  it('branches.delete removes a branch', async () => {
     const store = new Memory()
-    const vk = await VersionedKV.open(store)
-    await vk.createBranch('toremove')
-    await vk.deleteBranch('toremove')
-    expect((await vk.listBranches()).includes('toremove')).toBe(false)
-  })
-
-  it('cannot delete the current branch', async () => {
-    const store = new Memory()
-    const vk = await VersionedKV.open(store)
-    await expect(vk.deleteBranch('main')).rejects.toThrow(/current branch/)
+    const { repo, wt } = await open(store)
+    await repo.branches.create('toremove', wt.head)
+    await repo.branches.delete('toremove')
+    expect((await repo.branches.list()).includes('toremove')).toBe(false)
   })
 })
 
-describe('VersionedKV — mergeBase', () => {
+describe('Repo — mergeBase', () => {
   it('returns the commit itself for identical inputs', async () => {
     const store = new Memory()
-    const main = await VersionedKV.open(store)
-    await main.commit({ updates: new Map([['k', bytes('v')]]) })
-    expect(await main.mergeBase(main.currentCommit, main.currentCommit)).toBe(main.currentCommit)
+    const { repo, wt: main } = await open(store)
+    await put(main, 'k', 'v')
+    expect(await repo.mergeBase(main.head, main.head)).toBe(main.head)
   })
 
   it('resolves diverged branches to the fork point, either order', async () => {
     const store = new Memory()
-    const main = await VersionedKV.open(store)
-    await main.commit({ updates: new Map([['k', bytes('v')]]) })
-    const fork = main.currentCommit
-    const worker = (await main.createBranch('worker')) as VersionedKV
-    await main.commit({ updates: new Map([['a', bytes('1')]]) })
-    await worker.commit({ updates: new Map([['b', bytes('2')]]) })
-    expect(await main.mergeBase(main.currentCommit, worker.currentCommit)).toBe(fork)
-    expect(await worker.mergeBase(worker.currentCommit, main.currentCommit)).toBe(fork)
+    const { repo, wt: main } = await open(store)
+    await put(main, 'k', 'v')
+    const forkPoint = main.head
+    const worker = await fork(repo, 'worker', main.head)
+    await put(main, 'a', '1')
+    await put(worker, 'b', '2')
+    expect(await repo.mergeBase(main.head, worker.head)).toBe(forkPoint)
+    expect(await repo.mergeBase(worker.head, main.head)).toBe(forkPoint)
   })
 
   it('returns the ancestor for linear history', async () => {
     const store = new Memory()
-    const main = await VersionedKV.open(store)
-    await main.commit({ updates: new Map([['k', bytes('v')]]) })
-    const base = main.currentCommit
-    await main.commit({ updates: new Map([['a', bytes('1')]]) })
-    expect(await main.mergeBase(base, main.currentCommit)).toBe(base)
+    const { repo, wt: main } = await open(store)
+    await put(main, 'k', 'v')
+    const base = main.head
+    await put(main, 'a', '1')
+    expect(await repo.mergeBase(base, main.head)).toBe(base)
   })
 })
 
-describe('VersionedKV — three-way merge', () => {
+describe('Worktree — three-way merge', () => {
   it('auto-merges non-overlapping changes', async () => {
     const store = new Memory()
-    const a = await VersionedKV.open(store)
-    await a.commit({ updates: new Map([['shared', bytes('base')]]) })
+    const { repo, wt: a } = await open(store)
+    await put(a, 'shared', 'base')
 
     // Two writers on the same branch, both based on the same commit.
-    const b = await VersionedKV.open(store)
+    const b = await repo.worktree('main')
 
-    await a.commit({ updates: new Map([['from-a', bytes('a-val')]]) })
-    // b is now stale; b's base_commit doesn't match HEAD.
-    const r = await b.commit({ updates: new Map([['from-b', bytes('b-val')]]) })
+    await put(a, 'from-a', 'a-val')
+    // b is now stale; its head doesn't match the branch's.
+    const r = await put(b, 'from-b', 'b-val')
     expect(r.merged).toBe(true)
     expect(r.strategy).toBe('three_way')
-    expect(text((await b.get('from-a')) as Uint8Array)).toBe('a-val')
-    expect(text((await b.get('from-b')) as Uint8Array)).toBe('b-val')
-    expect(text((await b.get('shared')) as Uint8Array)).toBe('base')
+    expect(await read(b, 'from-a')).toBe('a-val')
+    expect(await read(b, 'from-b')).toBe('b-val')
+    expect(await read(b, 'shared')).toBe('base')
   })
 
   it('uses a per-key merge fn for contested keys', async () => {
     const store = new Memory()
-    const a = await VersionedKV.open(store)
-    await a.commit({ updates: new Map([['counter', bytes('0')]]) })
+    const { repo, wt: a } = await open(store)
+    await put(a, 'counter', '0')
 
-    const b = await VersionedKV.open(store)
+    const b = await repo.worktree('main')
 
-    await a.commit({ updates: new Map([['counter', bytes('1')]]) })
+    await put(a, 'counter', '1')
 
     // Sum-merge fn: parses both sides as ints and adds the deltas to base.
     const sumMerge: BytesMergeFn = (oldV, ours, theirs) => {
@@ -352,126 +377,113 @@ describe('VersionedKV — three-way merge', () => {
       return bytes(String(u + t - o))
     }
 
-    const r = await b.commit({
-      updates: new Map([['counter', bytes('5')]]),
-      mergeFns: new Map([['counter', sumMerge]]),
-    })
+    const r = await put(b, 'counter', '5', { mergeFns: new Map([['counter', sumMerge]]) })
     expect(r.merged).toBe(true)
     expect(r.strategy).toBe('three_way')
     expect(r.autoMergedKeys).toEqual(['counter'])
     // a wrote 1 (delta +1), b wrote 5 (delta +5), base 0 → merged should be 6.
-    expect(text((await b.get('counter')) as Uint8Array)).toBe('6')
+    expect(await read(b, 'counter')).toBe('6')
   })
 
   it('throws MergeConflict for a contested key with no merge fn', async () => {
     const store = new Memory()
-    const a = await VersionedKV.open(store)
-    await a.commit({ updates: new Map([['k', bytes('base')]]) })
-    const b = await VersionedKV.open(store)
+    const { repo, wt: a } = await open(store)
+    await put(a, 'k', 'base')
+    const b = await repo.worktree('main')
 
-    await a.commit({ updates: new Map([['k', bytes('a')]]) })
-    await expect(b.commit({ updates: new Map([['k', bytes('b')]]) })).rejects.toBeInstanceOf(
-      MergeConflict,
-    )
+    await put(a, 'k', 'a')
+    await expect(put(b, 'k', 'b')).rejects.toBeInstanceOf(MergeConflict)
   })
 
   it("with onConflict 'abandon', returns merged=false instead of throwing", async () => {
     const store = new Memory()
-    const a = await VersionedKV.open(store)
-    await a.commit({ updates: new Map([['k', bytes('base')]]) })
-    const b = await VersionedKV.open(store)
+    const { repo, wt: a } = await open(store)
+    await put(a, 'k', 'base')
+    const b = await repo.worktree('main')
+    const bHead = b.head
 
-    await a.commit({ updates: new Map([['k', bytes('a')]]) })
-    const r = await b.commit({
-      updates: new Map([['k', bytes('b')]]),
-      onConflict: 'abandon',
-    })
+    await put(a, 'k', 'a')
+    const r = await put(b, 'k', 'b', { onConflict: 'abandon' })
     expect(r.merged).toBe(false)
     expect(r.commit).toBeNull()
-    // b's in-memory base was restored (didn't move to a's commit).
-    expect(text((await b.get('k')) as Uint8Array)).toBe('base')
+    // b's head stayed put (didn't move to a's commit).
+    expect(b.head).toBe(bHead)
+    expect(await read(await repo.snapshot({ commit: b.head }), 'k')).toBe('base')
   })
 
   it('default merge fn handles all contested keys', async () => {
     const store = new Memory()
-    const a = await VersionedKV.open(store)
-    await a.commit({ updates: new Map([['k', bytes('base')]]) })
-    const b = await VersionedKV.open(store)
+    const { repo, wt: a } = await open(store)
+    await put(a, 'k', 'base')
+    const b = await repo.worktree('main')
 
-    await a.commit({ updates: new Map([['k', bytes('a')]]) })
-    const r = await b.commit({
-      updates: new Map([['k', bytes('b')]]),
+    await put(a, 'k', 'a')
+    const r = await put(b, 'k', 'b', {
       defaultMerge: (_, ours, theirs) =>
         bytes(`${text(ours ?? bytes(''))}+${text(theirs ?? bytes(''))}`),
     })
     expect(r.merged).toBe(true)
-    expect(text((await b.get('k')) as Uint8Array)).toMatch(/^[ab]\+[ab]$/)
+    expect(await read(b, 'k')).toMatch(/^[ab]\+[ab]$/)
   })
 })
 
-describe('VersionedKV — diff between commits', () => {
+describe('Repo — diff between commits', () => {
   it('reports added/removed/modified at the key level', async () => {
     const store = new Memory()
-    const vk = await VersionedKV.open(store)
-    await vk.commit({
-      updates: new Map([
-        ['k1', bytes('v1')],
-        ['k2', bytes('v2')],
-      ]),
-    })
-    const c1 = vk.currentCommit
-    await vk.commit({
-      updates: new Map([
-        ['k2', bytes('v2-new')], // modified
-        ['k3', bytes('v3')], // added
-      ]),
-      removals: new Set(['k1']), // removed
-    })
-    const c2 = vk.currentCommit
+    const { repo, wt } = await open(store)
+    wt.set('k1', bytes('v1'))
+    wt.set('k2', bytes('v2'))
+    await wt.commit()
+    const c1 = wt.head
+    wt.set('k2', bytes('v2-new')) // modified
+    wt.set('k3', bytes('v3')) // added
+    await wt.delete('k1') // removed
+    await wt.commit()
+    const c2 = wt.head
 
-    const d = await vk.diff(c1, c2)
+    const d = await repo.diff(c1, c2)
     expect([...d.added]).toEqual(['k3'])
     expect([...d.removed]).toEqual(['k1'])
     expect([...d.modified]).toEqual(['k2'])
   })
 })
 
-describe('VersionedKV — checkout and resetTo', () => {
-  it('checkout returns a Versioned at a historical commit', async () => {
+describe('Repo and Worktree — snapshot and reset', () => {
+  it('a snapshot reads a historical commit', async () => {
     const store = new Memory()
-    const vk = await VersionedKV.open(store)
-    await vk.commit({ updates: new Map([['k', bytes('v1')]]) })
-    const c1 = vk.currentCommit
-    await vk.commit({ updates: new Map([['k', bytes('v2')]]) })
+    const { repo, wt } = await open(store)
+    await put(wt, 'k', 'v1')
+    const c1 = wt.head
+    await put(wt, 'k', 'v2')
 
-    const historical = (await vk.checkout(c1)) as VersionedKV
-    expect(historical.currentCommit).toBe(c1)
-    expect(text((await historical.get('k')) as Uint8Array)).toBe('v1')
+    const historical = await repo.snapshot({ commit: c1 })
+    expect(historical.commit).toBe(c1)
+    expect(await read(historical, 'k')).toBe('v1')
 
-    // The original handle wasn't affected.
-    expect(text((await vk.get('k')) as Uint8Array)).toBe('v2')
+    // The worktree wasn't affected.
+    expect(await read(wt, 'k')).toBe('v2')
   })
 
-  it('resetTo moves HEAD to a previous commit', async () => {
+  it('reset moves HEAD to a previous commit', async () => {
     const store = new Memory()
-    const vk = await VersionedKV.open(store)
-    await vk.commit({ updates: new Map([['k', bytes('v1')]]) })
-    const c1 = vk.currentCommit
-    await vk.commit({ updates: new Map([['k', bytes('v2')]]) })
+    const { wt } = await open(store)
+    await put(wt, 'k', 'v1')
+    const c1 = wt.head
+    await put(wt, 'k', 'v2')
 
-    expect(await vk.resetTo(c1)).toBe(true)
-    expect(vk.currentCommit).toBe(c1)
-    expect(text((await vk.get('k')) as Uint8Array)).toBe('v1')
+    await expect(wt.reset(c1)).resolves.toBeUndefined()
+    expect(wt.head).toBe(c1)
+    expect(await read(wt, 'k')).toBe('v1')
   })
 })
 
-describe('VersionedKV — corrupt-HEAD recovery', () => {
+describe('Repo — corrupt-HEAD recovery', () => {
   it('recovers via prev-HEAD when current HEAD points to a missing commit', async () => {
     const store = new Memory()
-    const vk = await VersionedKV.open(store)
-    await vk.commit({ updates: new Map([['k', bytes('v1')]]) })
-    const goodHead = vk.currentCommit
-    await vk.commit({ updates: new Map([['k', bytes('v2')]]) })
+    const { wt } = await open(store)
+    await put(wt, 'k', 'v1')
+    const goodHead = wt.head
+    await put(wt, 'k', 'v2')
     // The CAS that just landed wrote `goodHead` to BRANCH_HEAD_PREV.
 
     // Simulate corruption: overwrite current HEAD with a string that
@@ -482,128 +494,140 @@ describe('VersionedKV — corrupt-HEAD recovery', () => {
       enc.encode(JSON.stringify('deadbeefdeadbeefdeadbeefdeadbeefdeadbeef')),
     )
 
-    const vk2 = await VersionedKV.open(store)
-    expect(vk2.currentCommit).toBe(goodHead)
-    expect(text((await vk2.get('k')) as Uint8Array)).toBe('v1')
+    const wt2 = await (await Repo.open(store)).worktree('main')
+    expect(wt2.head).toBe(goodHead)
+    expect(await read(wt2, 'k')).toBe('v1')
   })
 
   it('throws when both HEAD and prev-HEAD are corrupt and no recoverer is set', async () => {
     const store = new Memory()
-    const vk = await VersionedKV.open(store)
-    await vk.commit({ updates: new Map([['k', bytes('v')]]) })
+    const { wt } = await open(store)
+    await put(wt, 'k', 'v')
 
     // Corrupt both pointers.
     const dead = JSON.stringify('deadbeefdeadbeefdeadbeefdeadbeefdeadbeef')
     await store.set('__branch_head__main', enc.encode(dead))
     await store.set('__branch_head_prev__main', enc.encode(dead))
 
-    await expect(VersionedKV.open(store)).rejects.toThrow(/corrupt and unrecoverable/)
+    const repo2 = await Repo.open(store)
+    await expect(repo2.worktree('main')).rejects.toThrow(/corrupt and unrecoverable/)
   })
 
   it('uses an injected commit-scan recoverer when both HEAD pointers are bad', async () => {
     const store = new Memory()
-    const vk = await VersionedKV.open(store)
-    await vk.commit({ updates: new Map([['k', bytes('v1')]]) })
-    const goodHead = vk.currentCommit
+    const { wt } = await open(store)
+    await put(wt, 'k', 'v1')
+    const goodHead = wt.head
 
     // Corrupt both pointers.
     const dead = JSON.stringify('deadbeefdeadbeefdeadbeefdeadbeefdeadbeef')
     await store.set('__branch_head__main', enc.encode(dead))
     await store.set('__branch_head_prev__main', enc.encode(dead))
 
-    const vk2 = await VersionedKV.open(store, {
-      recoverFromCorruptHead: async () => goodHead,
-    })
-    expect(vk2.currentCommit).toBe(goodHead)
+    const repo2 = await Repo.open(store, { recoverFromCorruptHead: async () => goodHead })
+    const wt2 = await repo2.worktree('main')
+    expect(wt2.head).toBe(goodHead)
   })
 })
 
-describe('VersionedKV — fast-forward race retry', () => {
+describe('Worktree — fast-forward race retry', () => {
   /** Make `loser`'s next CAS lose: advance HEAD first, then run it. */
-  function raceOnce(loser: VersionedKV, advance: () => Promise<unknown>): void {
-    racePublish(loser.store, loser.currentBranch, advance)
+  function raceOnce(loser: Worktree, advance: () => Promise<unknown>): void {
+    racePublish(loser.repo.store, loser.branch, advance)
   }
 
-  const one = (key: string, value: string) => ({ updates: new Map([[key, bytes(value)]]) })
+  /** The node hashes under a keyset root, the root included. */
+  async function walkNodes(store: KVStore, root: string, into: Set<string>): Promise<void> {
+    if (root === EMPTY_HASH || into.has(root)) return
+    into.add(root)
+    const raw = await store.get(`kvgit:keyset:${root}`)
+    if (raw === null) throw new Error(`node ${root} is missing`)
+    const node = JSON.parse(text(raw)) as { children?: Record<string, string> }
+    for (const child of Object.values(node.children ?? {})) await walkNodes(store, child, into)
+  }
 
   it('a lost race merges instead of raising', async () => {
     const store = new Memory()
-    const v1 = await VersionedKV.open(store)
-    await v1.commit(one('base', '0'))
-    const v2 = await VersionedKV.open(store)
-    raceOnce(v2, () => v1.commit(one('other', '1')))
+    const { repo, wt: v1 } = await open(store)
+    await put(v1, 'base', '0')
+    const v2 = await repo.worktree('main')
+    raceOnce(v2, () => put(v1, 'other', '1'))
 
-    const result = await v2.commit(one('mine', '2'))
-
-    expect(result.merged).toBe(true)
-    expect(result.strategy).toBe('three_way')
-    expect(text((await v2.get('mine')) as Uint8Array)).toBe('2')
-    expect(text((await v2.get('other')) as Uint8Array)).toBe('1')
-  })
-
-  it('a lost race with skip merges a clean change', async () => {
-    // A lost race is not a conflict: like the base-behind-head case,
-    // `skip` still attempts the merge and succeeds when clean.
-    const store = new Memory()
-    const v1 = await VersionedKV.open(store)
-    await v1.commit(one('base', '0'))
-    const v2 = await VersionedKV.open(store)
-    raceOnce(v2, () => v1.commit(one('other', '1')))
-
-    const result = await v2.commit({ ...one('mine', '2'), onConflict: 'abandon' })
+    const result = await put(v2, 'mine', '2')
 
     expect(result.merged).toBe(true)
     expect(result.strategy).toBe('three_way')
+    expect(await read(v2, 'mine')).toBe('2')
+    expect(await read(v2, 'other')).toBe('1')
   })
 
-  it('a lost race with skip bails on a true conflict', async () => {
+  it('a lost race with abandon merges a clean change', async () => {
+    // A lost race is not a conflict: like the head-behind-branch case,
+    // `abandon` still attempts the merge and succeeds when clean.
     const store = new Memory()
-    const v1 = await VersionedKV.open(store)
-    await v1.commit(one('x', '1'))
-    const v2 = await VersionedKV.open(store)
-    raceOnce(v2, () => v1.commit(one('x', 'v1')))
+    const { repo, wt: v1 } = await open(store)
+    await put(v1, 'base', '0')
+    const v2 = await repo.worktree('main')
+    raceOnce(v2, () => put(v1, 'other', '1'))
 
-    const result = await v2.commit({ ...one('x', 'v2'), onConflict: 'abandon' })
+    const result = await put(v2, 'mine', '2', { onConflict: 'abandon' })
+
+    expect(result.merged).toBe(true)
+    expect(result.strategy).toBe('three_way')
+  })
+
+  it('a lost race with abandon bails on a true conflict', async () => {
+    const store = new Memory()
+    const { repo, wt: v1 } = await open(store)
+    await put(v1, 'x', '1')
+    const v2 = await repo.worktree('main')
+    const v2Head = v2.head
+    raceOnce(v2, () => put(v1, 'x', 'v1'))
+
+    const result = await put(v2, 'x', 'v2', { onConflict: 'abandon' })
 
     expect(result.merged).toBe(false)
     expect(result.strategy).toBe('three_way')
-    expect(v1.currentCommit).toBe(await v2.latestHead()) // branch untouched
-    expect(text((await v2.get('x')) as Uint8Array)).toBe('1') // loser restored
+    expect(v1.head).toBe(await repo.branches.get('main')) // branch untouched
+    // The loser stays at its head.
+    expect(v2.head).toBe(v2Head)
+    expect(await read(await repo.snapshot({ commit: v2.head }), 'x')).toBe('1')
   })
 
   it('a repeated race still raises', async () => {
     // The internal retry is bounded: a race on the merge CAS too still
     // surfaces ConcurrencyError instead of looping.
     const store = new Memory()
-    const v1 = await VersionedKV.open(store)
-    await v1.commit(one('base', '0'))
-    const v2 = await VersionedKV.open(store)
-    racePublish(store, 'main', () => v1.commit(one('other', '1')), null)
-    await expect(v2.commit(one('mine', '2'))).rejects.toThrow(ConcurrencyError)
+    const { repo, wt: v1 } = await open(store)
+    await put(v1, 'base', '0')
+    const v2 = await repo.worktree('main')
+    racePublish(store, 'main', () => put(v1, 'other', '1'), null)
+    await expect(put(v2, 'mine', '2')).rejects.toThrow(ConcurrencyError)
   })
 
-  it('a retry that finds its branch gone restores pre-commit state', async () => {
+  it('a retry that finds its branch gone keeps the pre-commit state', async () => {
     const store = new Memory()
-    const v1 = await VersionedKV.open(store)
-    await v1.commit(one('base', '0'))
-    const baseHead = v1.currentCommit
-    const v2 = await VersionedKV.open(store)
+    const { repo, wt: v1 } = await open(store)
+    await put(v1, 'base', '0')
+    const baseHead = v1.head
+    const v2 = await repo.worktree('main')
     raceOnce(v2, () => store.remove(BRANCH_HEAD('main')))
 
-    await expect(v2.commit(one('mine', '2'))).rejects.toThrow(UnknownBranchError)
-    expect(v2.currentCommit).toBe(baseHead)
-    expect(await v2.get('mine')).toBeNull()
-    expect(text((await v2.get('base')) as Uint8Array)).toBe('0')
+    await expect(put(v2, 'mine', '2')).rejects.toThrow(UnknownBranchError)
+    expect(v2.head).toBe(baseHead)
+    expect(await (await repo.snapshot({ commit: v2.head })).has('mine')).toBe(false)
+    expect(v2.status().updated).toEqual(new Set(['mine']))
+    expect(await read(v2, 'base')).toBe('0')
   })
 
-  it('a failing HEAD re-read restores pre-commit state', async () => {
+  it('a failing HEAD re-read keeps the pre-commit state', async () => {
     const store = new Memory()
-    const v1 = await VersionedKV.open(store)
-    await v1.commit(one('base', '0'))
-    const baseHead = v1.currentCommit
-    const v2 = await VersionedKV.open(store)
+    const { repo, wt: v1 } = await open(store)
+    await put(v1, 'base', '0')
+    const baseHead = v1.head
+    const v2 = await repo.worktree('main')
     raceOnce(v2, async () => {
-      await v1.commit(one('other', '1'))
+      await put(v1, 'other', '1')
       // A head read reads the head, the lease and the base's root
       // together; the heal check before it reads them one by one.
       failReads(
@@ -613,13 +637,13 @@ describe('VersionedKV — fast-forward race retry', () => {
       )
     })
 
-    await expect(v2.commit(one('mine', '2'))).rejects.toThrow('transient storage boom')
-    expect(v2.currentCommit).toBe(baseHead)
-    expect(await v2.get('mine')).toBeNull()
-    // The handle stays usable.
-    const result = await v2.commit(one('mine', '2'))
+    await expect(put(v2, 'mine', '2')).rejects.toThrow('transient storage boom')
+    expect(v2.head).toBe(baseHead)
+    expect(await (await repo.snapshot({ commit: v2.head })).has('mine')).toBe(false)
+    // The worktree stays usable.
+    const result = await put(v2, 'mine', '2')
     expect(result.merged).toBe(true)
-    expect(text((await v2.get('mine')) as Uint8Array)).toBe('2')
+    expect(await read(v2, 'mine')).toBe('2')
   })
 
   it('a raced merge strands no HAMT nodes', async () => {
@@ -628,30 +652,29 @@ describe('VersionedKV — fast-forward race retry', () => {
     // HAMT nodes, detaching the first attempt's nodes where the
     // incremental sweep cannot find them.
     const store = new Memory()
-    const v1 = await VersionedKV.open(store)
-    await v1.commit(one('base', '0'))
-    const v2 = await VersionedKV.open(store)
-    raceOnce(v2, () => v1.commit(one('other', '1')))
-    const result = await v2.commit(one('mine', '2'))
+    const { repo, wt: v1 } = await open(store)
+    await put(v1, 'base', '0')
+    const v2 = await repo.worktree('main')
+    raceOnce(v2, () => put(v1, 'other', '1'))
+    const result = await put(v2, 'mine', '2')
     expect(result.merged).toBe(true)
 
     const reachable = new Set<string>()
-    for await (const h of v2.history(v2.currentCommit, { allParents: true })) {
-      const raw = await store.get(COMMIT_ROOT(h))
-      if (raw === null) throw new Error(`commit ${h} has no root`)
-      const [, nodes] = await Keyset.fromRoot(store, loads(raw) as string).walk()
-      for (const n of nodes) reachable.add(n)
+    for await (const c of repo.log({ commit: v2.head })) {
+      const raw = await store.get(COMMIT_ROOT(c.hash))
+      if (raw === null) throw new Error(`commit ${c.hash} has no root`)
+      await walkNodes(store, loads(raw) as string, reachable)
     }
+    const prefix = 'kvgit:keyset:'
     const present = new Set<string>()
     for await (const k of store.keys()) {
-      if (k.startsWith(Keyset.DEFAULT_PREFIX)) present.add(k.slice(Keyset.DEFAULT_PREFIX.length))
+      if (k.startsWith(prefix)) present.add(k.slice(prefix.length))
     }
     expect([...present].filter((h) => !reachable.has(h))).toEqual([])
   })
 })
 
-describe('VersionedKV — mergeBase best common ancestor', () => {
-  const one = (key: string, value: string) => ({ updates: new Map([[key, bytes(value)]]) })
+describe('Repo — mergeBase best common ancestor', () => {
   const oursFn: BytesMergeFn = (_old, ours, _theirs) => {
     if (ours === null) throw new Error('unreachable in these tests')
     return ours
@@ -663,105 +686,105 @@ describe('VersionedKV — mergeBase best common ancestor', () => {
 
   it('a fork resolves to the fork point either order', async () => {
     const store = new Memory()
-    const v = await VersionedKV.open(store)
-    await v.commit(one('x', '0'))
-    const fork = v.currentCommit
-    const a = (await v.createBranch('a')) as VersionedKV
-    const b = (await v.createBranch('b')) as VersionedKV
-    await a.commit(one('a', '1'))
-    await b.commit(one('b', '2'))
+    const { repo, wt: v } = await open(store)
+    await put(v, 'x', '0')
+    const forkPoint = v.head
+    const a = await fork(repo, 'a', v.head)
+    const b = await fork(repo, 'b', v.head)
+    await put(a, 'a', '1')
+    await put(b, 'b', '2')
 
-    expect(await v.mergeBase(a.currentCommit, b.currentCommit)).toBe(fork)
-    expect(await v.mergeBase(b.currentCommit, a.currentCommit)).toBe(fork)
+    expect(await repo.mergeBase(a.head, b.head)).toBe(forkPoint)
+    expect(await repo.mergeBase(b.head, a.head)).toBe(forkPoint)
   })
 
   it('merge commits resolve through either order', async () => {
     // h2 loses the fast-forward race and lands a merge commit; the
     // base is the fork point whichever order the tips are given in.
     const store = new Memory()
-    const v = await VersionedKV.open(store)
-    await v.commit(one('x', '0'))
-    const fork = v.currentCommit
-    const h1 = await VersionedKV.open(store)
-    const h2 = await VersionedKV.open(store)
-    await h1.commit(one('a', '1'))
-    const merged = await h2.commit(one('b', '2'))
+    const { repo, wt: v } = await open(store)
+    await put(v, 'x', '0')
+    const forkPoint = v.head
+    const h1 = await repo.worktree('main')
+    const h2 = await repo.worktree('main')
+    await put(h1, 'a', '1')
+    const merged = await put(h2, 'b', '2')
     expect(merged.strategy).toBe('three_way')
 
-    const tipA = h1.currentCommit
-    const tipM = h2.currentCommit
-    expect(await v.mergeBase(tipM, tipA)).toBe(tipA)
-    expect(await v.mergeBase(tipA, tipM)).toBe(tipA)
-    expect(await v.mergeBase(tipM, fork)).toBe(fork)
-    expect(await v.mergeBase(tipM, tipM)).toBe(tipM)
+    const tipA = h1.head
+    const tipM = h2.head
+    expect(await repo.mergeBase(tipM, tipA)).toBe(tipA)
+    expect(await repo.mergeBase(tipA, tipM)).toBe(tipA)
+    expect(await repo.mergeBase(tipM, forkPoint)).toBe(forkPoint)
+    expect(await repo.mergeBase(tipM, tipM)).toBe(tipM)
   })
 
   it('merging the root into branches keeps the base', async () => {
     // Issue kvgit#47: naming the root as a merge parent must not
     // demote the base from the fork back to the root.
     const store = new Memory()
-    const v = await VersionedKV.open(store)
-    const root = v.currentCommit
-    await v.commit(one('x', '1'))
-    const fork = v.currentCommit
-    const a = (await v.createBranch('a')) as VersionedKV
-    const b = (await v.createBranch('b')) as VersionedKV
-    await a.commit(one('a', '1'))
-    await b.commit(one('b', '2'))
-    await a.mergeHeads(root)
-    await b.mergeHeads(root)
+    const { repo, wt: v } = await open(store)
+    const root = v.head
+    await put(v, 'x', '1')
+    const forkPoint = v.head
+    const a = await fork(repo, 'a', v.head)
+    const b = await fork(repo, 'b', v.head)
+    await put(a, 'a', '1')
+    await put(b, 'b', '2')
+    await a.merge({ commit: root })
+    await b.merge({ commit: root })
 
-    expect(await v.mergeBase(a.currentCommit, b.currentCommit)).toBe(fork)
-    expect(await v.mergeBase(b.currentCommit, a.currentCommit)).toBe(fork)
+    expect(await repo.mergeBase(a.head, b.head)).toBe(forkPoint)
+    expect(await repo.mergeBase(b.head, a.head)).toBe(forkPoint)
   })
 
   it('criss-cross base is deterministic', async () => {
     // Two best ancestors: the smallest hash wins, whichever order
     // the commits are given in.
     const store = new Memory()
-    const v = await VersionedKV.open(store)
-    const pa = (await v.createBranch('pa')) as VersionedKV
-    const pb = (await v.createBranch('pb')) as VersionedKV
-    await pa.commit(one('k', 'v1'))
-    await pb.commit(one('k', 'v2'))
-    const p1 = pa.currentCommit
-    const p2 = pb.currentCommit
-    const m = (await v.createBranch('m', { at: p1 })) as VersionedKV
-    await m.mergeHeads(p2, { mergeFns: new Map([['k', oursFn]]) })
-    const q = (await v.createBranch('q', { at: p2 })) as VersionedKV
-    await q.mergeHeads(p1, { mergeFns: new Map([['k', oursFn]]) })
+    const { repo, wt: v } = await open(store)
+    const pa = await fork(repo, 'pa', v.head)
+    const pb = await fork(repo, 'pb', v.head)
+    await put(pa, 'k', 'v1')
+    await put(pb, 'k', 'v2')
+    const p1 = pa.head
+    const p2 = pb.head
+    const m = await fork(repo, 'm', p1)
+    await m.merge({ commit: p2 }, { mergeFns: new Map([['k', oursFn]]) })
+    const q = await fork(repo, 'q', p2)
+    await q.merge({ commit: p1 }, { mergeFns: new Map([['k', oursFn]]) })
 
     const lo = p1 < p2 ? p1 : p2
-    expect(await v.mergeBase(m.currentCommit, q.currentCommit)).toBe(lo)
-    expect(await v.mergeBase(q.currentCommit, m.currentCommit)).toBe(lo)
+    expect(await repo.mergeBase(m.head, q.head)).toBe(lo)
+    expect(await repo.mergeBase(q.head, m.head)).toBe(lo)
   })
 
   it('criss-cross merge is direction independent', async () => {
-    // Both merge directions use the same base now (and a symmetric
-    // counter fn), so they resolve to the same value instead of each
-    // side winning its own merge.
+    // Both merge directions use the same base (and a symmetric counter
+    // fn), so they resolve to the same value instead of each side
+    // winning its own merge.
     const store = new Memory()
-    const v = await VersionedKV.open(store)
-    const pa = (await v.createBranch('pa')) as VersionedKV
-    const pb = (await v.createBranch('pb')) as VersionedKV
-    await pa.commit(one('n', '10'))
-    await pb.commit(one('n', '20'))
-    const p1 = pa.currentCommit
-    const p2 = pb.currentCommit
-    const m = (await v.createBranch('m', { at: p1 })) as VersionedKV
-    await m.mergeHeads(p2, { mergeFns: new Map([['n', oursFn]]) })
-    const q = (await v.createBranch('q', { at: p2 })) as VersionedKV
-    await q.mergeHeads(p1, { mergeFns: new Map([['n', oursFn]]) })
+    const { repo, wt: v } = await open(store)
+    const pa = await fork(repo, 'pa', v.head)
+    const pb = await fork(repo, 'pb', v.head)
+    await put(pa, 'n', '10')
+    await put(pb, 'n', '20')
+    const p1 = pa.head
+    const p2 = pb.head
+    const m = await fork(repo, 'm', p1)
+    await m.merge({ commit: p2 }, { mergeFns: new Map([['n', oursFn]]) })
+    const q = await fork(repo, 'q', p2)
+    await q.merge({ commit: p1 }, { mergeFns: new Map([['n', oursFn]]) })
 
-    const fwd = (await v.createBranch('fwd', { at: m.currentCommit })) as VersionedKV
-    await fwd.mergeHeads(q.currentCommit, { mergeFns: new Map([['n', counterFn]]) })
-    const back = (await v.createBranch('back', { at: q.currentCommit })) as VersionedKV
-    await back.mergeHeads(m.currentCommit, { mergeFns: new Map([['n', counterFn]]) })
-    expect(text((await fwd.get('n')) as Uint8Array)).toBe(text((await back.get('n')) as Uint8Array))
+    const fwd = await fork(repo, 'fwd', m.head)
+    await fwd.merge({ commit: q.head }, { mergeFns: new Map([['n', counterFn]]) })
+    const back = await fork(repo, 'back', q.head)
+    await back.merge({ commit: m.head }, { mergeFns: new Map([['n', counterFn]]) })
+    expect(await read(fwd, 'n')).toBe(await read(back, 'n'))
   })
 })
 
-describe('VersionedKV — sanity: ConcurrencyError import path', () => {
+describe('sanity: ConcurrencyError import path', () => {
   it('exports ConcurrencyError as a real class', () => {
     expect(typeof ConcurrencyError).toBe('function')
     const err = new ConcurrencyError('test')

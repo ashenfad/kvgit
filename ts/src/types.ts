@@ -2,8 +2,8 @@
  * @agex-ts/kvgit public type contracts.
  *
  * Canonical source for the public types of @agex-ts/kvgit. Implementations
- * (`Hamt`, `Keyset`, `VersionedKV`, `Staged`, `Namespaced`, the
- * backends) live in sibling files and import from here.
+ * (`Repo`, `Worktree`, `Namespaced`, the backends) live in sibling files
+ * and import from here.
  */
 
 import type { PyFloat } from './pyjson'
@@ -30,14 +30,14 @@ export {
 
 /**
  * Bytes-only key-value store. Serialization happens at higher layers
- * (e.g. `VersionedKV`).
+ * (a repository's codec).
  *
  * All operations are async to accommodate IndexedDB / OPFS / remote
  * backends. In-process backends (`Memory`) wrap sync operations in
  * resolved promises so user code is uniform across backends.
  *
- * `cas` is correctness-critical — it underpins branch HEAD advancement
- * in `VersionedKV`. Backends must guarantee atomicity (read + conditional
+ * `cas` is correctness-critical — it underpins every branch HEAD
+ * advancement. Backends must guarantee atomicity (read + conditional
  * write within a single transaction or equivalent).
  */
 export interface KVStore {
@@ -94,58 +94,6 @@ export interface KVStore {
 // ---------------------------------------------------------------------------
 // HAMT
 // ---------------------------------------------------------------------------
-
-/**
- * Per-key metadata stored alongside a blob pointer in a keyset entry.
- *
- * `size` is the blob's length in bytes. `chunks` lists the
- * content-addressed chunks a chunked codec's blob refers to (Python
- * kvgit's scientific codec writes them); absent for an opaque blob.
- * Everything here follows from the blob's bytes, so equal content gives
- * equal entries and equal HAMT nodes.
- */
-export interface MetaEntry {
-  readonly size: number
-  /** Seconds; set only on entries written before storage v4, and kept
-   *  so that an entry nobody touched re-encodes to the bytes it was
-   *  stored as. Never set on a new entry. */
-  readonly createdAt?: number
-  readonly chunks?: readonly string[]
-}
-
-/**
- * One entry in the keyset HAMT: a pointer to the blob's storage
- * location plus its metadata.
- *
- * A blob pointer is the blob's storage key, `kvgit:blob:<sha256>`.
- */
-export interface KeysetEntry {
-  readonly blob: string
-  readonly meta: MetaEntry
-}
-
-/**
- * Structural diff between two HAMT roots.
- *
- * Computed in O(changes + log N) by skipping subtrees that share a
- * hash. The primary payoff of structural sharing.
- */
-export interface HamtDiff {
-  readonly added: ReadonlyMap<string, Uint8Array>
-  readonly removed: ReadonlyMap<string, Uint8Array>
-  readonly modified: ReadonlyMap<string, readonly [Uint8Array, Uint8Array]>
-}
-
-/**
- * Structural diff between two `Keyset` roots — the typed-entry analog
- * of `HamtDiff`. Same hash-skipping payoff: cost is proportional to the
- * number of changed entries, not the total entry count.
- */
-export interface KeysetDiff {
-  readonly added: ReadonlyMap<string, KeysetEntry>
-  readonly removed: ReadonlyMap<string, KeysetEntry>
-  readonly modified: ReadonlyMap<string, readonly [KeysetEntry, KeysetEntry]>
-}
 
 // ---------------------------------------------------------------------------
 // Versioned
@@ -252,126 +200,8 @@ export type MergeFn<T = unknown> = (
   theirs: T | null,
 ) => T | MergeChoice
 
-/**
- * What a commit, merge or apply does when it can't land cleanly (no
- * common ancestor, a contested key no rule resolves, a lost race):
- *
- * - `'raise'` (default): throw `ConcurrencyError` or `MergeConflict`.
- * - `'abandon'`: return `{ merged: false }`. Pending changes remain and
- *   the in-memory state is restored; the caller decides whether to
- *   retry.
- */
-export type ConflictDisposition = 'raise' | 'abandon'
-
-/**
- * What a commit does when its branch has moved since the handle's base
- * (another writer committed to it first):
- *
- * - `'merge'` (default): three-way merge onto the branch's tip.
- * - `'raise'`: throw `BranchMovedError` and write nothing. For data
- *   whose keys are not independent, where a merge of two disjoint
- *   changes is a state neither writer made.
- */
-export type MovedDisposition = 'merge' | 'raise'
-
-/** Optional commit-level metadata. Surfaced via `commitInfo()`. */
+/** Optional commit-level metadata, as a commit records it. */
 export type CommitInfo = Record<string, unknown>
-
-/** The merge rules a call layers over the handle's registrations. */
-export interface MergeRuleOptions {
-  /** Registrations by key. */
-  mergeFns?: ReadonlyMap<string, MergePolicy> | null
-  /** Registrations by key prefix; a key takes the longest one it
-   *  starts with, after an exact key match. */
-  mergePrefixes?: ReadonlyMap<string, MergePolicy> | null
-  /** The registration for keys nothing else covers. */
-  defaultMerge?: MergePolicy | null
-}
-
-/** Options for `Versioned.commit()`. */
-export interface VersionedCommitOptions extends MergeRuleOptions {
-  updates?: Map<string, Uint8Array> | null
-  removals?: Set<string> | null
-  onConflict?: ConflictDisposition
-  onMoved?: MovedDisposition
-  info?: CommitInfo | null
-}
-
-/** Options for `Versioned.mergeHeads()`. */
-export interface MergeHeadsOptions extends MergeRuleOptions {
-  onConflict?: ConflictDisposition
-  info?: CommitInfo | null
-  postCheck?: PostCheck | null
-  /** Move HEAD to theirs without a merge commit when ours is an
-   *  ancestor of theirs (default true); false writes the merge commit
-   *  anyway. */
-  fastForward?: boolean
-}
-
-/** Options for `Versioned.applyChange()`. */
-export interface ApplyChangeOptions extends MergeRuleOptions {
-  onConflict?: ConflictDisposition
-  info?: CommitInfo | null
-  postCheck?: PostCheck | null
-}
-
-/**
- * Versioned key-value store. A commit log over a `KVStore`.
- *
- * `VersionedKV` is the v1 implementation; the protocol leaves room for
- * alternative implementations (e.g. a remote-RPC variant).
- */
-export interface Versioned {
-  readonly currentCommit: string
-  readonly baseCommit: string
-  readonly currentBranch: string
-  readonly initialCommit: string
-  readonly lastMergeResult: MergeResult | null
-
-  /** Resolve the branch's HEAD from storage (reflects other writers). */
-  latestHead(): Promise<string | null>
-
-  // --- Reads ---
-
-  get(key: string): Promise<Uint8Array | null>
-  getMany(keys: Iterable<string>): Promise<Map<string, Uint8Array>>
-  has(key: string): Promise<boolean>
-  keys(): AsyncIterable<string>
-
-  /** Read a key from another branch's HEAD without switching to it. */
-  peek(key: string, opts: { branch: string }): Promise<Uint8Array | null>
-
-  // --- Merge fn registry ---
-
-  setMergeFn(key: string, fn: MergePolicy): void
-  setMergePrefix(prefix: string, fn: MergePolicy): void
-  setDefaultMerge(fn: MergePolicy): void
-
-  // --- Writes ---
-
-  commit(opts?: VersionedCommitOptions): Promise<MergeResult>
-  mergeHeads(theirHead: string, opts?: MergeHeadsOptions): Promise<MergeResult>
-  applyChange(base: string, target: string, opts?: ApplyChangeOptions): Promise<MergeResult>
-
-  // --- Navigation ---
-
-  refresh(): Promise<void>
-  checkout(commitHash: string, opts?: { branch?: string }): Promise<Versioned | null>
-  createBranch(name: string, opts?: { at?: string }): Promise<Versioned>
-  deleteBranch(name: string): Promise<void>
-  switchBranch(name: string): Promise<void>
-  resetTo(commitHash: string): Promise<boolean>
-  history(commitHash?: string, opts?: { allParents?: boolean }): AsyncIterable<string>
-  listBranches(): Promise<string[]>
-
-  // --- Inspection ---
-
-  commitInfo(commitHash?: string): Promise<CommitInfo | null>
-  diff(commitA: string, commitB: string): Promise<DiffResult>
-  parents(commitHash?: string): Promise<readonly string[]>
-  mergeBase(commitA: string, commitB: string): Promise<string | null>
-  branchExists(name: string): Promise<boolean>
-}
 
 // ---------------------------------------------------------------------------
 // Sync / wire
@@ -419,12 +249,3 @@ export interface WireCommit {
 // ---------------------------------------------------------------------------
 // Encoding
 // ---------------------------------------------------------------------------
-
-/**
- * Encode a value to bytes for storage. The chunk-aware variants from
- * kvgit-py are deferred from v1; the encoder/decoder shape here will
- * extend additively when chunked codecs land.
- */
-export type Encoder<T = unknown> = (value: T) => Uint8Array
-
-export type Decoder<T = unknown> = (bytes: Uint8Array) => T

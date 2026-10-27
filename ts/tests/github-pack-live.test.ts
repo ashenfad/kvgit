@@ -10,7 +10,7 @@
 import { afterAll, describe, expect, it } from 'vitest'
 import { Memory } from '../src/backends/memory'
 import { GithubClient, PackRemote } from '../src/github/index'
-import { VersionedKV, pullBranch, pushBranch, walkDelta } from '../src/index'
+import { Repo, pullBranch, pushBranch, walkDelta } from '../src/index'
 
 const TOKEN = process.env.KVGIT_GH_TOKEN ?? ''
 const REPO = process.env.KVGIT_GH_REPO ?? ''
@@ -26,9 +26,10 @@ function device(): { store: Memory; remote: PackRemote } {
 }
 
 async function extend(store: Memory, branch: string, tag: string): Promise<string> {
-  const vk = await VersionedKV.open(store, { branch })
-  await vk.commit({ updates: new Map([[`k/${tag}`, enc.encode(`value ${tag}`)]]) })
-  return vk.currentCommit
+  const wt = await (await Repo.open(store)).worktree(branch, { create: true })
+  wt.set(`k/${tag}`, enc.encode(`value ${tag}`))
+  await wt.commit()
+  return wt.head
 }
 
 describe.runIf(LIVE)('PackRemote (live)', () => {
@@ -52,7 +53,7 @@ describe.runIf(LIVE)('PackRemote (live)', () => {
     await extend(a.store, branch, 'base')
     expect((await pushBranch(a.store, a.remote, branch)).status).toBe('created')
     expect((await pullBranch(b.store, b.remote, branch)).status).toBe('created')
-    const base = (await VersionedKV.open(a.store, { branch })).currentCommit
+    const base = await (await Repo.open(a.store)).branches.get(branch)
 
     const headA = await extend(a.store, branch, 'from-a')
     const headB = await extend(b.store, branch, 'from-b')

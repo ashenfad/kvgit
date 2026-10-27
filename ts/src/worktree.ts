@@ -3,8 +3,8 @@
  * it.
  */
 
+import type { Engine } from './engine'
 import { UnknownCommitError } from './errors'
-import type { NodeCache } from './hamt'
 import type { Ref, Repo } from './repo'
 import {
   type CommitInfo,
@@ -14,7 +14,6 @@ import {
   type MergeResult,
   type PostCheck,
 } from './types'
-import type { VersionedKV } from './versioned/kv'
 import { ROOT_COMMIT } from './versioned/layout'
 
 /** What a merge registration holds at the value level: a merge
@@ -90,7 +89,7 @@ export interface WorktreeMergeOptions<V> extends WorktreeApplyOptions<V> {
  */
 export class Worktree<V = Uint8Array> {
   readonly repo: Repo<V>
-  readonly #engine: VersionedKV
+  readonly #engine: Engine
   readonly #updates = new Map<string, V>()
   readonly #removals = new Set<string>()
   readonly #cache = new Map<string, V>()
@@ -99,7 +98,7 @@ export class Worktree<V = Uint8Array> {
   #defaultMerge: MergeRule<V> | undefined
 
   /** @internal Made by `Repo.worktree`. */
-  constructor(repo: Repo<V>, engine: VersionedKV) {
+  constructor(repo: Repo<V>, engine: Engine) {
     this.repo = repo
     this.#engine = engine
   }
@@ -109,15 +108,9 @@ export class Worktree<V = Uint8Array> {
     return true
   }
 
-  /** A worktree reads through its repository's content cache, so has
-   *  no node cache of its own. */
-  get nodeCache(): NodeCache | null {
-    return null
-  }
-
   /** The branch this worktree is bound to. */
   get branch(): string {
-    return this.#engine.currentBranch
+    return this.#engine.branch
   }
 
   /**
@@ -126,7 +119,7 @@ export class Worktree<V = Uint8Array> {
    * `repo.branches.get(wt.branch)` reads the branch's tip.
    */
   get head(): string {
-    return this.#engine.currentCommit
+    return this.#engine.head
   }
 
   // --- Reads ---
@@ -136,8 +129,8 @@ export class Worktree<V = Uint8Array> {
     if (this.#removals.has(key)) return undefined
     if (this.#updates.has(key)) return this.#updates.get(key)
     if (this.#cache.has(key)) return this.#cache.get(key)
-    const raw = await this.#engine.get(key)
-    if (raw === null) return undefined
+    const raw = (await this.#engine.getMany([key])).get(key)
+    if (raw === undefined) return undefined
     const value = this.repo.codec.decode(raw)
     this.#cache.set(key, value)
     return value
@@ -173,7 +166,7 @@ export class Worktree<V = Uint8Array> {
    *  deleted. */
   async keys(): Promise<string[]> {
     const seen = new Set<string>()
-    for await (const key of this.#engine.keys()) {
+    for (const key of await this.#engine.keys()) {
       if (!this.#removals.has(key)) seen.add(key)
     }
     for (const key of this.#updates.keys()) seen.add(key)
@@ -314,7 +307,7 @@ export class Worktree<V = Uint8Array> {
   async merge(ref: Ref, opts: WorktreeMergeOptions<V> = {}): Promise<MergeResult> {
     this.requireClean('merge')
     const theirHead = await this.repo.resolveRef(ref)
-    const result = await this.#engine.mergeHeads(theirHead, {
+    const result = await this.#engine.merge(theirHead, null, {
       ...this.rules(opts),
       ...(opts.info !== undefined && { info: opts.info }),
       ...(opts.postCheck !== undefined && { postCheck: opts.postCheck }),
@@ -345,7 +338,7 @@ export class Worktree<V = Uint8Array> {
     this.requireClean('apply a change')
     await this.repo.getCommit(base)
     await this.repo.getCommit(target)
-    const result = await this.#engine.applyChange(base, target, {
+    const result = await this.#engine.merge(target, base, {
       ...this.rules(opts),
       ...(opts.info !== undefined && { info: opts.info }),
       ...(opts.postCheck !== undefined && { postCheck: opts.postCheck }),

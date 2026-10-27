@@ -148,33 +148,32 @@ describe('IndexedDB — backend-specific', () => {
     expect(stored).toBe(held)
   })
 
-  it('end-to-end VersionedKV over IndexedDB', async () => {
+  it('end-to-end Repo over IndexedDB', async () => {
     // Sanity check that the higher layers compose correctly with this
-    // backend — same VersionedKV/Staged behavior we test against
-    // Memory should hold over IDB.
-    const { VersionedKV } = await import('../src/versioned/kv')
-    const { Staged } = await import('../src/staged')
+    // backend: the repository behavior tested against Memory holds
+    // over IDB.
+    const { Repo } = await import('../src/repo')
 
     const dbName = uniqueDbName()
     const idb1 = await IndexedDB.open({ dbName })
     openHandles.push(idb1)
 
-    const vk1 = await VersionedKV.open(idb1)
-    const s1 = new Staged(vk1)
-    s1.set('greeting', 'hello')
-    await s1.commit({ info: { author: 'a' } })
-    const head = vk1.currentCommit
+    const repo1 = await Repo.open<string>(idb1, { codec: 'json' })
+    const wt1 = await repo1.worktree('main', { create: true })
+    wt1.set('greeting', 'hello')
+    await wt1.commit({ info: { author: 'a' } })
+    const head = wt1.head
 
     // Reopen via a second handle on the same DB — state survives.
     idb1.close()
     openHandles.length = 0
     const idb2 = await IndexedDB.open({ dbName })
     openHandles.push(idb2)
-    const vk2 = await VersionedKV.open(idb2)
-    expect(vk2.currentCommit).toBe(head)
-    const s2 = new Staged(vk2)
-    expect(await s2.get<string>('greeting')).toBe('hello')
-    expect(await vk2.commitInfo()).toEqual({ author: 'a' })
+    const repo2 = await Repo.open<string>(idb2, { codec: 'json' })
+    const wt2 = await repo2.worktree('main')
+    expect(wt2.head).toBe(head)
+    expect(await wt2.get('greeting')).toBe('hello')
+    expect((await repo2.getCommit(wt2.head)).info).toEqual({ author: 'a' })
   })
 })
 

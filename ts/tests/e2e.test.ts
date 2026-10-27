@@ -3,8 +3,9 @@
  *
  * One realistic scenario that exercises the full stack:
  *
- *   Staged (default JSON codec) → VersionedKV → Keyset → Hamt → Memory
- *                       └─ Namespaced views                    └─ cleanOrphans
+ *   Repo (JSON codec) → Worktree → Memory
+ *          │              └─ Namespaced views
+ *          └─ branches, snapshots, log, diff, gc
  *
  * Doubles as a runnable example: if you read one test to understand
  * what the API looks like in practice, read this one.
@@ -12,7 +13,7 @@
 
 import { describe, expect, it } from 'vitest'
 import { Memory } from '../src/backends/memory'
-import { type MergeFn, Namespaced, Staged, VersionedKV } from '../src/index'
+import { type MergeFn, Namespaced, Repo } from '../src/index'
 
 interface Doc {
   text: string
@@ -24,61 +25,59 @@ describe('e2e: collaborative document store', () => {
     // ---------- Setup ----------
     const store = new Memory()
 
-    // Open a Versioned at HEAD on `main`. Wrap with a Staged so writes
-    // accumulate in memory until we commit.
-    const vkAlice = await VersionedKV.open(store)
-    const stagedAlice = new Staged(vkAlice)
+    // Open the repository with the JSON codec and check out `main`.
+    // Writes stay pending in the worktree until we commit.
+    const repoAlice = await Repo.open(store, { codec: 'json' })
+    const wtAlice = await repoAlice.worktree('main', { create: true })
 
-    // Two namespaced views over the same Staged — Alice writes only
+    // Two namespaced views over the same worktree — Alice writes only
     // under `alice/*`, the shared doc lives under `docs/*`.
-    const aliceProfile = new Namespaced(stagedAlice, 'alice')
-    const docs = new Namespaced(stagedAlice, 'docs')
+    const aliceProfile = new Namespaced(wtAlice, 'alice')
+    const docs = new Namespaced(wtAlice, 'docs')
 
     // ---------- Alice's first commit ----------
     aliceProfile.set('name', 'Alice')
     aliceProfile.set('email', 'alice@example.com')
     docs.set('intro', { text: 'Welcome.', edits: 1 } satisfies Doc)
 
-    expect(stagedAlice.hasChanges).toBe(true)
+    expect(wtAlice.status().clean).toBe(false)
 
-    const r1 = await stagedAlice.commit({ info: { author: 'alice', kind: 'init' } })
+    const r1 = await wtAlice.commit({ info: { author: 'alice', kind: 'init' } })
     expect(r1.merged).toBe(true)
     expect(r1.strategy).toBe('fast_forward')
-    expect(stagedAlice.hasChanges).toBe(false)
+    expect(wtAlice.status().clean).toBe(true)
 
-    const initCommit = vkAlice.currentCommit
-    expect(await vkAlice.commitInfo(initCommit)).toEqual({
+    const initCommit = wtAlice.head
+    expect((await repoAlice.getCommit(initCommit)).info).toEqual({
       author: 'alice',
       kind: 'init',
     })
 
     // ---------- Read-back through namespaced views ----------
-    expect(await aliceProfile.get<string>('name')).toBe('Alice')
-    const intro = await docs.get<Doc>('intro')
+    expect(await aliceProfile.get('name')).toBe('Alice')
+    const intro = (await docs.get('intro')) as Doc | undefined
     expect(intro?.text).toBe('Welcome.')
     expect(intro?.edits).toBe(1)
 
-    // descendantKeys reaches across nested namespaces too.
-    const allDocKeys: string[] = []
-    for await (const k of docs.keys()) allDocKeys.push(k)
-    expect(allDocKeys).toEqual(['intro'])
+    // keys() lists the namespace's direct children.
+    expect(await docs.keys()).toEqual(['intro'])
 
-    // ---------- Bob opens a second handle on the same store ----------
-    const vkBob = await VersionedKV.open(store)
-    const stagedBob = new Staged(vkBob)
-    const docsBob = new Namespaced(stagedBob, 'docs')
+    // ---------- Bob opens a second repository on the same store ----------
+    const repoBob = await Repo.open(store, { codec: 'json' })
+    const wtBob = await repoBob.worktree('main')
+    const docsBob = new Namespaced(wtBob, 'docs')
 
-    expect(vkBob.currentCommit).toBe(initCommit)
-    expect(await docsBob.get<Doc>('intro')).toEqual({ text: 'Welcome.', edits: 1 })
+    expect(wtBob.head).toBe(initCommit)
+    expect(await docsBob.get('intro')).toEqual({ text: 'Welcome.', edits: 1 })
 
     // ---------- Concurrent edits to the same doc ----------
     // Alice edits the intro.
-    const aliceIntro = (await docs.get<Doc>('intro')) as Doc
+    const aliceIntro = (await docs.get('intro')) as Doc
     docs.set('intro', { text: `${aliceIntro.text} - alice was here.`, edits: 2 })
-    await stagedAlice.commit({ info: { author: 'alice', kind: 'edit' } })
+    await wtAlice.commit({ info: { author: 'alice', kind: 'edit' } })
 
     // Bob, still based on initCommit, edits the same doc.
-    const bobIntro = (await docsBob.get<Doc>('intro')) as Doc
+    const bobIntro = (await docsBob.get('intro')) as Doc
     docsBob.set('intro', { text: `${bobIntro.text} - bob too.`, edits: 2 })
 
     // Without a merge fn, Bob's commit would throw MergeConflict.
@@ -96,78 +95,74 @@ describe('e2e: collaborative document store', () => {
         edits: base.edits + (o.edits - base.edits) + (t.edits - base.edits),
       }
     }
-    stagedBob.setMergeFn('docs/intro', docMerge)
+    wtBob.setMergeFn('docs/intro', docMerge as MergeFn<unknown>)
 
-    const r2 = await stagedBob.commit({ info: { author: 'bob', kind: 'merge' } })
+    const r2 = await wtBob.commit({ info: { author: 'bob', kind: 'merge' } })
     expect(r2.merged).toBe(true)
     expect(r2.strategy).toBe('three_way')
     expect(r2.autoMergedKeys).toEqual(['docs/intro'])
 
-    const merged = (await docsBob.get<Doc>('intro')) as Doc
+    const merged = (await docsBob.get('intro')) as Doc
     expect(merged.text).toBe('Welcome. - alice was here. - bob too.')
     // Alice +1, Bob +1, base 1 → merged edits = 3.
     expect(merged.edits).toBe(3)
 
     // ---------- Branching ----------
-    const draft = (await vkBob.createBranch('draft')) as VersionedKV
-    const stagedDraft = new Staged(draft)
-    const docsDraft = new Namespaced(stagedDraft, 'docs')
+    await repoBob.branches.create('draft', wtBob.head)
+    const wtDraft = await repoBob.worktree('draft')
+    const docsDraft = new Namespaced(wtDraft, 'docs')
     docsDraft.set('intro', { text: 'Draft completely different.', edits: 99 })
-    await stagedDraft.commit({ info: { author: 'bob', kind: 'draft' } })
+    await wtDraft.commit({ info: { author: 'bob', kind: 'draft' } })
 
     // The draft's writes don't bleed back to main.
-    const mainPeek = (await vkBob.peek('docs/intro', { branch: 'main' })) as Uint8Array
-    const peeked = JSON.parse(new TextDecoder().decode(mainPeek)) as Doc
+    const mainRaw = (await (
+      await repoBob.snapshot({ branch: 'main' })
+    ).raw.get('docs/intro')) as Uint8Array
+    const peeked = JSON.parse(new TextDecoder().decode(mainRaw)) as Doc
     expect(peeked.text).toBe('Welcome. - alice was here. - bob too.')
 
     // ---------- History walk ----------
     const linearHistory: string[] = []
-    for await (const c of vkBob.history()) linearHistory.push(c)
+    for await (const c of repoBob.log({ branch: 'main' }, { firstParent: true })) {
+      linearHistory.push(c.hash)
+    }
     // Should be [merge, alice-edit, init, root-empty]
     expect(linearHistory.length).toBe(4)
-    expect(linearHistory[0]).toBe(vkBob.currentCommit)
+    expect(linearHistory[0]).toBe(wtBob.head)
 
-    // allParents picks up the merge commit's second parent too.
+    // The full log picks up the merge commit's second parent too.
     const fullHistory = new Set<string>()
-    for await (const c of vkBob.history(undefined, { allParents: true })) {
-      fullHistory.add(c)
-    }
+    for await (const c of repoBob.log({ branch: 'main' })) fullHistory.add(c.hash)
     expect(fullHistory.size).toBeGreaterThanOrEqual(linearHistory.length)
 
     // ---------- Diff between two commits ----------
-    const d = await vkBob.diff(initCommit, vkBob.currentCommit)
+    const d = await repoBob.diff(initCommit, wtBob.head)
     // Only 'docs/intro' should show as modified (alice's profile keys were
     // already there at initCommit).
     expect([...d.modified]).toEqual(['docs/intro'])
     expect([...d.added]).toEqual([])
     expect([...d.removed]).toEqual([])
 
-    // ---------- Checkout a historical view ----------
-    const oldView = (await vkBob.checkout(initCommit)) as VersionedKV
-    const oldStaged = new Staged(oldView)
-    const oldDocs = new Namespaced(oldStaged, 'docs')
-    expect(await oldDocs.get<Doc>('intro')).toEqual({ text: 'Welcome.', edits: 1 })
-    // Live handle is unaffected.
-    expect(((await docsBob.get<Doc>('intro')) as Doc).text).toBe(
-      'Welcome. - alice was here. - bob too.',
-    )
+    // ---------- A snapshot of a historical commit ----------
+    const oldView = await repoBob.snapshot({ commit: initCommit })
+    expect(await oldView.get('docs/intro')).toEqual({ text: 'Welcome.', edits: 1 })
+    // The live worktree is unaffected.
+    expect(((await docsBob.get('intro')) as Doc).text).toBe('Welcome. - alice was here. - bob too.')
 
-    // ---------- listBranches ----------
-    expect(await vkBob.listBranches()).toEqual(['draft', 'main'])
+    // ---------- Listing branches ----------
+    expect(await repoBob.branches.list()).toEqual(['draft', 'main'])
 
     // ---------- Delete the draft branch + GC ----------
-    await vkBob.deleteBranch('draft')
-    expect(await vkBob.listBranches()).toEqual(['main'])
+    await repoBob.branches.delete('draft')
+    expect(await repoBob.branches.list()).toEqual(['main'])
 
-    // The draft commit is now unreachable; cleanOrphans (with minAge=-1
-    // for test purposes) sweeps it along with its blobs.
-    const removed = await vkBob.cleanOrphans({ minAge: -1 })
+    // The draft commit is now unreachable; gc (with minAge=-1 for test
+    // purposes) sweeps it along with its blobs.
+    const removed = await repoBob.gc({ minAge: -1 })
     expect(removed).toBeGreaterThanOrEqual(1)
 
     // Live state survives the sweep.
-    expect(((await docsBob.get<Doc>('intro')) as Doc).text).toBe(
-      'Welcome. - alice was here. - bob too.',
-    )
-    expect(await aliceProfile.get<string>('name')).toBe('Alice')
+    expect(((await docsBob.get('intro')) as Doc).text).toBe('Welcome. - alice was here. - bob too.')
+    expect(await aliceProfile.get('name')).toBe('Alice')
   })
 })

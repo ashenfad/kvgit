@@ -79,16 +79,11 @@ for await (const c of repo.log({ branch: 'main' })) console.log(c.hash, c.info)
   throws `BranchMovedError` (with nothing to commit too) (a `ConcurrencyError`; `err.head` is the
   tip it found), writes nothing reachable and keeps the pending
   changes. `refresh()` then moves to the tip to redo the work.
-- **Lazy worktrees.** `repo.worktree(name, { lazy: true })` leaves the
-  commit's keyset in its tree and reads it on demand, for branches of
-  tens of thousands of keys and up. Opening reads one record whatever
-  the size; reads walk the tree through a bounded cache of tree nodes
-  (`repo.nodeCache`, 16 MB, shared by every lazy worktree on the repo,
-  or `{ lazy: { cache: new NodeCache({ maxBytes }) } }`); a commit
-  rewrites only the paths it changes. Everything else behaves as in an
-  eager worktree, and both write the same commits. A lazy worktree
-  keeps no decoded values, and `keys()` reads the whole tree on every
-  call.
+- **Worktrees read on demand.** Opening reads the head's root alone,
+  whatever the branch holds; reads walk the tree through the
+  repository's content cache, and a commit rewrites only the paths it
+  changes. The first `keys()` builds an index the later ones read.
+  `lazy` is accepted and does nothing.
 - **`Snapshot`** is a read-only view pinned to one commit. It looks
   keys up in the tree a batch at a time, so reading a few keys stays
   cheap however many the commit holds; `raw` gives the stored bytes.
@@ -123,9 +118,6 @@ for await (const c of repo.log({ branch: 'main' })) console.log(c.hash, c.info)
   `TagExistsError`, `CorruptHeadError`, `StorageVersionError`,
   `MergeConflict`, `GcBusy`, `ConcurrencyError` and its subclass
   `BranchMovedError`.
-
-`Worktree` and `Repo` sit on `VersionedKV`, which stays available (as
-does `Staged`) for the code that still uses it.
 
 ## Codecs
 
@@ -218,10 +210,10 @@ of the value it held before its current one lives in
 `__branch_head_prev__<branch>`. If HEAD is unreadable — truncated
 bytes, a hash whose commit metadata is gone — head resolution falls
 back in tiers: the backup first, then the optional
-`recoverFromCorruptHead` callback you can pass to `Repo.open` (or
-`VersionedKV.open`), then nothing. That third tier is caller-supplied here (kvgit-py's
-built-in commit scan is not ported), so out of the box a branch
-recovers only as far back as its backup.
+`recoverFromCorruptHead` callback you can pass to `Repo.open`, then
+nothing. Out of the box a branch recovers only as far back as its
+backup; `recoverByCommitScan`, passed as the callback, guesses from a
+scan of every commit, as Python's `recover_by_commit_scan` does.
 
 A recoverer is not a trusted tier. Its answer is accepted only if it
 is a string naming a commit whose `__commit_root__` is present in this
@@ -364,7 +356,7 @@ this layer:
 
 The storage layout and commit-identity primitives live in
 [`src/versioned/layout.ts`](./src/versioned/layout.ts) — the single
-source of truth shared by `VersionedKV` and the sync layer. If you
+source of truth for the host's reads and the sync layer. If you
 change the layout or hash inputs, both move together and the storage
 version sentinel must bump.
 
