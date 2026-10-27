@@ -1138,6 +1138,7 @@ fn error_name(e: &Error) -> String {
         Error::MergeConflict { .. } => "MergeConflict",
         Error::GcBusy(_) => "GcBusy",
         Error::StorageVersion(_) => "StorageVersionError",
+        Error::Integrity(_) => "IntegrityError",
         Error::Malformed(_) | Error::Host | Error::Invalid(_) => "invalid",
     }
     .into()

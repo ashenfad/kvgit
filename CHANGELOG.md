@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **TypeScript repositories cache what the store never rewrites.** Tree nodes and commit records are answered from a cache of `cacheBytes` (32 MB by default, 0 turns it off), as Python's are, and any writer's sweep empties it before the next commit builds.
 - **TypeScript gains the commit-scan recoverer.** `recoverByCommitScan`, passed as `recoverFromCorruptHead`, guesses a damaged branch's head as Python's `recover_by_commit_scan` does, from the same code.
+- **`IntegrityError`, in both packages.** A transferred commit whose hash or parent generations don't match what it carries, or whose parent never came, is refused with it before anything of it is written; TypeScript's `applyWire` threw a plain `Error`.
 
 ### Changed
 - **Breaking (Python): stores stamped v2 or v3 are refused.** Opening or sweeping one raises `StorageVersionError`, as TypeScript did; the objects an older kvgit wrote still read once a store's stamp is v4.

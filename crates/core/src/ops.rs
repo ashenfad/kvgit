@@ -16,6 +16,7 @@ use crate::refs::{self, Ref};
 use crate::store::{dumps_str, loads_str};
 use crate::synced::{self, Owner};
 use crate::version;
+use crate::wire;
 use crate::worktree;
 use crate::write::{self, CommitArgs, Committed, Done, MergeArgs};
 use std::collections::HashMap;
@@ -76,6 +77,14 @@ pub type Op = Machine<Done<Out>>;
 /// - `publish_head {branch, expected, head, in_flight}`: whether the
 ///   branch moved from `expected` (null: was created) to `head`, a
 ///   commit that must be in the store.
+/// - `wire_walk {want, have}`: emits the commits reachable from `want`
+///   and from none of `have`, parents first, each as `{hash, parents,
+///   parent_gens, time, info, updates, removals}` (see [`wire::walk`]);
+///   answers null.
+/// - `wire_replay {hash, parents, parent_gens, time, info, updates,
+///   removals}`: write one commit of such a stream, `updates` as
+///   `[key, blob, size]`, the blobs' bytes held by the host;
+///   `"applied"`, or `"present"` for one already in the store.
 /// - `check_version {stamp}`: refuse a store of another storage layout;
 ///   with `stamp`, stamp a fresh one. Null.
 /// - `gc {min_age, deep, wait, lease_ttl}`: the number of commits swept,
@@ -124,6 +133,8 @@ pub const NAMES: &[&str] = &[
     "has_sync_head",
     "delete_branch_unless_synced",
     "publish_head",
+    "wire_walk",
+    "wire_replay",
     "check_version",
     "gc",
     "reset_branch",
@@ -245,6 +256,51 @@ fn texts(args: &Value, name: &str) -> Result<Vec<String>, Error> {
             .collect(),
         _ => Err(invalid()),
     }
+}
+
+/// A commit as `wire_replay` takes it.
+fn wire_commit(args: &Value) -> Result<wire::WireCommit, Error> {
+    let invalid = |what: &str| Error::Invalid(format!("a wire commit's {what} is malformed"));
+    let parent_gens = match arg(args, "parent_gens")? {
+        Value::Null => None,
+        Value::Array(items) => Some(
+            items
+                .iter()
+                .map(|g| match g {
+                    Value::Int(n) if *n >= 0 => Ok(*n as u64),
+                    _ => Err(invalid("parent generations")),
+                })
+                .collect::<Result<_, _>>()?,
+        ),
+        _ => return Err(invalid("parent generations")),
+    };
+    let updates = match arg(args, "updates")? {
+        Value::Array(items) => items
+            .iter()
+            .map(|item| match item {
+                Value::Array(parts) => match parts.as_slice() {
+                    [Value::Str(key), Value::Str(blob), Value::Int(size)] if *size >= 0 => {
+                        Ok((key.clone(), blob.clone(), *size as u64))
+                    }
+                    _ => Err(invalid("updates")),
+                },
+                _ => Err(invalid("updates")),
+            })
+            .collect::<Result<_, _>>()?,
+        _ => return Err(invalid("updates")),
+    };
+    Ok(wire::WireCommit {
+        hash: text(args, "hash")?.to_string(),
+        parents: texts(args, "parents")?,
+        parent_gens,
+        time: seconds(args, "time")?,
+        info: match arg(args, "info")? {
+            Value::Null => None,
+            info => Some(info.clone()),
+        },
+        updates,
+        removals: texts(args, "removals")?,
+    })
 }
 
 /// The remote a sync head belongs to: null for none named, else `{id}`.
@@ -529,6 +585,20 @@ async fn run(io: &Io, name: &str, args: &Value, notes: &mut Notes) -> Result<Val
                     &texts(args, "in_flight")?,
                 )
                 .await?,
+            )
+        }
+        "wire_walk" => {
+            wire::walk(io, text(args, "want")?, &texts(args, "have")?).await?;
+            Value::Null
+        }
+        "wire_replay" => {
+            let replayed = wire::replay(io, wire_commit(args)?).await?;
+            Value::Str(
+                match replayed {
+                    wire::Replayed::Applied => "applied",
+                    wire::Replayed::Present => "present",
+                }
+                .into(),
             )
         }
         "check_version" => {

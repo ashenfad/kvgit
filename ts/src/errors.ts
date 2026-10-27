@@ -145,6 +145,13 @@ export class StorageVersionError extends KvgitError {
   override readonly name: string = 'StorageVersionError'
 }
 
+/** A commit from another store that doesn't check out: its hash or its
+ *  parents' generations don't match what it carries, or a parent it
+ *  needs never came. Nothing of it is written. */
+export class IntegrityError extends KvgitError {
+  override readonly name: string = 'IntegrityError'
+}
+
 /**
  * A sweep couldn't take the store's GC lease because another sweep
  * holds an unexpired one. `gc({ wait: false })` throws it; by default

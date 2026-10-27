@@ -14,6 +14,7 @@ export {
   ConcurrencyError,
   CorruptHeadError,
   GcBusy,
+  IntegrityError,
   KvgitError,
   MergeConflict,
   StorageVersionError,

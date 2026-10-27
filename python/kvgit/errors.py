@@ -101,6 +101,12 @@ class StorageVersionError(KvgitError):
     read, or one older than any it supports. Nothing is written to it."""
 
 
+class IntegrityError(KvgitError):
+    """Raised for a commit from another store that doesn't check out: its
+    hash or its parents' generations don't match what it carries, or a
+    parent it needs never came. Nothing of it is written."""
+
+
 class GcBusy(KvgitError):
     """Raised when a sweep cannot take the store's GC lease because
     another sweep holds an unexpired one. ``Repo.gc(wait=False)`` raises

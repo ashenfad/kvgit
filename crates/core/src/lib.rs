@@ -23,6 +23,7 @@ pub mod synced;
 pub mod text;
 pub mod tree;
 pub mod version;
+pub mod wire;
 pub mod worktree;
 pub mod write;
 
