@@ -1,38 +1,35 @@
 /**
- * Namespaced: a key-prefix view over a `Staged`-shaped store.
+ * Namespaced: a key-prefix view over a worktree.
  *
- * Wraps any store that exposes async reads + sync buffered writes
- * (notably `Staged`, but also another `Namespaced`). All operations
- * route through a `<namespace>/<key>` prefix, so an enclosing
- * application can carve out independent sub-namespaces over a single
- * shared store.
+ * Wraps any store shaped like a `Worktree` (async reads, pending
+ * writes), another `Namespaced` included. All operations route through
+ * a `<namespace>/<key>` prefix, so an enclosing application can carve
+ * out independent sub-namespaces over a single shared worktree.
  *
- * Nesting flattens: `new Namespaced(new Namespaced(staged, 'a'), 'b')`
+ * Nesting flattens: `new Namespaced(new Namespaced(wt, 'a'), 'b')`
  * reads/writes keys under `a/b/` rather than building a deeper
  * prefix-of-prefix chain.
  */
 
 /**
- * The minimal shape `Namespaced` needs from its underlying store.
- *
- * Both `Staged` and `Namespaced` itself implement this naturally;
- * other stores can opt in by providing the same surface.
+ * The shape `Namespaced` needs from the store under it: a `Worktree`'s.
+ * `Namespaced` itself has it too.
  */
-export interface NamespaceableStore {
-  get<T = unknown>(key: string): Promise<T | undefined>
+export interface NamespaceableStore<V = unknown> {
+  get(key: string): Promise<V | undefined>
   has(key: string): Promise<boolean>
-  set<T = unknown>(key: string, value: T): void
-  delete(key: string): void
-  keys(): AsyncIterable<string>
+  set(key: string, value: V): void
+  delete(key: string): Promise<boolean>
+  keys(): Promise<string[]>
 }
 
-export class Namespaced implements NamespaceableStore {
+export class Namespaced<V = unknown> implements NamespaceableStore<V> {
   /** The full prefix this view is namespaced under (without trailing slash). */
   readonly namespace: string
 
-  private readonly store: NamespaceableStore
+  private readonly store: NamespaceableStore<V>
 
-  constructor(store: NamespaceableStore, namespace: string) {
+  constructor(store: NamespaceableStore<V>, namespace: string) {
     if (namespace.includes('/')) {
       throw new Error("Namespace names cannot contain '/'")
     }
@@ -40,7 +37,7 @@ export class Namespaced implements NamespaceableStore {
       this.namespace = `${store.namespace}/${namespace}`
       // Flatten: reach past the parent Namespaced to the underlying
       // store so we don't build a chain of indirection on each access.
-      this.store = (store as Namespaced).store
+      this.store = (store as Namespaced<V>).store
     } else {
       this.namespace = namespace
       this.store = store
@@ -53,40 +50,47 @@ export class Namespaced implements NamespaceableStore {
 
   // --- Reads ---
 
-  async get<T = unknown>(key: string): Promise<T | undefined> {
-    return this.store.get<T>(this.prefixed(key))
+  async get(key: string): Promise<V | undefined> {
+    return this.store.get(this.prefixed(key))
   }
 
   async has(key: string): Promise<boolean> {
     return this.store.has(this.prefixed(key))
   }
 
-  /** Direct child keys in this namespace (excluding nested sub-namespaces). */
-  async *keys(): AsyncIterable<string> {
+  /** Direct child keys in this namespace (excluding nested
+   *  sub-namespaces), sorted. */
+  async keys(): Promise<string[]> {
     const prefix = `${this.namespace}/`
-    for await (const k of this.store.keys()) {
+    const out: string[] = []
+    for (const k of await this.store.keys()) {
       if (!k.startsWith(prefix)) continue
       const remainder = k.slice(prefix.length)
       if (remainder.length === 0 || remainder.includes('/')) continue
-      yield remainder
+      out.push(remainder)
     }
+    return out
   }
 
-  /** All keys under this namespace, including those in nested sub-namespaces. */
-  async *descendantKeys(): AsyncIterable<string> {
+  /** All keys under this namespace, including those in nested
+   *  sub-namespaces, sorted. */
+  async descendantKeys(): Promise<string[]> {
     const prefix = `${this.namespace}/`
-    for await (const k of this.store.keys()) {
-      if (k.startsWith(prefix)) yield k.slice(prefix.length)
+    const out: string[] = []
+    for (const k of await this.store.keys()) {
+      if (k.startsWith(prefix)) out.push(k.slice(prefix.length))
     }
+    return out
   }
 
   // --- Writes ---
 
-  set<T = unknown>(key: string, value: T): void {
+  set(key: string, value: V): void {
     this.store.set(this.prefixed(key), value)
   }
 
-  delete(key: string): void {
-    this.store.delete(this.prefixed(key))
+  /** Delete a key; false if it was not there. */
+  delete(key: string): Promise<boolean> {
+    return this.store.delete(this.prefixed(key))
   }
 }

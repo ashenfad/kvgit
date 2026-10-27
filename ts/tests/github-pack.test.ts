@@ -14,7 +14,8 @@ import {
   encodePack,
 } from '../src/github/index'
 import {
-  VersionedKV,
+  Repo,
+  type Worktree,
   applyWire,
   deleteRemoteBranch,
   pullBranch,
@@ -63,18 +64,19 @@ describe('PackRemote id', () => {
   })
 })
 
-async function commitN(store: Memory, n: number, prefix: string): Promise<VersionedKV> {
-  const vk = await VersionedKV.open(store, { branch: BRANCH })
+/** A worktree on `branch` in `store`, which it creates if need be. */
+async function open(store: Memory, branch = BRANCH): Promise<Worktree> {
+  return (await Repo.open(store)).worktree(branch, { create: true })
+}
+
+async function commitN(store: Memory, n: number, prefix: string): Promise<Worktree> {
+  const wt = await open(store)
   for (let i = 0; i < n; i++) {
-    await vk.commit({
-      updates: new Map([
-        [`files/${prefix}${i}.txt`, bytes(`${prefix} ${i} `.repeat(20))],
-        ['index', bytes(`${prefix}${i}`)],
-      ]),
-      info: { tool: 'file_write', t: 1.5 },
-    })
+    wt.set(`files/${prefix}${i}.txt`, bytes(`${prefix} ${i} `.repeat(20)))
+    wt.set('index', bytes(`${prefix}${i}`))
+    await wt.commit({ info: { tool: 'file_write', t: 1.5 } })
   }
-  return vk
+  return wt
 }
 
 async function collect(iter: AsyncIterable<WireCommit>): Promise<WireCommit[]> {
@@ -86,28 +88,31 @@ async function collect(iter: AsyncIterable<WireCommit>): Promise<WireCommit[]> {
 describe('pack codec', () => {
   it('round-trips wire commits so applyWire re-derives every hash', async () => {
     const src = new Memory()
-    const vk = await commitN(src, 4, 'a')
-    await vk.commit({ updates: new Map(), removals: new Set(['files/a0.txt']) })
-    const commits = await collect(walkDelta(src, { want: vk.currentCommit }))
+    const wt = await commitN(src, 4, 'a')
+    await wt.delete('files/a0.txt')
+    await wt.commit()
+    const commits = await collect(walkDelta(src, { want: wt.head }))
     const pack = await encodePack(commits, { kernel: 'ts', base: null })
     expect(pack[0]).toBe(0x1f) // gzip
     const decoded = await decodePack(pack)
-    expect(decoded.tip).toBe(vk.currentCommit)
+    expect(decoded.tip).toBe(wt.head)
     const dst = new Memory()
     const res = await applyWire(dst, decoded.commits, { createBranch: BRANCH })
-    expect(res.head).toBe(vk.currentCommit)
-    const copy = await VersionedKV.open(dst, { branch: BRANCH })
+    expect(res.head).toBe(wt.head)
+    const copy = await open(dst)
     expect(text(await copy.get('files/a3.txt'))).toContain('a 3')
-    expect(await copy.get('files/a0.txt')).toBeNull()
+    expect(await copy.get('files/a0.txt')).toBeUndefined()
   })
 
   it('stores a value repeated across commits once', async () => {
     const src = new Memory()
-    const vk = await VersionedKV.open(src, { branch: BRANCH })
+    const wt = await open(src)
     const big = bytes('x'.repeat(5000))
-    await vk.commit({ updates: new Map([['a', big]]) })
-    await vk.commit({ updates: new Map([['b', big]]) })
-    const commits = await collect(walkDelta(src, { want: vk.currentCommit }))
+    wt.set('a', big)
+    await wt.commit()
+    wt.set('b', big)
+    await wt.commit()
+    const commits = await collect(walkDelta(src, { want: wt.head }))
     const raw = await encodePack(commits, { kernel: 'ts', base: null, compress: false })
     expect(raw.length).toBeLessThan(5000 * 1.5)
   })
@@ -117,7 +122,7 @@ describe('PackRemote push / fetch', () => {
   it('first push is one roster query and one mutation; fresh pull one query and one read', async () => {
     const gh = new FakeGithub()
     const a = await device(gh)
-    const vk = await commitN(a.store, 5, 'a')
+    const wt = await commitN(a.store, 5, 'a')
 
     expect((await pushBranch(a.store, a.remote, BRANCH)).status).toBe('created')
     expect(gh.count('graphql-query')).toBe(1)
@@ -128,12 +133,12 @@ describe('PackRemote push / fetch', () => {
     const b = await device(gh)
     const pulled = await pullBranch(b.store, b.remote, BRANCH)
     expect(pulled.status).toBe('created')
-    expect(pulled.localHead).toBe(vk.currentCommit)
+    expect(pulled.localHead).toBe(wt.head)
     expect(pulled.transferred).toBe(6) // root + 5
     expect(gh.count('graphql-query')).toBe(1)
     expect(gh.count('raw')).toBe(1)
-    const bVk = await VersionedKV.open(b.store, { branch: BRANCH })
-    expect(text(await bVk.get('index'))).toBe('a4')
+    const bWt = await open(b.store)
+    expect(text(await bWt.get('index'))).toBe('a4')
   })
 
   it('incremental push adds one pack; incremental pull reads only it', async () => {
@@ -144,7 +149,7 @@ describe('PackRemote push / fetch', () => {
     const b = await device(gh)
     await pullBranch(b.store, b.remote, BRANCH)
 
-    const vk = await commitN(a.store, 4, 'b')
+    const wt = await commitN(a.store, 4, 'b')
     gh.calls.length = 0
     const pushed = await pushBranch(a.store, a.remote, BRANCH)
     expect(pushed.status).toBe('pushed')
@@ -157,7 +162,7 @@ describe('PackRemote push / fetch', () => {
     expect(pulled.status).toBe('fast-forwarded')
     expect(pulled.transferred).toBe(4)
     expect(gh.count('raw')).toBe(1)
-    expect(pulled.localHead).toBe(vk.currentCommit)
+    expect(pulled.localHead).toBe(wt.head)
   })
 
   it('a pull that has part of a pack applies only what it lacks', async () => {
@@ -197,10 +202,10 @@ describe('PackRemote push / fetch', () => {
   it('a race inside the CAS window returns false from push (no partial write)', async () => {
     const gh = new FakeGithub()
     const a = await device(gh)
-    const vk = await commitN(a.store, 2, 'a')
+    const wt = await commitN(a.store, 2, 'a')
     await pushBranch(a.store, a.remote, BRANCH)
     await a.remote.listRefs()
-    const old = vk.currentCommit
+    const old = wt.head
     await commitN(a.store, 1, 'x')
     // Someone moves the ref between our roster read and our mutation.
     gh.beforeMutation = () => {
@@ -208,15 +213,10 @@ describe('PackRemote push / fetch', () => {
       gh.beforeMutation = null
     }
     const commits = walkDelta(a.store, {
-      want: (await VersionedKV.open(a.store, { branch: BRANCH })).currentCommit,
+      want: (await open(a.store)).head,
       have: [old],
     })
-    const ok = await a.remote.push(
-      BRANCH,
-      old,
-      (await VersionedKV.open(a.store, { branch: BRANCH })).currentCommit,
-      commits,
-    )
+    const ok = await a.remote.push(BRANCH, old, (await open(a.store)).head, commits)
     expect(ok).toBe(false)
   })
 
@@ -224,10 +224,10 @@ describe('PackRemote push / fetch', () => {
     const gh = new FakeGithub()
     gh.raceStyle = 'forbidden'
     const a = await device(gh)
-    const old = (await commitN(a.store, 1, 'a')).currentCommit
+    const old = (await commitN(a.store, 1, 'a')).head
     await pushBranch(a.store, a.remote, BRANCH)
     await a.remote.listRefs()
-    const head = (await commitN(a.store, 1, 'x')).currentCommit
+    const head = (await commitN(a.store, 1, 'x')).head
     gh.beforeMutation = () => {
       gh.refs.set(`refs/heads/${BRANCH}`, gh.refs.get('refs/heads/main') as string)
       gh.beforeMutation = null
@@ -249,12 +249,12 @@ describe('PackRemote push / fetch', () => {
   it('splits a push larger than maxPackBytes into several CAS-chained commits', async () => {
     const gh = new FakeGithub()
     const a = await device(gh, { maxPackBytes: 150 })
-    const vk = await commitN(a.store, 6, 'a') // ~80 bytes of values per commit
+    const wt = await commitN(a.store, 6, 'a') // ~80 bytes of values per commit
     expect((await pushBranch(a.store, a.remote, BRANCH)).status).toBe('created')
     expect(gh.count('graphql-mutation')).toBeGreaterThan(1)
     const b = await device(gh)
     const pulled = await pullBranch(b.store, b.remote, BRANCH)
-    expect(pulled.localHead).toBe(vk.currentCommit)
+    expect(pulled.localHead).toBe(wt.head)
   })
 })
 
@@ -280,11 +280,12 @@ describe('PackRemote and manifests it cannot use', () => {
   it('refuses a commit too large for one request, before sending it', async () => {
     const gh = new FakeGithub()
     const a = await device(gh)
-    const vk = await VersionedKV.open(a.store, { branch: BRANCH })
+    const wt = await open(a.store)
     // random bytes don't compress: 24MB stays over the 30MB base64 cap
     const big = new Uint8Array(24 * 1024 * 1024)
     for (let i = 0; i < big.length; i += 65536) crypto.getRandomValues(big.subarray(i, i + 65536))
-    await vk.commit({ updates: new Map([['files/big.bin', big]]) })
+    wt.set('files/big.bin', big)
+    await wt.commit()
     await expect(pushBranch(a.store, a.remote, BRANCH)).rejects.toThrow(
       /more than one request can carry/,
     )
@@ -298,8 +299,9 @@ describe('PackRemote and branches that are not sessions', () => {
     gh.plant('feature', { 'notes.md': 'mine' })
     for (const branch of ['main', 'feature']) {
       const store = new Memory()
-      const vk = await VersionedKV.open(store, { branch })
-      await vk.commit({ updates: new Map([['k', bytes('v')]]) })
+      const wt = await open(store, branch)
+      wt.set('k', bytes('v'))
+      await wt.commit()
       const before = gh.refs.get(`refs/heads/${branch}`)
       await expect(pushBranch(store, new PackRemote(gh.client(), store), branch)).rejects.toThrow(
         `branch '${branch}' exists in the repo but isn't a kvgit session`,
@@ -322,9 +324,9 @@ describe('PackRemote packs over time', () => {
   it('folds older packs once a push would exceed maxPacks, still one mutation', async () => {
     const gh = new FakeGithub()
     const a = await device(gh, { maxPacks: 4, keepRecent: 2 })
-    let vk: VersionedKV | null = null
+    let wt: Worktree | null = null
     for (let i = 0; i < 8; i++) {
-      vk = await commitN(a.store, 2, `t${i}-`)
+      wt = await commitN(a.store, 2, `t${i}-`)
       gh.calls.length = 0
       await pushBranch(a.store, a.remote, BRANCH)
       expect(gh.count('graphql-mutation')).toBe(1)
@@ -333,7 +335,7 @@ describe('PackRemote packs over time', () => {
     expect(packs.length).toBeLessThanOrEqual(4)
     const b = await device(gh)
     const pulled = await pullBranch(b.store, b.remote, BRANCH)
-    expect(pulled.localHead).toBe(vk?.currentCommit)
+    expect(pulled.localHead).toBe(wt?.head)
     expect(pulled.transferred).toBe(17)
   })
 
@@ -364,12 +366,13 @@ describe('PackRemote.repack and its request size', () => {
   it('refuses a history too large for one request, before sending it', async () => {
     const gh = new FakeGithub()
     const a = await device(gh)
-    const vk = await VersionedKV.open(a.store, { branch: BRANCH })
+    const wt = await open(a.store)
     // random bytes don't compress: two 12MB pushes fit, one 24MB pack doesn't
     for (const name of ['one', 'two']) {
       const big = new Uint8Array(12 * 1024 * 1024)
       for (let i = 0; i < big.length; i += 65536) crypto.getRandomValues(big.subarray(i, i + 65536))
-      await vk.commit({ updates: new Map([[`files/${name}.bin`, big]]) })
+      wt.set(`files/${name}.bin`, big)
+      await wt.commit()
       expect((await pushBranch(a.store, a.remote, BRANCH)).status).not.toBe('diverged')
     }
     const mutations = gh.count('graphql-mutation')
@@ -454,7 +457,7 @@ describe('PackRemote.deleteBranch', () => {
   it('deletes a session at the head expected, in one updateRefs', async () => {
     const gh = new FakeGithub()
     const a = await device(gh)
-    const vk = await commitN(a.store, 2, 'a')
+    const wt = await commitN(a.store, 2, 'a')
     await pushBranch(a.store, a.remote, BRANCH)
     expect(await a.remote.deleteBranch(BRANCH, 'f'.repeat(40))).toBe(false)
 
@@ -464,7 +467,7 @@ describe('PackRemote.deleteBranch', () => {
     expect(gh.count('graphql-mutation')).toBe(1)
     expect(gh.refs.has(`refs/heads/${BRANCH}`)).toBe(false)
     expect(await a.remote.roster()).toEqual([])
-    expect(await a.remote.deleteBranch(BRANCH, vk.currentCommit)).toBe(false)
+    expect(await a.remote.deleteBranch(BRANCH, wt.head)).toBe(false)
     expect((await pushBranch(a.store, a.remote, BRANCH)).status).toBe('created')
   })
 
@@ -475,24 +478,24 @@ describe('PackRemote.deleteBranch', () => {
     await pushBranch(a.store, a.remote, BRANCH)
     const b = await device(gh)
     await pullBranch(b.store, b.remote, BRANCH)
-    const bVk = await commitN(b.store, 1, 'b')
+    const bWt = await commitN(b.store, 1, 'b')
     await pushBranch(b.store, b.remote, BRANCH)
 
     const result = await deleteRemoteBranch(a.store, a.remote, BRANCH)
-    expect(result).toMatchObject({ status: 'moved', remoteHead: bVk.currentCommit })
-    expect((await a.remote.listRefs()).map((r) => r.head)).toEqual([bVk.currentCommit])
+    expect(result).toMatchObject({ status: 'moved', remoteHead: bWt.head })
+    expect((await a.remote.listRefs()).map((r) => r.head)).toEqual([bWt.head])
   })
 
   it('loses cleanly when the session moves after it was read', async () => {
     const gh = new FakeGithub()
     const a = await device(gh)
-    const vk = await commitN(a.store, 1, 'a')
+    const wt = await commitN(a.store, 1, 'a')
     await pushBranch(a.store, a.remote, BRANCH)
     gh.beforeMutation = () => {
       gh.refs.set(`refs/heads/${BRANCH}`, gh.refs.get('refs/heads/main') as string)
       gh.beforeMutation = null
     }
-    expect(await a.remote.deleteBranch(BRANCH, vk.currentCommit)).toBe(false)
+    expect(await a.remote.deleteBranch(BRANCH, wt.head)).toBe(false)
     expect(gh.refs.has(`refs/heads/${BRANCH}`)).toBe(true)
   })
 
@@ -578,14 +581,14 @@ describe('PackRemote fetch and what the store lacks', () => {
   it('takes a head it was told it has, but lacks, as not held', async () => {
     const gh = new FakeGithub()
     const a = await device(gh)
-    const vk = await commitN(a.store, 2, 'a')
+    const wt = await commitN(a.store, 2, 'a')
     await pushBranch(a.store, a.remote, BRANCH)
     // a store claiming the remote head (a sync head whose commits a
     // sweep took) still gets every commit
     const b = await device(gh)
     await b.remote.listRefs()
-    const got = await collect(b.remote.fetch(vk.currentCommit, [vk.currentCommit]))
-    expect(got.at(-1)?.hash).toBe(vk.currentCommit)
+    const got = await collect(b.remote.fetch(wt.head, [wt.head]))
+    expect(got.at(-1)?.hash).toBe(wt.head)
     expect((await applyWire(b.store, got)).applied).toBe(got.length)
   })
 })

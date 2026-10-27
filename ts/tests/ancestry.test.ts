@@ -8,7 +8,7 @@
 import { describe, expect, it } from 'vitest'
 import { Memory } from '../src/backends/memory'
 import { UnknownCommitError } from '../src/errors'
-import { MemoryRemote, VersionedKV, pullBranch, pushBranch, walkDelta } from '../src/index'
+import { MemoryRemote, Repo, type Worktree, pullBranch, pushBranch, walkDelta } from '../src/index'
 import type { KVStore } from '../src/types'
 import { ancestorsAbove, ancestryDelta, isAncestor } from '../src/versioned/ancestry'
 import { PARENT_COMMIT, PARENT_GENS, dumps } from '../src/versioned/layout'
@@ -189,25 +189,28 @@ describe('the cost of a sync on a long history', () => {
   const BRANCH = 'chat'
   const N = 300
 
-  async function long(): Promise<{ store: Memory; vk: VersionedKV }> {
+  async function long(): Promise<{ store: Memory; wt: Worktree }> {
     const store = new Memory()
-    const vk = await VersionedKV.open(store, { branch: BRANCH })
+    const repo = await Repo.open(store, { cacheBytes: 0 })
+    const wt = await repo.worktree(BRANCH, { create: true })
     for (let i = 0; i < N; i++) {
-      await vk.commit({ updates: new Map([[`k${i % 10}`, dumps(i)]]) })
+      wt.set(`k${i % 10}`, dumps(i))
+      await wt.commit()
     }
-    return { store, vk }
+    return { store, wt }
   }
 
   it('walks the delta, not the history', async () => {
-    const { store, vk } = await long()
-    const before = vk.currentCommit
-    await vk.commit({ updates: new Map([['k', dumps('one more')]]) })
+    const { store, wt } = await long()
+    const before = wt.head
+    wt.set('k', dumps('one more'))
+    await wt.commit()
     const counted = counting(store)
     const sent: string[] = []
-    for await (const wc of walkDelta(counted, { want: vk.currentCommit, have: [before] })) {
+    for await (const wc of walkDelta(counted, { want: wt.head, have: [before] })) {
       sent.push(wc.hash)
     }
-    expect(sent).toEqual([vk.currentCommit])
+    expect(sent).toEqual([wt.head])
     expect(counted.reads).toBeLessThan(40)
   })
 
@@ -219,7 +222,8 @@ describe('the cost of a sync on a long history', () => {
     const b = new Memory()
     await pullBranch(b, remote, BRANCH)
 
-    await a.vk.commit({ updates: new Map([['k', dumps('one more')]]) })
+    a.wt.set('k', dumps('one more'))
+    await a.wt.commit()
     const aCounting = counting(a.store)
     remoteStore.reads = 0
     expect((await pushBranch(aCounting, remote, BRANCH)).status).toBe('pushed')

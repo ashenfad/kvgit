@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { Memory } from '../src/backends/memory'
 import { type FakeGithubServer, serveFakeGithub } from '../src/github/fake-server'
 import { GithubClient, GithubError, PackRemote } from '../src/github/index'
-import { VersionedKV, pullBranch, pushBranch } from '../src/index'
+import { Repo, pullBranch, pushBranch } from '../src/index'
 
 const enc = new TextEncoder()
 const dec = new TextDecoder()
@@ -33,9 +33,10 @@ function device(s: FakeGithubServer, opts: { maxRetries?: number } = {}) {
 }
 
 async function write(store: Memory, key: string, value: string): Promise<string> {
-  const vk = await VersionedKV.open(store, { branch: 'notes' })
-  await vk.commit({ updates: new Map([[key, enc.encode(value)]]) })
-  return vk.currentCommit
+  const wt = await (await Repo.open(store)).worktree('notes', { create: true })
+  wt.set(key, enc.encode(value))
+  await wt.commit()
+  return wt.head
 }
 
 describe('the fake GitHub over HTTP', () => {
@@ -48,9 +49,9 @@ describe('the fake GitHub over HTTP', () => {
     expect(server.github.filesAt('notes')).toContain('kvgit/manifest.json')
 
     await pullBranch(b.store, b.remote, 'notes')
-    const vk = await VersionedKV.open(b.store, { branch: 'notes' })
-    expect(vk.currentCommit).toBe(head)
-    expect(dec.decode((await vk.get('k')) as Uint8Array)).toBe('from a')
+    const wt = await (await Repo.open(b.store)).worktree('notes')
+    expect(wt.head).toBe(head)
+    expect(dec.decode((await wt.get('k')) as Uint8Array)).toBe('from a')
   })
 
   it('lets a page of any origin call it', async () => {

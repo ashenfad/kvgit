@@ -15,7 +15,6 @@ import { Memory } from '../src/backends/memory'
 import { PyFloat } from '../src/pyjson'
 import { Repo } from '../src/repo'
 import { MergeChoice, type MergeResult } from '../src/types'
-import { VersionedKV } from '../src/versioned/kv'
 
 interface Step {
   step: string
@@ -57,17 +56,16 @@ describe('storage v4 matches Python kvgit byte for byte', () => {
     const store = new Memory()
 
     clock = (steps.get('open') as Step).time
-    const main = await VersionedKV.open(store, { now })
+    const repo = await Repo.open(store, { now })
+    const main = await repo.worktree('main', { create: true })
     expectStep('open', await dump(store))
 
     clock = (steps.get('first') as Step).time
-    const updates = new Map<string, Uint8Array>()
-    for (let i = 0; i < 12; i++) updates.set(`k/${String(i).padStart(2, '0')}`, bytes(`value ${i}`))
-    updates.set('a', bytes('1'))
-    updates.set('b', bytes('hello'))
-    updates.set('ünï/ключ', Uint8Array.of(0xff, 0x00, 0x01))
+    for (let i = 0; i < 12; i++) main.set(`k/${String(i).padStart(2, '0')}`, bytes(`value ${i}`))
+    main.set('a', bytes('1'))
+    main.set('b', bytes('hello'))
+    main.set('ünï/ключ', Uint8Array.of(0xff, 0x00, 0x01))
     const first = await main.commit({
-      updates,
       // `whole` is a float in Python (2.0); JS has one number type, so
       // a float that must be written as one is marked.
       info: { msg: 'first', n: 2, f: 0.5, whole: new PyFloat(2), é: 'ü', list: [1, null, true] },
@@ -76,94 +74,93 @@ describe('storage v4 matches Python kvgit byte for byte', () => {
     expectStep('first', await dump(store))
 
     clock = (steps.get('second') as Step).time
-    const second = await main.commit({
-      updates: new Map([
-        ['a', bytes('2')],
-        ['k/03', bytes('value 1')],
-      ]),
-      removals: new Set(['b']),
-    })
+    main.set('a', bytes('2'))
+    main.set('k/03', bytes('value 1'))
+    await main.delete('b')
+    const second = await main.commit()
     expect(second.commit).toBe(steps.get('second')?.commit)
     expectStep('second', await dump(store))
 
     clock = (steps.get('branch') as Step).time
-    const feature = await main.createBranch('feat')
-    const branch = await feature.commit({
-      updates: new Map([['feat-only', bytes('f')]]),
-      info: { branch: 'feat' },
-    })
+    await repo.branches.create('feat', main.head)
+    const feature = await repo.worktree('feat')
+    feature.set('feat-only', bytes('f'))
+    const branch = await feature.commit({ info: { branch: 'feat' } })
     expect(branch.commit).toBe(steps.get('branch')?.commit)
     expectStep('branch', await dump(store))
 
     clock = (steps.get('tag') as Step).time
-    const repo = await Repo.open(store, { now })
     await repo.tags.create('v1/ünï', branch.commit as string, {
       info: { note: 'tagged', ratio: 0.25 },
     })
     expectStep('tag', await dump(store))
 
     clock = (steps.get('writer one') as Step).time
-    const w1 = await VersionedKV.open(store, { now })
-    const w2 = await VersionedKV.open(store, { now })
-    const one = await w1.commit({ updates: new Map([['x', bytes('from w1')]]) })
+    const w1 = await repo.worktree('main')
+    const w2 = await repo.worktree('main')
+    w1.set('x', bytes('from w1'))
+    const one = await w1.commit()
     expect(one.commit).toBe(steps.get('writer one')?.commit)
     expectStep('writer one', await dump(store))
 
     clock = (steps.get('writer two') as Step).time
-    const two = await w2.commit({
-      updates: new Map([['y', bytes('from w2')]]),
-      info: { merge: true },
-    })
+    w2.set('y', bytes('from w2'))
+    const two = await w2.commit({ info: { merge: true } })
     expectResult('writer two', two)
     expectStep('writer two', await dump(store))
 
     clock = (steps.get('diverge') as Step).time - 0.5
-    const merger = await VersionedKV.open(store, { now })
-    const side = (await merger.createBranch('side')) as VersionedKV
-    await merger.commit({
-      updates: new Map([
-        ['n', bytes('main')],
-        ['cfg/a', bytes('main')],
-        ['cfg/b', bytes('main')],
-      ]),
-    })
+    const merger = await repo.worktree('main')
+    await repo.branches.create('side', merger.head)
+    const side = await repo.worktree('side')
+    merger.set('n', bytes('main'))
+    merger.set('cfg/a', bytes('main'))
+    merger.set('cfg/b', bytes('main'))
+    await merger.commit()
     clock = (steps.get('diverge') as Step).time
-    await side.commit({
-      updates: new Map([
-        ['n', bytes('side')],
-        ['cfg/a', bytes('side')],
-        ['s', bytes('side')],
-      ]),
-    })
+    side.set('n', bytes('side'))
+    side.set('cfg/a', bytes('side'))
+    side.set('s', bytes('side'))
+    await side.commit()
     expectStep('diverge', await dump(store))
 
     clock = (steps.get('merge') as Step).time
-    const merged = await merger.mergeHeads(side.currentCommit, {
-      mergeFns: new Map([
-        ['n', (_old, ours, theirs) => concat(theirs as Uint8Array, bytes('+'), ours as Uint8Array)],
-      ]),
-      mergePrefixes: new Map([['cfg/', MergeChoice.THEIRS]]),
-      info: { merge: 'side' },
-    })
+    const merged = await merger.merge(
+      { commit: side.head },
+      {
+        mergeFns: new Map([
+          [
+            'n',
+            (_old, ours, theirs) => concat(theirs as Uint8Array, bytes('+'), ours as Uint8Array),
+          ],
+        ]),
+        mergePrefixes: new Map([['cfg/', MergeChoice.THEIRS]]),
+        info: { merge: 'side' },
+      },
+    )
     expectResult('merge', merged)
     expectStep('merge', await dump(store))
 
     clock = (steps.get('fast forward') as Step).time
-    const ff = (await merger.createBranch('ff')) as VersionedKV
-    await ff.commit({ updates: new Map([['ff', bytes('1')]]) })
-    expectResult('fast forward', await merger.mergeHeads(ff.currentCommit))
+    await repo.branches.create('ff', merger.head)
+    const ff = await repo.worktree('ff')
+    ff.set('ff', bytes('1'))
+    await ff.commit()
+    expectResult('fast forward', await merger.merge({ commit: ff.head }))
     expectStep('fast forward', await dump(store))
 
     clock = (steps.get('cherry-pick') as Step).time - 0.5
-    await side.commit({ updates: new Map([['pick', bytes('picked')]]), removals: new Set(['s']) })
-    const picked = side.currentCommit
-    const parent = (await side.parents(picked))[0] as string
+    side.set('pick', bytes('picked'))
+    await side.delete('s')
+    await side.commit()
+    const picked = side.head
+    const parent = (await repo.getCommit(picked)).parents[0] as string
     clock = (steps.get('cherry-pick') as Step).time
-    expectResult('cherry-pick', await merger.applyChange(parent, picked, { info: { pick: true } }))
+    expectResult('cherry-pick', await merger.apply(parent, picked, { info: { pick: true } }))
     expectStep('cherry-pick', await dump(store))
 
     clock = (steps.get('revert') as Step).time
-    expectResult('revert', await merger.applyChange(picked, parent))
+    expectResult('revert', await merger.apply(picked, parent))
     expectStep('revert', await dump(store))
   })
 })

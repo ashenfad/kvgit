@@ -5,9 +5,8 @@ import { loadCore } from '../src/core'
 import {
   CantMark,
   MergeConflict,
-  Staged,
+  Repo,
   type TextMergeOptions,
-  VersionedKV,
   makeTextMerge,
   text,
   textMerge,
@@ -179,42 +178,40 @@ describe('strict mode and conflict flag', () => {
     expect(out).toBe('a\r<<<<<<< ours\nB\r=======\nX\r>>>>>>> theirs\nc\r')
   })
 
-  it('strict conflict aborts a Staged merge', async () => {
+  it('strict conflict aborts a worktree merge', async () => {
     const store = new Memory()
-    const a = await VersionedKV.open(store)
-    const stagedA = new Staged(a)
-    stagedA.set('doc', 'a\nb\nc\nd\n')
-    await stagedA.commit()
+    const repo = await Repo.open(store, { codec: 'json' })
+    const a = await repo.worktree('main', { create: true })
+    a.set('doc', 'a\nb\nc\nd\n')
+    await a.commit()
 
-    const b = await VersionedKV.open(store)
-    const stagedB = new Staged(b)
+    const b = await repo.worktree('main')
 
-    stagedA.set('doc', 'a\nX\nc\nd\n')
-    await stagedA.commit()
+    a.set('doc', 'a\nX\nc\nd\n')
+    await a.commit()
 
-    stagedB.set('doc', 'a\nY\nc\nd\n')
-    await expect(stagedB.commit({ defaultMerge: textMerge({ strict: true }) })).rejects.toThrow(
+    b.set('doc', 'a\nY\nc\nd\n')
+    await expect(b.commit({ defaultMerge: textMerge({ strict: true }) })).rejects.toThrow(
       MergeConflict,
     )
   })
 
-  it('strict clean change still merges at Staged level', async () => {
+  it('strict clean change still merges at worktree level', async () => {
     const store = new Memory()
-    const a = await VersionedKV.open(store)
-    const stagedA = new Staged(a)
-    stagedA.set('doc', 'a\nb\nc\nd\n')
-    await stagedA.commit()
+    const repo = await Repo.open(store, { codec: 'json' })
+    const a = await repo.worktree('main', { create: true })
+    a.set('doc', 'a\nb\nc\nd\n')
+    await a.commit()
 
-    const b = await VersionedKV.open(store)
-    const stagedB = new Staged(b)
+    const b = await repo.worktree('main')
 
-    stagedA.set('doc', 'a\nB\nc\nd\n')
-    await stagedA.commit()
+    a.set('doc', 'a\nB\nc\nd\n')
+    await a.commit()
 
-    stagedB.set('doc', 'a\nb\nc\nD\n')
-    const r = await stagedB.commit({ defaultMerge: textMerge({ strict: true }) })
+    b.set('doc', 'a\nb\nc\nD\n')
+    const r = await b.commit({ defaultMerge: textMerge({ strict: true }) })
     expect(r.merged).toBe(true)
-    expect(await stagedB.get('doc')).toBe('a\nB\nc\nD\n')
+    expect(await b.get('doc')).toBe('a\nB\nc\nD\n')
   })
 
   it('value-level merge keeps str/bytes spelling', () => {

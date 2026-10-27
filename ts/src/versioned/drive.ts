@@ -25,7 +25,6 @@ import {
   UnknownCommitError,
   UnknownTagError,
 } from '../errors'
-import { pack, unpack } from '../hamt'
 import { CantMark } from '../merges'
 import { pyDumps } from '../pyjson'
 import { type BytesMergeFn, type KVStore, MergeChoice, type PostCheck } from '../types'
@@ -98,6 +97,35 @@ export function cacheStore(store: KVStore, cache: ContentCache): void {
 /** @internal The content cache `store` is read through, if any. */
 export function cacheOf(store: KVStore): ContentCache | undefined {
   return caches.get(store)
+}
+
+/** Byte strings laid end to end, and their lengths. */
+export function pack(values: Iterable<Uint8Array>): [Uint8Array, Uint32Array] {
+  const list = [...values]
+  const lengths = new Uint32Array(list.length)
+  let total = 0
+  for (let i = 0; i < list.length; i++) {
+    lengths[i] = (list[i] as Uint8Array).length
+    total += lengths[i] as number
+  }
+  const data = new Uint8Array(total)
+  let at = 0
+  for (const v of list) {
+    data.set(v, at)
+    at += v.length
+  }
+  return [data, lengths]
+}
+
+/** The byte strings `pack` laid end to end. */
+export function unpack(data: Uint8Array, lengths: Uint32Array): Uint8Array[] {
+  const out: Uint8Array[] = []
+  let at = 0
+  for (const n of lengths) {
+    out.push(data.slice(at, at + n))
+    at += n
+  }
+  return out
 }
 
 /** Read and write through the store's cache, if it has one. */

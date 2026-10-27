@@ -21,9 +21,9 @@
  * successful syncs and is the `have` frontier for delta computation;
  * it never advances on divergence.
  *
- * Note: a fast-forwarded local ref does not refresh live `VersionedKV`
- * instances — callers holding one should `refresh()` after a pull
- * that reports movement.
+ * Note: a fast-forwarded local ref does not refresh open worktrees —
+ * callers holding one should `refresh()` after a pull that reports
+ * movement.
  */
 
 import type { KVStore, WireCommit } from '../types'

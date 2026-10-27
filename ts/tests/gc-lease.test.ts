@@ -16,13 +16,14 @@ import {
   ROOT_COMMIT,
   Repo,
   StorageVersionError,
-  VersionedKV,
+  type Worktree,
   applyWire,
   publishHead,
   pullBranch,
   walkDelta,
 } from '../src/index'
 import { PyFloat } from '../src/pyjson'
+import type { KVStore } from '../src/types'
 import { gcStore } from '../src/versioned/kv'
 import {
   BRANCH_HEAD,
@@ -37,7 +38,23 @@ import { GC_LEASE_TTL, leaseExpiry } from '../src/versioned/lease'
 
 const enc = new TextEncoder()
 const bytes = (s: string): Uint8Array => enc.encode(s)
-const one = (key: string, value: string) => ({ updates: new Map([[key, bytes(value)]]) })
+
+/** A worktree on `main`, created if the store has none. */
+async function open(store: KVStore, opts: { now?: () => number } = {}): Promise<Worktree> {
+  const repo = await Repo.open(store, opts)
+  return repo.worktree('main', { create: true })
+}
+
+/** Write one key and commit it. */
+function commitOne(
+  wt: Worktree,
+  key: string,
+  value: string,
+  opts: Parameters<Worktree['commit']>[0] = {},
+) {
+  wt.set(key, bytes(value))
+  return wt.commit(opts)
+}
 
 async function markers(store: Memory): Promise<string[]> {
   const out: string[] = []
@@ -79,37 +96,37 @@ class PublishHookStore extends Memory {
 describe('in-flight markers', () => {
   it('a batch carries a marker and the publish removes it', async () => {
     const store = new PublishHookStore()
-    const vk = await VersionedKV.open(store)
+    const wt = await open(store)
     let seen: string[] = []
     store.beforePublish = async () => {
       seen = await markers(store)
     }
-    await vk.commit(one('k', 'v'))
-    expect(seen).toEqual([IN_FLIGHT_KEY(vk.currentCommit)])
+    await commitOne(wt, 'k', 'v')
+    expect(seen).toEqual([IN_FLIGHT_KEY(wt.head)])
     expect(await markers(store)).toEqual([])
   })
 
   it('an unpublished commit survives a minAge 0 sweep, and then publishes', async () => {
     const store = new PublishHookStore()
-    const vk = await VersionedKV.open(store)
+    const wt = await open(store)
     let removed = -1
     store.beforePublish = async () => {
       // The batch is in, the head isn't: without the marker the commit
       // would look like abandoned work.
       removed = await gcStore(store, { minAge: 0 })
     }
-    await vk.commit(one('k', 'v'))
+    await commitOne(wt, 'k', 'v')
     expect(removed).toBe(0)
-    expect(await store.get(COMMIT_ROOT(vk.currentCommit))).not.toBeNull()
-    expect(await (await VersionedKV.open(store)).get('k')).toEqual(bytes('v'))
+    expect(await store.get(COMMIT_ROOT(wt.head))).not.toBeNull()
+    expect(await (await open(store)).get('k')).toEqual(bytes('v'))
     expect(await markers(store)).toEqual([])
   })
 
   it("keeps the merge path's own first commit through a sweep too", async () => {
     const store = new PublishHookStore()
-    const a = await VersionedKV.open(store)
-    const b = await VersionedKV.open(store)
-    await a.commit(one('a', '1'))
+    const a = await open(store)
+    const b = await open(store)
+    await commitOne(a, 'a', '1')
     // b finds the branch moved: it writes its own commit and a merge
     // commit over it, both in flight, and a sweep runs before the
     // merge publishes.
@@ -119,10 +136,10 @@ describe('in-flight markers', () => {
       await gcStore(store, { minAge: 0 })
       swept = true
     }
-    const result = await b.commit(one('b', '2'))
+    const result = await commitOne(b, 'b', '2')
     expect(swept).toBe(true)
     expect(result.strategy).toBe('three_way')
-    const tip = await VersionedKV.open(store)
+    const tip = await open(store)
     expect(await tip.get('a')).toEqual(bytes('1'))
     expect(await tip.get('b')).toEqual(bytes('2'))
     expect(await markers(store)).toEqual([])
@@ -130,10 +147,10 @@ describe('in-flight markers', () => {
 
   it('an abandoned attempt withdraws its markers', async () => {
     const store = new Memory()
-    const a = await VersionedKV.open(store)
-    const b = await VersionedKV.open(store)
-    await a.commit(one('k', 'a'))
-    const result = await b.commit({ ...one('k', 'b'), onConflict: 'abandon' })
+    const a = await open(store)
+    const b = await open(store)
+    await commitOne(a, 'k', 'a')
+    const result = await commitOne(b, 'k', 'b', { onConflict: 'abandon' })
     expect(result.merged).toBe(false)
     // Withdrawal is best effort and asynchronous; let it land.
     await new Promise((r) => setTimeout(r, 0))
@@ -142,7 +159,7 @@ describe('in-flight markers', () => {
 
   it('a lapsed marker releases its commit to the sweep', async () => {
     const store = new PublishHookStore()
-    const vk = await VersionedKV.open(store)
+    const wt = await open(store)
     let commit = ''
     let swept = -1
     store.beforePublish = async () => {
@@ -157,7 +174,7 @@ describe('in-flight markers', () => {
     }
     // Its commit was swept, so its publish refuses rather than naming a
     // commit that is gone.
-    await expect(vk.commit(one('k', 'v'))).rejects.toThrow()
+    await expect(commitOne(wt, 'k', 'v')).rejects.toThrow()
     expect(swept).toBe(1)
     expect(await store.get(COMMIT_ROOT(commit))).toBeNull()
     expect(await markers(store)).toEqual([])
@@ -166,9 +183,9 @@ describe('in-flight markers', () => {
 
   it('withdraws an abandoned marker only if it still holds its own bytes', async () => {
     const store = new Memory()
-    const a = await VersionedKV.open(store)
-    const b = await VersionedKV.open(store)
-    await a.commit(one('k', 'a'))
+    const a = await open(store)
+    const b = await open(store)
+    await commitOne(a, 'k', 'a')
     // Another writer's batch rewrites b's marker key between b's batch
     // and its withdrawal: b must leave that marker alone.
     const original = store.casMany.bind(store)
@@ -183,7 +200,7 @@ describe('in-flight markers', () => {
       }
       return original(expected, writes, list)
     }
-    const result = await b.commit({ ...one('k', 'b'), onConflict: 'abandon' })
+    const result = await commitOne(b, 'k', 'b', { onConflict: 'abandon' })
     expect(result.merged).toBe(false)
     await new Promise((r) => setTimeout(r, 0))
     expect(theirs).not.toBeNull()
@@ -196,25 +213,25 @@ describe('in-flight markers', () => {
     // A handle on a frozen historical clock: its markers still expire in
     // wall time, so a sweep on the same clock keeps its commit.
     const store = new PublishHookStore()
-    const vk = await VersionedKV.open(store, { now: () => 0 })
+    const wt = await open(store, { now: () => 0 })
     store.beforePublish = async () => {
       expect(await gcStore(store, { minAge: 0, now: () => 0 })).toBe(0)
     }
-    await vk.commit(one('k', 'v'))
-    expect(await (await VersionedKV.open(store)).get('k')).toEqual(bytes('v'))
+    await commitOne(wt, 'k', 'v')
+    expect(await (await open(store)).get('k')).toEqual(bytes('v'))
   })
 })
 
 describe('writers under the lease', () => {
   it('a writer waits for a live lease and proceeds once it is released', async () => {
     const store = new Memory()
-    const vk = await VersionedKV.open(store)
+    const wt = await open(store)
     const now = Date.now() / 1000
     const held = liveLease(now + 60)
     await store.set(GC_LEASE_KEY, held)
 
     let landed = false
-    const writing = vk.commit(one('k', 'v')).then(() => {
+    const writing = commitOne(wt, 'k', 'v').then(() => {
       landed = true
     })
     await new Promise((r) => setTimeout(r, 120))
@@ -225,16 +242,16 @@ describe('writers under the lease', () => {
     await store.cas(GC_LEASE_KEY, liveLease(0), held)
     await writing
     expect(landed).toBe(true)
-    expect(await (await VersionedKV.open(store)).get('k')).toEqual(bytes('v'))
+    expect(await (await open(store)).get('k')).toEqual(bytes('v'))
   })
 
   it('a writer does not wait past the lease expiry', async () => {
     const store = new Memory()
-    const vk = await VersionedKV.open(store)
+    const wt = await open(store)
     // A holder that died: its lease runs out in 0.1s.
     await store.set(GC_LEASE_KEY, liveLease(Date.now() / 1000 + 0.1))
     const started = Date.now()
-    await vk.commit(one('k', 'v'))
+    await commitOne(wt, 'k', 'v')
     expect(Date.now() - started).toBeLessThan(2000)
   })
 
@@ -260,8 +277,8 @@ describe('writers under the lease', () => {
 describe('the lease itself', () => {
   it('is taken by a sweep and released as an expired record no earlier reader matches', async () => {
     const store = new Memory()
-    const vk = await VersionedKV.open(store)
-    await vk.commit(one('k', 'v'))
+    const wt = await open(store)
+    await commitOne(wt, 'k', 'v')
     await gcStore(store, { minAge: 0 })
     const raw = await store.get(GC_LEASE_KEY)
     expect(raw).not.toBeNull()
@@ -279,23 +296,24 @@ describe('the lease itself', () => {
 
   it('refuses a second sweep with wait: false, and waits by default', async () => {
     const store = new Memory()
-    await VersionedKV.open(store)
+    await open(store)
     // A lease that outlives the refusals, however slow the runner.
     const held = liveLease(Date.now() / 1000 + 60)
     await store.set(GC_LEASE_KEY, held)
     await expect(gcStore(store, { wait: false })).rejects.toThrow(GcBusy)
-    const vk = await VersionedKV.open(store)
-    await expect(vk.deepClean()).rejects.toThrow(GcBusy)
-    // cleanOrphans waits the holder out: a short lease, so the wait is.
+    const repo = await Repo.open(store)
+    await expect(repo.gc({ deep: true, wait: false })).rejects.toThrow(GcBusy)
+    // A sweep waits the holder out by default: a short lease, so the
+    // wait is.
     const expires = Date.now() / 1000 + 0.15
     expect(await store.cas(GC_LEASE_KEY, liveLease(expires), held)).toBe(true)
-    expect(await vk.cleanOrphans()).toBe(0)
+    expect(await repo.gc()).toBe(0)
     expect(Date.now() / 1000).toBeGreaterThanOrEqual(expires)
   })
 
   it('treats an expired or unreadable record as no lease', async () => {
     const store = new Memory()
-    await VersionedKV.open(store)
+    await open(store)
     await store.set(GC_LEASE_KEY, liveLease(1))
     expect(await gcStore(store, { wait: false })).toBe(0)
     await store.set(GC_LEASE_KEY, bytes('not json'))
@@ -314,7 +332,7 @@ describe('the lease itself', () => {
       }
     }
     const store = new FailingMemory()
-    await VersionedKV.open(store)
+    await open(store)
     store.armed = true
     await expect(gcStore(store, { minAge: 0 })).rejects.toThrow('backend down')
     expect(leaseExpiry(await store.get(GC_LEASE_KEY))).toBe(0)
@@ -329,7 +347,7 @@ describe('the lease itself', () => {
       }
     }
     const store = new PeekingMemory()
-    await VersionedKV.open(store)
+    await open(store)
     store.during = null
     const at = Date.now() / 1000
     await gcStore(store, { minAge: 0 })
@@ -347,9 +365,9 @@ describe('the lease itself', () => {
 describe('synced commits', () => {
   it('are marked in flight until the head that names them lands', async () => {
     const src = new Memory()
-    const vk = await VersionedKV.open(src)
-    await vk.commit(one('k', 'v'))
-    const head = vk.currentCommit
+    const wt = await open(src)
+    await commitOne(wt, 'k', 'v')
+    const head = wt.head
 
     const dst = new Memory()
     const applied = await applyWire(dst, walkDelta(src, { want: head }))
@@ -370,9 +388,9 @@ describe('synced commits', () => {
 
   it('re-protects commits already present, which may be orphans from an earlier fetch', async () => {
     const src = new Memory()
-    const vk = await VersionedKV.open(src)
-    await vk.commit(one('k', 'v'))
-    const head = vk.currentCommit
+    const wt = await open(src)
+    await commitOne(wt, 'k', 'v')
+    const head = wt.head
 
     // An earlier fetch left the commits here unpublished, and their
     // markers have lapsed: they are orphans now.
@@ -387,19 +405,19 @@ describe('synced commits', () => {
     expect(await gcStore(dst, { minAge: -1 })).toBe(0)
     expect(await publishHead(dst, 'main', null, head, { inFlight: again.inFlight })).toBe(true)
     expect(await markers(dst)).toEqual([])
-    expect(await (await VersionedKV.open(dst)).get('k')).toEqual(bytes('v'))
+    expect(await (await open(dst)).get('k')).toEqual(bytes('v'))
   })
 
   it('a pull publishes the head and drops the markers together', async () => {
     const remoteStore = new Memory()
     const remote = new MemoryRemote(remoteStore)
-    const writer = await VersionedKV.open(remoteStore)
-    await writer.commit(one('k', 'v'))
+    const writer = await open(remoteStore)
+    await commitOne(writer, 'k', 'v')
 
     const local = new Memory()
     const outcome = await pullBranch(local, remote, 'main')
     expect(outcome.status).toBe('created')
     expect(await markers(local)).toEqual([])
-    expect(await (await VersionedKV.open(local)).get('k')).toEqual(bytes('v'))
+    expect(await (await open(local)).get('k')).toEqual(bytes('v'))
   })
 })

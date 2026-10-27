@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { Memory } from '../src/backends/memory'
 import { IntegrityError } from '../src/errors'
 import {
-  VersionedKV,
+  Repo,
   type WireCommit,
   applyWire,
   clearSyncHead,
@@ -31,27 +31,28 @@ async function collect(store: Memory, want: string, have?: string[]): Promise<Wi
  *  from its second parent). */
 async function buildSource(): Promise<{ store: Memory; head: string; midpoint: string }> {
   const store = new Memory()
-  const vk = await VersionedKV.open(store)
-  await vk.commit({ updates: new Map([['greeting', bytes('hello')]]) })
-  await vk.commit({
-    updates: new Map([
-      ['greeting', bytes('hello world')],
-      ['files/a.txt', bytes('aaa')],
-    ]),
-    info: { title: 'turn 2' },
-  })
-  const midpoint = vk.currentCommit
+  const repo = await Repo.open(store)
+  const wt = await repo.worktree('main', { create: true })
+  wt.set('greeting', bytes('hello'))
+  await wt.commit()
+  wt.set('greeting', bytes('hello world'))
+  wt.set('files/a.txt', bytes('aaa'))
+  await wt.commit({ info: { title: 'turn 2' } })
+  const midpoint = wt.head
 
   // Divergence: a second writer on a stale base forces a three-way
   // merge that takes a key from the other side.
-  const stale = await VersionedKV.open(store, { commitHash: midpoint })
-  await vk.commit({ updates: new Map([['ka', bytes('from-a')]]) })
-  const r = await stale.commit({ updates: new Map([['kb', bytes('from-b')]]) })
+  const stale = await repo.worktree('main')
+  wt.set('ka', bytes('from-a'))
+  await wt.commit()
+  stale.set('kb', bytes('from-b'))
+  const r = await stale.commit()
   expect(r.strategy).toBe('three_way')
 
-  const final = await VersionedKV.open(store)
-  await final.commit({ removals: new Set(['files/a.txt']) })
-  return { store, head: final.currentCommit, midpoint }
+  const final = await repo.worktree('main')
+  await final.delete('files/a.txt')
+  await final.commit()
+  return { store, head: final.head, midpoint }
 }
 
 describe('applyWire — round trips', () => {
@@ -67,24 +68,25 @@ describe('applyWire — round trips', () => {
 
     // The replayed store opens as a normal kvgit store at the same
     // content-addressed head, with values and meta intact.
-    const vk = await VersionedKV.open(dst)
-    expect(vk.currentCommit).toBe(head)
-    expect(text((await vk.get('greeting')) as Uint8Array)).toBe('hello world')
-    expect(text((await vk.get('ka')) as Uint8Array)).toBe('from-a')
-    expect(text((await vk.get('kb')) as Uint8Array)).toBe('from-b')
-    expect(await vk.get('files/a.txt')).toBeNull()
+    const repo = await Repo.open(dst)
+    const wt = await repo.worktree('main')
+    expect(wt.head).toBe(head)
+    expect(text((await wt.get('greeting')) as Uint8Array)).toBe('hello world')
+    expect(text((await wt.get('ka')) as Uint8Array)).toBe('from-a')
+    expect(text((await wt.get('kb')) as Uint8Array)).toBe('from-b')
+    expect(await wt.get('files/a.txt')).toBeUndefined()
 
     // History (incl. the merge's two parents) survives the wire.
-    const srcVk = await VersionedKV.open(src)
+    const srcRepo = await Repo.open(src)
     const srcHistory: string[] = []
-    for await (const c of srcVk.history(head, { allParents: true })) srcHistory.push(c)
+    for await (const c of srcRepo.log({ commit: head })) srcHistory.push(c.hash)
     const dstHistory: string[] = []
-    for await (const c of vk.history(head, { allParents: true })) dstHistory.push(c)
+    for await (const c of repo.log({ commit: head })) dstHistory.push(c.hash)
     expect(dstHistory).toEqual(srcHistory)
 
     // Commit info round-trips.
     const infos: unknown[] = []
-    for (const wc of wire) infos.push(await vk.commitInfo(wc.hash))
+    for (const wc of wire) infos.push((await repo.getCommit(wc.hash)).info)
     expect(infos).toContainEqual({ title: 'turn 2' })
   })
 
@@ -102,9 +104,9 @@ describe('applyWire — round trips', () => {
     expect(result.applied).toBe(delta.length)
     expect(result.head).toBe(head)
 
-    const vk = await VersionedKV.open(dst, { commitHash: head })
-    expect(text((await vk.get('kb')) as Uint8Array)).toBe('from-b')
-    expect(await vk.get('files/a.txt')).toBeNull()
+    const snap = await (await Repo.open(dst)).snapshot({ commit: head })
+    expect(text((await snap.get('kb')) as Uint8Array)).toBe('from-b')
+    expect(await snap.get('files/a.txt')).toBeUndefined()
   })
 
   it('is idempotent: re-applying skips every commit and changes nothing', async () => {
@@ -136,9 +138,9 @@ describe('applyWire — round trips', () => {
     await applyWire(b, await collect(a, head), { createBranch: 'main' })
     const c = new Memory()
     await applyWire(c, await collect(b, head), { createBranch: 'main' })
-    const vk = await VersionedKV.open(c)
-    expect(vk.currentCommit).toBe(head)
-    expect(text((await vk.get('greeting')) as Uint8Array)).toBe('hello world')
+    const wt = await (await Repo.open(c)).worktree('main')
+    expect(wt.head).toBe(head)
+    expect(text((await wt.get('greeting')) as Uint8Array)).toBe('hello world')
   })
 })
 
@@ -237,10 +239,11 @@ describe('sync heads', () => {
 
   it('does not pollute the branch namespace', async () => {
     const store = new Memory()
-    const vk = await VersionedKV.open(store)
-    await setSyncHead(store, 'main', vk.currentCommit)
-    await setSyncHead(store, 'main', vk.currentCommit, 'github:o/r')
-    expect(await vk.listBranches()).toEqual(['main'])
+    const repo = await Repo.open(store)
+    const wt = await repo.worktree('main', { create: true })
+    await setSyncHead(store, 'main', wt.head)
+    await setSyncHead(store, 'main', wt.head, 'github:o/r')
+    expect(await repo.branches.list()).toEqual(['main'])
   })
 
   it('keeps one head per remote', async () => {

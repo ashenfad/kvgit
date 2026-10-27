@@ -15,11 +15,9 @@
 
 import { describe, expect, it } from 'vitest'
 import { Memory } from '../src/backends/memory'
-import { Keyset } from '../src/keyset'
-import { decodeEntry } from '../src/keyset'
-import type { KeysetEntry } from '../src/types'
-import { VersionedKV } from '../src/versioned/kv'
-import { BLOB_PREFIX, COMMIT_ROOT, blobKey, loads } from '../src/versioned/layout'
+import { Repo, type Worktree } from '../src/index'
+import type { KVStore } from '../src/types'
+import { BLOB_PREFIX, COMMIT_ROOT, blobKey, dumps, loads, sha256Hex } from '../src/versioned/layout'
 
 const enc = new TextEncoder()
 const dec = new TextDecoder()
@@ -71,21 +69,47 @@ class HookedMemory extends Memory {
   }
 }
 
-/** Land a commit on `main` from an independent handle. */
+/** Where HAMT nodes live, keyed by the hash of their bytes. */
+const NODE_PREFIX = 'kvgit:keyset:'
+
+/** A worktree on `main`, created if the store has none. */
+async function open(store: KVStore): Promise<Worktree> {
+  const repo = await Repo.open(store)
+  return repo.worktree('main', { create: true })
+}
+
+/** Write `updates` and commit them. */
+async function commitAll(wt: Worktree, updates: Iterable<[string, Uint8Array]>): Promise<void> {
+  for (const [k, v] of updates) wt.set(k, v)
+  await wt.commit()
+}
+
+/** Write one key and commit it. */
+function commitOne(wt: Worktree, key: string, value: string): Promise<void> {
+  return commitAll(wt, [[key, bytes(value)]])
+}
+
+/** A worktree on a new branch `name` at `at` (default: `wt`'s head). */
+async function branchFrom(wt: Worktree, name: string, at: string = wt.head): Promise<Worktree> {
+  await wt.repo.branches.create(name, at)
+  return wt.repo.worktree(name)
+}
+
+/** Land a commit on `main` from an independent repository handle. */
 async function landCommit(
   store: Memory,
   key: string,
   value: string,
 ): Promise<{ commit: string; root: string; blob: string }> {
-  const writer = await VersionedKV.open(store)
-  await writer.commit({ updates: new Map([[key, bytes(value)]]) })
-  const commit = writer.currentCommit
+  const writer = await open(store)
+  await commitOne(writer, key, value)
+  const commit = writer.head
   return { commit, root: await rootOf(store, commit), blob: await blobKey(bytes(value)) }
 }
 
 async function nodeKeys(store: Memory): Promise<Set<string>> {
   const out = new Set<string>()
-  for await (const k of store.keys(Keyset.DEFAULT_PREFIX)) out.add(k)
+  for await (const k of store.keys(NODE_PREFIX)) out.add(k)
   return out
 }
 
@@ -105,15 +129,15 @@ async function rootOf(store: Memory, commit: string): Promise<string> {
 async function readTree(
   store: Memory,
   root: string,
-): Promise<{ entries: Map<string, KeysetEntry>; nodes: Set<string>; missing: Set<string> }> {
-  const entries = new Map<string, KeysetEntry>()
+): Promise<{ entries: Map<string, { blob: string }>; nodes: Set<string>; missing: Set<string> }> {
+  const entries = new Map<string, { blob: string }>()
   const nodes = new Set<string>()
   const missing = new Set<string>()
   const queue = [root]
   while (queue.length > 0) {
     const h = queue.pop() as string
     if (nodes.has(h) || missing.has(h)) continue
-    const raw = await store.get(Keyset.DEFAULT_PREFIX + h)
+    const raw = await store.get(NODE_PREFIX + h)
     if (raw === null) {
       missing.add(h)
       continue
@@ -127,7 +151,9 @@ async function readTree(
         const binary = atob(b64)
         const buf = new Uint8Array(binary.length)
         for (let i = 0; i < binary.length; i++) buf[i] = binary.charCodeAt(i)
-        entries.set(k, decodeEntry(buf))
+        // An entry is the JSON `[blob key, meta]`.
+        const [blob] = JSON.parse(dec.decode(buf)) as [string, unknown]
+        entries.set(k, { blob })
       }
     } else {
       queue.push(...Object.values(node.children))
@@ -136,7 +162,6 @@ async function readTree(
   return { entries, nodes, missing }
 }
 
-// ---------------------------------------------------------------------------
 // Content addressing
 // ---------------------------------------------------------------------------
 
@@ -145,31 +170,29 @@ describe('content addressing', () => {
     // Same logical end state ({x: 1, y: 2}), reached by different
     // commit sequences in different stores.
     const storeA = new Memory()
-    const a = await VersionedKV.open(storeA)
-    await a.commit({ updates: new Map([['x', bytes('1')]]) })
-    await a.commit({ updates: new Map([['y', bytes('2')]]) })
+    const a = await open(storeA)
+    await commitOne(a, 'x', '1')
+    await commitOne(a, 'y', '2')
 
     const storeB = new Memory()
-    const b = await VersionedKV.open(storeB)
-    await b.commit({ updates: new Map([['y', bytes('2')]]) })
-    await b.commit({ updates: new Map([['x', bytes('1')]]) })
+    const b = await open(storeB)
+    await commitOne(b, 'y', '2')
+    await commitOne(b, 'x', '1')
 
-    const rootA = await rootOf(storeA, a.currentCommit)
-    expect(await rootOf(storeB, b.currentCommit)).toBe(rootA)
+    const rootA = await rootOf(storeA, a.head)
+    expect(await rootOf(storeB, b.head)).toBe(rootA)
     expect(await blobKeys(storeA)).toEqual(await blobKeys(storeB))
     expect((await readTree(storeA, rootA)).nodes).toEqual((await readTree(storeB, rootA)).nodes)
   })
 
   it('stores a value written under two keys once', async () => {
     const store = new Memory()
-    const vk = await VersionedKV.open(store)
-    await vk.commit({
-      updates: new Map([
-        ['a', bytes('same')],
-        ['b', bytes('same')],
-      ]),
-    })
-    const { entries } = await readTree(store, await rootOf(store, vk.currentCommit))
+    const wt = await open(store)
+    await commitAll(wt, [
+      ['a', bytes('same')],
+      ['b', bytes('same')],
+    ])
+    const { entries } = await readTree(store, await rootOf(store, wt.head))
     expect(entries.get('a')?.blob).toBe(await blobKey(bytes('same')))
     expect(entries.get('b')?.blob).toBe(entries.get('a')?.blob)
     expect((await blobKeys(store)).size).toBe(1)
@@ -180,21 +203,21 @@ describe('content addressing', () => {
 // The race
 // ---------------------------------------------------------------------------
 
-describe('cleanOrphans — a commit starting mid-sweep', () => {
+describe('gc — a commit starting mid-sweep', () => {
   /**
-   * The seam is the first `get` of the orphan's `__commit_root__`, the
+   * The seam is the first read of the orphan's `__commit_root__`, the
    * first read of the orphan-collection loop: the mark phase is done
    * and the sweep is collecting what to delete. A commit started here
    * waits for the sweep's lease and lands after it.
    */
   async function sweepWithLateCommit(lateValue: string, orphanValue: string) {
     const store = new HookedMemory()
-    const vk = await VersionedKV.open(store)
-    await vk.commit({ updates: new Map([['seed', bytes('s')]]) })
-    const keep = vk.currentCommit
-    await vk.commit({ updates: new Map([['garbage', bytes(orphanValue)]]) })
-    const orphan = vk.currentCommit
-    await vk.resetTo(keep)
+    const wt = await open(store)
+    await commitOne(wt, 'seed', 's')
+    const keep = wt.head
+    await commitOne(wt, 'garbage', orphanValue)
+    const orphan = wt.head
+    await wt.reset(keep)
 
     let late: Promise<{ commit: string; root: string; blob: string }> | null = null
     let landedDuringSweep = false
@@ -205,7 +228,7 @@ describe('cleanOrphans — a commit starting mid-sweep', () => {
       })
     })
     let sweepDone = false
-    const removed = await vk.cleanOrphans(SWEEP_ALL)
+    const removed = await wt.repo.gc(SWEEP_ALL)
     sweepDone = true
     expect(late, 'seam never fired').not.toBeNull()
     const landed = await (late as unknown as Promise<{
@@ -242,17 +265,17 @@ describe('cleanOrphans — a commit starting mid-sweep', () => {
     const { store, landed } = await sweepWithLateCommit('shared', 'shared')
     expect(landed.blob).toBe(await blobKey(bytes('shared')))
     expect(await store.get(landed.blob)).not.toBeNull()
-    const reopened = await VersionedKV.open(store)
+    const reopened = await open(store)
     expect(await reopened.get('late')).toEqual(bytes('shared'))
   })
 
   it('control: a sweep that finds no orphans deletes nothing', async () => {
     const store = new Memory()
-    const vk = await VersionedKV.open(store)
-    await vk.commit({ updates: new Map([['seed', bytes('s')]]) })
+    const wt = await open(store)
+    await commitOne(wt, 'seed', 's')
     const before = await nodeKeys(store)
 
-    expect(await vk.cleanOrphans(SWEEP_ALL)).toBe(0)
+    expect(await wt.repo.gc(SWEEP_ALL)).toBe(0)
     expect(await nodeKeys(store)).toEqual(before)
   })
 })
@@ -261,91 +284,88 @@ describe('cleanOrphans — a commit starting mid-sweep', () => {
 // The sweep still sweeps
 // ---------------------------------------------------------------------------
 
-describe('cleanOrphans — still collects ordinary garbage', () => {
+describe('gc — still collects ordinary garbage', () => {
   it("removes an orphan's commit metadata, blobs and exclusively-owned nodes", async () => {
     const store = new Memory()
-    const vk = await VersionedKV.open(store)
+    const wt = await open(store)
     const seeds = new Map<string, Uint8Array>()
     for (let i = 0; i < 40; i++) seeds.set(`key${i}`, bytes(`v${i}`))
-    await vk.commit({ updates: seeds })
-    const keep = vk.currentCommit
+    await commitAll(wt, seeds)
+    const keep = wt.head
     const keepNodes = (await readTree(store, await rootOf(store, keep))).nodes
 
-    await vk.commit({ updates: new Map([['garbage', bytes('g')]]) })
-    const orphan = vk.currentCommit
+    await commitOne(wt, 'garbage', 'g')
+    const orphan = wt.head
     const orphanRoot = await rootOf(store, orphan)
     const orphanNodes = (await readTree(store, orphanRoot)).nodes
     const exclusive = [...orphanNodes].filter((h) => !keepNodes.has(h))
     expect(exclusive.length, 'orphan should own nodes the live commit does not').toBeGreaterThan(0)
 
-    await vk.resetTo(keep)
-    expect(await vk.cleanOrphans(SWEEP_ALL)).toBe(1)
+    await wt.reset(keep)
+    expect(await wt.repo.gc(SWEEP_ALL)).toBe(1)
 
     // Commit metadata gone.
     expect(await store.get(COMMIT_ROOT(orphan))).toBeNull()
     expect(await store.get(`__parent_commit__${orphan}`)).toBeNull()
     expect(await store.get(`__commit_time__${orphan}`)).toBeNull()
     // Blob gone.
-    expect(await store.get(`${orphan}:garbage`)).toBeNull()
+    expect(await store.get(await blobKey(bytes('g')))).toBeNull()
     // Every node the orphan uniquely owned is gone...
     for (const h of exclusive) {
-      expect(await store.get(Keyset.DEFAULT_PREFIX + h), `orphan node ${h} survived`).toBeNull()
+      expect(await store.get(NODE_PREFIX + h), `orphan node ${h} survived`).toBeNull()
     }
     // ...and every node the live commit needs survived.
     const live = await readTree(store, await rootOf(store, keep))
     expect([...live.missing]).toEqual([])
     for (let i = 0; i < 40; i++) {
-      expect(await vk.get(`key${i}`)).toEqual(bytes(`v${i}`))
+      expect(await wt.get(`key${i}`)).toEqual(bytes(`v${i}`))
     }
   })
 
   it('collects an orphan chain, not just its tip', async () => {
     const store = new Memory()
-    const vk = await VersionedKV.open(store)
-    await vk.commit({ updates: new Map([['k', bytes('v0')]]) })
-    const keep = vk.currentCommit
-    await vk.commit({ updates: new Map([['k', bytes('v1')]]) })
-    await vk.commit({ updates: new Map([['k', bytes('v2')]]) })
-    await vk.commit({ updates: new Map([['k', bytes('v3')]]) })
-    await vk.resetTo(keep)
+    const wt = await open(store)
+    await commitOne(wt, 'k', 'v0')
+    const keep = wt.head
+    await commitOne(wt, 'k', 'v1')
+    await commitOne(wt, 'k', 'v2')
+    await commitOne(wt, 'k', 'v3')
+    await wt.reset(keep)
 
-    expect(await vk.cleanOrphans(SWEEP_ALL)).toBe(3)
+    expect(await wt.repo.gc(SWEEP_ALL)).toBe(3)
 
     // Nothing but the surviving commit's own nodes is left in the
     // namespace — the chain took its whole tree with it.
     const survivors = (await readTree(store, await rootOf(store, keep))).nodes
-    const expected = new Set([...survivors].map((h) => Keyset.DEFAULT_PREFIX + h))
+    const expected = new Set([...survivors].map((h) => NODE_PREFIX + h))
     expect(await nodeKeys(store)).toEqual(expected)
-    expect(await vk.get('k')).toEqual(bytes('v0'))
+    expect(await wt.get('k')).toEqual(bytes('v0'))
   })
 })
 
-describe('cleanOrphans — structural sharing', () => {
+describe('gc — structural sharing', () => {
   it('a subtree shared between a live commit and an orphan survives', async () => {
     const store = new Memory()
-    const vk = await VersionedKV.open(store)
+    const wt = await open(store)
     const seeds = new Map<string, Uint8Array>()
     for (let i = 0; i < 60; i++) seeds.set(`key${i}`, bytes(`v${i}`))
-    await vk.commit({ updates: seeds })
-    const base = vk.currentCommit
+    await commitAll(wt, seeds)
+    const base = wt.head
 
     // A branch that adds one key: most subtrees stay shared with base.
-    const feature = (await vk.createBranch('feature')) as VersionedKV
-    await feature.commit({ updates: new Map([['feature-only', bytes('fv')]]) })
-    const featureCommit = feature.currentCommit
+    const feature = await branchFrom(wt, 'feature')
+    await commitOne(feature, 'feature-only', 'fv')
+    const featureCommit = feature.head
     const featureNodes = (await readTree(store, await rootOf(store, featureCommit))).nodes
     const baseNodes = (await readTree(store, await rootOf(store, base))).nodes
     const shared = [...featureNodes].filter((h) => baseNodes.has(h))
     expect(shared.length, 'expected structural sharing between base and feature').toBeGreaterThan(0)
 
-    await vk.deleteBranch('feature')
-    expect(await vk.cleanOrphans(SWEEP_ALL)).toBe(1)
+    await wt.repo.branches.delete('feature')
+    expect(await wt.repo.gc(SWEEP_ALL)).toBe(1)
 
     for (const h of shared) {
-      expect(
-        await store.get(Keyset.DEFAULT_PREFIX + h),
-        `shared node ${h} was swept`,
-      ).not.toBeNull()
+      expect(await store.get(NODE_PREFIX + h), `shared node ${h} was swept`).not.toBeNull()
     }
     const live = await readTree(store, await rootOf(store, base))
     expect([...live.missing]).toEqual([])
@@ -354,143 +374,139 @@ describe('cleanOrphans — structural sharing', () => {
 
   it('two orphans sharing a subtree both get collected without double-delete trouble', async () => {
     const store = new Memory()
-    const vk = await VersionedKV.open(store)
-    await vk.commit({ updates: new Map([['seed', bytes('s')]]) })
-    const keep = vk.currentCommit
+    const wt = await open(store)
+    await commitOne(wt, 'seed', 's')
+    const keep = wt.head
 
     const seeds = new Map<string, Uint8Array>()
     for (let i = 0; i < 40; i++) seeds.set(`key${i}`, bytes(`v${i}`))
-    const a = (await vk.createBranch('a', { at: keep })) as VersionedKV
-    await a.commit({ updates: seeds })
-    const forkPoint = a.currentCommit
-    await a.commit({ updates: new Map([['a-only', bytes('av')]]) })
-    const b = (await vk.createBranch('b', { at: forkPoint })) as VersionedKV
-    await b.commit({ updates: new Map([['b-only', bytes('bv')]]) })
+    const a = await branchFrom(wt, 'a', keep)
+    await commitAll(a, seeds)
+    const forkPoint = a.head
+    await commitOne(a, 'a-only', 'av')
+    const b = await branchFrom(wt, 'b', forkPoint)
+    await commitOne(b, 'b-only', 'bv')
 
-    await vk.deleteBranch('a')
-    await vk.deleteBranch('b')
-    expect(await vk.cleanOrphans(SWEEP_ALL)).toBe(3)
+    await wt.repo.branches.delete('a')
+    await wt.repo.branches.delete('b')
+    expect(await wt.repo.gc(SWEEP_ALL)).toBe(3)
 
     const live = await readTree(store, await rootOf(store, keep))
     expect([...live.missing]).toEqual([])
-    expect(await vk.get('seed')).toEqual(bytes('s'))
+    expect(await wt.get('seed')).toEqual(bytes('s'))
   })
 })
 
-describe('cleanOrphans — damaged orphans', () => {
+describe('gc — damaged orphans', () => {
   it('does not crash on an orphan whose HAMT nodes are already missing', async () => {
     const store = new Memory()
-    const vk = await VersionedKV.open(store)
-    await vk.commit({ updates: new Map([['seed', bytes('s')]]) })
-    const keep = vk.currentCommit
-    await vk.commit({ updates: new Map([['garbage', bytes('g')]]) })
-    const orphan = vk.currentCommit
+    const wt = await open(store)
+    await commitOne(wt, 'seed', 's')
+    const keep = wt.head
+    await commitOne(wt, 'garbage', 'g')
+    const orphan = wt.head
     const orphanRoot = await rootOf(store, orphan)
-    await vk.resetTo(keep)
+    await wt.reset(keep)
 
     // Simulate a half-swept / interrupted store: the orphan's commit
     // metadata is there but its keyset nodes are gone.
     const orphanNodes = (await readTree(store, orphanRoot)).nodes
     const keepNodes = (await readTree(store, await rootOf(store, keep))).nodes
     await store.removeMany(
-      [...orphanNodes].filter((h) => !keepNodes.has(h)).map((h) => Keyset.DEFAULT_PREFIX + h),
+      [...orphanNodes].filter((h) => !keepNodes.has(h)).map((h) => NODE_PREFIX + h),
     )
 
-    expect(await vk.cleanOrphans(SWEEP_ALL)).toBe(1)
+    expect(await wt.repo.gc(SWEEP_ALL)).toBe(1)
     expect(await store.get(COMMIT_ROOT(orphan))).toBeNull()
-    expect(await vk.get('seed')).toEqual(bytes('s'))
+    expect(await wt.get('seed')).toEqual(bytes('s'))
 
     // The orphan's blob is only ever found through the keyset that
     // points at it, and that keyset is gone, so it survives until a
-    // deepClean scans the blob namespace.
+    // deep sweep scans the blob namespace.
     const garbage = await blobKey(bytes('g'))
     expect(await store.get(garbage)).not.toBeNull()
-    await vk.deepClean(SWEEP_ALL)
+    await wt.repo.gc({ ...SWEEP_ALL, deep: true, wait: false })
     expect(await store.get(garbage)).toBeNull()
-    expect(await vk.get('seed')).toEqual(bytes('s'))
+    expect(await wt.get('seed')).toEqual(bytes('s'))
   })
 
   it('does not crash on an orphan whose root is corrupt', async () => {
     const store = new Memory()
-    const vk = await VersionedKV.open(store)
-    await vk.commit({ updates: new Map([['seed', bytes('s')]]) })
-    const keep = vk.currentCommit
-    await vk.commit({ updates: new Map([['garbage', bytes('g')]]) })
-    const orphan = vk.currentCommit
-    await vk.resetTo(keep)
+    const wt = await open(store)
+    await commitOne(wt, 'seed', 's')
+    const keep = wt.head
+    await commitOne(wt, 'garbage', 'g')
+    const orphan = wt.head
+    await wt.reset(keep)
 
     await store.set(COMMIT_ROOT(orphan), bytes('not json'))
-    expect(await vk.cleanOrphans(SWEEP_ALL)).toBe(1)
+    expect(await wt.repo.gc(SWEEP_ALL)).toBe(1)
     expect(await store.get(COMMIT_ROOT(orphan))).toBeNull()
-    expect(await vk.get('seed')).toEqual(bytes('s'))
+    expect(await wt.get('seed')).toEqual(bytes('s'))
   })
 })
 
 // ---------------------------------------------------------------------------
-// deepClean
+// Deep sweeps
 // ---------------------------------------------------------------------------
 
-describe('deepClean', () => {
-  it('reclaims stray nodes that no commit points at, which cleanOrphans leaves', async () => {
+describe('gc — deep', () => {
+  it('reclaims stray nodes that no commit points at, which a plain sweep leaves', async () => {
     const store = new Memory()
-    const vk = await VersionedKV.open(store)
-    await vk.commit({ updates: new Map([['seed', bytes('s')]]) })
+    const wt = await open(store)
+    await commitOne(wt, 'seed', 's')
 
-    // A keyset written but never committed — an interrupted write, or a
-    // crash between the node write and the CAS. No orphan commit points
-    // at it, so no orphan keyset walk can find it.
-    const stray = await (await Keyset.empty(store)).persist({
-      updates: [['stranded', { blob: 'kvgit:blob:deadbeef', meta: { size: 1 } }]],
-    })
-    const strayKey = Keyset.DEFAULT_PREFIX + stray.root
-    expect(await store.get(strayKey)).not.toBeNull()
+    // A keyset node written but never committed — an interrupted write,
+    // or a crash between the node write and the CAS. No orphan commit
+    // points at it, so no orphan keyset walk can find it.
+    const entry = enc.encode(JSON.stringify(['kvgit:blob:deadbeef', { size: 1 }]))
+    const node = dumps({ items: { stranded: btoa(String.fromCharCode(...entry)) }, kind: 'leaf' })
+    const strayKey = NODE_PREFIX + (await sha256Hex(node))
+    await store.set(strayKey, node)
 
     // The incremental path cannot see it.
-    await vk.cleanOrphans(SWEEP_ALL)
+    await wt.repo.gc(SWEEP_ALL)
     expect(
       await store.get(strayKey),
-      'cleanOrphans is scoped to orphan keysets and must leave commit-less nodes alone',
+      'a plain sweep is scoped to orphan keysets and must leave commit-less nodes alone',
     ).not.toBeNull()
 
     // The quiescent-store path does.
-    await vk.deepClean(SWEEP_ALL)
+    await wt.repo.gc({ ...SWEEP_ALL, deep: true, wait: false })
     expect(await store.get(strayKey)).toBeNull()
 
     // Live state is untouched.
-    expect(await vk.get('seed')).toEqual(bytes('s'))
+    expect(await wt.get('seed')).toEqual(bytes('s'))
   })
 
   it('collects orphan commits too, and reports the same count', async () => {
     const store = new Memory()
-    const vk = await VersionedKV.open(store)
-    await vk.commit({ updates: new Map([['seed', bytes('s')]]) })
-    const keep = vk.currentCommit
-    await vk.commit({ updates: new Map([['garbage', bytes('g')]]) })
-    const orphan = vk.currentCommit
-    await vk.resetTo(keep)
+    const wt = await open(store)
+    await commitOne(wt, 'seed', 's')
+    const keep = wt.head
+    await commitOne(wt, 'garbage', 'g')
+    const orphan = wt.head
+    await wt.reset(keep)
 
-    expect(await vk.deepClean(SWEEP_ALL)).toBe(1)
+    expect(await wt.repo.gc({ ...SWEEP_ALL, deep: true, wait: false })).toBe(1)
     expect(await store.get(COMMIT_ROOT(orphan))).toBeNull()
-    expect(await store.get(`${orphan}:garbage`)).toBeNull()
-    expect(await vk.get('seed')).toEqual(bytes('s'))
+    expect(await store.get(await blobKey(bytes('g')))).toBeNull()
+    expect(await wt.get('seed')).toEqual(bytes('s'))
   })
 
   it('protects nodes of young orphans from the namespace scan', async () => {
     const store = new Memory()
-    const vk = await VersionedKV.open(store)
-    await vk.commit({ updates: new Map([['seed', bytes('s')]]) })
-    const keep = vk.currentCommit
-    await vk.commit({ updates: new Map([['young', bytes('y')]]) })
-    const young = vk.currentCommit
+    const wt = await open(store)
+    await commitOne(wt, 'seed', 's')
+    const keep = wt.head
+    await commitOne(wt, 'young', 'y')
+    const young = wt.head
     const youngNodes = (await readTree(store, await rootOf(store, young))).nodes
-    await vk.resetTo(keep)
+    await wt.reset(keep)
 
-    expect(await vk.deepClean({ minAge: 60_000_000 })).toBe(0)
+    expect(await wt.repo.gc({ minAge: 60_000_000, deep: true, wait: false })).toBe(0)
     for (const h of youngNodes) {
-      expect(
-        await store.get(Keyset.DEFAULT_PREFIX + h),
-        `young orphan node ${h} swept`,
-      ).not.toBeNull()
+      expect(await store.get(NODE_PREFIX + h), `young orphan node ${h} swept`).not.toBeNull()
     }
   })
 })

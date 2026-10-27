@@ -147,8 +147,8 @@ export function makeTextMerge(opts: TextMergeOptions = {}): TextBytesMergeFn {
 export const text: TextBytesMergeFn = makeTextMerge()
 
 /**
- * Marker merge for decoded `string` values (or raw bytes), for use
- * with `Staged`. Encodes `string` sides as UTF-8, marker-merges, and
+ * Marker merge for decoded `string` values (or raw bytes), as a
+ * worktree's merge rule. Encodes `string` sides as UTF-8, marker-merges, and
  * decodes the result back to `string` when any side was `string`.
  */
 export function textMerge(opts: TextMergeOptions = {}): MergeFn {

@@ -1,37 +1,9 @@
 export * from './types'
 export {
-  Hamt,
-  type HamtNode,
-  type HamtOptions,
-  NodeCache,
-  type NodeCacheStats,
-  type UpdatedOptions,
-} from './hamt'
-export {
-  Keyset,
-  decodeEntry,
-  encodeEntry,
-  type KeysetOptions,
-  type KeysetUpdatedOptions,
-} from './keyset'
-export { VersionedBase } from './versioned/base'
-export {
-  VersionedKV,
   recoverByCommitScan,
   repairHead,
   type CorruptHeadRecoverer,
-  type LazyKeysetOptions,
-  type VersionedKVOptions,
 } from './versioned/kv'
-export {
-  type Change,
-  pickMergePolicy,
-  resolveMerge,
-  type BlobReader,
-  type MergeResolution,
-  type ResolveMergeOptions,
-} from './versioned/merge'
-export { diffKeysets, walkHistory, type ParentLoader } from './versioned/helpers'
 export {
   CantMark,
   makeTextMerge,
@@ -71,14 +43,6 @@ export {
   type SyncResult,
   type SyncStatus,
 } from './sync/sync'
-export {
-  Staged,
-  jsonDecoder,
-  jsonEncoder,
-  type StagedCommitOptions,
-  type StagedMergeHeadsOptions,
-  type StagedOptions,
-} from './staged'
 export { Namespaced, type NamespaceableStore } from './namespaced'
 export { PyFloat, pyDumps, pyLoads, type PyDumpsOptions } from './pyjson'
 export { ROOT_COMMIT, STORAGE_VERSION } from './versioned/layout'
