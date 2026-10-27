@@ -159,16 +159,35 @@ encoding, are reached now only through `VersionedKV`, and go with it.
   `VersionedBase` reach (the history walk, `commit_changes`) goes with
   them.
 - TypeScript: `VersionedKV`, `VersionedBase`, `Staged`, the JSON
-  encoder pair, the tree classes, `SequenceMatcher`,
-  `encodeEntry`/`decodeEntry`, `diffKeysets` and `walkHistory` leave
-  the exports, and the code only they reach goes with them; the value
-  cache becomes byte-bounded; `lazy` retires or becomes a no-op.
+  encoder pair, the tree classes, `encodeEntry`/`decodeEntry`,
+  `diffKeysets` and `walkHistory` leave the exports, and the code only
+  they reach goes with them; `SequenceMatcher` stays, as TypeScript's
+  own; the value cache becomes byte-bounded; `lazy` becomes a no-op.
 - Docs: a README per host, the storage format and the request protocol
   documented once, the CHANGELOG with every breaking change.
 
 **Exit:** the consumers' uses of kvgit are covered: nontainer `main`,
 agex-ts (`world`, `kvsql`, `agex-ts`) and agex-studio pass against the
 branch's packages, linked locally.
+
+Met 2026-10-27 against two consumer branches, which land with C8:
+nontainer `main` and agex-ts's termish reach API this stage removes,
+so they pass only with these changes, and C8 merges them before the
+release.
+
+- nontainer: `apply` resolves through `Repo.resolve` and
+  `Repo.merge_rule`, and the empty-branch check compares against
+  `EMPTY_ROOT` (branch `kvgit-05`); its kvgit cap rises to `<0.6` with
+  the 0.5.0 floor.
+- agex-ts: termish's `KvgitFS` runs on a `Worktree`, with
+  `fileRecordCodec` and `polymorphicCodec` in place of the encoder
+  pairs (branch `kvgit-05`), since `Staged` is gone. World, kvsql and
+  agex-ts need no change.
+
+Against the branch: nontainer 3,413 passed; termish 1,216, world 1,338,
+kvsql 313 and agex-ts 222 passed, with agex-ts's own copy of the package
+replaced by this one; agex-studio's 765 passed, its typecheck and build
+clean, with the four packages linked.
 
 ## C8. Migration and release
 
