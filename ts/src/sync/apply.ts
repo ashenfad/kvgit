@@ -2,12 +2,12 @@
  * Wire replay: apply `WireCommit`s to a local store.
  *
  * `applyWire` is the receiver side of every transfer (sync pull,
- * bundle import). It reconstructs each commit's records byte-exactly:
- * blob keys are derived from the bytes, the keyset HAMT is rebuilt
- * locally over the first parent's (nodes never cross the wire), and the
- * commit hash is recomputed from the rebuilt root and the recorded
- * time and info, and compared against the claimed hash — a mismatch
- * refuses the commit before anything is written.
+ * bundle import). Each commit's values are keyed by their bytes here,
+ * and the core replays it: it rebuilds the keyset over the first
+ * parent's (nodes never cross the wire), recomputes the commit hash
+ * from the rebuilt root and the recorded time and info, and checks the
+ * parents' generations, refusing the commit with an `IntegrityError`
+ * before anything is written if either doesn't match.
  *
  * Requirements on the stream (which `walkDelta` guarantees):
  * - topological order: every parent precedes its children, except
@@ -24,26 +24,10 @@
  * `applyWire` itself never touches it.
  */
 
-import { EMPTY_HASH } from '../hamt'
-import { Keyset } from '../keyset'
-import type { KVStore, KeysetEntry, WireCommit } from '../types'
+import type { KVStore, WireCommit } from '../types'
 import { callCore } from '../versioned/drive'
 import { checkStorageVersion } from '../versioned/kv'
-import {
-  COMMIT_ROOT,
-  GC_LEASE_KEY,
-  IN_FLIGHT_KEY,
-  PARENT_COMMIT,
-  PARENT_GENS,
-  ROOT_COMMIT,
-  blobKey,
-  commitHash,
-  commitRecords,
-  generationOf,
-  loads,
-  safeLoads,
-} from '../versioned/layout'
-import { inFlightMarker, tryLand, waitForGc } from '../versioned/lease'
+import { blobKey } from '../versioned/layout'
 
 const wallClock = (): number => Date.now() / 1000
 
@@ -88,87 +72,34 @@ export async function applyWire(
 ): Promise<ApplyWireResult> {
   await checkStorageVersion(store)
   const inFlight: string[] = []
-
   let applied = 0
   let skipped = 0
   let head: string | null = null
-  const generations = new Map<string, number>()
 
   for await (const wc of commits) {
     head = wc.hash
-    // Content-addressed: present means identical. But present isn't
-    // reachable (it may be an orphan from an earlier fetch), so it is
-    // marked in flight like a commit written here, until the head that
-    // names it is published.
-    if (await remark(store, wc.hash)) {
-      inFlight.push(wc.hash)
-      skipped++
-      continue
-    }
-
-    // Rebuild the keyset over the first parent's (structural sharing
-    // comes back for free), with each update's blob keyed by its bytes.
-    const writes = new Map<string, Uint8Array>()
-    const entryUpdates: Array<readonly [string, KeysetEntry]> = []
+    const held = new Map<string, Uint8Array>()
+    const updates: Array<[string, string, number]> = []
     for (const [key, bytes] of wc.updates) {
-      const pointer = await blobKey(bytes)
-      writes.set(pointer, bytes)
-      entryUpdates.push([key, { blob: pointer, meta: { size: bytes.length } }])
+      const blob = await blobKey(bytes)
+      held.set(blob, bytes)
+      updates.push([key, blob, bytes.length])
     }
-    const firstParent = wc.parents[0]
-    const parentKs = Keyset.fromRoot(
-      store,
-      firstParent !== undefined ? await rootAt(store, firstParent) : EMPTY_HASH,
-    )
-    const newKs = await parentKs.updated({ updates: entryUpdates, removals: wc.removals })
-
-    // The root commit's hash is fixed rather than derived, so it is
-    // checked by its shape: no parents, no info, an empty keyset.
-    const recomputed =
-      wc.hash === ROOT_COMMIT
-        ? wc.parents.length === 0 && newKs.root === EMPTY_HASH && wc.info == null
-          ? ROOT_COMMIT
-          : 'a root commit with content'
-        : await commitHash(wc.parents, newKs.root, wc.time, wc.info)
-    if (recomputed !== wc.hash) {
-      throw new Error(
-        `applyWire: integrity check failed for ${wc.hash} (recomputed ${recomputed}) — refusing commit`,
-      )
-    }
-
-    // The hash doesn't cover parent generations, so they are checked
-    // against the parents' own records: commits made on top of this one
-    // count from them.
-    const expectedGens =
-      wc.parents.length === 0
-        ? null
-        : await Promise.all(wc.parents.map((p) => generationAt(store, p, generations)))
-    if (dumpsText(wc.parentGens) !== dumpsText(expectedGens)) {
-      throw new Error(
-        `applyWire: parent generations ${dumpsText(wc.parentGens)} for ${wc.hash} do not match its parents' ${dumpsText(expectedGens)} — refusing commit`,
-      )
-    }
-
-    // One batch per commit, as a commit is written: blobs, nodes, records.
-    for (const [k, v] of newKs.pending) writes.set(k, v)
-    const records = commitRecords({
-      commit: wc.hash,
-      root: newKs.root,
-      parents: wc.parents,
-      parentGens: wc.parentGens,
-      created: wc.time,
+    const args = {
+      hash: wc.hash,
+      parents: [...wc.parents],
+      parent_gens: wc.parentGens === null ? null : [...wc.parentGens],
+      time: wc.time,
       info: wc.info ?? null,
-    })
-    for (const [k, v] of records) writes.set(k, v)
-    // Marked in flight and landed while no sweep runs: a commit no head
-    // names yet must not be swept before one does.
-    writes.set(IN_FLIGHT_KEY(wc.hash), inFlightMarker())
-    for (;;) {
-      const lease = await waitForGc(store)
-      if (await store.casMany(new Map([[GC_LEASE_KEY, lease]]), writes)) break
+      updates,
+      removals: [...wc.removals],
     }
+    // Written or already here, it is marked in flight until the head
+    // that names it is published.
+    const replayed = await callCore('wire_replay', args, { store, held, now: wallClock })
+    if (replayed === 'present') skipped++
+    else applied++
     inFlight.push(wc.hash)
-    applied++
   }
 
   if (opts.createBranch !== undefined && head !== null) {
@@ -179,28 +110,6 @@ export async function applyWire(
   }
 
   return { applied, skipped, head, inFlight }
-}
-
-/**
- * Give a commit already in the store a fresh in-flight marker, while no
- * sweep runs and conditional on its root still being there.
- *
- * @returns false if the commit isn't in the store (or a sweep took it
- *   meanwhile), so the caller writes it in full.
- */
-async function remark(store: KVStore, commit: string): Promise<boolean> {
-  for (;;) {
-    const lease = await waitForGc(store)
-    const root = await store.get(COMMIT_ROOT(commit))
-    if (root === null) return false
-    const landed = await tryLand(
-      store,
-      lease,
-      new Map([[COMMIT_ROOT(commit), root]]),
-      new Map([[IN_FLIGHT_KEY(commit), inFlightMarker()]]),
-    )
-    if (landed !== null) return landed
-  }
 }
 
 /**
@@ -221,51 +130,6 @@ export async function publishHead(
 ): Promise<boolean> {
   const args = { branch, expected, head: newHead, in_flight: [...(opts.inFlight ?? [])] }
   return (await callCore('publish_head', args, { store, now: wallClock })) as boolean
-}
-
-/** A stored commit's generation: 0 with no parents, else one more than
- *  its highest parent's, as its recorded parent generations say. */
-async function generationAt(
-  store: KVStore,
-  commit: string,
-  cache: Map<string, number>,
-): Promise<number> {
-  const cached = cache.get(commit)
-  if (cached !== undefined) return cached
-  const parentsBytes = await store.get(PARENT_COMMIT(commit))
-  if (parentsBytes === null) {
-    throw new Error(
-      `applyWire: parent ${commit} is neither in the stream nor the store (stream must be parents-first)`,
-    )
-  }
-  const parents = loads(parentsBytes) as string[]
-  let gen = 0
-  if (parents.length > 0) {
-    const gensBytes = await store.get(PARENT_GENS(commit))
-    const gens = gensBytes === null ? null : safeLoads(gensBytes)
-    if (!Array.isArray(gens) || gens.length !== parents.length) {
-      throw new Error(`applyWire: commit ${commit} has no parent generations recorded`)
-    }
-    gen = generationOf(gens as number[])
-  }
-  cache.set(commit, gen)
-  return gen
-}
-
-function dumpsText(value: unknown): string {
-  return JSON.stringify(value ?? null)
-}
-
-/** A commit's keyset root; throws if the commit is absent, which in a
- *  parents-first stream means a parent neither sent nor held. */
-async function rootAt(store: KVStore, commit: string): Promise<string> {
-  const rootBytes = await store.get(COMMIT_ROOT(commit))
-  if (rootBytes === null) {
-    throw new Error(
-      `applyWire: parent ${commit} is neither in the stream nor the store (stream must be parents-first)`,
-    )
-  }
-  return loads(rootBytes) as string
 }
 
 // ---------------------------------------------------------------------------

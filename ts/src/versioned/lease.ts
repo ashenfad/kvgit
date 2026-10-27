@@ -16,9 +16,7 @@
  * a handle stamps its commits with.
  */
 
-import { PyFloat } from '../pyjson'
-import type { KVStore } from '../types'
-import { GC_LEASE_KEY, dumps, safeLoads } from './layout'
+import { safeLoads } from './layout'
 
 /** Default seconds a sweep's lease stays live: what a sweep that dies
  *  holding it costs writers, at most. */
@@ -26,9 +24,6 @@ export const GC_LEASE_TTL = 600
 
 /** Seconds an in-flight marker protects an unpublished commit. */
 export const IN_FLIGHT_TTL = 600
-
-/** Seconds a writer sleeps between checks while a lease is live. */
-export const GC_WAIT_POLL = 0.05
 
 /**
  * Where leases and in-flight markers read the time (wall time, in
@@ -45,14 +40,6 @@ export const leaseEnv = {
   owner: (): string => `ts-${globalThis.crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`,
 }
 
-/** The clock leases and in-flight markers expire by. */
-export const leaseClock = (): number => leaseEnv.clock()
-
-/** A fresh in-flight marker: the time its protection lapses. */
-export function inFlightMarker(): Uint8Array {
-  return dumps(new PyFloat(leaseClock() + IN_FLIGHT_TTL))
-}
-
 /** The time (seconds) the lease in `raw` runs out; 0 for no lease.
  *  Bytes that don't decode to a record with a numeric `expires` count
  *  as expired, so garbage under the key can't wedge the store. */
@@ -62,51 +49,4 @@ export function leaseExpiry(raw: Uint8Array | null): number {
   if (record === null || typeof record !== 'object' || Array.isArray(record)) return 0
   const expires = (record as Record<string, unknown>).expires
   return typeof expires === 'number' ? expires : 0
-}
-
-/**
- * Wait until no live lease is held; return the lease record then
- * (absent, or the expired record the last sweep left). A write that
- * must not land under a sweep expects these bytes: a sweep that starts
- * afterwards replaces them with a record of its own, so the write fails
- * and the writer comes back here.
- *
- * While a lease is live this polls, sleeping at most until that lease's
- * expiry, so a holder that died without releasing delays a writer by
- * the remainder of its term and no longer.
- */
-export async function waitForGc(store: KVStore): Promise<Uint8Array | null> {
-  let raw = await store.get(GC_LEASE_KEY)
-  while (raw !== null) {
-    const remaining = leaseExpiry(raw) - leaseClock()
-    if (remaining <= 0) return raw
-    await leaseEnv.sleep(Math.min(GC_WAIT_POLL, remaining))
-    raw = await store.get(GC_LEASE_KEY)
-  }
-  return null
-}
-
-/**
- * Apply a batch unless a sweep has started since `lease` was read.
- *
- * @returns true when it landed; false when one of the caller's own
- *   expectations failed; null when the lease moved, so whatever the
- *   caller checked may no longer hold: wait, check again, retry.
- */
-export async function tryLand(
-  store: KVStore,
-  lease: Uint8Array | null,
-  expected: ReadonlyMap<string, Uint8Array | null>,
-  writes: ReadonlyMap<string, Uint8Array>,
-  removes: Iterable<string> = [],
-): Promise<boolean | null> {
-  const expect = new Map(expected)
-  expect.set(GC_LEASE_KEY, lease)
-  if (await store.casMany(expect, writes, removes)) return true
-  return sameBytes(await store.get(GC_LEASE_KEY), lease) ? false : null
-}
-
-export function sameBytes(a: Uint8Array | null, b: Uint8Array | null): boolean {
-  if (a === null || b === null) return a === b
-  return a.length === b.length && a.every((v, i) => v === b[i])
 }

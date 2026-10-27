@@ -50,6 +50,10 @@ pub enum Error {
     },
     /// Something read from the store that should be a record isn't.
     Malformed(String),
+    /// A commit that arrived from another store doesn't check out: its
+    /// hash or its parents' generations don't match what it carries, or
+    /// a parent it needs never came.
+    Integrity(String),
     /// The store is stamped with a storage layout this code doesn't
     /// read, or is from before stamps.
     StorageVersion(String),
@@ -81,6 +85,7 @@ impl Error {
             Error::Invalid(_) => "invalid",
             Error::GcBusy(_) => "gc_busy",
             Error::StorageVersion(_) => "storage_version",
+            Error::Integrity(_) => "integrity",
         }
     }
 
@@ -122,7 +127,8 @@ impl fmt::Display for Error {
             | Error::Malformed(message)
             | Error::Invalid(message)
             | Error::GcBusy(message)
-            | Error::StorageVersion(message) => f.write_str(message),
+            | Error::StorageVersion(message)
+            | Error::Integrity(message) => f.write_str(message),
             Error::MergeConflict { keys, .. } => {
                 write!(f, "Merge conflict on keys: {}", keys.join(", "))
             }

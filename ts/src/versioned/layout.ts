@@ -180,31 +180,6 @@ export function generationOf(parentGens: readonly number[]): number {
   return parentGens.length === 0 ? 0 : 1 + Math.max(...parentGens)
 }
 
-/**
- * The records of a commit, keyed as they are stored: its root, parents,
- * the parents' generations (absent for the root commit), its time, and
- * its info when it has one.
- */
-export function commitRecords(opts: {
-  commit: string
-  root: string
-  parents: readonly string[]
-  parentGens: readonly number[] | null
-  created: number | PyFloat
-  info: unknown
-}): Map<string, Uint8Array> {
-  const { commit } = opts
-  const time = opts.created instanceof PyFloat ? opts.created : new PyFloat(opts.created)
-  const out = new Map<string, Uint8Array>([
-    [COMMIT_ROOT(commit), dumps(opts.root)],
-    [PARENT_COMMIT(commit), dumps([...opts.parents])],
-  ])
-  if (opts.parentGens !== null) out.set(PARENT_GENS(commit), dumps([...opts.parentGens]))
-  out.set(COMMIT_TIME(commit), dumps(time))
-  if (opts.info !== null) out.set(INFO_KEY(commit), dumps(opts.info))
-  return out
-}
-
 // ---------------------------------------------------------------------------
 // Heads and the version stamp
 // ---------------------------------------------------------------------------

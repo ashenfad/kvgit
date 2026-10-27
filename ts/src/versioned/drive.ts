@@ -17,6 +17,7 @@ import {
   ConcurrencyError,
   CorruptHeadError,
   GcBusy,
+  IntegrityError,
   MergeConflict,
   StorageVersionError,
   TagExistsError,
@@ -384,6 +385,8 @@ function toError(f: Failure, causes: Map<string, unknown>): Error {
       return new GcBusy(f.message)
     case 'storage_version':
       return new StorageVersionError(f.message)
+    case 'integrity':
+      return new IntegrityError(f.message)
     case 'concurrency':
       return new ConcurrencyError(f.message)
     case 'merge_conflict': {

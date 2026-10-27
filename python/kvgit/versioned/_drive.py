@@ -17,6 +17,7 @@ from ..errors import (
     ConcurrencyError,
     CorruptHeadError,
     GcBusy,
+    IntegrityError,
     MergeConflict,
     StorageVersionError,
     TagExistsError,
@@ -182,6 +183,7 @@ _ERRORS: dict[str, Callable[[str], Exception]] = {
     "concurrency": ConcurrencyError,
     "gc_busy": GcBusy,
     "storage_version": StorageVersionError,
+    "integrity": IntegrityError,
 }
 
 

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { Memory } from '../src/backends/memory'
+import { IntegrityError } from '../src/errors'
 import {
   VersionedKV,
   type WireCommit,
@@ -163,6 +164,7 @@ describe('applyWire — refusals', () => {
     )
     // The tampered commit's records never landed.
     expect(await dst.get(`__commit_root__${target.hash}`)).toBeNull()
+    await expect(applyWire(new Memory(), tampered)).rejects.toThrow(IntegrityError)
   })
 
   it('refuses a merge that drops a key it took from its second parent', async () => {
@@ -211,7 +213,7 @@ describe('applyWire — refusals', () => {
     const { store: src, head } = await buildSource()
     const wire = await collect(src, head)
     const dst = new Memory()
-    await expect(applyWire(dst, [...wire].reverse())).rejects.toThrow(/parents-first/)
+    await expect(applyWire(dst, [...wire].reverse())).rejects.toThrow(/sends parents first/)
   })
 
   it('refuses createBranch onto an existing branch', async () => {
