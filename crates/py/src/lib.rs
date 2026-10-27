@@ -10,7 +10,7 @@ mod _core {
     use kvgit_core::json::Value;
     use kvgit_core::keyset::Entry;
     use kvgit_core::machine::{Cas, Machine, Reply, Request, Step, Write};
-    use kvgit_core::merge::{MergeAnswer, Rule, Rules};
+    use kvgit_core::merge::{self, MergeAnswer, Rule, Rules};
     use kvgit_core::ops::{self, Out as OpOut};
     use kvgit_core::refs;
     use kvgit_core::text::{self, TextError, TextRule};
@@ -297,6 +297,10 @@ mod _core {
             },
         )
     }
+
+    /// One key's change on one side of a resolve: the key, then its
+    /// `(blob, size)` before and after, None where it is absent.
+    type SideChange = (String, Option<(String, u64)>, Option<(String, u64)>);
 
     fn entry_from_py(obj: &Bound<'_, PyAny>) -> PyResult<Entry> {
         let py = obj.py();
@@ -1062,6 +1066,43 @@ mod _core {
             };
             Ok(Op {
                 machine: Some(ops::merge(args)),
+                asked: None,
+            })
+        }
+
+        /// A three-way resolve over values the host holds: each side's
+        /// changes as `(key, old, new)`, each side of a change a
+        /// `(blob, size)` or None where the key is absent.
+        #[staticmethod]
+        #[pyo3(signature = (ours, theirs, merge_fns, merge_prefixes, default_merge))]
+        fn resolve(
+            ours: Vec<SideChange>,
+            theirs: Vec<SideChange>,
+            merge_fns: &Bound<'_, PyDict>,
+            merge_prefixes: Vec<(String, Bound<'_, PyAny>)>,
+            default_merge: Option<&Bound<'_, PyAny>>,
+        ) -> PyResult<Op> {
+            let changes = |side: Vec<SideChange>| {
+                let entry =
+                    |e: Option<(String, u64)>| e.map(|(blob, size)| Entry::new(blob, size, vec![]));
+                side.into_iter()
+                    .map(|(key, old, new)| {
+                        (
+                            key,
+                            merge::Change {
+                                old: entry(old),
+                                new: entry(new),
+                            },
+                        )
+                    })
+                    .collect()
+            };
+            Ok(Op {
+                machine: Some(ops::resolve(
+                    changes(ours),
+                    changes(theirs),
+                    rules_of(merge_fns, &merge_prefixes, default_merge)?,
+                )),
                 asked: None,
             })
         }

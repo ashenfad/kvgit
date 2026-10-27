@@ -162,6 +162,14 @@ class Op:
         roots: list[tuple[str, str]],
         generations: list[tuple[str, int]],
     ) -> Op: ...
+    @staticmethod
+    def resolve(
+        ours: list[tuple[str, tuple[str, int] | None, tuple[str, int] | None]],
+        theirs: list[tuple[str, tuple[str, int] | None, tuple[str, int] | None]],
+        merge_fns: dict[str, Any],
+        merge_prefixes: list[tuple[str, Any]],
+        default_merge: Any,
+    ) -> Op: ...
     def use_cache(self, cache: ContentCache) -> None: ...
     def resume(
         self, wall: float, reply: Any = None, failed: bool = False

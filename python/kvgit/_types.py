@@ -3,6 +3,7 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
+from typing import Any
 
 
 class MergeChoice(Enum):
@@ -132,3 +133,21 @@ class MergeResult:
 
     def __bool__(self) -> bool:
         return self.merged
+
+
+@dataclass(frozen=True)
+class Resolution:
+    """What a three-way resolve over named values decided, as a change
+    to ours. Returned by ``Repo.resolve``."""
+
+    values: dict[str, Any]
+    """The value each changed key takes, where it differs from ours."""
+
+    removals: frozenset[str]
+    """Keys ours holds that the merged state doesn't."""
+
+    auto_merged_keys: tuple[str, ...]
+    """Keys a merge rule decided, as in a ``MergeResult``."""
+
+    carried_keys: tuple[str, ...]
+    """Keys only theirs changed, taken as they were."""

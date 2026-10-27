@@ -41,8 +41,8 @@ if TYPE_CHECKING:
 from .base import ChunkReader, ChunkSink
 
 # Below this size, the chunk indirection costs more than the savings.
-# Tunable via constructor; this default is conservative for IndexedDB
-# where each entry has hundreds of bytes of fixed overhead.
+# Tunable via constructor, for a backend whose entries carry more fixed
+# overhead.
 DEFAULT_MIN_BYTES = 1024
 
 

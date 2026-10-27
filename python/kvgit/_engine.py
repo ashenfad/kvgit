@@ -10,6 +10,7 @@ from ._store import (
     BRANCH_HEAD,
     CHUNK_PREFIX,
     EMPTY_HASH,
+    Clock,
     CorruptHeadRecoverer,
     _call,
     _on_tree,
@@ -42,6 +43,7 @@ class Engine:
         branch: str,
         *,
         recover: CorruptHeadRecoverer | None = None,
+        now: Clock | None = None,
     ) -> None:
         # A name the branch API refuses never reaches the store: the
         # empty name, or one under the tag namespace.
@@ -49,6 +51,7 @@ class Engine:
         self.store = store
         self.branch = branch
         self._recover = recover
+        self._now = now
         # Whether the store is known stamped for content-keyed blobs.
         # Stamps only rise, so once seen it is never read again.
         self._stamped = False
@@ -271,6 +274,7 @@ class Engine:
             recoverer=self._recover,
             clock=time.time,
             sleep=time.sleep,
+            now=self._now,
         )
         result = MergeResult(
             merged=done["merged"],

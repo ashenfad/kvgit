@@ -230,6 +230,11 @@ def _on_tree(
     )
 
 
+Clock = Callable[[], float]
+"""Seconds since the epoch, as a float: where commit, tag and sweep
+times are read from. Leases always expire by the wall clock."""
+
+
 def _check_storage_version(store: KVStore) -> None:
     """Refuse a store stamped with another storage layout, or one with
     branches and no stamp, from before stamps; stamp a fresh one."""
@@ -240,6 +245,7 @@ def _call(
     op: str,
     store: KVStore,
     recoverer: Callable[[KVStore, str], Any] | None = None,
+    now: Clock | None = None,
     /,
     **args: Any,
 ) -> Any:
@@ -251,6 +257,7 @@ def _call(
         owner=lambda: _new_lease_owner(),
         clock=time.time,
         sleep=time.sleep,
+        now=now,
     )
 
 
@@ -470,7 +477,9 @@ def _new_lease_owner() -> str:
     return f"{os.getpid()}-{uuid.uuid4().hex[:12]}"
 
 
-def create_branch(store: KVStore, name: str, target: str) -> None:
+def create_branch(
+    store: KVStore, name: str, target: str, *, now: Clock | None = None
+) -> None:
     """Create branch ``name`` pointing at commit ``target``.
 
     ``target`` may be :data:`ROOT_COMMIT`, which the store holds as soon
@@ -490,7 +499,7 @@ def create_branch(store: KVStore, name: str, target: str) -> None:
         BranchExistsError: if the name is taken.
         UnknownCommitError: if ``target`` is not in the store.
     """
-    _call("create_branch", store, name=name, target=target)
+    _call("create_branch", store, None, now, name=name, target=target)
 
 
 def delete_branch(store: KVStore, name: str) -> None:
@@ -523,7 +532,12 @@ def delete_branch(store: KVStore, name: str) -> None:
 
 
 def create_tag(
-    store: KVStore, name: str, target: str, info: dict | None = None
+    store: KVStore,
+    name: str,
+    target: str,
+    info: dict | None = None,
+    *,
+    now: Clock | None = None,
 ) -> None:
     """Name commit ``target`` permanently, keeping it and its ancestry alive.
 
@@ -540,7 +554,7 @@ def create_tag(
         TagExistsError: if the name is taken.
         UnknownCommitError: if ``target`` is not in the store.
     """
-    _call("create_tag", store, name=name, target=target, info=info)
+    _call("create_tag", store, None, now, name=name, target=target, info=info)
 
 
 def delete_tag(store: KVStore, name: str) -> None:
@@ -579,6 +593,7 @@ def gc(
     deep: bool = False,
     wait: bool = True,
     lease_ttl: float = GC_LEASE_TTL,
+    now: Clock | None = None,
 ) -> int:
     """Sweep what no live commit reaches; return how many commits went.
 
@@ -608,7 +623,14 @@ def gc(
             key included.
     """
     removed = _call(
-        "gc", store, min_age=min_age, deep=deep, wait=wait, lease_ttl=lease_ttl
+        "gc",
+        store,
+        None,
+        now,
+        min_age=min_age,
+        deep=deep,
+        wait=wait,
+        lease_ttl=lease_ttl,
     )
     if removed:
         logging.getLogger("kvgit.orphans").debug(

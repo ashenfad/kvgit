@@ -12,10 +12,9 @@ That's it: a `Worktree` on branch `main` of an in-memory `Repo`. For persistence
 
 ```python
 wt = kvgit.open("disk", path="/tmp/mydb")      # SQLite-backed via diskcache
-wt = kvgit.open("indexeddb", db_name="myapp")  # browser-persistent via IndexedDB
 ```
 
-`kind="disk"` requires `pip install kvgit[disk]`. `kind="indexeddb"` is available in Pyodide (browser) environments but has portability and durability tradeoffs — see [Browser persistence in Pyodide](pyodide.md) for the full picture and the recommended cross-browser alternative.
+`kind="disk"` requires `pip install kvgit[disk]`.
 
 `kvgit.open()` is sugar. It builds a `Repo` over the backend and opens (or creates) one branch. Build the `Repo` yourself for any other backend, or to set repo-wide options:
 
@@ -533,7 +532,7 @@ The codec is fixed per store in practice: values written under one read back as 
 
 ## Storing scientific data efficiently (chunked codecs)
 
-A common pain point: an agent or notebook holds a 10 MB DataFrame and slices it into half a dozen derived variables. With plain pickle, every commit re-serializes each derived value in full -- 10 MB times the number of slices, every commit. The store fills up fast, especially against IndexedDB or other quota-bound backends.
+A common pain point: an agent or notebook holds a 10 MB DataFrame and slices it into half a dozen derived variables. With plain pickle, every commit re-serializes each derived value in full -- 10 MB times the number of slices, every commit. The store fills up fast, especially against quota-bound backends.
 
 The `kvgit.codecs` package solves this by externalizing large numpy buffers as content-addressed chunks. Equal buffers (across keys, across commits, across branches) are stored exactly once.
 

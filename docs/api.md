@@ -30,10 +30,9 @@ The one-line happy path: open a store, creating it if it is new, and a worktree 
 
 ```python
 kvgit.open(
-    kind="memory",       # "memory", "disk", or "indexeddb"
+    kind="memory",       # "memory" or "disk"
     *,
     path=None,           # required for "disk"
-    db_name="kvgit",     # IndexedDB database name (only for "indexeddb")
     branch="main",
     codec="pickle",
     cache_bytes=32 * 1024 * 1024,
@@ -43,9 +42,8 @@ kvgit.open(
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `kind` | `Literal["memory", "disk", "indexeddb"]` | `"memory"` | Backend type |
+| `kind` | `Literal["memory", "disk"]` | `"memory"` | Backend type |
 | `path` | `str \| None` | `None` | Required for `"disk"` |
-| `db_name` | `str` | `"kvgit"` | IndexedDB database name. Only used with `"indexeddb"`. |
 | `branch` | `str` | `"main"` | Branch to open; created at the empty root commit if missing |
 | `codec` | see [Codecs](#codecs) | `"pickle"` | How values become stored bytes |
 | `cache_bytes` | `int` | 32 MB | See [The cache](#the-cache) |
@@ -78,12 +76,13 @@ repo = Repo(
     recover_from_corrupt_head=None,
     cache_bytes=32 * 1024 * 1024,
     value_cache_bytes=32 * 1024 * 1024,
+    now=None,
 )
 ```
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `backend` | `KVStore` | (required) | `Memory()`, `Disk(path)`, `Postgres(dsn)`, `IndexedDB(...)`, a `Composite`, or your own |
+| `backend` | `KVStore` | (required) | `Memory()`, `Disk(path)`, `Postgres(dsn)`, a `Composite`, or your own |
 | `codec` | `str \| (encoder, decoder)` | `"pickle"` | See [Codecs](#codecs) |
 | `merge_fns` | `dict[str, MergeFn \| MergeChoice] \| None` | `None` | Merge rules by key, for every worktree this repo opens |
 | `merge_prefixes` | `dict[str, MergeFn \| MergeChoice] \| None` | `None` | Merge rules by key prefix, likewise |
@@ -91,6 +90,7 @@ repo = Repo(
 | `recover_from_corrupt_head` | `CorruptHeadRecoverer \| None` | `None` | Last-resort HEAD recovery; see [HEAD Recovery](#head-recovery) |
 | `cache_bytes` | `int` | 32 MB | Memory for what the store never rewrites; `0` turns it off. See [The cache](#the-cache) |
 | `value_cache_bytes` | `int` | 32 MB | Memory for the values each worktree reads; `0` holds none. See [The read cache](#the-read-cache) |
+| `now` | `Callable[[], float] \| None` | `time.time` | The clock commit and tag times are read from and a sweep's `min_age` is measured by, in seconds. GC leases always expire by the wall clock. |
 
 None of these settings is written to the store: they belong to the process that opens it. Opening reads the store's version stamp once and raises [`StorageVersionError`](#errors) for a layout this code does not read. It stamps a fresh store, and writes nothing else.
 
@@ -159,7 +159,18 @@ See [Tags](#tags) for the semantics.
 | `merge_base(a, b)` | `str \| None` | Lowest common ancestor, or `None` if the two share no history. Criss-cross ties go to the smallest hash. `UnknownCommitError` if either is not in the store. |
 | `snapshot(*, commit=None, branch=None, tag=None)` | `Snapshot` | Read-only view of the commit the ref resolves to now |
 
-History ends at the empty root commit every branch starts from (`ROOT_COMMIT`, the same hash in every store).
+History ends at the empty root commit every branch starts from (`ROOT_COMMIT`, the same hash in every store). Its root is `EMPTY_ROOT`, the root of an empty keyset: a commit whose `root` equals it holds nothing.
+
+### Resolving values
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `resolve(base, ours, theirs, *, merge_fns=None, merge_prefixes=None, default_merge=None)` | `Resolution` | A three-way merge of values the caller names, by the same rules a branch merge uses |
+| `merge_rule(key, *, merge_fns=None, merge_prefixes=None, default_merge=None)` | `MergeFn \| MergeChoice \| None` | The rule that governs `key`: exact key, else the longest prefix it starts with, else the default |
+
+`resolve` takes each side's state of the keys in question as a mapping; a key missing from one is absent on that side. What one side changed since `base` is taken, keys both changed alike agree, and keys both changed differently go to the merge rules, the call's layered over the repository's. Two values are the same when the codec encodes them to the same bytes. Nothing is read from or written to the store. It answers with the change to `ours` (a [`Resolution`](#resolution)), or raises [`MergeConflict`](#mergeconflict) for keys no rule resolves.
+
+This is the merge with the base chosen by the caller rather than found in history: applying a change between two commits to a third, for example, where the caller reads the three sides itself. `merge_rule` tells a caller which keys a `MergeChoice` decides outright, whose values it then needn't read.
 
 ### Garbage collection
 
@@ -503,6 +514,17 @@ Frozen dataclass returned by `commit()`, `merge()`, `apply()`, `cherry_pick()` a
 
 Both are empty for a commit with no other side (`fast_forward` on `commit()`) and for `no_op`. A key both sides changed identically appears in neither, unless a registered `MergeChoice` covers it: the policy decides every key it covers, so the key is in `auto_merged_keys`.
 
+### Resolution
+
+Frozen dataclass returned by `Repo.resolve()`: the change to `ours`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `values` | `dict[str, Any]` | The value each changed key takes, where it differs from ours |
+| `removals` | `frozenset[str]` | Keys ours holds that the merged state doesn't |
+| `auto_merged_keys` | `tuple[str, ...]` | Keys a merge rule decided, as in `MergeResult` |
+| `carried_keys` | `tuple[str, ...]` | Keys only theirs changed, taken as they were |
+
 ### TagInfo
 
 Frozen dataclass returned by `repo.tags.info()`.
@@ -723,7 +745,7 @@ Materialized arrays are independent, writable copies. Reads allocate a fresh arr
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `min_bytes` | `int` | `1024` | Below this size, standalone arrays inline rather than chunk. Tunable per backend (IndexedDB has higher per-entry overhead, so a higher threshold may be appropriate). |
+| `min_bytes` | `int` | `1024` | Below this size, standalone arrays inline rather than chunk. Tunable per backend: one with more per-entry overhead may want a higher threshold. |
 
 ### `PandasCodec`
 
@@ -935,7 +957,7 @@ from kvgit.kv.base import KVStore
 
 `cas(key, value, expected)` is the one-key case, provided by the base class on top of `cas_many`.
 
-A backend implements `cas_many` with whatever multi-key atomicity it has: a lock (`Memory`), a SQLite transaction (`Disk`), one `readwrite` transaction (`IndexedDB`), or — outside kvgit — a Postgres transaction, a Redis `MULTI`/`WATCH`, a DynamoDB transactional write. `keys(prefix)` lets a backend with an ordered index answer the sweep's and the branch listing's prefix scans without reading every key; `Memory` and `Disk` filter, `IndexedDB` asks for a key range.
+A backend implements `cas_many` with whatever multi-key atomicity it has: a lock (`Memory`), a SQLite transaction (`Disk`), a Postgres transaction (`Postgres`), or — outside kvgit — a Redis `MULTI`/`WATCH`, a DynamoDB transactional write. `keys(prefix)` lets a backend with an ordered index answer the sweep's and the branch listing's prefix scans without reading every key; `Memory` and `Disk` filter, `Postgres` scans an index range.
 
 ---
 
@@ -997,26 +1019,6 @@ Keys are a `text COLLATE "C"` primary key, so `keys(prefix)` is an index range s
 
 ---
 
-## IndexedDB
-
-Browser-persistent `KVStore` via IndexedDB. Available automatically in [Pyodide](https://pyodide.org/) environments (no extra install needed).
-
-```python
-from kvgit.kv.indexeddb import IndexedDB
-
-store = IndexedDB()
-store = IndexedDB(db_name="myapp", store_name="state")
-```
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `db_name` | `str` | `"kvgit"` | IndexedDB database name. Each name is an independent store, persisted across page reloads. |
-| `store_name` | `str` | `"kv"` | Object store name within the database. |
-
-Requires JSPI (JavaScript Promise Integration). CAS is atomic across Web Workers sharing the same database.
-
----
-
 ## Composite
 
 N-tier cache composing any number of `KVStore`s, ordered fastest first. The last tier is authoritative.
@@ -1036,7 +1038,7 @@ store = Composite([Memory(), Disk("/path/to/db")])
 | `cas` | Delegated to Ln. On success the new value is written into the cache tiers, unless the key is `__`-prefixed. |
 | `keys` / `items` | Ln only. |
 
-Tier failures that look operational (`OSError`, network errors, a Pyodide `JsException`) are logged at WARNING and the next tier is tried. `TypeError`, `AttributeError` and `AssertionError` are treated as programming bugs and propagate.
+Tier failures that look operational (`OSError`, network errors) are logged at WARNING and the next tier is tried. `TypeError`, `AttributeError` and `AssertionError` are treated as programming bugs and propagate.
 
 ### Cache tiers serve only immutable, content-derived keys
 

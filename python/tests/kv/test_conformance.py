@@ -2,8 +2,7 @@
 
 ``cas_many`` and ``keys(prefix)`` are run against each backend that can
 run here — Postgres when a server answers at ``KVGIT_POSTGRES_DSN``
-(default ``dbname=kvgit_test``); the IndexedDB backend has the same
-cases in ``test_indexeddb.py``, run in a browser.
+(default ``dbname=kvgit_test``).
 """
 
 import os

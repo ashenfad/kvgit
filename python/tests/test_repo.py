@@ -3,6 +3,7 @@
 import os
 import random
 import tempfile
+import time
 from collections.abc import Mapping
 
 import pytest
@@ -810,3 +811,50 @@ class TestReadsAHandleAlreadyHas:
         _, repo, _ = self._repo()
         with pytest.raises(UnknownCommitError):
             repo.snapshot(commit="0" * 40)
+
+
+class TestNow:
+    """``Repo(now=...)``: the clock commits, tags and sweeps read."""
+
+    def test_commits_tags_and_the_root_take_its_time(self):
+        clock = [1_000.5]
+        repo = Repo(Memory(), now=lambda: clock[0])
+        assert repo.now() == 1_000.5
+        wt = repo.worktree("main", create=True)
+        assert repo.get_commit(ROOT_COMMIT).time == 1_000.5
+        clock[0] = 2_000.25
+        wt["k"] = 1
+        commit = wt.commit().commit
+        assert repo.get_commit(commit).time == 2_000.25
+        clock[0] = 3_000.0
+        repo.tags.create("v1", commit)
+        assert repo.tags.info("v1").time == 3_000.0
+
+    def test_a_sweep_measures_min_age_by_it(self):
+        clock = [1_000.0]
+        repo = Repo(Memory(), now=lambda: clock[0])
+        wt = repo.worktree("main", create=True)
+        side = fork(wt, "side")
+        side["k"] = 1
+        side.commit()
+        repo.branches.delete("side")
+        clock[0] = 1_030.0
+        assert repo.gc(min_age=60) == 0
+        clock[0] = 1_100.0
+        assert repo.gc(min_age=60) == 1
+
+    def test_the_default_is_the_wall_clock(self):
+        assert Repo(Memory()).now is time.time
+
+    def test_a_falsy_clock_is_still_the_clock(self):
+        class Clock:
+            def __call__(self) -> float:
+                return 1_234.5
+
+            def __bool__(self) -> bool:
+                return False
+
+        repo = Repo(Memory(), now=Clock())
+        assert repo.now() == 1_234.5
+        repo.worktree("main", create=True)
+        assert repo.get_commit(ROOT_COMMIT).time == 1_234.5

@@ -11,7 +11,7 @@ logger = logging.getLogger("kvgit.kv.composite")
 # protocol mismatch) rather than operational tier unavailability.
 # These are re-raised so they surface instead of being silently masked
 # by the cache-fallback machinery. Everything else under Exception
-# (OSError, ConnectionError, Pyodide JsException, ...) is logged and
+# (OSError, ConnectionError, ...) is logged and
 # treated as "tier unavailable, try next".
 _BUG_EXCEPTIONS = (TypeError, AttributeError, AssertionError)
 
@@ -124,7 +124,7 @@ class Composite(KVStore):
             store = self._stores[i]
             try:
                 # Delegate to the tier's bulk get — backends with high
-                # per-call latency (Disk, IndexedDB) collapse N round-trips
+                # per-call latency (Disk, Postgres) collapse N round-trips
                 # into one. The protocol guarantees only existing keys
                 # appear in the result.
                 tier_values = store.get_many(remaining)

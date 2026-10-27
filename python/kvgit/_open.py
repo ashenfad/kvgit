@@ -11,10 +11,9 @@ from .worktree import Worktree
 
 
 def _make_backend(
-    kind: Literal["memory", "disk", "indexeddb"],
+    kind: Literal["memory", "disk"],
     *,
     path: str | None,
-    db_name: str,
 ) -> KVStore:
     """Construct a ``KVStore`` backend by kind."""
     if kind == "memory":
@@ -25,19 +24,14 @@ def _make_backend(
         from .kv.disk import Disk
 
         return Disk(path)
-    elif kind == "indexeddb":
-        from .kv.indexeddb import IndexedDB
-
-        return IndexedDB(db_name=db_name)
     else:
         raise ValueError(f"Unknown kind: {kind!r}")
 
 
 def open(
-    kind: Literal["memory", "disk", "indexeddb"] = "memory",
+    kind: Literal["memory", "disk"] = "memory",
     *,
     path: str | None = None,
-    db_name: str = "kvgit",
     branch: str = "main",
     codec: CodecSpec = "pickle",
     cache_bytes: int = DEFAULT_CACHE_BYTES,
@@ -54,10 +48,9 @@ def open(
     anything more — another backend, merge rules, several branches.
 
     Args:
-        kind: ``"memory"`` (default), ``"disk"`` (``pip install
-            kvgit[disk]``) or ``"indexeddb"`` (Pyodide).
+        kind: ``"memory"`` (default) or ``"disk"`` (``pip install
+            kvgit[disk]``).
         path: The directory, for ``kind="disk"``.
-        db_name: The IndexedDB database name, for ``kind="indexeddb"``.
         branch: The branch to check out (default ``"main"``).
         codec: How values are stored; see :class:`Repo`.
         cache_bytes: Memory for what the store never changes; see
@@ -65,7 +58,7 @@ def open(
         value_cache_bytes: Memory for the values the worktree reads;
             see :class:`Repo`.
     """
-    backend = _make_backend(kind, path=path, db_name=db_name)
+    backend = _make_backend(kind, path=path)
     repo = Repo(
         backend,
         codec=codec,
