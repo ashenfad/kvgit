@@ -16,6 +16,7 @@ import { core } from './core'
 import { Engine } from './engine'
 import { BranchExistsError, UnknownTagError } from './errors'
 import type { CommitInfo, DiffResult, KVStore } from './types'
+import { DEFAULT_VALUE_CACHE_BYTES, ValueCache } from './valueCache'
 import { cacheOf, cacheStore, callCore, streamCore } from './versioned/drive'
 import {
   type CorruptHeadRecoverer,
@@ -77,6 +78,11 @@ export interface RepoOptions<V> {
    *  it before the next commit builds. Repositories opened over one
    *  store share the first one's. */
   cacheBytes?: number
+  /** Memory for the decoded values each worktree reads, held until its
+   *  head moves (32 MB per worktree by default; 0 holds none). A value
+   *  costing more than a quarter of it is never held; see
+   *  {@link ValueCache}. */
+  valueCacheBytes?: number
 }
 
 /** The default budget for a repository's content cache. */
@@ -107,6 +113,8 @@ export class Repo<V = Uint8Array> {
   readonly recover: CorruptHeadRecoverer | undefined
   /** @internal */
   readonly now: () => number
+  /** @internal */
+  readonly valueCacheBytes: number
 
   private constructor(store: KVStore, opts: RepoOptions<V>) {
     this.store = store
@@ -117,6 +125,7 @@ export class Repo<V = Uint8Array> {
     this.defaultMerge = opts.defaultMerge
     this.recover = opts.recoverFromCorruptHead
     this.now = opts.now ?? wallClock
+    this.valueCacheBytes = opts.valueCacheBytes ?? DEFAULT_VALUE_CACHE_BYTES
     this.branches = new Branches(this as Repo<unknown>)
     this.tags = new Tags(this as Repo<unknown>)
   }
@@ -144,6 +153,10 @@ export class Repo<V = Uint8Array> {
     const budget = opts.cacheBytes ?? DEFAULT_CACHE_BYTES
     if (budget < 0 || !Number.isInteger(budget)) {
       throw new RangeError(`cacheBytes must be a whole number, 0 or more; got ${budget}`)
+    }
+    const values = opts.valueCacheBytes ?? DEFAULT_VALUE_CACHE_BYTES
+    if (values < 0 || !Number.isInteger(values)) {
+      throw new RangeError(`valueCacheBytes must be a whole number, 0 or more; got ${values}`)
     }
     if (budget > 0 && cacheOf(store) === undefined) {
       cacheStore(store, new c.ContentCache(budget))
