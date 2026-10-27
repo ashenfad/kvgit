@@ -19,6 +19,7 @@ pub mod merge;
 pub mod ops;
 pub mod refs;
 pub mod store;
+pub mod synced;
 pub mod text;
 pub mod tree;
 pub mod version;

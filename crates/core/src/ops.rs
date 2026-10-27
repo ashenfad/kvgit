@@ -14,6 +14,7 @@ use crate::layout::commit_root;
 use crate::machine::{Io, Machine};
 use crate::refs::{self, Ref};
 use crate::store::{dumps_str, loads_str};
+use crate::synced::{self, Owner};
 use crate::version;
 use crate::worktree;
 use crate::write::{self, CommitArgs, Committed, Done, MergeArgs};
@@ -65,6 +66,16 @@ pub type Op = Machine<Done<Out>>;
 /// - `ancestors_above {have, floor}`: the commits reachable from `have`
 ///   of generation `floor` and above, sorted; on history without
 ///   generations, all of them.
+/// - `sync_head {branch, remote}`, `claim_sync_head {branch, remote}`:
+///   the head the branch last synced to, or null. `remote` is null for
+///   no remote named, else `{id}`, the id null for a remote without one.
+/// - `set_sync_head {branch, commit, remote}`,
+///   `clear_sync_head {branch, remote}`, `mark_syncing {branch}`: null.
+/// - `has_sync_head {branch}`: whether the branch syncs somewhere.
+/// - `delete_branch_unless_synced {name}`: whether the branch went.
+/// - `publish_head {branch, expected, head, in_flight}`: whether the
+///   branch moved from `expected` (null: was created) to `head`, a
+///   commit that must be in the store.
 /// - `check_version {stamp}`: refuse a store of another storage layout;
 ///   with `stamp`, stamp a fresh one. Null.
 /// - `gc {min_age, deep, wait, lease_ttl}`: the number of commits swept,
@@ -105,6 +116,14 @@ pub const NAMES: &[&str] = &[
     "ancestry_delta",
     "is_ancestor",
     "ancestors_above",
+    "sync_head",
+    "claim_sync_head",
+    "set_sync_head",
+    "clear_sync_head",
+    "mark_syncing",
+    "has_sync_head",
+    "delete_branch_unless_synced",
+    "publish_head",
     "check_version",
     "gc",
     "reset_branch",
@@ -225,6 +244,19 @@ fn texts(args: &Value, name: &str) -> Result<Vec<String>, Error> {
             .map(|v| v.as_str().map(str::to_string).ok_or_else(invalid))
             .collect(),
         _ => Err(invalid()),
+    }
+}
+
+/// The remote a sync head belongs to: null for none named, else `{id}`.
+fn owner<'a>(args: &'a Value, name: &str) -> Result<Owner<'a>, Error> {
+    match arg(args, name)? {
+        Value::Null => Ok(Owner::Any),
+        remote @ Value::Object(_) => match remote.get("id") {
+            None | Some(Value::Null) => Ok(Owner::Shared),
+            Some(Value::Str(id)) => Ok(Owner::Remote(id)),
+            Some(_) => Err(Error::Invalid(format!("{name:?}'s id isn't a string"))),
+        },
+        _ => Err(Error::Invalid(format!("{name:?} isn't a remote"))),
     }
 }
 
@@ -459,6 +491,45 @@ async fn run(io: &Io, name: &str, args: &Value, notes: &mut Notes) -> Result<Val
                 .collect();
             found.sort();
             strings(found)
+        }
+        "sync_head" => {
+            opt_str(synced::sync_head_of(io, text(args, "branch")?, owner(args, "remote")?).await?)
+        }
+        "claim_sync_head" => opt_str(
+            synced::claim_sync_head(io, text(args, "branch")?, owner(args, "remote")?).await?,
+        ),
+        "set_sync_head" => {
+            let (branch, commit) = (text(args, "branch")?, text(args, "commit")?);
+            synced::set_sync_head(io, branch, commit, owner(args, "remote")?).await?;
+            Value::Null
+        }
+        "clear_sync_head" => {
+            synced::clear_sync_head(io, text(args, "branch")?, owner(args, "remote")?).await?;
+            Value::Null
+        }
+        "mark_syncing" => {
+            synced::mark_syncing(io, text(args, "branch")?).await?;
+            Value::Null
+        }
+        "has_sync_head" => Value::Bool(synced::has_sync_head(io, text(args, "branch")?).await?),
+        "delete_branch_unless_synced" => {
+            Value::Bool(synced::delete_branch_unless_synced(io, text(args, "name")?).await?)
+        }
+        "publish_head" => {
+            let expected = match arg(args, "expected")? {
+                Value::Null => None,
+                _ => Some(text(args, "expected")?),
+            };
+            Value::Bool(
+                synced::publish_head(
+                    io,
+                    text(args, "branch")?,
+                    expected,
+                    text(args, "head")?,
+                    &texts(args, "in_flight")?,
+                )
+                .await?,
+            )
         }
         "check_version" => {
             version::check(io, flag(args, "stamp")?).await?;

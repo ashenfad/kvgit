@@ -70,34 +70,6 @@ export const IN_FLIGHT_PREFIX = '__inflight__'
  */
 export const TAG_BRANCH_PREFIX = 'refs/tags/'
 
-/** Remote-tracking state for the sync layer: the last remote commit a
- *  branch is known to be synced to. Reserved here so the layout is
- *  complete in one place; written by the sync orchestration layer.
- *  (Deliberately NOT under `__branch_head__` so branch prefix scans
- *  don't see it.) This is the one record a branch shares with every
- *  remote that has no `id`, and what stores written before per-remote
- *  records hold. */
-export const SYNC_HEAD = (branch: string): string => `__sync_head__${branch}`
-
-/** Every per-remote sync head lives under this prefix. */
-export const SYNC_HEAD_AT_PREFIX = '__sync_head_at__'
-
-/** The prefix of `branch`'s per-remote sync heads: both parts are
- *  URI-encoded, so the `/` between them can't occur inside either and
- *  one branch's prefix never covers another's. */
-export const SYNC_HEADS_OF = (branch: string): string =>
-  `${SYNC_HEAD_AT_PREFIX}${encodeURIComponent(branch)}/`
-
-/** The last commit `branch` is known to share with the remote whose
- *  `id` is `remoteId`. */
-export const SYNC_HEAD_AT = (branch: string, remoteId: string): string =>
-  `${SYNC_HEADS_OF(branch)}${encodeURIComponent(remoteId)}`
-
-/** That `branch` syncs with some remote: written before a push reads
- *  the branch, and with any sync head, so a delete unless synced either
- *  lands before a sync takes the branch up or fails. */
-export const SYNC_MARK = (branch: string): string => `__sync_mark__${branch}`
-
 /** Length of a commit hash in hex chars (sha-256 truncated to 40). */
 export const COMMIT_HASH_LEN = 40
 

@@ -37,6 +37,9 @@ pub const INFO_PREFIX: &str = "__info__";
 pub const TAG_INFO_PREFIX: &str = "__tag_info__";
 pub const IN_FLIGHT_PREFIX: &str = "__inflight__";
 pub const GC_LEASE_KEY: &str = "__gc_lease__";
+pub const SYNC_HEAD_PREFIX: &str = "__sync_head__";
+pub const SYNC_HEAD_AT_PREFIX: &str = "__sync_head_at__";
+pub const SYNC_MARK_PREFIX: &str = "__sync_mark__";
 pub const BLOB_PREFIX: &str = "kvgit:blob:";
 pub const KEYSET_PREFIX: &str = "kvgit:keyset:";
 
@@ -91,6 +94,43 @@ pub fn tag_info_key(tag: &str) -> String {
 
 pub fn in_flight_key(commit: &str) -> String {
     format!("{IN_FLIGHT_PREFIX}{commit}")
+}
+
+/// The head a branch last synced to, kept for every remote without an
+/// id of its own.
+pub fn sync_head(branch: &str) -> String {
+    format!("{SYNC_HEAD_PREFIX}{branch}")
+}
+
+/// The prefix of a branch's sync heads kept per remote. The branch is
+/// escaped, so no branch's prefix is a prefix of another's.
+pub fn sync_heads_of(branch: &str) -> String {
+    format!("{SYNC_HEAD_AT_PREFIX}{}/", uri_component(branch))
+}
+
+/// The head a branch last synced to on the remote with this id.
+pub fn sync_head_at(branch: &str, remote: &str) -> String {
+    format!("{}{}", sync_heads_of(branch), uri_component(remote))
+}
+
+/// Present while a branch syncs somewhere: set before a push reads the
+/// branch, removed with its last sync head.
+pub fn sync_mark(branch: &str) -> String {
+    format!("{SYNC_MARK_PREFIX}{branch}")
+}
+
+/// `text` escaped as JavaScript's `encodeURIComponent` escapes it: each
+/// byte of its UTF-8 as `%XX`, but for letters, digits and `-_.!~*'()`.
+fn uri_component(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for &b in text.as_bytes() {
+        if b.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// The key a value's bytes are stored under.
