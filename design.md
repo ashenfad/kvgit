@@ -312,7 +312,9 @@ Python adds what nontainer reaches into internals for today:
 TypeScript drops `VersionedKV`, `VersionedBase`, `Staged`,
 `jsonEncoder`/`jsonDecoder`, and the tree classes (`Hamt`, `Keyset`,
 `NodeCache`, entry encoding) from its exports. `SequenceMatcher` stays
-exported (the world uses it), now from the core. The sync API, the
+exported (the world uses it) as TypeScript's own: the core's matcher
+runs without difflib's autojunk heuristic, and the world's diffs follow
+Python's default, which uses it. The sync API, the
 `github` subpath and the backends stay.
 
 Aligned in both:
@@ -426,6 +428,16 @@ Made 2026-10-26, with sync:
 - Pre-v4 history doesn't sync. The replay recomputes every commit's
   hash by v4's formula and refuses one that differs, and a pre-v4
   commit carries 0.3's hash, made another way.
+
+Made 2026-10-27, with the public surface:
+
+- `Namespaced` wraps a worktree in both packages; TypeScript's took
+  `Staged`'s shape, which is gone.
+- Python's three-way resolve over named values is `Repo.resolve`,
+  beside `Repo.merge_rule`, and runs the core's resolve; a resolve
+  writes nothing, so chunk-aware codecs encode its values as merge
+  output.
+- TypeScript's `lazy` stays an accepted no-op.
 
 ## Open questions
 
