@@ -24,34 +24,28 @@
  * `applyWire` itself never touches it.
  */
 
-import { UnknownBranchError } from '../errors'
 import { EMPTY_HASH } from '../hamt'
 import { Keyset } from '../keyset'
 import type { KVStore, KeysetEntry, WireCommit } from '../types'
+import { callCore } from '../versioned/drive'
 import { checkStorageVersion } from '../versioned/kv'
 import {
-  BRANCH_HEAD,
-  BRANCH_HEAD_PREV,
   COMMIT_ROOT,
   GC_LEASE_KEY,
   IN_FLIGHT_KEY,
   PARENT_COMMIT,
   PARENT_GENS,
   ROOT_COMMIT,
-  SYNC_HEAD,
-  SYNC_HEADS_OF,
-  SYNC_HEAD_AT,
-  SYNC_MARK,
   blobKey,
   commitHash,
   commitRecords,
-  dumps,
   generationOf,
   loads,
   safeLoads,
 } from '../versioned/layout'
 import { inFlightMarker, tryLand, waitForGc } from '../versioned/lease'
-import { rejectReservedBranch } from '../versioned/refs'
+
+const wallClock = (): number => Date.now() / 1000
 
 export interface ApplyWireOptions {
   /**
@@ -216,6 +210,7 @@ async function remark(store: KVStore, commit: string): Promise<boolean> {
  *
  * @returns false if the branch isn't at `expected` (or exists, for a
  *   create).
+ * @throws UnknownCommitError if `newHead` isn't in the store.
  */
 export async function publishHead(
   store: KVStore,
@@ -224,27 +219,8 @@ export async function publishHead(
   newHead: string,
   opts: { inFlight?: readonly string[] } = {},
 ): Promise<boolean> {
-  const branchKey = BRANCH_HEAD(branch)
-  const expectedBytes = expected === null ? null : dumps(expected)
-  const writes = new Map([[branchKey, dumps(newHead)]])
-  const removes = (opts.inFlight ?? []).map(IN_FLIGHT_KEY)
-  if (expectedBytes === null) removes.push(BRANCH_HEAD_PREV(branch))
-  else writes.set(BRANCH_HEAD_PREV(branch), expectedBytes)
-  for (;;) {
-    const lease = await waitForGc(store)
-    // The head must name a commit that is here when it lands.
-    if ((await store.get(COMMIT_ROOT(newHead))) === null) {
-      throw new Error(`publishHead: commit ${newHead} is not in the store`)
-    }
-    const landed = await tryLand(
-      store,
-      lease,
-      new Map([[branchKey, expectedBytes]]),
-      writes,
-      removes,
-    )
-    if (landed !== null) return landed
-  }
+  const args = { branch, expected, head: newHead, in_flight: [...(opts.inFlight ?? [])] }
+  return (await callCore('publish_head', args, { store, now: wallClock })) as boolean
 }
 
 /** A stored commit's generation: 0 with no parents, else one more than
@@ -305,21 +281,15 @@ async function rootAt(store: KVStore, commit: string): Promise<string> {
  */
 export type SyncHeadOwner = string | { readonly id?: string | undefined }
 
-function ownerId(owner: SyncHeadOwner): string | undefined {
-  return typeof owner === 'string' ? owner : owner.id
+/** The remote a sync head belongs to, as the core takes it: null for
+ *  none named. */
+function remoteArg(owner: SyncHeadOwner | undefined): { id: string | null } | null {
+  if (owner === undefined) return null
+  return { id: (typeof owner === 'string' ? owner : owner.id) ?? null }
 }
 
-async function readHead(store: KVStore, key: string): Promise<string | null> {
-  const raw = await store.get(key)
-  if (raw === null) return null
-  const parsed = safeLoads(raw)
-  return typeof parsed === 'string' ? parsed : null
-}
-
-async function keysUnder(store: KVStore, prefix: string): Promise<string[]> {
-  const out: string[] = []
-  for await (const k of store.keys(prefix)) out.push(k)
-  return out
+async function call(op: string, store: KVStore, args: object): Promise<unknown> {
+  return callCore(op, args, { store, now: wallClock })
 }
 
 /**
@@ -340,34 +310,19 @@ export async function getSyncHead(
   branch: string,
   remote?: SyncHeadOwner,
 ): Promise<string | null> {
-  const id = remote === undefined ? undefined : ownerId(remote)
-  if (id !== undefined) {
-    return (
-      (await readHead(store, SYNC_HEAD_AT(branch, id))) ??
-      (await readHead(store, SYNC_HEAD(branch)))
-    )
-  }
-  const shared = await readHead(store, SYNC_HEAD(branch))
-  if (shared !== null || remote !== undefined) return shared
-  const keys = await keysUnder(store, SYNC_HEADS_OF(branch))
-  return keys.length === 1 ? readHead(store, keys[0] as string) : null
+  return (await call('sync_head', store, { branch, remote: remoteArg(remote) })) as string | null
 }
-
-const MARKED = dumps(true)
 
 /** Whether `branch` has a sync head on record with any remote, or a
  *  push of it has begun: it syncs somewhere, and was not forgotten
  *  since. */
 export async function hasSyncHead(store: KVStore, branch: string): Promise<boolean> {
-  if ((await store.get(SYNC_MARK(branch))) !== null) return true
-  if ((await store.get(SYNC_HEAD(branch))) !== null) return true
-  for await (const _ of store.keys(SYNC_HEADS_OF(branch))) return true
-  return false
+  return (await call('has_sync_head', store, { branch })) as boolean
 }
 
 /** Mark `branch` as syncing, before a push reads it. */
 export async function markSyncing(store: KVStore, branch: string): Promise<void> {
-  if ((await store.get(SYNC_MARK(branch))) === null) await store.set(SYNC_MARK(branch), MARKED)
+  await call('mark_syncing', store, { branch })
 }
 
 /**
@@ -380,20 +335,7 @@ export async function markSyncing(store: KVStore, branch: string): Promise<void>
  * @throws UnknownBranchError if there is no such branch.
  */
 export async function deleteBranchUnlessSynced(store: KVStore, branch: string): Promise<boolean> {
-  await rejectReservedBranch(branch)
-  const head = BRANCH_HEAD(branch)
-  for (;;) {
-    const current = await store.get(head)
-    if (current === null) throw new UnknownBranchError(branch)
-    if (await hasSyncHead(store, branch)) return false
-    const expected = new Map<string, Uint8Array | null>([
-      [head, current],
-      [SYNC_MARK(branch), null],
-      [SYNC_HEAD(branch), null],
-    ])
-    if (await store.casMany(expected, new Map(), [head, BRANCH_HEAD_PREV(branch)])) return true
-    // it moved, or began syncing: look again
-  }
+  return (await call('delete_branch_unless_synced', store, { name: branch })) as boolean
 }
 
 /** Record `commit` as the head `branch` last synced to on `remote`
@@ -405,25 +347,7 @@ export async function setSyncHead(
   commit: string,
   remote?: SyncHeadOwner,
 ): Promise<void> {
-  const id = remote === undefined ? undefined : ownerId(remote)
-  if (id === undefined) {
-    await store.casMany(
-      new Map(),
-      new Map([
-        [SYNC_HEAD(branch), dumps(commit)],
-        [SYNC_MARK(branch), MARKED],
-      ]),
-    )
-    return
-  }
-  await store.casMany(
-    new Map(),
-    new Map([
-      [SYNC_HEAD_AT(branch, id), dumps(commit)],
-      [SYNC_MARK(branch), MARKED],
-    ]),
-    [SYNC_HEAD(branch)],
-  )
+  await call('set_sync_head', store, { branch, commit, remote: remoteArg(remote) })
 }
 
 /**
@@ -439,23 +363,9 @@ export async function claimSyncHead(
   branch: string,
   remote: SyncHeadOwner,
 ): Promise<string | null> {
-  const id = ownerId(remote)
-  if (id === undefined) return readHead(store, SYNC_HEAD(branch))
-  const ownKey = SYNC_HEAD_AT(branch, id)
-  const sharedKey = SYNC_HEAD(branch)
-  for (;;) {
-    const own = await readHead(store, ownKey)
-    if (own !== null) return own
-    const raw = await store.get(sharedKey)
-    if (raw === null) return null
-    const shared = safeLoads(raw)
-    if (typeof shared !== 'string') return null
-    const expected = new Map<string, Uint8Array | null>([
-      [sharedKey, raw],
-      [ownKey, null],
-    ])
-    if (await store.casMany(expected, new Map([[ownKey, raw]]), [sharedKey])) return shared
-  }
+  return (await call('claim_sync_head', store, { branch, remote: remoteArg(remote) })) as
+    | string
+    | null
 }
 
 /**
@@ -468,14 +378,5 @@ export async function clearSyncHead(
   branch: string,
   remote?: SyncHeadOwner,
 ): Promise<void> {
-  const id = remote === undefined ? undefined : ownerId(remote)
-  if (id !== undefined) await store.remove(SYNC_HEAD_AT(branch, id))
-  else if (remote === undefined) {
-    for (const k of await keysUnder(store, SYNC_HEADS_OF(branch))) await store.remove(k)
-  }
-  await store.remove(SYNC_HEAD(branch))
-  // the mark goes with the last head
-  if ((await keysUnder(store, SYNC_HEADS_OF(branch))).length === 0) {
-    await store.remove(SYNC_MARK(branch))
-  }
+  await call('clear_sync_head', store, { branch, remote: remoteArg(remote) })
 }
