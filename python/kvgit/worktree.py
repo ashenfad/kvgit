@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 from ._engine import Engine
 from ._store import ROOT_COMMIT
-from ._types import BytesMergeFn, MergeChoice, MergeResult, PostCheck
+from ._types import MergeChoice, MergeResult, PostCheck
 from .cache import ValueCache
 from .content_types import MergeFn
 from .errors import UnknownCommitError
@@ -223,39 +223,19 @@ class Worktree(MutableMapping[str, Any]):
             **self._merge_prefixes,
             **(merge_prefixes or {}),
         }
-        default = default_merge or self._default_merge or repo._default_merge
+        default = next(
+            (
+                r
+                for r in (default_merge, self._default_merge, repo._default_merge)
+                if r is not None
+            ),
+            None,
+        )
         return {
-            "merge_fns": {k: self._lower(r) for k, r in fns.items()} or None,
-            "merge_prefixes": {k: self._lower(r) for k, r in prefixes.items()} or None,
-            "default_merge": self._lower(default) if default is not None else None,
+            "merge_fns": {k: repo._lower(r) for k, r in fns.items()} or None,
+            "merge_prefixes": {k: repo._lower(r) for k, r in prefixes.items()} or None,
+            "default_merge": repo._lower(default) if default is not None else None,
         }
-
-    def _lower(self, rule: MergeRule) -> BytesMergeFn | MergeChoice:
-        """A merge rule, as the bytes-level merge takes it.
-
-        A ``MergeChoice`` names a side rather than computing a value, so
-        it goes down untouched. A merge function is wrapped: each side is
-        decoded with the repository's codec, and the result encoded back
-        with it.
-        """
-        if isinstance(rule, MergeChoice):
-            return rule
-        decode = self._codec.decode
-        encode = self._codec.encode_merged
-
-        def lowered(
-            old: bytes | None, ours: bytes | None, theirs: bytes | None
-        ) -> bytes | MergeChoice:
-            result = rule(
-                decode(old) if old is not None else None,
-                decode(ours) if ours is not None else None,
-                decode(theirs) if theirs is not None else None,
-            )
-            if isinstance(result, MergeChoice):
-                return result
-            return encode(result)
-
-        return lowered
 
     # -- Commit --
 

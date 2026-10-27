@@ -8,13 +8,6 @@ from .memory import Memory
 __all__ = ["Composite", "Disk", "KVStore", "Memory"]
 
 try:
-    from .indexeddb import IndexedDB
-
-    __all__ += ["IndexedDB"]
-except ImportError:
-    pass
-
-try:
     from .postgres import Postgres
 
     __all__ += ["Postgres"]

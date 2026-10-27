@@ -73,7 +73,7 @@ class Branches(Mapping[str, str]):
             UnknownCommitError: if ``at`` is not in the store.
         """
         target = at or ROOT_COMMIT
-        _kv.create_branch(self._repo._store, name, target)
+        _kv.create_branch(self._repo._store, name, target, now=self._repo._now)
         return target
 
     def delete(self, name: str) -> None:
@@ -145,7 +145,7 @@ class Tags(Mapping[str, str]):
             TagExistsError: if the name is taken.
             UnknownCommitError: if ``commit`` is not in the store.
         """
-        _kv.create_tag(self._repo._store, name, commit, info)
+        _kv.create_tag(self._repo._store, name, commit, info, now=self._repo._now)
 
     def delete(self, name: str) -> None:
         """Delete a tag. A commit it alone kept alive becomes collectable

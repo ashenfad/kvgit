@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import base64
+import time
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from typing import Any
 
 from . import _core, _store as _kv
 from ._codec import Codec, CodecSpec
-from ._engine import Engine
-from ._store import EMPTY_HASH, GC_LEASE_TTL, ROOT_COMMIT, CorruptHeadRecoverer
-from ._types import DiffResult, MergeChoice
+from ._drive import drive
+from ._engine import Engine, _lowered
+from ._store import EMPTY_HASH, GC_LEASE_TTL, ROOT_COMMIT, Clock, CorruptHeadRecoverer
+from ._types import BytesMergeFn, DiffResult, MergeChoice, Resolution
 from .cache import (
     DEFAULT_CACHE_BYTES,
     DEFAULT_VALUE_CACHE_BYTES,
@@ -51,7 +54,7 @@ class Repo:
 
     Args:
         backend: Any ``KVStore`` — ``Memory()``, ``Disk(path)``,
-            ``Postgres(dsn)``, ``IndexedDB(...)``.
+            ``Postgres(dsn)``.
         codec: ``"pickle"`` (default: values are any picklable object),
             ``"scientific"`` (pickle plus chunked numpy/pandas buffers),
             ``"bytes"`` (values are bytes, stored as they are), or an
@@ -73,6 +76,10 @@ class Repo:
             default; ``0`` holds none). A value costing more than a
             quarter of it is never held; see
             :class:`~kvgit.cache.ValueCache`.
+        now: The clock commit and tag times are read from, and a sweep's
+            ``min_age`` is measured by: seconds since the epoch, as a
+            float (``time.time`` by default). GC leases always expire by
+            the wall clock, whatever this says.
 
     Raises:
         StorageVersionError: if the store is stamped with a layout this
@@ -90,6 +97,7 @@ class Repo:
         recover_from_corrupt_head: CorruptHeadRecoverer | None = None,
         cache_bytes: int = DEFAULT_CACHE_BYTES,
         value_cache_bytes: int = DEFAULT_VALUE_CACHE_BYTES,
+        now: Clock | None = None,
     ) -> None:
         _kv._check_storage_version(backend)
         if value_cache_bytes < 0:
@@ -115,6 +123,7 @@ class Repo:
         self._merge_prefixes = dict(merge_prefixes or {})
         self._default_merge = default_merge
         self._recover = recover_from_corrupt_head
+        self._now = now
         self.branches = Branches(self)
         """Every branch, as a live mapping of name to tip commit, with
         ``create`` and ``delete``."""
@@ -124,6 +133,11 @@ class Repo:
 
     def __repr__(self) -> str:
         return f"Repo({type(self._backend).__name__})"
+
+    @property
+    def now(self) -> Clock:
+        """The clock commit and tag times are read from."""
+        return self._now if self._now is not None else time.time
 
     @property
     def store(self) -> KVStore:
@@ -160,10 +174,11 @@ class Repo:
         """
         if create and name not in self.branches:
             try:
-                _kv.create_branch(self._store, name, ROOT_COMMIT)
+                _kv.create_branch(self._store, name, ROOT_COMMIT, now=self._now)
             except BranchExistsError:
                 pass  # created by someone else in the meantime
-        return Worktree(self, Engine(self._store, name, recover=self._recover))
+        engine = Engine(self._store, name, recover=self._recover, now=self._now)
+        return Worktree(self, engine)
 
     def repair_head(self, name: str) -> str | None:
         """Persist a recovered HEAD for a damaged branch; return the commit
@@ -222,6 +237,116 @@ class Repo:
             modified=frozenset(found["modified"]),
         )
 
+    def merge_rule(
+        self,
+        key: str,
+        *,
+        merge_fns: dict[str, MergeRule] | None = None,
+        merge_prefixes: dict[str, MergeRule] | None = None,
+        default_merge: MergeRule | None = None,
+    ) -> MergeRule | None:
+        """The merge rule that governs ``key``: its exact key, else the
+        longest registered prefix it starts with, else the default, from
+        the call's rules layered over the repository's; None for none.
+
+        A ``MergeChoice`` here is a standing policy, so a key it gives to
+        one side never needs its values read.
+        """
+        fns = {**self._merge_fns, **(merge_fns or {})}
+        if key in fns:
+            return fns[key]
+        prefixes = {**self._merge_prefixes, **(merge_prefixes or {})}
+        covering = [p for p in prefixes if key.startswith(p)]
+        if covering:
+            return prefixes[max(covering, key=len)]
+        return _first(default_merge, self._default_merge)
+
+    def resolve(
+        self,
+        base: Mapping[str, Any],
+        ours: Mapping[str, Any],
+        theirs: Mapping[str, Any],
+        *,
+        merge_fns: dict[str, MergeRule] | None = None,
+        merge_prefixes: dict[str, MergeRule] | None = None,
+        default_merge: MergeRule | None = None,
+    ) -> Resolution:
+        """Resolve a three-way merge of values the caller names, as a
+        merge resolves branches: what changed on one side since ``base``
+        is taken, keys both changed alike agree, and keys both changed
+        differently go to the merge rules, the call's layered over the
+        repository's.
+
+        Each mapping is a side's state of the keys in question; a key
+        missing from one is absent on that side. Two values are the same
+        when the repository's codec encodes them to the same bytes.
+        Nothing is read from or written to the store.
+
+        Returns the change to ``ours``: the values it takes and the keys
+        it loses.
+
+        Raises:
+            MergeConflict: keys both sides changed that no rule resolves.
+        """
+        held: dict[str, bytes] = {}
+        # Each key's own objects, by blob: two keys holding equal bytes
+        # share a blob, and each takes back the object it was given.
+        values: dict[str, dict[str, Any]] = {}
+
+        def side(state: Mapping[str, Any], key: str) -> tuple[str, int] | None:
+            if key not in state:
+                return None
+            # As a merge function's output is stored: without chunks,
+            # since a resolve writes nothing for them to land in.
+            raw = self._codec.encode_merged(state[key])
+            blob = _kv.blob_key(raw)
+            held[blob] = raw
+            values.setdefault(key, {}).setdefault(blob, state[key])
+            return (blob, len(raw))
+
+        our_changes = []
+        their_changes = []
+        for key in sorted({*base, *ours, *theirs}):
+            old, mine, other = side(base, key), side(ours, key), side(theirs, key)
+            if mine != old:
+                our_changes.append((key, old, mine))
+            if other != old:
+                their_changes.append((key, old, other))
+        fns = {**self._merge_fns, **(merge_fns or {})}
+        prefixes = {**self._merge_prefixes, **(merge_prefixes or {})}
+        default = _first(default_merge, self._default_merge)
+        hosted: list[Any] = []
+        op = _core.Op.resolve(
+            our_changes,
+            their_changes,
+            *_lowered(
+                hosted,
+                {k: self._lower(r) for k, r in fns.items()},
+                {k: self._lower(r) for k, r in prefixes.items()},
+                self._lower(default) if default is not None else None,
+            ),
+        )
+        done = drive(
+            op,
+            self._store,
+            held=held,
+            merge_fns=hosted,
+            clock=time.time,
+            sleep=time.sleep,
+            now=self._now,
+        )
+        taken = {key: values[key][blob] for key, blob in done["updates"]}
+        for key, blob in done["merged"]:
+            taken[key] = self._codec.decode(held[blob])
+        for key, text in done["made"]:
+            taken[key] = self._codec.decode(base64.b64decode(text))
+        return Resolution(
+            values=taken,
+            removals=frozenset(done["removals"]),
+            auto_merged_keys=tuple(done["auto_merged"]),
+            carried_keys=tuple(done["carried"]),
+        )
+
     def merge_base(self, a: str, b: str) -> str | None:
         """The lowest common ancestor of two commits, or None if they share
         no history — the base a merge of the two would use.
@@ -267,7 +392,14 @@ class Repo:
         :class:`GcBusy` instead of waiting. Writers wait while a sweep
         runs.
         """
-        return _kv.gc(self._store, min_age, deep=deep, wait=wait, lease_ttl=lease_ttl)
+        return _kv.gc(
+            self._store,
+            min_age,
+            deep=deep,
+            wait=wait,
+            lease_ttl=lease_ttl,
+            now=self._now,
+        )
 
     # -- Internal --
 
@@ -298,6 +430,39 @@ class Repo:
         if roots is not None and found["root"] is not None:
             roots[found["commit"]] = found["root"]
         return found["commit"]
+
+    def _lower(self, rule: MergeRule) -> BytesMergeFn | MergeChoice:
+        """A merge rule, as the bytes-level merge takes it.
+
+        A ``MergeChoice`` names a side rather than computing a value, so
+        it goes down untouched. A merge function is wrapped: each side is
+        decoded with the repository's codec, and the result encoded back
+        with it.
+        """
+        if isinstance(rule, MergeChoice):
+            return rule
+        decode = self._codec.decode
+        encode = self._codec.encode_merged
+
+        def lowered(
+            old: bytes | None, ours: bytes | None, theirs: bytes | None
+        ) -> bytes | MergeChoice:
+            result = rule(
+                decode(old) if old is not None else None,
+                decode(ours) if ours is not None else None,
+                decode(theirs) if theirs is not None else None,
+            )
+            if isinstance(result, MergeChoice):
+                return result
+            return encode(result)
+
+        return lowered
+
+
+def _first(*rules: MergeRule | None) -> MergeRule | None:
+    """The first rule given; None if none is. A rule counts by being
+    there, whatever its truth value."""
+    return next((r for r in rules if r is not None), None)
 
 
 def _commit(record: dict[str, Any]) -> Commit:

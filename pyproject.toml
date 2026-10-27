@@ -166,11 +166,6 @@ combine-as-imports = true
 # which forces module-level imports to follow the skip call. E402 is the
 # wrong rule here — the pattern is the official pytest idiom.
 "python/tests/codecs/*.py" = ["E402"]
-# The Pyodide FS probes exist to prove that ordinary blocking Python
-# file I/O — exactly what diskcache issues — works over an IDBFS/OPFS
-# mount. ASYNC230 objects to `open()` inside an async def, but the
-# blocking call *is* the thing under test.
-"python/tests/kv/test_pyodide_fs.py" = ["ASYNC230"]
 # Crash-injection stress harness: it kills workers mid-write and then
 # pokes at whatever survived. Catching Exception at every probe is the
 # design, not an oversight.

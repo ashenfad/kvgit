@@ -8,12 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Python resolves values it names.** `Repo.resolve(base, ours, theirs)` runs a branch merge's three-way resolve over caller-supplied values, and `Repo.merge_rule(key)` says which rule governs a key; `EMPTY_ROOT` is the root of an empty keyset.
+- **Python's `Repo` takes `now`.** The clock commit and tag times are read from and a sweep's `min_age` is measured by, as TypeScript's `now` is.
 - **TypeScript repositories cache what the store never rewrites.** Tree nodes and commit records are answered from a cache of `cacheBytes` (32 MB by default, 0 turns it off), as Python's are, and any writer's sweep empties it before the next commit builds.
 - **TypeScript gains the commit-scan recoverer.** `recoverByCommitScan`, passed as `recoverFromCorruptHead`, guesses a damaged branch's head as Python's `recover_by_commit_scan` does, from the same code.
 - **`IntegrityError`, in both packages.** A transferred commit whose hash or parent generations don't match what it carries, or whose parent never came, is refused with it before anything of it is written; TypeScript's `applyWire` threw a plain `Error`.
 - **Python syncs, internally.** `kvgit._sync` pushes, pulls and syncs branches with a remote as TypeScript does, from the same core, with a reference `MemoryRemote`; it isn't public API yet.
 
 ### Changed
+- **Breaking (Python): the IndexedDB backend is gone.** `kvgit.kv.indexeddb`, `kvgit.open("indexeddb")` and its `db_name` go, with the Pyodide guide; browsers use the TypeScript package.
 - **Breaking (Python): `kvgit.versioned` and `kvgit.hamt` are gone.** `VersionedKV`, `VersionedBase`, `Keyset`, `Hamt`, `resolve_merge` and `pick_merge_policy` leave with them; `Repo` and `Worktree` are the API, and `MergeChoice`, `MergeResult`, `DiffResult`, `TagInfo` and `MergePolicy` are imported from `kvgit`.
 - **Breaking (Python): stores stamped v2 or v3 are refused.** Opening or sweeping one raises `StorageVersionError`, as TypeScript did; the objects an older kvgit wrote still read once a store's stamp is v4.
 - **A worktree opens without loading its keyset.** Opening reads the head's root alone, reads walk the tree through the content cache, and the first listing builds a key index the later ones read. A snapshot reads the same way.

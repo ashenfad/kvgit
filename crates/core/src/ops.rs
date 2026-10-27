@@ -4,6 +4,7 @@
 //! with what it committed instead.
 
 use crate::ancestry;
+use crate::base64;
 use crate::error::Error;
 use crate::gc::{self, Gc};
 use crate::head::{self, Notes, Resolved};
@@ -12,6 +13,7 @@ use crate::json::Value;
 use crate::keyset;
 use crate::layout::commit_root;
 use crate::machine::{Io, Machine};
+use crate::merge::{self, Change, Merged, Resolution, Rules};
 use crate::refs::{self, Ref};
 use crate::store::{dumps_str, loads_str};
 use crate::synced::{self, Owner, PullPlan, PushPlan};
@@ -19,7 +21,7 @@ use crate::version;
 use crate::wire;
 use crate::worktree;
 use crate::write::{self, CommitArgs, Committed, Done, MergeArgs};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// What an operation answers with.
 #[derive(Debug)]
@@ -203,6 +205,58 @@ pub fn merge(args: MergeArgs) -> Op {
         let done = write::merge(io, args).await;
         landed(tree, done)
     })
+}
+
+/// Resolve a three-way merge over values the host names: each side's
+/// changes from a base it chose, every value a blob whose bytes the host
+/// holds. It answers with the resolution and writes nothing:
+/// `{updates, removals, merged, made, auto_merged, carried}`, where
+/// `updates` and `merged` name blobs (`[key, blob]`), `made` gives the
+/// text merge's bytes (`[key, base64]`), and the rest are keys.
+pub fn resolve(
+    ours: BTreeMap<String, Change>,
+    theirs: BTreeMap<String, Change>,
+    rules: Rules,
+) -> Op {
+    Machine::new(move |io| async move {
+        let result = merge::resolve(&io, &ours, &theirs, &rules)
+            .await
+            .map(|r| Out::Value(resolution(r)));
+        Done {
+            result,
+            notes: Notes::new(),
+        }
+    })
+}
+
+fn resolution(r: Resolution) -> Value {
+    let pairs = |items: Vec<(String, String)>| {
+        Value::Array(
+            items
+                .into_iter()
+                .map(|(k, v)| Value::Array(vec![Value::Str(k), Value::Str(v)]))
+                .collect(),
+        )
+    };
+    let mut merged = Vec::new();
+    let mut made = Vec::new();
+    for (key, value) in r.merged {
+        match value {
+            Merged::Held { blob, .. } => merged.push((key, blob)),
+            Merged::Made(bytes) => made.push((key, base64::encode(&bytes))),
+        }
+    }
+    Value::Object(vec![
+        (
+            "updates".into(),
+            pairs(r.updates.into_iter().map(|(k, e)| (k, e.blob)).collect()),
+        ),
+        ("removals".into(), strings(r.removals.into_iter().collect())),
+        ("merged".into(), pairs(merged)),
+        ("made".into(), pairs(made)),
+        ("auto_merged".into(), strings(r.auto_merged)),
+        ("carried".into(), strings(r.carried)),
+    ])
 }
 
 fn arg<'a>(args: &'a Value, name: &str) -> Result<&'a Value, Error> {

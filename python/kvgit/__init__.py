@@ -1,12 +1,18 @@
 """kvgit: versioned key-value store."""
 
 from ._open import open
-from ._store import ROOT_COMMIT, CorruptHeadRecoverer, recover_by_commit_scan
+from ._store import (
+    EMPTY_HASH as EMPTY_ROOT,
+    ROOT_COMMIT,
+    CorruptHeadRecoverer,
+    recover_by_commit_scan,
+)
 from ._types import (
     DiffResult,
     MergeChoice,
     MergePolicy,
     MergeResult,
+    Resolution,
     TagInfo,
 )
 from .content_types import MergeFn, counter, last_writer_wins, text_merge
@@ -40,6 +46,7 @@ from .repo import Commit, RawSnapshot, Repo, Snapshot
 from .worktree import Status, Worktree
 
 __all__ = [
+    "EMPTY_ROOT",
     "ROOT_COMMIT",
     "BranchExistsError",
     "BranchMovedError",
@@ -61,6 +68,7 @@ __all__ = [
     "Namespaced",
     "RawSnapshot",
     "Repo",
+    "Resolution",
     "Snapshot",
     "Status",
     "StorageVersionError",

@@ -68,6 +68,7 @@ def steps(
     owner: Callable[[], str] | None = None,
     clock: Callable[[], float],
     sleep: Callable[[float], None],
+    now: Callable[[], float] | None = None,
 ) -> Generator[Any, None, Any]:
     """Perform `op`'s requests, yielding each part of the answer it emits
     early, and return its outcome.
@@ -75,7 +76,9 @@ def steps(
     ``held`` holds the bytes the operation writes by key without
     reading them; values merge functions make join it. ``merge_fns`` are
     the functions the operation names by number, and ``post_check`` the
-    check it runs over the values they make.
+    check it runs over the values they make. ``clock`` is the wall
+    clock leases expire by; ``now``, the clock commit, tag and sweep
+    times are read from, is ``clock`` unless given.
     """
     held = {} if held is None else held
     # A store seen through a content cache: the operation reads through
@@ -110,7 +113,7 @@ def steps(
             continue
         try:
             if kind == "get":
-                reply = dict(store.get_many(request[1]))
+                reply = _read(store, request[1], held)
             elif kind == "scan":
                 reply = list(store.keys(request[1]))
             elif kind == "cas":
@@ -122,7 +125,7 @@ def steps(
             elif kind == "merge":
                 reply = _merge(store, request[1], merge_fns, held, errors)
             elif kind == "now":
-                reply = clock()
+                reply = (now if now is not None else clock)()
             elif kind == "owner":
                 reply = owner() if owner is not None else None
             elif kind == "check":
@@ -143,6 +146,16 @@ def steps(
             failed = True
 
 
+def _read(store: KVStore, keys: list[str], held: dict[str, bytes]) -> dict[str, bytes]:
+    """The values of ``keys``: the bytes held here first, being the
+    same content-keyed bytes the store would answer, then the store's."""
+    found = {k: held[k] for k in keys if k in held}
+    rest = [k for k in keys if k not in found]
+    if rest:
+        found.update(store.get_many(rest))
+    return found
+
+
 def _merge(
     store: KVStore,
     asks: list[tuple[int, str, str | None, str | None, str | None]],
@@ -152,7 +165,7 @@ def _merge(
 ) -> list[Any]:
     """Run each merge function asked for on its key's three sides."""
     blobs = {b for _, _, *sides in asks for b in sides if b is not None}
-    values = store.get_many(list(blobs)) if blobs else {}
+    values = _read(store, list(blobs), held) if blobs else {}
     answers: list[Any] = []
     for rule, key, *sides in asks:
         old, ours, theirs = (None if b is None else values.get(b) for b in sides)
