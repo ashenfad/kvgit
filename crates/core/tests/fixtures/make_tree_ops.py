@@ -1,7 +1,11 @@
 """Write tree-ops.json: batches of sets and removals applied in turn to
 a tree by Python kvgit's HAMT, with the root after each batch.
 
-    uv run --extra dev python crates/core/tests/fixtures/make_tree_ops.py
+Run with kvgit 0.4.3, the last release with a HAMT of its own, from
+outside the repository so its source can't shadow the release:
+
+    cd /tmp && uv run --isolated --no-project --with 'kvgit==0.4.3' \
+        python "$REPO/crates/core/tests/fixtures/make_tree_ops.py"
 """
 
 import json
@@ -9,6 +13,7 @@ import random
 from pathlib import Path
 
 from kvgit.hamt import EMPTY_HASH, Hamt
+
 from kvgit.kv.memory import Memory
 
 

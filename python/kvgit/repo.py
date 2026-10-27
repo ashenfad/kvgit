@@ -6,8 +6,11 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from . import _core
+from . import _core, _store as _kv
 from ._codec import Codec, CodecSpec
+from ._engine import Engine
+from ._store import EMPTY_HASH, GC_LEASE_TTL, ROOT_COMMIT, CorruptHeadRecoverer
+from ._types import DiffResult, MergeChoice
 from .cache import (
     DEFAULT_CACHE_BYTES,
     DEFAULT_VALUE_CACHE_BYTES,
@@ -19,17 +22,8 @@ from .errors import (
     BranchExistsError,
     UnknownCommitError,
 )
-from .hamt import EMPTY_HASH
 from .kv.base import KVStore
 from .refs import Branches, Tags
-from .versioned import kv as _kv
-from .versioned.kv import (
-    GC_LEASE_TTL,
-    ROOT_COMMIT,
-    CorruptHeadRecoverer,
-    VersionedKV,
-)
-from .versioned.protocol import DiffResult, MergeChoice
 from .worktree import Worktree
 
 MergeRule = MergeFn | MergeChoice
@@ -169,14 +163,7 @@ class Repo:
                 _kv.create_branch(self._store, name, ROOT_COMMIT)
             except BranchExistsError:
                 pass  # created by someone else in the meantime
-        engine = VersionedKV(
-            self._store,
-            branch=name,
-            create=False,
-            recover_from_corrupt_head=self._recover,
-            check_version=False,
-        )
-        return Worktree(self, engine)
+        return Worktree(self, Engine(self._store, name, recover=self._recover))
 
     def repair_head(self, name: str) -> str | None:
         """Persist a recovered HEAD for a damaged branch; return the commit

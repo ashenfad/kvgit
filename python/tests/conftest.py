@@ -22,7 +22,7 @@ def pytest_configure(config):
 
 
 # KVGIT_TEST_BACKEND=postgres reruns the whole suite with every in-memory
-# store swapped for a fresh Postgres table, so the versioned layer's tests
+# store swapped for a fresh Postgres table, so the tests
 # double as a conformance run for the backend. KVGIT_POSTGRES_DSN names the
 # database (default: dbname=kvgit_test); it is dropped and recreated.
 if os.environ.get("KVGIT_TEST_BACKEND") == "postgres":
@@ -34,7 +34,6 @@ if os.environ.get("KVGIT_TEST_BACKEND") == "postgres":
     import kvgit._open
     import kvgit.kv
     import kvgit.kv.memory
-    import kvgit.versioned.kv
     from kvgit.kv.postgres import Postgres
 
     _dsn = os.environ.get("KVGIT_POSTGRES_DSN", "dbname=kvgit_test")
@@ -52,7 +51,7 @@ if os.environ.get("KVGIT_TEST_BACKEND") == "postgres":
         def __init__(self) -> None:
             super().__init__(pool=_pool, table=f"t{next(_ids)}")
 
-    for _mod in (kvgit.kv, kvgit.kv.memory, kvgit._open, kvgit.versioned.kv):
+    for _mod in (kvgit.kv, kvgit.kv.memory, kvgit._open):
         _mod.Memory = _PostgresAsMemory
 
     def pytest_unconfigure(config):

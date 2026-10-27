@@ -5,10 +5,10 @@ from __future__ import annotations
 from collections.abc import ItemsView, Iterator, Mapping
 from typing import TYPE_CHECKING
 
+from . import _store as _kv
+from ._store import ROOT_COMMIT
+from ._types import TagInfo
 from .errors import UnknownTagError
-from .versioned import kv as _kv
-from .versioned.kv import ROOT_COMMIT, VersionedKV
-from .versioned.protocol import TagInfo
 
 if TYPE_CHECKING:
     from .repo import Repo
@@ -53,13 +53,16 @@ class Branches(Mapping[str, str]):
         return found["commit"]
 
     def __contains__(self, name: object) -> bool:
-        return isinstance(name, str) and VersionedKV.exists(self._repo._store, name)
+        # A damaged head still counts: opening it raises either way.
+        return isinstance(name, str) and _kv._call(
+            "branch_exists", self._repo._store, name=name
+        )
 
     def __iter__(self) -> Iterator[str]:
-        return iter(VersionedKV.branches(self._repo._store))
+        return iter(_kv._call("branches", self._repo._store))
 
     def __len__(self) -> int:
-        return len(VersionedKV.branches(self._repo._store))
+        return len(_kv._call("branches", self._repo._store))
 
     def create(self, name: str, at: str | None = None) -> str:
         """Create branch ``name`` at commit ``at`` (default: the empty root

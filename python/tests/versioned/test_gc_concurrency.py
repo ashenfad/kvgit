@@ -1,18 +1,18 @@
 """Concurrency coverage for the orphan sweep.
 
-``clean_orphans`` used to reach its delete list through several
-independent ``store.keys()`` scans. Anything a concurrent writer
-committed *between* two of those scans was invisible to the mark phase
-but visible to the sweep phase, so its HAMT nodes and chunks were
-deleted while its ``__commit_root__`` (fixed at the earlier scan)
-survived — a live branch HEAD pointing at missing nodes.
+A sweep reaches its delete list through several ``store.keys()``
+scans. Anything a concurrent writer committed *between* two of those
+scans would be invisible to the mark phase but visible to the sweep
+phase, so its HAMT nodes and chunks would be deleted while its
+``__commit_root__`` (fixed at the earlier scan) survived — a live branch
+HEAD pointing at missing nodes.
 
-Every sweep now runs under the GC lease, and every commit batch lands
-only while no lease is held, so a writer that starts mid-sweep waits for
-the sweep to finish. The seam here is deterministic: ``ScanHookStore``
+Every sweep runs under the GC lease, and every commit batch lands only
+while no lease is held, so a writer that starts mid-sweep waits for the
+sweep to finish. The seam here is deterministic: ``ScanHookStore``
 counts ``keys()`` calls and runs a callback after the Nth one, and the
 tests start a writer thread from inside the sweep at the worst moment
-the old code had, then check that its commit comes through whole.
+for the mark phase, then check that its commit comes through whole.
 """
 
 from __future__ import annotations
@@ -20,23 +20,22 @@ from __future__ import annotations
 import threading
 import time
 
-from support import fork, pointers, root_of, worktree
+from support import clean_orphans, deep_clean, fork, pointers, root_of, worktree
 
-from kvgit.encoding import dumps
-from kvgit.hamt import EMPTY_HASH
-from kvgit.kv.memory import Memory
-from kvgit.versioned.keyset import Keyset
-from kvgit.versioned.kv import (
+from kvgit import _core
+from kvgit._store import (
     CHUNK_PREFIX,
     COMMIT_ROOT,
     COMMIT_TIME,
+    EMPTY_HASH,
     GC_LEASE_KEY,
     _resolve_head,
-    clean_orphans,
-    deep_clean,
 )
+from kvgit.encoding import dumps
+from kvgit.kv.memory import Memory
 
-NODE_PREFIX = Keyset.DEFAULT_PREFIX
+NODE_PREFIX = "kvgit:keyset:"
+BUCKET_MAX = 8
 
 # Scan order inside a sweep: (1) in-flight markers, (2) branch heads,
 # (3) __commit_root__, then on the deep path (4) kvgit:keyset:,
@@ -93,8 +92,11 @@ def node_hashes(store, commit_hash: str) -> set[str]:
     root = root_of(store, commit_hash)
     if root is None or root == EMPTY_HASH:
         return set()
-    _, nodes = Keyset(store, root=root).walk()
-    return nodes
+    op = _core.TreeOp.walk(NODE_PREFIX, BUCKET_MAX, root, set())
+    kind, payload = op.resume()
+    while kind == "get":
+        kind, payload = op.resume(dict(store.get_many(payload)))
+    return payload[1]
 
 
 def missing_nodes(store, commit_hash: str, expected: set[str]) -> list[str]:
@@ -334,7 +336,7 @@ class TestDamagedOrphans:
 
 class TestOrdinaryGarbage:
     def test_orphan_payload_is_still_collected(self):
-        """The fix must not turn GC into a no-op.
+        """The lease must not turn GC into a no-op.
 
         Everything an orphan alone holds — commit metadata, blob, HAMT
         nodes, chunks — is reclaimed by the routine sweep, and nothing

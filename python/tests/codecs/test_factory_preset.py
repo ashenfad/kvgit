@@ -33,7 +33,7 @@ class TestScientificCodec:
         np.testing.assert_array_equal(wt["x"], arr)
 
     def test_scientific_preset_dedups(self):
-        from kvgit.versioned.kv import CHUNK_PREFIX
+        from kvgit._store import CHUNK_PREFIX
 
         wt = kvgit.open(codec="scientific")
         big = np.arange(2048, dtype="float64")

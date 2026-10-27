@@ -5,15 +5,15 @@ import threading
 import pytest
 
 from kvgit import Repo
-from kvgit.cache import CachedStore, ContentCache, cacheable
-from kvgit.errors import UnknownCommitError
-from kvgit.kv.memory import Memory
-from kvgit.versioned.kv import (
+from kvgit._store import (
     BRANCH_HEAD,
     COMMIT_ROOT,
     GC_LEASE_KEY,
     PARENT_COMMIT,
 )
+from kvgit.cache import CachedStore, ContentCache, cacheable
+from kvgit.errors import UnknownCommitError
+from kvgit.kv.memory import Memory
 
 
 class Counting(Memory):

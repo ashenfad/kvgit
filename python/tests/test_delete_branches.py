@@ -4,20 +4,18 @@ import os
 import tempfile
 
 import pytest
-from support import fork, pointers, worktree
+from support import clean_orphans, fork, pointers, worktree
 
 from kvgit import Repo, UnknownBranchError
-from kvgit.kv.disk import Disk
-from kvgit.kv.memory import Memory
-from kvgit.versioned.kv import (
+from kvgit._store import (
     BRANCH_HEAD,
     BRANCH_HEAD_PREV,
     COMMIT_ROOT,
-    VersionedKV,
     _resolve_head,
     blob_key,
-    clean_orphans,
 )
+from kvgit.kv.disk import Disk
+from kvgit.kv.memory import Memory
 
 
 class TestDeleteBranch:
@@ -115,9 +113,10 @@ class TestDeleteBranch:
 class TestSharedOrphanSweep:
     def test_the_sweep_reclaims_a_deleted_branchs_commits_and_blobs(self):
         backend = Memory()
-        v = VersionedKV(backend)  # main
-        dev = v.create_branch("dev")
-        dev.commit({"secret": b"unique-blob-value"})
+        v = worktree(backend, codec="bytes")  # main
+        dev = fork(v, "dev")
+        dev["secret"] = b"unique-blob-value"
+        dev.commit()
         pointer = blob_key(b"unique-blob-value")
         assert backend.get(pointer) == b"unique-blob-value"
 
@@ -125,7 +124,7 @@ class TestSharedOrphanSweep:
         removed = clean_orphans(backend, min_age=0)
 
         assert removed >= 1
-        assert backend.get(COMMIT_ROOT % dev.current_commit) is None
+        assert backend.get(COMMIT_ROOT % dev.head) is None
         assert backend.get(pointer) is None
 
     def test_repo_gc_and_the_module_sweep_agree(self):

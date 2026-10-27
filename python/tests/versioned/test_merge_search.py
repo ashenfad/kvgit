@@ -4,18 +4,37 @@ import itertools
 import random
 
 import pytest
+from support import clean_orphans, fork
 
+from kvgit import Repo
+from kvgit._store import COMMIT_ROOT, EMPTY_HASH, PARENT_COMMIT, PARENT_GENS
 from kvgit.encoding import dumps, loads
 from kvgit.kv.memory import Memory
-from kvgit.versioned.kv import (
-    COMMIT_ROOT,
-    PARENT_COMMIT,
-    PARENT_GENS,
-    VersionedKV,
-    clean_orphans,
-    load_parents,
-    merge_base,
-)
+
+
+def open_repo(store) -> Repo:
+    """A raw-bytes repository over ``store`` with no content cache, so
+    every record a search needs is read from the store."""
+    return Repo(store, codec="bytes", cache_bytes=0)
+
+
+def handle(store, branch: str = "main"):
+    """A worktree on ``branch`` from its own repository handle."""
+    return open_repo(store).worktree(branch, create=True)
+
+
+def put(wt, updates: dict[str, bytes]) -> None:
+    """Stage ``updates`` on ``wt``, then commit them."""
+    wt.update(updates)
+    wt.commit()
+
+
+def load_parents(store, commit: str) -> tuple[str, ...]:
+    return open_repo(store).get_commit(commit).parents
+
+
+def merge_base(store, a: str, b: str) -> str | None:
+    return open_repo(store).merge_base(a, b)
 
 
 class CountingMemory(Memory):
@@ -78,19 +97,19 @@ def random_history(seed, steps=120, branch_count=4):
     ever conflicts."""
     rng = random.Random(seed)
     store = Memory()
-    main = VersionedKV(store)
-    main.commit({"seed": b"0"})
-    handles = [main] + [main.create_branch(f"b{i}") for i in range(1, branch_count)]
+    main = handle(store)
+    put(main, {"seed": b"0"})
+    handles = [main] + [fork(main, f"b{i}") for i in range(1, branch_count)]
     counter = itertools.count()
     for _ in range(steps):
         h = rng.choice(handles)
         if rng.random() < 0.3:
             other = rng.choice(handles)
             if other is not h:
-                h.merge_heads(other.current_commit, fast_forward=rng.random() < 0.5)
+                h.merge(commit=other.head, fast_forward=rng.random() < 0.5)
                 continue
         n = next(counter)
-        h.commit({f"k{n}": str(n).encode()})
+        put(h, {f"k{n}": str(n).encode()})
     return store
 
 
@@ -118,36 +137,43 @@ class TestSearch:
 
     def test_criss_cross_ties_go_to_the_smallest_hash(self):
         store = Memory()
-        main = VersionedKV(store)
-        main.commit({"base": b"0"})
-        dev = main.create_branch("dev")
-        main.commit({"m": b"1"})
-        dev.commit({"d": b"1"})
-        m1, d1 = main.current_commit, dev.current_commit
-        main.merge_heads(d1, fast_forward=False)
-        dev.merge_heads(m1, fast_forward=False)
-        a, b = main.current_commit, dev.current_commit
+        main = handle(store)
+        put(main, {"base": b"0"})
+        dev = fork(main, "dev")
+        put(main, {"m": b"1"})
+        put(dev, {"d": b"1"})
+        m1, d1 = main.head, dev.head
+        main.merge(commit=d1, fast_forward=False)
+        dev.merge(commit=m1, fast_forward=False)
+        a, b = main.head, dev.head
         assert merge_base(store, a, b) == min(m1, d1)
         assert walk_merge_base(store, a, b) == min(m1, d1)
 
     def test_unrelated_histories_have_no_common_ancestor(self):
         store = Memory()
-        one = VersionedKV(store)
-        one.commit({"a": b"1"})
-        store.set_many(**{PARENT_COMMIT % "island": dumps([])})
-        assert merge_base(store, one.current_commit, "island") is None
+        one = handle(store)
+        put(one, {"a": b"1"})
+        # A root commit outside every branch's history: no parents, and a
+        # keyset root so the store holds it as a commit.
+        store.set_many(
+            **{
+                PARENT_COMMIT % "island": dumps([]),
+                COMMIT_ROOT % "island": dumps(EMPTY_HASH),
+            }
+        )
+        assert merge_base(store, one.head, "island") is None
 
     def test_a_lost_race_reads_the_same_whatever_the_history(self):
         def reads_for(history):
             store = CountingMemory()
-            v = VersionedKV(store)
+            v = handle(store)
             for i in range(history):
-                v.commit({f"k{i % 5}": str(i).encode()})
-            a = VersionedKV(store)
-            b = VersionedKV(store)
-            a.commit({"x": b"1"})
+                put(v, {f"k{i % 5}": str(i).encode()})
+            a = handle(store)
+            b = handle(store)
+            put(a, {"x": b"1"})
             store.record_reads = 0
-            b.commit({"y": b"2"})
+            put(b, {"y": b"2"})
             return store.record_reads
 
         assert reads_for(10) == reads_for(300) <= 3
@@ -171,18 +197,18 @@ class TestHistoryWithoutGenerations:
 
     def test_a_commit_over_old_history_stores_true_generations(self):
         store = Memory()
-        v = VersionedKV(store)
+        v = handle(store)
         for i in range(6):
-            v.commit({f"k{i}": b"1"})
-        dev = v.create_branch("dev")
-        dev.commit({"d": b"1"})
-        v.merge_heads(dev.current_commit, fast_forward=False)
+            put(v, {f"k{i}": b"1"})
+        dev = fork(v, "dev")
+        put(dev, {"d": b"1"})
+        v.merge(commit=dev.head, fast_forward=False)
         self._strip(store, keep=set())
 
-        fresh = VersionedKV(store)  # knows nothing about generations
-        fresh.commit({"new": b"1"})
+        fresh = handle(store)  # knows nothing about generations
+        put(fresh, {"new": b"1"})
         truth = longest_paths(store)
-        new = fresh.current_commit
+        new = fresh.head
         parents = load_parents(store, new)
         assert loads(store.get(PARENT_GENS % new)) == [truth[p] for p in parents]
 
@@ -191,11 +217,11 @@ class TestHistoryWithoutGenerations:
         old = set(commits(store))
         self._strip(store, keep=set())
         # New history on top, with generations.
-        main = VersionedKV(store)
-        dev = VersionedKV(store, branch="b1")
+        main = handle(store)
+        dev = handle(store, "b1")
         for i in range(10):
-            main.commit({f"new-m{i}": b"1"})
-            dev.commit({f"new-d{i}": b"1"})
+            put(main, {f"new-m{i}": b"1"})
+            put(dev, {f"new-d{i}": b"1"})
         new = [c for c in commits(store) if c not in old]
         for a, b in itertools.combinations(new, 2):
             assert merge_base(store, a, b) == walk_merge_base(store, a, b)
@@ -204,11 +230,11 @@ class TestHistoryWithoutGenerations:
 class TestCollection:
     def test_gc_removes_an_orphans_generations(self):
         store = Memory()
-        main = VersionedKV(store)
-        dev = main.create_branch("dev")
-        dev.commit({"k": b"v"})
-        orphan = dev.current_commit
+        main = handle(store)
+        dev = fork(main, "dev")
+        put(dev, {"k": b"v"})
+        orphan = dev.head
         assert store.get(PARENT_GENS % orphan) is not None
-        main.delete_branch("dev")
+        main.repo.branches.delete("dev")
         clean_orphans(store, min_age=0)
         assert store.get(PARENT_GENS % orphan) is None

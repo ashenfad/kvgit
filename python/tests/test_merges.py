@@ -8,10 +8,9 @@ from pathlib import Path
 
 import pytest
 
-from kvgit import MergeConflict
+from kvgit import MergeConflict, Repo
 from kvgit.kv.memory import Memory
 from kvgit.merges import CantMark, make_text_merge, text, text_merge_result
-from kvgit.versioned.kv import VersionedKV as Versioned
 
 GIT = shutil.which("git")
 needs_git = pytest.mark.skipif(GIT is None, reason="git binary not available")
@@ -19,6 +18,18 @@ needs_git = pytest.mark.skipif(GIT is None, reason="git binary not available")
 _ALPHABET = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", ""]
 
 BASE = b"a\nb\nc\nd\n"
+
+
+def _handle(store):
+    """A worktree on ``main`` of a raw-bytes repository over ``store``;
+    each call opens its own handle on the branch."""
+    return Repo(store, codec="bytes").worktree("main", create=True)
+
+
+def _commit(wt, updates, **options):
+    """Stage ``updates`` on ``wt``, then commit them."""
+    wt.update(updates)
+    return wt.commit(**options)
 
 
 class TestCleanMerges:
@@ -302,37 +313,37 @@ class TestGitDifferential:
         assert checked_clean > 0  # the net must catch clean merges too
 
 
-class TestVersionedIntegration:
+class TestCommitIntegration:
     def _two_branches(self):
         store = Memory()
-        v1 = Versioned(store)
-        v1.commit({"doc": b"a\nb\nc\nd\n"})
-        v2 = Versioned(store)
+        v1 = _handle(store)
+        _commit(v1, {"doc": b"a\nb\nc\nd\n"})
+        v2 = _handle(store)
         return v1, v2
 
     def test_default_merge_automerges_text(self):
         from kvgit.merges import text as text_merge
 
         v1, v2 = self._two_branches()
-        v1.commit({"doc": b"a\nB\nc\nd\n"})
-        result = v2.commit({"doc": b"a\nb\nc\nD\n"}, default_merge=text_merge)
+        _commit(v1, {"doc": b"a\nB\nc\nd\n"})
+        result = _commit(v2, {"doc": b"a\nb\nc\nD\n"}, default_merge=text_merge)
         assert result
         assert v2.get("doc") == b"a\nB\nc\nD\n"
 
     def test_conflict_filed_without_fn(self):
         v1, v2 = self._two_branches()
-        v1.commit({"doc": b"a\nB\nc\nd\n"})
+        _commit(v1, {"doc": b"a\nB\nc\nd\n"})
         with pytest.raises(MergeConflict) as exc_info:
-            v2.commit({"doc": b"a\nb\nc\nD\n"})
+            _commit(v2, {"doc": b"a\nb\nc\nD\n"})
         assert "doc" in exc_info.value.conflicting_keys
 
     def test_binary_conflict_carries_cantmark(self):
         from kvgit.merges import text as text_merge
 
         v1, v2 = self._two_branches()
-        v1.commit({"doc": b"a\x00b"})
+        _commit(v1, {"doc": b"a\x00b"})
         with pytest.raises(MergeConflict) as exc_info:
-            v2.commit({"doc": b"a\nb\nc\nD\n"}, default_merge=text_merge)
+            _commit(v2, {"doc": b"a\nb\nc\nD\n"}, default_merge=text_merge)
         assert "doc" in exc_info.value.conflicting_keys
         assert isinstance(exc_info.value.merge_errors["doc"], CantMark)
 
@@ -393,14 +404,15 @@ class TestStrictAndFlag:
         with pytest.raises(CantMark):
             make_text_merge(strict=True)(BASE, b"\xff binary", BASE)
 
-    def test_strict_conflict_aborts_versioned_merge(self):
+    def test_strict_conflict_aborts_the_merge(self):
         store = Memory()
-        v1 = Versioned(store)
-        v1.commit({"doc": BASE})
-        v2 = Versioned(store)
-        v1.commit({"doc": b"a\nX\nc\nd\n"})
+        v1 = _handle(store)
+        _commit(v1, {"doc": BASE})
+        v2 = _handle(store)
+        _commit(v1, {"doc": b"a\nX\nc\nd\n"})
         with pytest.raises(MergeConflict) as exc_info:
-            v2.commit(
+            _commit(
+                v2,
                 {"doc": b"a\nY\nc\nd\n"},
                 default_merge=make_text_merge(strict=True),
             )
@@ -409,11 +421,12 @@ class TestStrictAndFlag:
 
     def test_strict_clean_change_still_merges(self):
         store = Memory()
-        v1 = Versioned(store)
-        v1.commit({"doc": BASE})
-        v2 = Versioned(store)
-        v1.commit({"doc": b"a\nB\nc\nd\n"})
-        result = v2.commit(
+        v1 = _handle(store)
+        _commit(v1, {"doc": BASE})
+        v2 = _handle(store)
+        _commit(v1, {"doc": b"a\nB\nc\nd\n"})
+        result = _commit(
+            v2,
             {"doc": b"a\nb\nc\nD\n"},
             default_merge=make_text_merge(strict=True),
         )

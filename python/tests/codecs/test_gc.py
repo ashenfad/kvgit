@@ -10,14 +10,14 @@ np = pytest.importorskip("numpy")
 
 from support import fork, worktree
 
+from kvgit._store import (
+    CHUNK_PREFIX,
+    COMMIT_TIME,
+)
 from kvgit.codecs import compose
 from kvgit.codecs.numpy import NumpyCodec
 from kvgit.encoding import dumps
 from kvgit.kv.memory import Memory
-from kvgit.versioned.kv import (
-    CHUNK_PREFIX,
-    COMMIT_TIME,
-)
 
 
 def make_staged(store=None):

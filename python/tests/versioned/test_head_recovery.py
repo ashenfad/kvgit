@@ -9,8 +9,8 @@ recovers *to*. It must only ever name a value the
 ``__branch_head__<branch>`` key actually held, and specifically the one
 it held immediately before its current value. Naming an older real HEAD
 silently drops commits; naming a commit that was never HEAD hands the
-branch a lineage it never had — the resurrection class that
-``delete_branch`` leaving its prev-HEAD behind produced in v0.3.1.
+branch a lineage it never had — the resurrection a deleted branch's
+leftover backup would cause.
 
 **Reading never writes.** Recovery on a read path is in-memory only.
 Persisting it is either an explicit ``repair_head`` call or a side
@@ -32,29 +32,28 @@ import threading
 import time
 
 import pytest
-from support import race_publish, root_of
+from support import clean_orphans, fork, race_publish, root_of
 
-from kvgit import ConcurrencyError, MergeConflict
-from kvgit.encoding import dumps, loads
-from kvgit.errors import CorruptHeadError, UnknownBranchError
-from kvgit.kv.memory import Memory
-from kvgit.versioned.keyset import Keyset
-from kvgit.versioned.kv import (
+from kvgit import ConcurrencyError, MergeConflict, Repo, Worktree, _core
+from kvgit._store import (
     BRANCH_HEAD,
     BRANCH_HEAD_PREV,
     COMMIT_ROOT,
     COMMIT_TIME,
     PARENT_COMMIT,
-    VersionedKV,
     _resolve_head,
     blob_key,
-    clean_orphans,
     recover_by_commit_scan,
     repair_head,
 )
+from kvgit._types import MergeResult
+from kvgit.encoding import dumps, loads
+from kvgit.errors import CorruptHeadError, UnknownBranchError
+from kvgit.kv.memory import Memory
 
 HEAD_PREFIX = BRANCH_HEAD.replace("%s", "")
 ROOT_PREFIX = COMMIT_ROOT.replace("%s", "")
+NODE_PREFIX = "kvgit:keyset:"
 
 
 class HookStore(Memory):
@@ -66,7 +65,7 @@ class HookStore(Memory):
     it. Assertions about prev-HEAD compare against this rather than
     against what the code under test believes.
 
-    Two seams, both one-shot:
+    Three seams, all one-shot:
 
     * ``arm_commit_batch`` fires when a commit's write batch is written
       — after its writer has read HEAD, before it reaches its CAS.
@@ -76,7 +75,7 @@ class HookStore(Memory):
       part of an atomic batch — so a writer can be paused while another
       completes.
 
-    Both are points every version of the code passes through, so a test
+    All are points every version of the code passes through, so a test
     written against them means the same thing before and after a fix.
     """
 
@@ -164,6 +163,27 @@ class HookStore(Memory):
         return applied
 
 
+def open_repo(store, **options) -> Repo:
+    """A repository over ``store`` that stores values as given."""
+    return Repo(store, codec="bytes", **options)
+
+
+def open_main(store, **options) -> Worktree:
+    """A worktree on ``main``, created if the store has none."""
+    return open_repo(store, **options).worktree("main", create=True)
+
+
+def commit(wt: Worktree, updates: dict[str, bytes], **options) -> MergeResult:
+    """Write ``updates`` into ``wt`` and commit them."""
+    wt.update(updates)
+    return wt.commit(**options)
+
+
+def history(repo: Repo, branch: str = "main") -> list[str]:
+    """Every commit reachable from ``branch``, merge parents included."""
+    return [c.hash for c in repo.log(branch=branch)]
+
+
 def age_commits(store, seconds: float) -> None:
     """Backdate every ``__commit_time__`` so orphans clear ``min_age``."""
     now = time.time()
@@ -178,8 +198,11 @@ def node_hashes(store, commit_hash: str) -> set[str]:
     root = root_of(store, commit_hash)
     if root is None:
         return set()
-    _, nodes = Keyset(store, root=root).walk()
-    return set(nodes)
+    op = _core.TreeOp.walk(NODE_PREFIX, 8, root, set(), False)
+    kind, payload = op.resume()
+    while kind == "get":
+        kind, payload = op.resume(dict(store.get_many(payload)))
+    return set(payload[1])
 
 
 class TestPrevHeadInvariant:
@@ -197,21 +220,20 @@ class TestPrevHeadInvariant:
         makes the candidate durable, and every later read short-circuits
         the scan and 'recovers' main onto a branch it never had.
 
-        The scan is opt-in since v0.3.4, so the handle asks for it. The
-        invariant is unchanged: whatever a recoverer returns is still a
-        candidate, and prev-HEAD must not be where it becomes durable.
+        The scan is opt-in, so the repository asks for it. Whatever a
+        recoverer returns is still a candidate, and prev-HEAD must not
+        be where it becomes durable.
         """
         store = HookStore()
-        v = VersionedKV(store, recover_from_corrupt_head=recover_by_commit_scan)
-        v.commit({"a": b"1"})
+        v = open_main(store, recover_from_corrupt_head=recover_by_commit_scan)
+        commit(v, {"a": b"1"})
 
         # A commit that is never main's HEAD: a branch tip that outlives
         # its branch (young orphans survive the min_age guard).
-        v.create_branch("tmp")
-        tmp = VersionedKV(store, branch="tmp")
-        tmp.commit({"t": b"tmp-only"})
-        tmp_tip = tmp.current_commit
-        v.delete_branch("tmp")
+        tmp = fork(v, "tmp")
+        commit(tmp, {"t": b"tmp-only"})
+        tmp_tip = tmp.head
+        v.repo.branches.delete("tmp")
 
         # The damage the recovery path exists for: unreadable HEAD, and
         # no backup to fall back on.
@@ -219,7 +241,7 @@ class TestPrevHeadInvariant:
         store.remove(BRANCH_HEAD_PREV % "main")
 
         try:
-            v.commit({"a": b"2"})
+            commit(v, {"a": b"2"})
         except ConcurrencyError:
             pass
 
@@ -247,25 +269,23 @@ class TestPrevHeadInvariant:
         first commit as well as its second.
         """
         store = HookStore()
-        v = VersionedKV(store)
-        v.commit({"a": b"1"})
-        first = v.current_commit
+        v = open_main(store)
+        commit(v, {"a": b"1"})
 
-        loser = VersionedKV(store, commit_hash=first)
-        winner = VersionedKV(store, commit_hash=first)
+        loser = v.repo.worktree("main")
+        winner = v.repo.worktree("main")
 
         def winner_lands_twice() -> None:
-            winner.commit({"w": b"1"})
-            winner.commit({"w": b"2"})
+            commit(winner, {"w": b"1"})
+            commit(winner, {"w": b"2"})
 
         store.arm_commit_batch(winner_lands_twice)
 
-        # Issue #39: the lost fast-forward race merges internally instead
-        # of raising, so the loser lands a merge commit on top. The
-        # invariant under test is unchanged: whatever wins the final CAS
+        # A lost fast-forward race merges instead of raising, so the
+        # loser lands a merge commit on top. Whatever wins the final CAS
         # writes the backup, so prev-HEAD is still the immediately-prior
         # HEAD rather than the loser's stale value.
-        loser.commit({"a": b"2"})
+        commit(loser, {"a": b"2"})
 
         history = store.head_history["main"]
         prev = loads(store.get(BRANCH_HEAD_PREV % "main"))
@@ -284,11 +304,9 @@ class TestPrevHeadInvariant:
         the backup stale.
         """
         store = HookStore()
-        v = VersionedKV(store)
-        v.commit({"a": b"1"})
-        first = v.current_commit
-        v.commit({"a": b"2"})
-        second = v.current_commit
+        v = open_main(store)
+        first = commit(v, {"a": b"1"}).commit
+        second = commit(v, {"a": b"2"}).commit
 
         class Died(Exception):
             """Stands in for the process dying mid-commit."""
@@ -298,7 +316,7 @@ class TestPrevHeadInvariant:
 
         store.arm_set(BRANCH_HEAD_PREV % "main", die)
         with pytest.raises(Died):
-            v.commit({"a": b"3"})
+            commit(v, {"a": b"3"})
 
         assert loads(store.get(BRANCH_HEAD % "main")) == second
         assert loads(store.get(BRANCH_HEAD_PREV % "main")) == first
@@ -308,59 +326,57 @@ class TestReadsDoNotWrite:
     """Head resolution on a read path recovers without persisting."""
 
     def test_opening_a_damaged_branch_does_not_mutate_the_store(self):
-        """Constructing a handle is a read, even on a damaged branch."""
+        """Opening a worktree is a read, even on a damaged branch."""
         store = Memory()
-        v = VersionedKV(store)
-        v.commit({"x": b"1"})
-        v.commit({"x": b"2"})
+        v = open_main(store)
+        commit(v, {"x": b"1"})
+        commit(v, {"x": b"2"})
         store.set(BRANCH_HEAD % "main", b"")
 
         before = dict(store.items())
-        recovered = VersionedKV(store)
+        recovered = open_repo(store).worktree("main")
         assert recovered.get("x") == b"1", "recovery must still happen"
         assert dict(store.items()) == before, (
             "a read repaired the store in place; a read-only consumer "
             "cannot do that, and two concurrent readers race each other"
         )
 
-    def test_peek_and_switch_do_not_mutate_the_store(self):
+    def test_snapshot_and_worktree_do_not_mutate_the_store(self):
         """The other read entry points hold the same line."""
         store = Memory()
-        v = VersionedKV(store)
-        v.commit({"x": b"1"})
-        v.create_branch("dev")
-        dev = VersionedKV(store, branch="dev")
-        dev.commit({"d": b"1"})
-        dev.commit({"d": b"2"})
+        v = open_main(store)
+        commit(v, {"x": b"1"})
+        dev = fork(v, "dev")
+        commit(dev, {"d": b"1"})
+        commit(dev, {"d": b"2"})
         store.set(BRANCH_HEAD % "dev", b"")
 
+        repo = open_repo(store)
         before = dict(store.items())
-        assert v.peek("d", branch="dev") == b"1"
-        assert dict(store.items()) == before, "peek wrote to the store"
+        assert repo.snapshot(branch="dev")["d"] == b"1"
+        assert dict(store.items()) == before, "snapshot wrote to the store"
 
-        v.switch_branch("dev")
-        assert v.get("d") == b"1"
-        assert dict(store.items()) == before, "switch_branch wrote to the store"
+        assert repo.worktree("dev").get("d") == b"1"
+        assert dict(store.items()) == before, "worktree wrote to the store"
 
     def test_repair_head_is_the_explicit_persisting_call(self):
         """``repair_head`` is how a damaged HEAD is made good on disk."""
         store = Memory()
-        v = VersionedKV(store)
-        v.commit({"x": b"1"})
-        good = v.current_commit
-        v.commit({"x": b"2"})
+        v = open_main(store)
+        good = commit(v, {"x": b"1"}).commit
+        commit(v, {"x": b"2"})
         store.set(BRANCH_HEAD % "main", b"")
 
         assert repair_head(store, "main") == good
         assert loads(store.get(BRANCH_HEAD % "main")) == good
         # Idempotent, and a no-op on an already-healthy branch.
         assert repair_head(store, "main") == good
-        assert VersionedKV(store).repair_head() == good
+        assert open_repo(store).repair_head("main") == good
 
     def test_repair_head_reports_an_unrecoverable_branch(self):
         """Nothing to recover, and no branch at all, both read as None."""
         store = Memory()
-        VersionedKV(store)
+        open_main(store)
         store.set(BRANCH_HEAD % "main", b"")
         for key in [k for k in list(store.keys()) if k.startswith(ROOT_PREFIX)]:
             store.remove(key)
@@ -377,17 +393,16 @@ class TestReadsDoNotWrite:
         both win.
         """
         store = HookStore()
-        v = VersionedKV(store)
-        v.commit({"x": b"1"})
-        good = v.current_commit
-        v.commit({"x": b"2"})
+        v = open_main(store)
+        good = commit(v, {"x": b"1"}).commit
+        commit(v, {"x": b"2"})
         store.set(BRANCH_HEAD % "main", b"")
 
-        writer = VersionedKV(store)
-        assert writer.current_commit == good, "the read should recover"
+        writer = open_repo(store).worktree("main")
+        assert writer.head == good, "the read should recover"
         assert store.get(BRANCH_HEAD % "main") == b"", "and not persist it"
 
-        result = writer.commit({"x": b"3"})
+        result = commit(writer, {"x": b"3"})
         assert result.merged, "a damaged HEAD must not make a branch read-only"
         assert loads(store.get(BRANCH_HEAD % "main")) == result.commit
         history = store.head_history["main"]
@@ -413,19 +428,18 @@ class TestLostCasGarbage:
         already built, so there is exactly one orphan for the sweep.
         """
         store = HookStore()
-        v = VersionedKV(store)
-        v.commit({"a": b"1"})
-        first = v.current_commit
+        v = open_main(store)
+        commit(v, {"a": b"1"})
 
-        loser = VersionedKV(store, commit_hash=first)
-        winner = VersionedKV(store, commit_hash=first)
-        store.arm_commit_batch(lambda: winner.commit({"a": b"winner"}))
+        loser = v.repo.worktree("main")
+        winner = v.repo.worktree("main")
+        store.arm_commit_batch(lambda: commit(winner, {"a": b"winner"}))
 
         with pytest.raises(MergeConflict):
-            loser.commit({"a": b"loser"})
+            commit(loser, {"a": b"loser"})
 
         # The loser's writes are still there, untouched.
-        live_history = set(winner.history())
+        live_history = set(history(winner.repo))
         orphans = [
             key[len(ROOT_PREFIX) :]
             for key in store.keys()
@@ -441,24 +455,24 @@ class TestLostCasGarbage:
         assert store.get(PARENT_COMMIT % orphan) is not None
 
         # The winner is unaffected, and ordinary GC reclaims the orphan.
-        assert VersionedKV(store).get("a") == b"winner"
+        assert open_repo(store).worktree("main").get("a") == b"winner"
         age_commits(store, 10_000)
         assert clean_orphans(store, min_age=3600) == 1
         assert store.get(COMMIT_ROOT % orphan) is None
         assert store.get(blob_key(b"loser")) is None
 
-        live = VersionedKV(store)
-        unshared = orphan_nodes - node_hashes(store, live.current_commit)
+        live = open_repo(store).worktree("main")
+        unshared = orphan_nodes - node_hashes(store, live.head)
         assert unshared, "the orphan should own at least one node of its own"
-        assert not [
-            n for n in unshared if store.get(Keyset.DEFAULT_PREFIX + n) is not None
-        ], "the orphan's own HAMT nodes were not reclaimed"
+        assert not [n for n in unshared if store.get(NODE_PREFIX + n) is not None], (
+            "the orphan's own HAMT nodes were not reclaimed"
+        )
         assert live.get("a") == b"winner"
 
 
 class TestRetryNodeAccounting:
     def test_raced_new_key_merge_strands_no_nodes(self):
-        """The #39 retry must keep its first attempt as our side.
+        """A retry after a lost CAS must keep its first attempt as our side.
 
         Rebuilding the commit after a lost CAS would mint a second
         commit for the same change (the hash covers the commit time)
@@ -466,20 +480,20 @@ class TestRetryNodeAccounting:
         commit leaves every written node reachable from live history.
         """
         store = Memory()
-        v1 = VersionedKV(store)
-        v1.commit({"base": b"0"})
-        v2 = VersionedKV(store)
-        race_publish(store, "main", lambda: v1.commit({"other": b"1"}))
-        result = v2.commit({"mine": b"2"})
+        v1 = open_main(store)
+        commit(v1, {"base": b"0"})
+        v2 = v1.repo.worktree("main")
+        race_publish(store, "main", lambda: commit(v1, {"other": b"1"}))
+        result = commit(v2, {"mine": b"2"})
         assert result.merged
 
         reachable: set[str] = set()
-        for h in v2.history(all_parents=True):
+        for h in history(v2.repo):
             reachable |= node_hashes(store, h)
         present = {
-            key[len(Keyset.DEFAULT_PREFIX) :]
+            key[len(NODE_PREFIX) :]
             for key in store.keys()
-            if key.startswith(Keyset.DEFAULT_PREFIX)
+            if key.startswith(NODE_PREFIX)
         }
         assert present - reachable == set()
 
@@ -488,14 +502,11 @@ class TestAbsentHeadCannotRecover:
     """A branch with no HEAD is deleted, not damaged.
 
     Recovery tiers exist for a HEAD that is *present and unusable*.
-    ``delete_branch`` removes the key, so an absent HEAD means the
+    Deleting a branch removes the key, so an absent HEAD means the
     branch is gone — and a backup that outlives it must not bring it
-    back. Writing the backup after the CAS once opened a route to
-    exactly that: a writer descheduled between the two, resuming after a
-    concurrent delete, recreated only the backup.
-
-    Reviving a branch from a lone backup is the v0.3.1 failure class,
-    reached from a new direction.
+    back. Writing the backup after the CAS would open a route to exactly
+    that: a writer descheduled between the two, resuming after a
+    concurrent delete, recreating only the backup.
     """
 
     def test_a_writer_racing_a_delete_cannot_bring_the_branch_back(self):
@@ -506,17 +517,18 @@ class TestAbsentHeadCannotRecover:
         backup behind to resurrect it.
         """
         store = HookStore()
-        VersionedKV(store).commit({"anchor": b"1"})
-        doomed = VersionedKV(store, branch="doomed")
-        doomed.commit({"secret": b"classified"})
+        repo = open_repo(store)
+        commit(repo.worktree("main", create=True), {"anchor": b"1"})
+        doomed = repo.worktree("doomed", create=True)
+        commit(doomed, {"secret": b"classified"})
 
         def delete_it_mid_write():
-            VersionedKV(store).delete_branch("doomed")
+            open_repo(store).branches.delete("doomed")
 
         # Delete the branch just before the writer's publishing write.
         store.arm_set(BRANCH_HEAD_PREV % "doomed", delete_it_mid_write)
         with pytest.raises(UnknownBranchError, match="no HEAD"):
-            doomed.commit({"secret": b"classified-v2"})
+            commit(doomed, {"secret": b"classified-v2"})
 
         assert store.get(BRANCH_HEAD % "doomed") is None, "the delete should have won"
         assert store.get(BRANCH_HEAD_PREV % "doomed") is None
@@ -525,43 +537,43 @@ class TestAbsentHeadCannotRecover:
     def test_a_corrupt_but_present_head_still_recovers(self):
         """The gate must not cost the tier its actual purpose."""
         store = HookStore()
-        v = VersionedKV(store)
-        first = v.commit({"k": b"1"}).commit
-        v.commit({"k": b"2"})
+        v = open_main(store)
+        first = commit(v, {"k": b"1"}).commit
+        commit(v, {"k": b"2"})
         store.set(BRANCH_HEAD % "main", b"")
         assert _resolve_head(store, "main") == first
 
     def test_a_healthy_branch_is_unaffected(self):
         store = HookStore()
-        head = VersionedKV(store).commit({"k": b"1"}).commit
+        head = commit(open_main(store), {"k": b"1"}).commit
         assert _resolve_head(store, "main") == head
 
     def test_creating_a_branch_drops_any_stale_backup(self):
-        """Installing an anchor means that name has no previous HEAD.
+        """Creating a branch means that name has no previous HEAD.
 
-        A backup can outlive ``delete_branch`` (the delayed write above).
+        A backup can outlive a branch deletion (the delayed write above).
         While the name is unclaimed the gate makes it harmless — but
-        re-installing an anchor would make it reachable again, since the
-        prev-HEAD tier only requires HEAD to *exist*, and a fresh branch's
-        HEAD can be corrupted before its first successful CAS.
+        creating the branch again would make it reachable again, since
+        the prev-HEAD tier only requires HEAD to *exist*, and a fresh
+        branch's HEAD can be corrupted before its first successful CAS.
         """
         store = HookStore()
-        vk = VersionedKV(store)
-        vk.commit({"anchor": b"1"})
+        vk = open_main(store)
+        commit(vk, {"anchor": b"1"})
         store.set(BRANCH_HEAD_PREV % "revived", dumps("deadbeef" * 5))
 
-        vk.create_branch("revived")
+        vk.repo.branches.create("revived", at=vk.head)
         assert store.get(BRANCH_HEAD_PREV % "revived") is None, (
-            "create_branch left a stale backup the new branch could recover onto"
+            "creating the branch left a stale backup it could recover onto"
         )
 
     def test_fresh_initialization_drops_any_stale_backup(self):
-        """The other path that installs an anchor for an unclaimed name."""
+        """The other path that creates a branch for an unclaimed name."""
         store = HookStore()
-        VersionedKV(store).commit({"anchor": b"1"})
+        commit(open_main(store), {"anchor": b"1"})
         store.set(BRANCH_HEAD_PREV % "revived", dumps("deadbeef" * 5))
 
-        VersionedKV(store, branch="revived")
+        open_repo(store).worktree("revived", create=True)
         assert store.get(BRANCH_HEAD_PREV % "revived") is None
 
 
@@ -575,19 +587,19 @@ class TestTheBackupIsExact:
 
     def test_a_paused_writer_publishes_with_the_right_backup(self):
         store = HookStore()
-        writer = VersionedKV(store)
-        writer.commit({"k": b"1"})
+        writer = open_main(store)
+        commit(writer, {"k": b"1"})
 
         landed = {}
 
         def other_writer_advances():
-            other = VersionedKV(store)
-            landed["third"] = other.commit({"k2": b"3"}).commit
+            other = open_repo(store).worktree("main")
+            landed["third"] = commit(other, {"k2": b"3"}).commit
 
         # Pause the writer just before its publishing write; another
         # writer publishes first, so this one merges and publishes after.
         store.arm_set(BRANCH_HEAD_PREV % "main", other_writer_advances)
-        result = writer.commit({"k": b"2"})
+        result = commit(writer, {"k": b"2"})
 
         head = loads(store.get(BRANCH_HEAD % "main"))
         prev = loads(store.get(BRANCH_HEAD_PREV % "main"))
@@ -603,16 +615,16 @@ class TestRepairHeadReturnValue:
 
     def test_returns_what_head_names_when_another_process_wins(self):
         store = HookStore()
-        v = VersionedKV(store)
-        v.commit({"k": b"1"})
-        second = v.commit({"k": b"2"}).commit
+        v = open_main(store)
+        commit(v, {"k": b"1"})
+        second = commit(v, {"k": b"2"}).commit
         store.set(BRANCH_HEAD % "main", b"")  # corrupt -> resolves to `first`
 
         def another_process_repairs_it_differently():
             store.set(BRANCH_HEAD % "main", dumps(second))
 
-        # Fire between _resolve_head's read and _heal_head's, so the heal
-        # CAS finds a HEAD it must not touch and declines.
+        # Fire between the resolve's read of HEAD and the heal's, so the
+        # heal CAS finds a HEAD it must not touch and declines.
         store.arm_get(
             BRANCH_HEAD % "main", another_process_repairs_it_differently, nth=2
         )
@@ -629,14 +641,14 @@ class TestRepairHeadReturnValue:
 
     def test_healthy_branch_is_a_no_op_that_still_reports_head(self):
         store = HookStore()
-        v = VersionedKV(store)
-        v.commit({"k": b"1"})
-        head = v.commit({"k": b"2"}).commit
+        v = open_main(store)
+        commit(v, {"k": b"1"})
+        head = commit(v, {"k": b"2"}).commit
         assert repair_head(store, "main") == head
 
     def test_missing_branch_returns_none(self):
         store = HookStore()
-        VersionedKV(store).commit({"k": b"1"})
+        commit(open_main(store), {"k": b"1"})
         store.remove(BRANCH_HEAD % "main")
         store.remove(BRANCH_HEAD_PREV % "main")
         assert repair_head(store, "nonexistent") is None
@@ -655,33 +667,29 @@ class TestRedoMintsANewCommit:
 
     def test_a_redo_is_a_new_commit_with_the_same_root(self):
         store = Memory()
-        v = VersionedKV(store)
-        v.commit({"a": b"1"})
-        first = v.current_commit
-        v.commit({"a": b"2"})
-        second = v.current_commit
+        v = open_main(store)
+        first = commit(v, {"a": b"1"}).commit
+        second = commit(v, {"a": b"2"}).commit
 
-        v.reset_to(first)
-        v.commit({"a": b"2"})
-        assert v.current_commit != second
-        assert root_of(store, v.current_commit) == root_of(store, second)
+        v.reset(first)
+        commit(v, {"a": b"2"})
+        assert v.head != second
+        assert root_of(store, v.head) == root_of(store, second)
 
     def test_a_redo_under_a_sweep_loses_nothing(self):
         """A writer that starts mid-sweep waits for it, then lands whole."""
         store = HookStore()
-        v = VersionedKV(store)
-        v.commit({"a": b"1"})
-        first = v.current_commit
-        v.commit({"a": b"2"})
-        second = v.current_commit
-        v.reset_to(first)
+        v = open_main(store)
+        first = commit(v, {"a": b"1"}).commit
+        second = commit(v, {"a": b"2"}).commit
+        v.reset(first)
         age_commits(store, 10_000)
 
         # Once the sweep has read the orphan's age and believes it old,
         # another thread redoes the same change onto the branch.
         redone: list[str] = []
         writer = threading.Thread(
-            target=lambda: redone.append(v.commit({"a": b"2"}).commit)
+            target=lambda: redone.append(commit(v, {"a": b"2"}).commit)
         )
         store.arm_get(COMMIT_TIME % second, writer.start)
         assert clean_orphans(store, min_age=3600) == 1
@@ -691,7 +699,7 @@ class TestRedoMintsANewCommit:
         assert redone and redone[0] != second
         assert loads(store.get(BRANCH_HEAD % "main")) == redone[0]
         assert _resolve_head(store, "main") == redone[0]
-        assert VersionedKV(store).get("a") == b"2"
+        assert open_repo(store).worktree("main").get("a") == b"2"
 
 
 class TestScanRecoveryIsOptIn:
@@ -699,11 +707,11 @@ class TestScanRecoveryIsOptIn:
 
     When HEAD is unresolvable *and* the prev-HEAD backup is gone, the
     information needed to answer "what did this branch point at" is not
-    in the store. The scan tier answered anyway, by picking the newest
-    tip no healthy branch claims — and a deleted branch's commits are
-    unclaimed by definition until ``clean_orphans`` collects them. So
-    the scan could serve one branch another branch's deleted data, with
-    nothing but a ``logger.warning`` to say so.
+    in the store. A scan picks the newest tip no healthy branch claims —
+    and a deleted branch's commits are unclaimed by definition until a
+    sweep collects them. So the scan could serve one branch another
+    branch's deleted data, with nothing but a ``logger.warning`` to say
+    so.
 
     ``None`` — "this branch is unrecoverable" — is honest and
     actionable. The scan is still available to anyone who wants it,
@@ -714,20 +722,18 @@ class TestScanRecoveryIsOptIn:
     def _leaky_store():
         """A deleted branch's tip, and an unrelated doubly-damaged HEAD.
 
-        No race and no seam: an ordinary ``delete_branch``, then main's
-        HEAD corrupted with its backup removed. ``tmp``'s commits are
-        young orphans, so the sweep inside ``delete_branch`` leaves them
-        in place — unclaimed, and therefore scan candidates.
+        No race and no seam: an ordinary branch delete, then main's HEAD
+        corrupted with its backup removed. ``tmp``'s commits are young
+        orphans, unclaimed, and therefore scan candidates.
         """
         store = Memory()
-        v = VersionedKV(store)
-        v.commit({"anchor": b"1"})
+        v = open_main(store)
+        commit(v, {"anchor": b"1"})
 
-        v.create_branch("tmp")
-        tmp = VersionedKV(store, branch="tmp")
-        tmp.commit({"classified": b"top-secret-payload"})
-        tmp_tip = tmp.current_commit
-        v.delete_branch("tmp")
+        tmp = fork(v, "tmp")
+        commit(tmp, {"classified": b"top-secret-payload"})
+        tmp_tip = tmp.head
+        v.repo.branches.delete("tmp")
 
         store.set(BRANCH_HEAD % "main", b"")
         store.remove(BRANCH_HEAD_PREV % "main")
@@ -748,7 +754,7 @@ class TestScanRecoveryIsOptIn:
         )
 
         with pytest.raises(CorruptHeadError, match="corrupt and unrecoverable"):
-            VersionedKV(store)
+            open_repo(store).worktree("main")
         assert repair_head(store, "main") is None
 
     def test_the_scan_still_recovers_when_it_is_asked_for(self):
@@ -762,8 +768,8 @@ class TestScanRecoveryIsOptIn:
             == tmp_tip
         )
 
-        v = VersionedKV(store, recover_from_corrupt_head=recover_by_commit_scan)
-        assert v.get("anchor") == b"1"
+        repo = open_repo(store, recover_from_corrupt_head=recover_by_commit_scan)
+        assert repo.worktree("main").get("anchor") == b"1"
         assert (
             repair_head(store, "main", recover_from_corrupt_head=recover_by_commit_scan)
             == tmp_tip
@@ -771,32 +777,33 @@ class TestScanRecoveryIsOptIn:
         assert loads(store.get(BRANCH_HEAD % "main")) == tmp_tip
 
     def test_a_healthy_branch_resolves_without_a_recoverer(self):
-        """Tier 1 is untouched."""
+        """The first tier, HEAD itself, needs no recoverer."""
         store = Memory()
-        head = VersionedKV(store).commit({"k": b"1"}).commit
+        head = commit(open_main(store), {"k": b"1"}).commit
         assert _resolve_head(store, "main") == head
-        assert VersionedKV(store).current_commit == head
+        assert open_repo(store).worktree("main").head == head
 
     def test_a_corrupt_head_still_recovers_from_its_backup(self):
-        """Tier 2 is untouched — the backup is real information."""
+        """The backup tier needs no recoverer — the backup is real
+        information."""
         store = Memory()
-        v = VersionedKV(store)
-        first = v.commit({"k": b"1"}).commit
-        v.commit({"k": b"2"})
+        v = open_main(store)
+        first = commit(v, {"k": b"1"}).commit
+        commit(v, {"k": b"2"})
         store.set(BRANCH_HEAD % "main", b"")
 
         assert store.get(BRANCH_HEAD_PREV % "main") is not None
         assert _resolve_head(store, "main") == first
-        assert VersionedKV(store).get("k") == b"1"
+        assert open_repo(store).worktree("main").get("k") == b"1"
 
 
 class TestRecovererThreading:
-    """A handle's recoverer applies to every resolve the handle makes."""
+    """A repository's recoverer applies to every resolve it makes."""
 
     @staticmethod
     def _spy():
         """A recoverer that records its calls and defers to the scan."""
-        calls: list[tuple[str, ...]] = []
+        calls: list[str] = []
 
         def recoverer(store, branch):
             calls.append(branch)
@@ -805,107 +812,123 @@ class TestRecovererThreading:
         return recoverer, calls
 
     @staticmethod
-    def _damaged(branch: str):
-        """A store with a healthy ``main`` and ``branch`` doubly damaged."""
+    def _healthy(branch: str):
+        """A store with a healthy ``main`` and, if named, ``branch``
+        forked from it with a commit of its own; and ``branch``'s tip."""
         store = Memory()
-        v = VersionedKV(store)
-        v.commit({"anchor": b"1"})
+        v = open_main(store)
+        commit(v, {"anchor": b"1"})
         if branch != "main":
-            v.create_branch(branch)
-            other = VersionedKV(store, branch=branch)
-            other.commit({"k": b"payload"})
-            tip = other.current_commit
-        else:
-            tip = v.current_commit
+            other = fork(v, branch)
+            commit(other, {"k": b"payload"})
+            return store, other.head
+        return store, v.head
+
+    @staticmethod
+    def _damage(store, branch: str) -> None:
+        """Corrupt ``branch``'s HEAD and remove its backup."""
         store.set(BRANCH_HEAD % branch, b"")
         store.remove(BRANCH_HEAD_PREV % branch)
+
+    def _damaged(self, branch: str):
+        """A store with a healthy ``main`` and ``branch`` doubly damaged."""
+        store, tip = self._healthy(branch)
+        self._damage(store, branch)
         return store, tip
 
     def test_a_commit_takes_a_recoverer_that_cannot_say(self):
         # A recoverer answering None leaves the branch unrecoverable; the
         # commit then reports the branch, not a failure of its own.
-        store, tip = self._damaged("main")
-        v = VersionedKV(
-            store, commit_hash=tip, recover_from_corrupt_head=lambda s, b: None
+        store, tip = self._healthy("main")
+        v = open_repo(store, recover_from_corrupt_head=lambda s, b: None).worktree(
+            "main"
         )
+        assert v.head == tip
+        self._damage(store, "main")
         with pytest.raises(UnknownBranchError):
-            v.commit({"k": b"2"})
+            commit(v, {"k": b"2"})
 
-    def test_latest_head_uses_the_recoverer(self):
+    def test_branch_lookup_uses_the_recoverer(self):
         store, tip = self._damaged("main")
         recoverer, calls = self._spy()
 
-        v = VersionedKV(store, commit_hash=tip, recover_from_corrupt_head=recoverer)
-        assert v.latest_head == tip
+        repo = open_repo(store, recover_from_corrupt_head=recoverer)
+        assert repo.branches["main"] == tip
         assert calls == ["main"]
 
-        assert VersionedKV(store, commit_hash=tip).latest_head is None
+        with pytest.raises(CorruptHeadError):
+            open_repo(store).branches["main"]
 
     def test_refresh_uses_the_recoverer(self):
-        store, tip = self._damaged("main")
+        store, tip = self._healthy("main")
         recoverer, calls = self._spy()
+        v = open_repo(store, recover_from_corrupt_head=recoverer).worktree("main")
+        plain = open_repo(store).worktree("main")
+        self._damage(store, "main")
 
-        v = VersionedKV(store, commit_hash=tip, recover_from_corrupt_head=recoverer)
         v.refresh()
-        assert v.current_commit == tip
+        assert v.head == tip
         assert calls == ["main"]
 
         with pytest.raises(CorruptHeadError, match="corrupt and unrecoverable"):
-            VersionedKV(store, commit_hash=tip).refresh()
+            plain.refresh()
 
-    def test_switch_branch_uses_the_recoverer(self):
+    def test_opening_a_worktree_uses_the_recoverer(self):
         store, _ = self._damaged("dev")
         recoverer, calls = self._spy()
 
-        v = VersionedKV(store, recover_from_corrupt_head=recoverer)
-        v.switch_branch("dev")
-        assert v.get("k") == b"payload"
+        repo = open_repo(store, recover_from_corrupt_head=recoverer)
+        assert repo.worktree("dev").get("k") == b"payload"
         assert calls == ["dev"]
 
         with pytest.raises(CorruptHeadError, match="corrupt and unrecoverable"):
-            VersionedKV(store).switch_branch("dev")
+            open_repo(store).worktree("dev")
 
-    def test_peek_uses_the_recoverer(self):
+    def test_snapshot_uses_the_recoverer(self):
         store, _ = self._damaged("dev")
         recoverer, calls = self._spy()
 
-        v = VersionedKV(store, recover_from_corrupt_head=recoverer)
-        assert v.peek("k", branch="dev") == b"payload"
+        repo = open_repo(store, recover_from_corrupt_head=recoverer)
+        assert repo.snapshot(branch="dev")["k"] == b"payload"
         assert calls == ["dev"]
 
-        assert VersionedKV(store).peek("k", branch="dev") is None
+        with pytest.raises(CorruptHeadError):
+            open_repo(store).snapshot(branch="dev")
 
-    def test_derived_handles_inherit_it(self):
-        """``checkout`` and ``create_branch`` hand back the same setting."""
+    def test_every_worktree_inherits_it(self):
+        """Each worktree a repository hands out carries its recoverer."""
         store, tip = self._damaged("main")
         recoverer, _ = self._spy()
 
-        v = VersionedKV(store, commit_hash=tip, recover_from_corrupt_head=recoverer)
+        repo = open_repo(store, recover_from_corrupt_head=recoverer)
 
-        # ``checkout`` stays on the damaged branch, so this is behaviour:
-        # only an inherited recoverer resolves it.
-        assert v.checkout(tip).latest_head == tip
-        assert VersionedKV(store, commit_hash=tip).checkout(tip).latest_head is None
+        # A second worktree stays on the damaged branch, so this is
+        # behaviour: only an inherited recoverer resolves it.
+        assert repo.worktree("main").head == tip
+        with pytest.raises(CorruptHeadError):
+            open_repo(store).worktree("main")
 
-        assert v.create_branch("forked")._recover_from_corrupt_head is recoverer
+        repo.branches.create("forked", at=tip)
+        assert repo.worktree("forked")._engine._recover is recoverer
 
-    def test_clean_orphans_never_uses_it(self):
+    def test_gc_never_uses_it(self):
         """GC must not decide reachability from a guess.
 
         Deliberate, not an oversight: a wrong answer here marks the
         wrong commits live, so real garbage survives and a guessed tip
         gets walked as though it were the branch's own history. The
         sweep sees only what the store actually claims, even when the
-        caller's handle carries a recoverer.
+        repository carries a recoverer.
         """
         store, dev_tip = self._damaged("dev")
         recoverer, calls = self._spy()
         age_commits(store, 7200)
 
-        v = VersionedKV(store, recover_from_corrupt_head=recoverer)
-        assert v.clean_orphans() == 1
+        repo = open_repo(store, recover_from_corrupt_head=recoverer)
+        repo.worktree("main")
+        assert repo.gc() == 1
         assert calls == [], (
-            f"clean_orphans consulted the recoverer for {calls} — the mark "
+            f"gc consulted the recoverer for {calls} — the mark "
             f"phase must not resolve a branch by guessing"
         )
         assert store.get(COMMIT_ROOT % dev_tip) is None, (
@@ -916,30 +939,26 @@ class TestRecovererThreading:
         """A seam unreachable through ``Repo`` is not a seam.
 
         ``Repo`` is how the docs tell people to open a store with
-        options, so the opt-in has to be expressible there and not only
-        by constructing a ``VersionedKV`` by hand.
+        options, so the opt-in has to be expressible there.
         """
-        from kvgit import Repo
-        from kvgit.versioned.kv import recover_by_commit_scan
-
         repo = Repo(Memory(), recover_from_corrupt_head=recover_by_commit_scan)
         wt = repo.worktree("main", create=True)
         wt["k"] = 1
         wt.commit()
         assert wt["k"] == 1
-        assert wt._engine._recover_from_corrupt_head is recover_by_commit_scan
+        assert wt._engine._recover is recover_by_commit_scan
 
         plain = Repo(Memory()).worktree("main", create=True)
-        assert plain._engine._recover_from_corrupt_head is None
+        assert plain._engine._recover is None
 
     def test_a_recoverer_returning_a_dangling_hash_is_rejected(self):
         """A pluggable tier is not a trusted tier.
 
-        Tiers 1 and 2 validate what they read: a string naming a commit
-        whose root exists. The scan used to satisfy that by construction
-        — its answer came straight off a ``__commit_root__`` key — but a
-        caller-supplied recoverer does not, and ``_resolve_head``
-        promises a *valid* commit or None.
+        HEAD and its backup are validated when read: a string naming a
+        commit whose root exists. The scan satisfies that by
+        construction — its answer comes straight off a
+        ``__commit_root__`` key — but a caller-supplied recoverer does
+        not, and ``_resolve_head`` promises a *valid* commit or None.
 
         An unchecked answer is worse than no answer: ``repair_head``
         makes it durable, replacing obviously-corrupt HEAD bytes with a
@@ -947,7 +966,7 @@ class TestRecovererThreading:
         damage it replaced.
         """
         store = HookStore()
-        VersionedKV(store).commit({"k": b"1"})
+        commit(open_main(store), {"k": b"1"})
         store.set(BRANCH_HEAD % "main", b"")
         store.remove(BRANCH_HEAD_PREV % "main")
         dangling = "deadbeef" * 5
@@ -969,7 +988,7 @@ class TestRecovererThreading:
 
     def test_a_recoverer_returning_a_non_string_is_rejected(self):
         store = HookStore()
-        VersionedKV(store).commit({"k": b"1"})
+        commit(open_main(store), {"k": b"1"})
         store.set(BRANCH_HEAD % "main", b"")
         store.remove(BRANCH_HEAD_PREV % "main")
         assert (
@@ -980,8 +999,7 @@ class TestRecovererThreading:
     def test_a_valid_recoverer_is_still_honoured(self):
         """The check must not cost the tier its purpose."""
         store = HookStore()
-        v = VersionedKV(store)
-        head = v.commit({"k": b"1"}).commit
+        head = commit(open_main(store), {"k": b"1"}).commit
         store.set(BRANCH_HEAD % "main", b"")
         store.remove(BRANCH_HEAD_PREV % "main")
         assert (

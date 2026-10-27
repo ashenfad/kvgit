@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 
 import kvgit
-from kvgit.versioned.kv import CHUNK_PREFIX
+from kvgit._store import CHUNK_PREFIX
 
 # ---------- helpers ----------
 

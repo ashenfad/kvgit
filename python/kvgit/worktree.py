@@ -6,11 +6,12 @@ from collections.abc import Iterator, MutableMapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from ._engine import Engine
+from ._store import ROOT_COMMIT
+from ._types import BytesMergeFn, MergeChoice, MergeResult, PostCheck
 from .cache import ValueCache
 from .content_types import MergeFn
 from .errors import UnknownCommitError
-from .versioned.kv import ROOT_COMMIT, VersionedKV
-from .versioned.protocol import BytesMergeFn, MergeChoice, MergeResult, PostCheck
 
 if TYPE_CHECKING:
     from .repo import Repo
@@ -50,7 +51,7 @@ class Worktree(MutableMapping[str, Any]):
     the one-line case.
     """
 
-    def __init__(self, repo: Repo, engine: VersionedKV) -> None:
+    def __init__(self, repo: Repo, engine: Engine) -> None:
         self._repo = repo
         self._engine = engine
         self._codec = repo._codec
@@ -80,7 +81,7 @@ class Worktree(MutableMapping[str, Any]):
     @property
     def branch(self) -> str:
         """The branch this worktree is bound to."""
-        return self._engine.current_branch
+        return self._engine.branch
 
     @property
     def head(self) -> str:
@@ -89,7 +90,7 @@ class Worktree(MutableMapping[str, Any]):
         The branch itself may have moved on since, if another worktree
         committed to it; ``repo.branches[wt.branch]`` reads the branch's tip.
         """
-        return self._engine.current_commit
+        return self._engine.head
 
     @property
     def cache(self) -> ValueCache:
@@ -112,7 +113,7 @@ class Worktree(MutableMapping[str, Any]):
         value = self._cache.get(key, _MISSING)
         if value is not _MISSING:
             return value
-        raw = self._engine.get(key)
+        raw = self._engine.get_many([key]).get(key)
         if raw is None:
             return default
         value, nbytes = self._codec.decode_sized(raw)
@@ -133,7 +134,7 @@ class Worktree(MutableMapping[str, Any]):
             else:
                 fetch.append(key)
         if fetch:
-            for key, raw in self._engine.get_many(*fetch).items():
+            for key, raw in self._engine.get_many(fetch).items():
                 value, nbytes = self._codec.decode_sized(raw)
                 self._cache.remember(key, value, nbytes)
                 result[key] = value
@@ -304,13 +305,13 @@ class Worktree(MutableMapping[str, Any]):
             removals = self._removals
         encoded = {k: self._codec.encode(k, v, sink) for k, v in updates.items()}
         result = self._engine.commit(
-            encoded or None,
-            set(removals) or None,
+            encoded,
+            set(removals),
             on_conflict=on_conflict,
             on_moved=on_moved,
             info=info,
-            chunks=(sink.chunks or None) if sink is not None else None,
-            chunk_refs=(sink.refs_by_key or None) if sink is not None else None,
+            chunks=sink.chunks if sink is not None else {},
+            chunk_refs=sink.refs_by_key if sink is not None else {},
             **self._rules(merge_fns, merge_prefixes, default_merge),
         )
         if result.merged:
@@ -368,12 +369,13 @@ class Worktree(MutableMapping[str, Any]):
         """
         self._require_clean("merge")
         their_head = self._repo._resolve_ref(commit=commit, branch=branch, tag=tag)
-        result = self._engine.merge_heads(
+        result = self._engine.merge(
             their_head,
+            base=None,
+            fast_forward=fast_forward,
             on_conflict=on_conflict,
             post_check=post_check,
             info=info,
-            fast_forward=fast_forward,
             **self._rules(merge_fns, merge_prefixes, default_merge),
         )
         if result.merged:
@@ -411,9 +413,10 @@ class Worktree(MutableMapping[str, Any]):
             UnknownBranchError: the branch was deleted.
         """
         self._require_clean("apply a change")
-        result = self._engine.apply_change(
-            base,
+        result = self._engine.merge(
             target,
+            base=base,
+            fast_forward=False,
             on_conflict=on_conflict,
             post_check=post_check,
             info=info,

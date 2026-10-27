@@ -1,8 +1,8 @@
 """Runs a corpus scenario (``corpus/README.md``) through kvgit's public API.
 
-The clock and lease owners are the scenario's: ``time`` and
-``_new_lease_owner`` in ``kvgit.versioned.kv`` are replaced while it
-runs, so every run writes the same bytes.
+The clock and lease owners are the scenario's: ``time`` in
+``kvgit._store`` and ``kvgit._engine``, and ``_new_lease_owner``, are
+replaced while it runs, so every run writes the same bytes.
 """
 
 from __future__ import annotations
@@ -24,12 +24,13 @@ from kvgit import (
     Repo,
     Snapshot,
     Worktree,
+    _engine,
+    _store as _kv,
     _sync,
     recover_by_commit_scan,
 )
 from kvgit.kv.memory import Memory
 from kvgit.merges import make_text_merge, text_merge_result
-from kvgit.versioned import kv as _kv
 
 CORPUS = Path(__file__).resolve().parents[2] / "corpus" / "scenarios"
 HOST = "python"
@@ -79,6 +80,7 @@ def _pinned(clock: _Clock) -> Iterator[None]:
     owners = (f"lease-{n}" for n in range(1, 1_000_000))
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(_kv, "time", clock)
+        mp.setattr(_engine, "time", clock)
         mp.setattr(_kv, "_new_lease_owner", lambda: next(owners))
         yield
 

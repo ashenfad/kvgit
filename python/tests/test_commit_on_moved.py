@@ -5,8 +5,8 @@ import pytest
 from support import worktree
 
 from kvgit import BranchMovedError, ConcurrencyError
+from kvgit._store import BRANCH_HEAD, IN_FLIGHT_KEY
 from kvgit.kv.memory import Memory
-from kvgit.versioned.kv import BRANCH_HEAD, IN_FLIGHT_KEY
 
 IN_FLIGHT_PREFIX = IN_FLIGHT_KEY % ""
 

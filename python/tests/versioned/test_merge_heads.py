@@ -1,19 +1,24 @@
-"""Tests for cross-branch merge: VersionedKV.merge_heads + Worktree.merge."""
+"""Tests for cross-branch merge: Worktree.merge over raw bytes and decoded values."""
 
 import pytest
 from support import fork, worktree
 
-from kvgit import MergeConflict, UnknownCommitError
+from kvgit import MergeConflict, Repo, UnknownCommitError
 from kvgit.kv.memory import Memory
 from kvgit.merges import CantMark, text
-from kvgit.versioned.kv import VersionedKV as Versioned
 
 
-def _branched_versioned():
-    """Main + worker VersionedKV pair sharing one store (raw bytes)."""
-    main = Versioned(Memory())
-    main.commit({"doc": b"a\nb\nc\nd\n"})
-    worker = main.create_branch("worker")
+def _commit(wt, updates):
+    """Stage ``updates`` on ``wt``, then commit them."""
+    wt.update(updates)
+    return wt.commit()
+
+
+def _branched_bytes():
+    """Main + worker worktrees of one repository storing raw bytes."""
+    main = worktree(codec="bytes")
+    _commit(main, {"doc": b"a\nb\nc\nd\n"})
+    worker = fork(main, "worker")
     return main, worker
 
 
@@ -26,98 +31,98 @@ def _branched():
     return main, worker
 
 
-class TestMergeHeads:
+class TestMergeOverBytes:
     def test_fast_forward_takes_theirs(self):
-        main, worker = _branched_versioned()
-        worker.commit({"k": b"2"})
+        main, worker = _branched_bytes()
+        _commit(worker, {"k": b"2"})
 
-        result = main.merge_heads(worker.current_commit)
+        result = main.merge(commit=worker.head)
         assert result.merged
         assert main.get("k") == b"2"
 
     def test_disjoint_changes_union(self):
-        main, worker = _branched_versioned()
-        main.commit({"a": b"1"})
-        worker.commit({"b": b"2"})
+        main, worker = _branched_bytes()
+        _commit(main, {"a": b"1"})
+        _commit(worker, {"b": b"2"})
 
-        result = main.merge_heads(worker.current_commit)
+        result = main.merge(commit=worker.head)
         assert result.merged
         assert main.get("a") == b"1"
         assert main.get("b") == b"2"
 
     def test_overlap_without_fn_conflicts(self):
-        main, worker = _branched_versioned()
-        main.commit({"doc": b"a\nB\nc\nd\n"})
-        worker.commit({"doc": b"a\nb\nc\nD\n"})
+        main, worker = _branched_bytes()
+        _commit(main, {"doc": b"a\nB\nc\nd\n"})
+        _commit(worker, {"doc": b"a\nb\nc\nD\n"})
 
         with pytest.raises(MergeConflict) as exc_info:
-            main.merge_heads(worker.current_commit)
+            main.merge(commit=worker.head)
         assert "doc" in exc_info.value.conflicting_keys
 
     def test_overlap_with_text_fn_marks(self):
-        main, worker = _branched_versioned()
-        main.commit({"doc": b"a\nB\nc\nd\n"})
-        worker.commit({"doc": b"a\nb\nc\nD\n"})
+        main, worker = _branched_bytes()
+        _commit(main, {"doc": b"a\nB\nc\nd\n"})
+        _commit(worker, {"doc": b"a\nb\nc\nD\n"})
 
-        result = main.merge_heads(worker.current_commit, default_merge=text)
+        result = main.merge(commit=worker.head, default_merge=text)
         assert result.merged
         assert main.get("doc") == b"a\nB\nc\nD\n"
 
     def test_post_check_refusal_raises(self):
-        main, worker = _branched_versioned()
-        main.commit({"doc": b"a\nB\nc\nd\n"})
-        worker.commit({"doc": b"a\nY\nc\nd\n"})
+        main, worker = _branched_bytes()
+        _commit(main, {"doc": b"a\nB\nc\nd\n"})
+        _commit(worker, {"doc": b"a\nY\nc\nd\n"})
 
-        before = main.current_commit
+        before = main.head
         with pytest.raises(MergeConflict) as exc_info:
-            main.merge_heads(
-                worker.current_commit,
+            main.merge(
+                commit=worker.head,
                 default_merge=text,
                 post_check=lambda key, value: b"<<<<<<<" not in value,
             )
         assert "doc" in exc_info.value.conflicting_keys
-        assert main.current_commit == before
+        assert main.head == before
 
     def test_post_check_refusal_abandons(self):
-        main, worker = _branched_versioned()
-        main.commit({"doc": b"a\nB\nc\nd\n"})
-        worker.commit({"doc": b"a\nY\nc\nd\n"})
+        main, worker = _branched_bytes()
+        _commit(main, {"doc": b"a\nB\nc\nd\n"})
+        _commit(worker, {"doc": b"a\nY\nc\nd\n"})
 
-        before = main.current_commit
-        result = main.merge_heads(
-            worker.current_commit,
+        before = main.head
+        result = main.merge(
+            commit=worker.head,
             default_merge=text,
             post_check=lambda key, value: False,
             on_conflict="abandon",
         )
         assert not result.merged
         assert result.commit is None
-        assert main.current_commit == before
+        assert main.head == before
 
     def test_fresh_branches_share_empty_genesis(self):
         """Two fresh branches have no shared commits — but both descend
         from the deterministic empty genesis, so they still merge: same
         key added on both sides is an ordinary added/added conflict,
         not an unrelated-histories refusal."""
-        mem = Memory()
-        main = Versioned(mem, branch="aaa")
-        main.commit({"k": b"1"})
-        other = Versioned(mem, branch="bbb")
-        other.commit({"k": b"2"})
+        repo = Repo(Memory(), codec="bytes")
+        main = repo.worktree("aaa", create=True)
+        _commit(main, {"k": b"1"})
+        other = repo.worktree("bbb", create=True)
+        _commit(other, {"k": b"2"})
 
-        before = main.current_commit
+        before = main.head
         with pytest.raises(MergeConflict) as exc_info:
-            main.merge_heads(other.current_commit)
+            main.merge(commit=other.head)
         assert "k" in exc_info.value.conflicting_keys
-        assert main.current_commit == before
+        assert main.head == before
 
     def test_binary_conflict_carries_cantmark(self):
-        main, worker = _branched_versioned()
-        main.commit({"doc": b"a\x00b"})
-        worker.commit({"doc": b"a\nb\nc\nD\n"})
+        main, worker = _branched_bytes()
+        _commit(main, {"doc": b"a\x00b"})
+        _commit(worker, {"doc": b"a\nb\nc\nD\n"})
 
         with pytest.raises(MergeConflict) as exc_info:
-            main.merge_heads(worker.current_commit, default_merge=text)
+            main.merge(commit=worker.head, default_merge=text)
         assert isinstance(exc_info.value.merge_errors["doc"], CantMark)
 
 
@@ -128,22 +133,22 @@ class TestEngineChecksItsCommits:
 
     def test_unknown_commits_are_refused_and_nothing_is_published(self):
         store = Memory()
-        engine = Versioned(store)
-        engine.commit({"k": b"1"})
-        known = engine.current_commit
+        engine = worktree(store, codec="bytes")
+        _commit(engine, {"k": b"1"})
+        known = engine.head
         missing = "f" * 40
         before = dict(store.items())
 
         for attempt in (
-            lambda: engine.apply_change(known, missing),
-            lambda: engine.apply_change(missing, known),
-            lambda: engine.merge_heads(missing),
-            lambda: engine.apply_change(known, missing, on_conflict="abandon"),
-            lambda: engine.merge_heads(missing, on_conflict="abandon"),
+            lambda: engine.apply(known, missing),
+            lambda: engine.apply(missing, known),
+            lambda: engine.merge(commit=missing),
+            lambda: engine.apply(known, missing, on_conflict="abandon"),
+            lambda: engine.merge(commit=missing, on_conflict="abandon"),
         ):
             with pytest.raises(UnknownCommitError, match=missing):
                 attempt()
-        assert engine.latest_head == known
+        assert engine.repo.branches["main"] == known
         assert engine.get("k") == b"1"
         assert dict(store.items()) == before
 
@@ -209,15 +214,15 @@ class TestReviewRegression35:
     def test_merge_parents_put_ours_first(self):
         """Linear history must stay on the merging branch: the merge
         commit's first parent is our pre-merge head (git convention),
-        so history() doesn't divert onto the source branch."""
-        main, worker = _branched_versioned()
-        main.commit({"a": b"1"})
-        worker.commit({"b": b"2"})
-        our_head = main.current_commit
+        so the branch's log doesn't divert onto the source branch."""
+        main, worker = _branched_bytes()
+        _commit(main, {"a": b"1"})
+        _commit(worker, {"b": b"2"})
+        our_head = main.head
 
-        main.merge_heads(worker.current_commit)
-        assert main.parents() == (our_head, worker.current_commit)
-        assert our_head in list(main.history())
+        main.merge(commit=worker.head)
+        assert main.repo.get_commit(main.head).parents == (our_head, worker.head)
+        assert our_head in [c.hash for c in main.repo.log(branch=main.branch)]
 
     def test_worktree_uses_registered_fns(self):
         """set_default_merge applies to merge() without per-call args."""
@@ -233,50 +238,48 @@ class TestReviewRegression35:
         assert main["doc"] == b"a\nB\nc\nd\n"
 
     def test_bogus_on_conflict_rejected_before_mutating(self):
-        main, worker = _branched_versioned()
-        worker.commit({"b": b"2"})
-        before = main.current_commit
+        main, worker = _branched_bytes()
+        _commit(worker, {"b": b"2"})
+        before = main.head
 
         with pytest.raises(ValueError, match="on_conflict"):
-            main.merge_heads(worker.current_commit, on_conflict="bogus")
-        assert main.current_commit == before
+            main.merge(commit=worker.head, on_conflict="bogus")
+        assert main.head == before
 
 
-class TestVersionedMergeParity:
-    def test_versioned_level_merge(self):
-        """The engine verb works directly on VersionedKV too."""
-        v1 = Versioned(Memory())
-        v1.commit({"k": b"base"})
-        v2 = v1.create_branch("dev")
-        v2.commit({"k": b"dev"})
+class TestBytesMerge:
+    def test_raw_bytes_merge(self):
+        """A merge function sees raw bytes on a bytes-codec repository."""
+        v1 = worktree(codec="bytes")
+        _commit(v1, {"k": b"base"})
+        v2 = fork(v1, "dev")
+        _commit(v2, {"k": b"dev"})
 
-        result = v1.merge_heads(v2.current_commit, default_merge=text)
+        result = v1.merge(commit=v2.head, default_merge=text)
         assert result.merged
         assert v1.get("k") == b"dev"
 
 
 class TestMergeBase:
     def test_same_commit_is_its_own_base(self):
-        main, _ = _branched_versioned()
-        assert main.merge_base(main.current_commit, main.current_commit) == (
-            main.current_commit
-        )
+        main, _ = _branched_bytes()
+        assert main.repo.merge_base(main.head, main.head) == (main.head)
 
     def test_diverged_branches_resolve_to_fork_point(self):
-        main, worker = _branched_versioned()
-        fork = main.current_commit
-        main.commit({"a": b"1"})
-        worker.commit({"b": b"2"})
+        main, worker = _branched_bytes()
+        fork_point = main.head
+        _commit(main, {"a": b"1"})
+        _commit(worker, {"b": b"2"})
 
-        assert main.merge_base(main.current_commit, worker.current_commit) == fork
-        assert worker.merge_base(worker.current_commit, main.current_commit) == fork
+        assert main.repo.merge_base(main.head, worker.head) == fork_point
+        assert worker.repo.merge_base(worker.head, main.head) == fork_point
 
     def test_linear_history_returns_ancestor(self):
-        main, _ = _branched_versioned()
-        base = main.current_commit
-        main.commit({"a": b"1"})
+        main, _ = _branched_bytes()
+        base = main.head
+        _commit(main, {"a": b"1"})
 
-        assert main.merge_base(base, main.current_commit) == base
+        assert main.repo.merge_base(base, main.head) == base
 
     def test_repo_merge_base_matches_the_engine(self):
         main, worker = _branched()
