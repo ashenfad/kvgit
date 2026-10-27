@@ -1,6 +1,5 @@
 {
   "description": "Two devices that both commit before syncing: the second push and pull report the branch diverged and move no ref; merging the fetched remote head locally and syncing again settles it.",
-  "only": ["ts"],
   "clock": 1700004100.25,
   "steps": [
     { "op": "remote", "as": "origin", "id": "origin" },

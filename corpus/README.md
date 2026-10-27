@@ -211,8 +211,7 @@ reference remote over a store of its own, which replays every push and
 checks every hash. A sync result gives `status`, `branch`,
 `local_head`, `remote_head` (the remote head seen before it moved) and
 `transferred`; `sync` gives `status`, `pull` and `push` (a result, or
-`null` when it stopped after the pull). Only TypeScript runs these for
-now, so it records their `final`.
+`null` when it stopped after the pull).
 
 **Interleavings**
 

@@ -298,7 +298,7 @@ describe('races and lifecycle', () => {
     }
 
     const bStore = new Memory()
-    await expect(pullBranch(bStore, hollow, BRANCH)).rejects.toThrow(/not present after apply/)
+    await expect(pullBranch(bStore, hollow, BRANCH)).rejects.toThrow(/not present after the fetch/)
     // No branch ref was minted for the missing head.
     expect(await bStore.get(`__branch_head__${BRANCH}`)).toBeNull()
   })
