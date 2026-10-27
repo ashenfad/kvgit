@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { Memory } from '../src/backends/memory'
+import { UnknownCommitError } from '../src/errors'
 import { VersionedKV, type WireCommit, applyWire, walkDelta } from '../src/index'
 
 const enc = new TextEncoder()
@@ -104,7 +105,7 @@ describe('walkDelta — linear history', () => {
   it('throws when want is missing from the store', async () => {
     const store = new Memory()
     await VersionedKV.open(store)
-    await expect(collect(store, 'f'.repeat(40))).rejects.toThrow(/commit record missing/)
+    await expect(collect(store, 'f'.repeat(40))).rejects.toThrow(UnknownCommitError)
   })
 })
 

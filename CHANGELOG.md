@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The commit scan breaks ties by hash.** Of two unclaimed tips made at the same time, it recovers to the smaller hash, where Python picked either.
 - **Breaking (TypeScript): the text merge needs the core loaded.** `text`, `textMergeResult` and the functions `makeTextMerge` builds run the core's merge, which `Repo.open` loads; code that merges text before opening any repository awaits the new `loadCore()` first.
 - **Breaking (Python): commit info keys must be strings.** Other keys raise `TypeError`, since `json.dumps` writes them as strings and they wouldn't read back as the keys the commit hash covers.
+- **TypeScript's `ancestryDelta` throws `UnknownCommitError` for a commit it can't send.** It threw a plain `Error`; the search now runs in the core.
 
 ## [0.4.3] - 2026-10-16
 

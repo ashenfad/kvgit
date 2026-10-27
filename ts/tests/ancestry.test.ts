@@ -7,6 +7,7 @@
 
 import { describe, expect, it } from 'vitest'
 import { Memory } from '../src/backends/memory'
+import { UnknownCommitError } from '../src/errors'
 import { MemoryRemote, VersionedKV, pullBranch, pushBranch, walkDelta } from '../src/index'
 import type { KVStore } from '../src/types'
 import { ancestorsAbove, ancestryDelta, isAncestor } from '../src/versioned/ancestry'
@@ -178,9 +179,9 @@ describe('ancestry, against the whole-history walk', () => {
     await d.store.remove(PARENT_COMMIT('c0010'))
     const tip = d.commits.at(-1) as string
     if (reach(d, [tip]).has('c0010')) {
-      await expect(ancestryDelta(d.store, tip, [])).rejects.toThrow(/commit record missing/)
+      await expect(ancestryDelta(d.store, tip, [])).rejects.toThrow(UnknownCommitError)
     }
-    await expect(ancestryDelta(d.store, 'missing', [])).rejects.toThrow(/commit record missing/)
+    await expect(ancestryDelta(d.store, 'missing', [])).rejects.toThrow(UnknownCommitError)
   })
 })
 

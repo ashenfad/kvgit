@@ -3,6 +3,7 @@
 //! through one class rather than one per operation. A commit answers
 //! with what it committed instead.
 
+use crate::ancestry;
 use crate::error::Error;
 use crate::gc::{self, Gc};
 use crate::head::{self, Notes, Resolved};
@@ -56,6 +57,14 @@ pub type Op = Machine<Done<Out>>;
 /// - `merge_base {a, b, check}`: `{base, generations}`, the base or
 ///   null and `[commit, generation]` pairs worked out on the way; with
 ///   `check`, both commits must be in the store.
+/// - `ancestry_delta {want, have}`: `[commit, parents]` for each commit
+///   reachable from `want` and from none of `have`, a list; `want`'s
+///   side must be in the store.
+/// - `is_ancestor {ancestor, from}`: whether `ancestor` is `from` or in
+///   its history; false for a commit the store lacks.
+/// - `ancestors_above {have, floor}`: the commits reachable from `have`
+///   of generation `floor` and above, sorted; on history without
+///   generations, all of them.
 /// - `check_version {stamp}`: refuse a store of another storage layout;
 ///   with `stamp`, stamp a fresh one. Null.
 /// - `gc {min_age, deep, wait, lease_ttl}`: the number of commits swept,
@@ -93,6 +102,9 @@ pub const NAMES: &[&str] = &[
     "log",
     "diff",
     "merge_base",
+    "ancestry_delta",
+    "is_ancestor",
+    "ancestors_above",
     "check_version",
     "gc",
     "reset_branch",
@@ -203,6 +215,17 @@ fn resolved(r: Resolved) -> Value {
         ("commit".into(), Value::Str(r.commit)),
         ("root".into(), opt_str(r.root)),
     ])
+}
+
+fn texts(args: &Value, name: &str) -> Result<Vec<String>, Error> {
+    let invalid = || Error::Invalid(format!("{name:?} isn't a list of strings"));
+    match arg(args, name)? {
+        Value::Array(items) => items
+            .iter()
+            .map(|v| v.as_str().map(str::to_string).ok_or_else(invalid))
+            .collect(),
+        _ => Err(invalid()),
+    }
 }
 
 fn strings(items: Vec<String>) -> Value {
@@ -418,6 +441,25 @@ async fn run(io: &Io, name: &str, args: &Value, notes: &mut Notes) -> Result<Val
             .await?
             .head,
         ),
+        "ancestry_delta" => Value::Array(
+            ancestry::delta(io, text(args, "want")?, &texts(args, "have")?)
+                .await?
+                .into_iter()
+                .map(|(commit, parents)| Value::Array(vec![Value::Str(commit), strings(parents)]))
+                .collect(),
+        ),
+        "is_ancestor" => Value::Bool(
+            ancestry::is_ancestor(io, text(args, "ancestor")?, text(args, "from")?).await?,
+        ),
+        "ancestors_above" => {
+            let floor = number(args, "floor")?.unwrap_or(0);
+            let mut found: Vec<String> = ancestry::above(io, &texts(args, "have")?, floor)
+                .await?
+                .into_iter()
+                .collect();
+            found.sort();
+            strings(found)
+        }
         "check_version" => {
             version::check(io, flag(args, "stamp")?).await?;
             Value::Null
