@@ -1,6 +1,6 @@
 # @agex-ts/kvgit
 
-Versioned key-value store with branches, commits, and three-way merges. The TypeScript counterpart of Python's [kvgit](https://github.com/ashenfad/kvgit), on its v4 format byte for byte, redesigned around async storage so it works equally well in Node and the browser.
+Versioned key-value store with branches, commits, and three-way merges. The TypeScript counterpart of Python's [kvgit](https://github.com/ashenfad/kvgit), on the same Rust core and its v4 format byte for byte, built around async storage so it works equally well in Node and the browser.
 
 > **Status:** Pre-alpha. Public API is unstable; pin a specific minor version.
 
@@ -22,13 +22,20 @@ allowBuilds:
   cbor-extract: false
 ```
 
+The core is kvgit's Rust core compiled to WebAssembly. Its bytes ship
+inside the package's JavaScript, so it loads the same way under Node,
+bundlers and workers, with no URL to resolve or file to fetch.
+`Repo.open` loads it. The text merge helpers are synchronous, so code
+that calls `text`, `textMergeResult` or a `makeTextMerge` function
+before opening any repository awaits `loadCore()` first.
+
 ## Concept
 
 A `Map<string, T>` with git-like history. Every `commit()` creates a checkpoint; branches are first-class; sessions can fork cheaply because the underlying HAMT shares structure across versions. Three-way merges are pluggable per key.
 
 ## Design
 
-The canonical type contracts live in [`src/types.ts`](./src/types.ts). `@agex-ts/world` keeps each session as a branch of one repository; [the design history](https://github.com/ashenfad/agex-ts/blob/main/docs/design.md) has why the format follows Python's.
+The store, merge and wire types live in [`src/types.ts`](https://github.com/ashenfad/kvgit/blob/main/ts/src/types.ts); the `Repo` and `Worktree` types in [`src/repo.ts`](https://github.com/ashenfad/kvgit/blob/main/ts/src/repo.ts) and [`src/worktree.ts`](https://github.com/ashenfad/kvgit/blob/main/ts/src/worktree.ts). `@agex-ts/world` keeps each session as a branch of one repository; [the design history](https://github.com/ashenfad/agex-ts/blob/main/docs/design.md) has why the format follows Python's.
 
 ## Storage backends
 
@@ -40,11 +47,13 @@ scans, and an atomic compare-and-swap of one key (`cas`) or of several
 |---|---|---|
 | `Memory` | `@agex-ts/kvgit/backends/memory` | `new Memory()`: tests, scratch |
 | `IndexedDB` | `@agex-ts/kvgit/backends/idb` | `await IndexedDB.open({ dbName, storeName })` in the browser; `IndexedDB.deleteDatabase(name)` removes one |
-| `Sqlite` | `@agex-ts/kvgit/backends/sqlite` | `Sqlite.open({ path, wal })` on Node's `node:sqlite` (`:memory:` by default, WAL on for a file); refused in a browser build |
+| `Sqlite` | `@agex-ts/kvgit/backends/sqlite` | `await Sqlite.open({ path, wal })` on Node's `node:sqlite` (`:memory:` by default, WAL on for a file): Node 22.5 or later, behind `--experimental-sqlite` before Node 24; refused in a browser build |
 
 ## Repo and worktrees
 
-The API follows Python kvgit 0.4's, made async:
+The API follows Python kvgit's `Repo` and `Worktree`, made async;
+Python's `Repo.resolve` and `Repo.merge_rule` have no TypeScript
+counterpart:
 
 ```ts
 import { Repo, jsonCodec } from '@agex-ts/kvgit'
@@ -69,33 +78,50 @@ for await (const c of repo.log({ branch: 'main' })) console.log(c.hash, c.info)
 - **`Worktree`** is one branch checked out for work: writes stay
   pending until `commit()`, reads see them, and a commit that loses the
   race to another worktree on the same branch merges onto the new tip
-  with the effective merge functions (the call's, then the
-  worktree's, then the repository's).
+  with the effective merge rules (a call's override the worktree's,
+  which override the repository's). `status()` lists the pending
+  writes and deletions, `discard()` drops them, `reset(commit)` moves
+  the branch to a commit and `refresh()` to its current tip, both
+  dropping them. `commit({ keys })` commits only those pending keys and
+  leaves the rest pending.
+- **What a commit or merge did.** `commit`, `merge`, `apply`,
+  `cherryPick` and `revert` return a `MergeResult`: `merged`, the
+  `commit` the branch is at afterwards, a `strategy` (`'no_op'`,
+  `'fast_forward'`, `'three_way'` or `'apply'`), `autoMergedKeys` (keys
+  a merge rule decided) and `carriedKeys` (keys taken from the other
+  side as they were). A conflict no rule resolves throws
+  `MergeConflict`; with `onConflict: 'abandon'` the call returns
+  `merged: false` and changes nothing.
 - **Refusing to merge.** Where keys are not independent (pages of one
   database, say), a merge of two disjoint changes is a state neither
   writer made. `commit({ onMoved: 'raise' })` lands only as a
   fast-forward from the worktree's head: if the branch moved, before
   the commit or inside the compare-and-swap that publishes it, it
-  throws `BranchMovedError` (with nothing to commit too) (a `ConcurrencyError`; `err.head` is the
-  tip it found), writes nothing reachable and keeps the pending
-  changes. `refresh()` then moves to the tip to redo the work.
+  throws `BranchMovedError`, even with nothing to commit (a
+  `ConcurrencyError`; `err.head` is the tip it found), writes nothing
+  reachable and keeps the pending changes. `refresh()` then moves to the tip to redo the work.
 - **Worktrees read on demand.** Opening reads the head's root alone,
   whatever the branch holds; reads walk the tree through the
   repository's content cache, and a commit rewrites only the paths it
   changes. The first `keys()` builds an index the later ones read.
   `lazy` is accepted and does nothing.
-- **Caches.** A repository remembers what its store never rewrites
-  (tree nodes, commit records) in a content cache of `cacheBytes`, and
-  each worktree remembers the values it reads in `wt.cache`, a
-  `ValueCache` of `valueCacheBytes` (32 MB each by default; `0` turns
-  either off). A value costing more than a quarter of its worktree's
-  budget is never held, and a worktree's values go when its head moves.
+- **Caches.** A store's repositories remember what it never rewrites
+  (tree nodes, commit records) in one content cache of `cacheBytes`,
+  set by the first `Repo.open` over the store, and each worktree
+  remembers the values it reads in `wt.cache`, a `ValueCache` of
+  `valueCacheBytes` (32 MB each by default; `0` turns either off). A
+  value's cost is the bytes it was decoded from plus its key and about
+  96 bytes of bookkeeping; a value costing more than a quarter of its
+  worktree's budget is never held, and a worktree's values go when its
+  head moves.
 - **`Snapshot`** is a read-only view pinned to one commit. It looks
   keys up in the tree a batch at a time, so reading a few keys stays
   cheap however many the commit holds; `raw` gives the stored bytes.
 - **`repo.branches`** and **`repo.tags`** are live collections. A tag
   never moves, and keeps its commit and its ancestry alive through
-  `gc`. Tags are stored as Python kvgit stores them (a branch head under
+  `gc`. `tags.info(name)` gives a tag's commit, creation time, info and
+  whether its commit is missing; `tags.entries()` maps every tag to
+  its commit in one pass. Tags are stored as Python kvgit stores them (a branch head under
   `refs/tags/`, plus a record of when and why), so either reads the
   other's.
 - **Merging.** `wt.merge({ branch | commit | tag })` fast-forwards when
@@ -105,16 +131,19 @@ for await (const c of repo.log({ branch: 'main' })) console.log(c.hash, c.info)
   merge commit `[ours, theirs]`. `wt.apply(base, target)` lands the
   change from `base` to `target` as one ordinary commit, with
   `cherryPick(commit)` and `revert(commit)` built on it.
-- **Merge rules** come from the repository, the worktree and the call,
-  in that order, each by key (`mergeFns`), by key prefix
+- **Merge rules** come from the repository, the worktree and the call
+  (a call's override the worktree's, which override the
+  repository's), each by key (`mergeFns`), by key prefix
   (`mergePrefixes`, longest match wins) or as a default. A rule is a
   merge function over decoded values, consulted only where both sides
   changed a key (it may answer with a `MergeChoice` to keep one side),
   or a `MergeChoice` itself: a standing policy giving one side every
-  key it covers that either side changed. `text` (`textMerge`, or
-  `makeTextMerge({ oursLabel, theirsLabel, strict })`) merges lines as
-  git does, conflict markers and all, byte for byte with Python's
-  `kvgit.merges`. A `merge`, `apply`, `cherryPick` or `revert` also
+  key it covers that either side changed. `text`, a rule over bytes,
+  merges lines as git does, conflict markers and all, byte for byte
+  with Python's `kvgit.merges`; `makeTextMerge({ oursLabel,
+  theirsLabel, strict })` builds one with other labels, and
+  `textMerge(opts)` builds the same merge over decoded string values.
+  They run in the core, which must be loaded (see "Install"). A `merge`, `apply`, `cherryPick` or `revert` also
   takes `postCheck`, which can refuse a merged value as a conflict.
 - The common ancestor is found by generation: commits record their
   parents' generations, so the search for two tips that forked
@@ -122,8 +151,19 @@ for await (const c of repo.log({ branch: 'main' })) console.log(c.hash, c.info)
 - Errors derive from `KvgitError`: `UnknownBranchError`,
   `UnknownTagError`, `UnknownCommitError`, `BranchExistsError`,
   `TagExistsError`, `CorruptHeadError`, `StorageVersionError`,
-  `MergeConflict`, `GcBusy`, `ConcurrencyError` and its subclass
-  `BranchMovedError`.
+  `IntegrityError`, `MergeConflict`, `GcBusy`, `ConcurrencyError` and
+  its subclass `BranchMovedError`.
+- **`Namespaced`** is a key-prefix view over a worktree:
+  `new Namespaced(wt, 'ns')` reads and writes keys under `ns/`, and a
+  `Namespaced` over another one flattens to a single `a/b/` prefix.
+  Like a worktree's, its `get`, `has`, `delete`, `keys` (direct
+  children) and `descendantKeys` are async, and `set` stays pending
+  until the worktree commits.
+- Store-level calls take a raw `KVStore` where no repository is open:
+  `gcStore(store, opts)` is `repo.gc`, and `mergeBase(store, a, b)` is
+  `repo.mergeBase` without its check that both commits exist.
+  [`src/index.ts`](https://github.com/ashenfad/kvgit/blob/main/ts/src/index.ts)
+  lists the rest of the public surface.
 
 ## Codecs
 
@@ -143,17 +183,17 @@ reader of a store has to use the codec its writers did. Pass a codec
   string, no base64), bigint, `Map` (any keys), `Set`, `Date` and the
   other typed arrays. Python reads it with `cbor2`: a `Map` arrives as a
   tagged map, and an integer Python writes past 32 bits comes back a
-  bigint ([`tests/fixtures/golden-cbor.json`](./tests/fixtures/golden-cbor.json),
-  from [`scripts/golden-cbor.py`](./scripts/golden-cbor.py), checks what
+  bigint ([`tests/fixtures/golden-cbor.json`](https://github.com/ashenfad/kvgit/blob/main/ts/tests/fixtures/golden-cbor.json),
+  from [`scripts/golden-cbor.py`](https://github.com/ashenfad/kvgit/blob/main/ts/scripts/golden-cbor.py), checks what
   TS reads from Python).
 
 ## Storage format
 
 Stores use kvgit storage v4, shared with the Python package byte for
 byte: a store either one writes, the other reads, and a commit either
-one makes gets the same hash in both. [`docs/storage.md`](../docs/storage.md)
+one makes gets the same hash in both. [`docs/storage.md`](https://github.com/ashenfad/kvgit/blob/main/docs/storage.md)
 describes every key. Records are JSON as Python's `json.dumps` writes
-it, which [`src/pyjson.ts`](./src/pyjson.ts) reproduces.
+it, which [`src/pyjson.ts`](https://github.com/ashenfad/kvgit/blob/main/ts/src/pyjson.ts) reproduces.
 
 Two consequences for callers:
 
@@ -165,18 +205,17 @@ Two consequences for callers:
   takes a clock (a function returning seconds) for deterministic times;
   it defaults to the wall clock.
 
-The golden test ([`tests/golden-v4.test.ts`](./tests/golden-v4.test.ts))
+The golden test ([`tests/golden-v4.test.ts`](https://github.com/ashenfad/kvgit/blob/main/ts/tests/golden-v4.test.ts))
 replays a scripted history and compares every key and byte against
 what Python kvgit wrote for it
-([`scripts/golden-v4.py`](./scripts/golden-v4.py)).
+([`scripts/golden-v4.py`](https://github.com/ashenfad/kvgit/blob/main/ts/scripts/golden-v4.py)).
 
 ## Garbage collection
 
 Resetting a branch, deleting one, or losing a race leaves commits
-nothing points at. `repo.gc({ minAge, deep })` (or `vk.cleanOrphans` /
-`vk.deepClean` on an engine handle, whose `minAge` is in milliseconds)
-reclaims them, with everything only
-they held: records, blobs and HAMT nodes.
+nothing points at. `repo.gc({ minAge, deep, wait, leaseTtl })` (or
+`gcStore(store, opts)` on a raw store) reclaims them, with everything
+only they held: records, blobs and HAMT nodes.
 
 **It is safe beside concurrent writers,** as in Python kvgit:
 
@@ -192,17 +231,18 @@ they held: records, blobs and HAMT nodes.
   between the two keeps it. A marker lapses after ten minutes, which is
   what eventually releases the commit of a writer that died before
   publishing.
-- `minAge` (seconds for `repo.gc`, default an hour) is policy only: how
+- `minAge` (seconds, default an hour) is policy only: how
   long abandoned work lingers. Any value is safe, 0 included.
 - Lease and marker expiries are always wall-clock time: they coordinate
   writers in different handles and processes. A `now` option pins only
   commit and tag times and the `minAge` cutoff.
-- The lease expires (`leaseTtl`, default ten minutes), so a sweep that
-  dies holding it delays writers by the rest of its term and no longer.
-  A second sweep waits for the first, or with `wait: false` throws
-  `GcBusy` (`deepClean` doesn't wait).
+- The lease expires (`leaseTtl`, in seconds, default ten minutes), so
+  a sweep that dies holding it delays writers by the rest of its term
+  and no longer. A second sweep, deep or not, waits for the first, or
+  with `wait: false` throws `GcBusy`.
 
-`deep` also scans the `kvgit:keyset:` and `kvgit:blob:` namespaces for
+`deep` also scans the `kvgit:keyset:`, `kvgit:chunk:` and `kvgit:blob:`
+namespaces for
 content no commit references at all: leftovers from an interrupted
 write, or the blobs of an orphan whose keyset is unreadable, which no
 orphan keyset points at.
@@ -231,10 +271,10 @@ gone.
 Two rules govern this.
 
 **Reads never write.** Resolving a damaged branch on a read path —
-opening a handle, `peek`, `switchBranch`, `refresh`, the mark phase of
-a sweep — recovers in memory and leaves the store exactly as it found
-it. The mark phase is the one place that stops at the backup tier even
-when the handle carries a recoverer: GC must not decide reachability
+opening a worktree or snapshot, `repo.branches.get`, `log`, `refresh`,
+the mark phase of a sweep — recovers in memory and leaves the store
+exactly as it found it. The mark phase is the one place that stops at
+the backup tier even when the repository carries a recoverer: GC must not decide reachability
 from a guess, so a branch whose HEAD does not resolve marks nothing
 and keeps its commits as young orphans until `minAge` and an explicit
 `repairHead` settle what it points at. A read-only consumer can therefore read a damaged store, two
@@ -245,9 +285,8 @@ until someone repairs it.
 
 Two things persist a recovery:
 
-- `repo.repairHead(name)` — or `repairHead(store, branch)`, or
-  `vk.repairHead()` — the explicit
-  maintenance call, and the one to reach for. It returns the commit
+- `repo.repairHead(name)` — or `repairHead(store, branch)` — the
+  explicit maintenance call, and the one to reach for. It returns the commit
   HEAD names when it returns, which is not necessarily the one it
   recovered: if another writer repaired, advanced or deleted the
   branch in between, the answer describes the store rather than the
@@ -260,8 +299,8 @@ Two things persist a recovery:
   damaged bytes, so two writers racing it cannot both win; a HEAD that
   merely *moved* — an ordinary lost race — is never touched, and a
   HEAD that is *absent* is never recreated, since that is the
-  deleted-branch resurrection `deleteBranch` drops the backup to
-  prevent.
+  deleted-branch resurrection `repo.branches.delete` drops the backup
+  to prevent.
 
 **The backup is exactly the HEAD the swap replaced.** A HEAD swap
 writes `__branch_head__` and `__branch_head_prev__` in one atomic
@@ -283,28 +322,28 @@ this layer:
   Don't implement a remote by putting a slow store behind `KVStore`;
   implement the wire layer.
 - **The unit of transfer is the commit, in wire form** (`WireCommit`
-  in [`src/types.ts`](./src/types.ts)): parents and their
+  in [`src/types.ts`](https://github.com/ashenfad/kvgit/blob/main/ts/src/types.ts)): parents and their
   generations, time, info, changed value bytes, removals. Produced by `walkDelta(store, { want, have })`
-  ([`src/sync/walk.ts`](./src/sync/walk.ts)) — commits reachable from
+  ([`src/sync/walk.ts`](https://github.com/ashenfad/kvgit/blob/main/ts/src/sync/walk.ts)) — commits reachable from
   `want` but not `have`, parents-first. `have = ∅` is a full export
   (bundles are the degenerate case). Replayed by
-  `applyWire(store, commits)` ([`src/sync/apply.ts`](./src/sync/apply.ts)),
+  `applyWire(store, commits)` ([`src/sync/apply.ts`](https://github.com/ashenfad/kvgit/blob/main/ts/src/sync/apply.ts)),
   which recomputes every commit hash from the replayed state and
-  refuses mismatches before writing.
+  refuses a mismatch with `IntegrityError` before writing.
 - **HAMT nodes never cross the wire.** A receiver rebuilds each
   commit's keyset over its first parent's, keying each changed value's
   blob by its bytes, so the rebuilt root is the sender's; it then
   recomputes the commit hash from that root, the time and the info
   (see `commitHash` in
-  [`src/versioned/layout.ts`](./src/versioned/layout.ts)) and refuses
+  [`src/versioned/layout.ts`](https://github.com/ashenfad/kvgit/blob/main/ts/src/versioned/layout.ts)) and refuses
   a mismatch. A merge commit's delta lists every key that differs from
   its first parent, the ones it took from the other side included, so
   replay never consults a second parent. The one commit not checked
   this way is the root commit, whose hash is fixed: it is checked by
   its shape (no parents, no info, an empty keyset). See the fidelity
-  tests in [`tests/sync-walk.test.ts`](./tests/sync-walk.test.ts) and
+  tests in [`tests/sync-walk.test.ts`](https://github.com/ashenfad/kvgit/blob/main/ts/tests/sync-walk.test.ts) and
   the refusal tests in
-  [`tests/sync-apply.test.ts`](./tests/sync-apply.test.ts).
+  [`tests/sync-apply.test.ts`](https://github.com/ashenfad/kvgit/blob/main/ts/tests/sync-apply.test.ts).
 - **Merge never crosses the wire either.** Remotes move objects and
   CAS refs; reconciliation always happens locally via the existing
   three-way machinery (`commit()` / merge fns). Remotes can therefore
@@ -312,10 +351,11 @@ this layer:
   qualifies; no kvgit code needs to run on the far side. The protocol
   is `Remote` (`listRefs` / `fetch` / `push`, and optionally
   `deleteBranch`, by the same compare-and-swap) in
-  [`src/sync/remote.ts`](./src/sync/remote.ts), with `MemoryRemote`
-  as the reference implementation.
+  [`src/sync/remote.ts`](https://github.com/ashenfad/kvgit/blob/main/ts/src/sync/remote.ts), with `MemoryRemote`
+  as the reference implementation: `new MemoryRemote(store, { id })`
+  keeps the far side's history in a `KVStore` of its own.
 - **Sync is fast-forward only.** `pullBranch` / `pushBranch` /
-  `syncBranch` ([`src/sync/sync.ts`](./src/sync/sync.ts)) move refs
+  `syncBranch` ([`src/sync/sync.ts`](https://github.com/ashenfad/kvgit/blob/main/ts/src/sync/sync.ts)) move refs
   only along their own ancestry and report `'diverged'` otherwise —
   objects may transfer on divergence (useful for a later merge), but
   no ref moves and nothing merges automatically. A vanished
@@ -332,7 +372,7 @@ this layer:
   (what one tip has that another lacks, whether one commit is
   another's ancestor) are answered by searching down from both,
   highest generation first, stopping where the two histories meet
-  ([`src/versioned/ancestry.ts`](./src/versioned/ancestry.ts)). History
+  ([`src/versioned/ancestry.ts`](https://github.com/ashenfad/kvgit/blob/main/ts/src/versioned/ancestry.ts)). History
   written before generations were stored is searched whole.
 - **Parent order is significant.** A commit that merges after losing
   its race has `parents[0]` "theirs" (the head that won) and
@@ -349,7 +389,7 @@ this layer:
   stores synced by earlier versions kept it: the first remote with an
   `id` to sync the branch takes that record up as its own. Read and
   write it with `getSyncHead` / `setSyncHead` / `clearSyncHead` in
-  [`src/sync/apply.ts`](./src/sync/apply.ts), naming the remote;
+  [`src/sync/apply.ts`](https://github.com/ashenfad/kvgit/blob/main/ts/src/sync/apply.ts), naming the remote;
   without one, `getSyncHead` answers with the branch's only sync head
   and `clearSyncHead` forgets them all. A sync also marks the branch
   (`__sync_mark__<branch>`) before a push reads it, and the mark goes
@@ -358,11 +398,13 @@ this layer:
   branch only if it has neither, in one step against a push taking it
   up meanwhile.
 
-The storage layout and commit-identity primitives live in
-[`src/versioned/layout.ts`](./src/versioned/layout.ts) — the single
-source of truth for the host's reads and the sync layer. If you
-change the layout or hash inputs, both move together and the storage
-version sentinel must bump.
+The storage layout is specified in
+[`docs/storage.md`](https://github.com/ashenfad/kvgit/blob/main/docs/storage.md)
+and implemented once, in the Rust core
+([`crates/core/src/layout.rs`](https://github.com/ashenfad/kvgit/blob/main/crates/core/src/layout.rs));
+[`src/versioned/layout.ts`](https://github.com/ashenfad/kvgit/blob/main/ts/src/versioned/layout.ts)
+mirrors its key names for the TypeScript side. A change to the layout
+or the hash inputs bumps the storage version.
 
 ### Pack sync over GitHub (`@agex-ts/kvgit/github`)
 
@@ -449,7 +491,7 @@ bytes it takes for text).
   for a later push.
 - Packs are opaque to git, so a repo grows with what is pushed (a
   small multiple of each session's size, with folding).
-- Live tests ([`tests/github-pack-live.test.ts`](./tests/github-pack-live.test.ts))
+- Live tests ([`tests/github-pack-live.test.ts`](https://github.com/ashenfad/kvgit/blob/main/ts/tests/github-pack-live.test.ts))
   run against a scratch repo when `KVGIT_GH_TOKEN` and `KVGIT_GH_REPO`
   are set.
 
@@ -465,11 +507,11 @@ page in a browser can sync against it, and two browser profiles can
 play two devices. `fake.failNext({ status, body, headers, path })`
 answers the next requests with a failure (a rate limit, a server
 error); `maxBodyBytes` refuses larger requests with 413, standing in
-for GitHub's undocumented size limit.
+for GitHub's undocumented size limit. From `ts/`:
 
 ```sh
-pnpm -F @agex-ts/kvgit build
-pnpm -F @agex-ts/kvgit fake-github -- --port 4180 --repo me/sync
+pnpm build
+pnpm fake-github -- --port 4180 --repo me/sync
 ```
 
 It keeps everything in memory, gone when it stops; its commit ids

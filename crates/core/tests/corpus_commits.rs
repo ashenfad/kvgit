@@ -3,9 +3,8 @@
 //! machines interleaved where a scenario holds a commit at its batch or
 //! its publish, and the store must end byte for byte as Python left it.
 //!
-//! Until the rest of the engine is in the core, this runner keeps the
-//! worktree state and the reads a scenario checks by itself, and runs
-//! only the scenarios made of the steps it knows. Branches, tags and
+//! This runner keeps the worktree state and the reads a scenario checks
+//! by itself, and runs only the scenarios made of the steps it knows. Branches, tags and
 //! heads go through the core's operations by name, as the hosts call
 //! them.
 

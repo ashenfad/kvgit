@@ -24,8 +24,9 @@ under a reserved name, hidden from the branch API, so that reachability
 tagged commit alive with no knowledge of tags at all. The record beside
 it holds only creation time and caller info, which nothing collects.
 
-``__branch_head_prev__`` is written only after a HEAD swap succeeds, so
-it always names a commit ``__branch_head__`` really held. Recovery reads
+``__branch_head_prev__`` is written in the same ``cas_many`` that moves
+HEAD, expecting HEAD to hold the value it backs up, so it always names
+a commit ``__branch_head__`` really held. Recovery reads
 it, so a value that was never HEAD would graft onto the branch a lineage
 it never had.
 

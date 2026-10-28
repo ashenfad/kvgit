@@ -1,7 +1,9 @@
 # The scenario corpus
 
 Language-neutral scenarios that every kvgit implementation runs: the
-Python package, the TypeScript package, and later the core itself. A
+Python package and the TypeScript package, each through its public API.
+The core runs the commit scenarios itself and reads every recorded
+store back (`crates/core/tests/corpus_*.rs`). A
 scenario names a starting store, a sequence of operations by named
 actors with the results each must give, and the exact bytes of the
 store at the end. Two implementations that pass the same scenario
@@ -74,8 +76,9 @@ Every run of a scenario writes the same bytes:
   JSON parser in TypeScript cannot tell it from `10000000000000000`.
 
 The runners arrange this through test hooks, not public API: Python
-replaces `time` and `_new_lease_owner` in `kvgit.versioned.kv`;
-TypeScript passes `now` to `Repo.open` and replaces `leaseEnv`.
+replaces `time` in `kvgit._store` and `kvgit._engine`, and
+`_new_lease_owner`; TypeScript passes `now` to `Repo.open` and replaces
+`leaseEnv`.
 
 ## Steps
 

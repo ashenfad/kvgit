@@ -191,12 +191,15 @@ clean, with the four packages linked.
 
 ## C8. Migration and release
 
-- On `main`, before the merge: a 0.4.x with the store inventory and
-  the backfill.
-- Run the inventory on the stores worth keeping, and the backfill where
-  it reports anything.
+- Check the stamps of the stores worth keeping; a store stamped v2 or
+  v3 takes one commit under kvgit 0.4.x first.
+- The docs brought in line with the code, in both packages.
+- Python's `Disk` backend on one SQLite table, with
+  `Disk.import_diskcache` for existing stores and a disk shape in the
+  benchmarks.
 - Publish workflows: wheels and sdist to PyPI, the npm package with its
-  wasm, one version.
+  wasm, one version (npm has `@agex-ts/kvgit` 0.2.1, so the TypeScript
+  package moves from 0.2 to 0.5).
 - `core` merges to `main`; 0.5.0 releases both packages.
 - agex-ts drops `packages/kvgit-ts` and depends on the published
   package; agex-studio and nontainer raise their floors.

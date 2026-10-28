@@ -1,9 +1,10 @@
 """Text merge with conflict markers.
 
-A batteries-included ``BytesMergeFn`` for line-oriented text: disjoint
+A batteries-included bytes-level merge for line-oriented text: disjoint
 changes merge cleanly, overlapping changes come back with git-style
 ``<<<<<<<`` markers instead of raising. Register it as a per-key fn or
-as ``default_merge`` wherever text blobs merge (see ``resolve_merge``).
+as ``default_merge`` wherever values are ``bytes``; for ``str`` values,
+use :func:`kvgit.text_merge`.
 
 Anything that cannot be marked — undecodable bytes, NUL bytes, inputs
 over the size cap — raises :class:`CantMark`, which the merge machinery

@@ -303,7 +303,9 @@ w2.commit()
 print(w2["hits"])    # 135 (115 + 120 - 100)
 ```
 
-`last_writer_wins()` always takes the HEAD value, and `text_merge()`
+`last_writer_wins()` always takes `theirs` -- the merged-in side on
+`merge()`, and the branch tip when a commit merges after losing a race,
+so the committing worktree's own write is discarded -- and `text_merge()`
 resolves line-oriented text -- disjoint line edits merge cleanly,
 overlapping ones come back with git-style `<<<<<<<` markers:
 
@@ -526,7 +528,7 @@ snap = wt.repo.snapshot(commit=wt.head)
 snap.raw["config"]  # b'{"retries": 3}'
 ```
 
-The codec is fixed per store in practice: values written under one read back as that codec's bytes under another, so switching an existing store means rewriting its values. Merge functions see decoded values, and a merged value is encoded with the repo's codec.
+The codec is fixed per store in practice: values written under one codec read back as their stored bytes under `"bytes"` and generally fail to decode under any other, so switching an existing store means rewriting its values. Merge functions see decoded values, and a merged value is encoded with the repo's codec.
 
 ---
 
@@ -577,10 +579,10 @@ wt.commit()
 
 ### Migrating an existing store
 
-Current kvgit reads every older store in place; see [Storage versions](api.md#storage-versions). Chunked codecs need no migration either -- a store takes chunked writes as it is. To reclaim disk from arrays an older store pickled once per key, import its values into a fresh chunked store -- the dedup happens during the copy:
+kvgit reads stores stamped v4. A store an older kvgit wrote is stamped v4 by kvgit 0.4.x's first commit to it; one stamped v2 or v3, or unstamped with branches, raises `StorageVersionError`. See [Storage versions](api.md#storage-versions). Chunked codecs need no migration -- a v4 store takes chunked writes as it is. To reclaim disk from arrays a store pickled once per key, import its values into a fresh chunked store -- the dedup happens during the copy:
 
 ```python
-old = kvgit.open("disk", path="/old/store")  # plain pickle
+old = kvgit.open("disk", path="/old/store")  # a v4 store, plain pickle
 new = kvgit.open("disk", path="/new/store", codec=codec)
 for k in old.keys():
     new[k] = old[k]
@@ -594,7 +596,7 @@ If `old` happened to hold five separate copies of the same array under five keys
 | Type | Behavior |
 |------|----------|
 | `numpy.ndarray` (>= 1 KiB) | Externalized; views dedup against parent buffer |
-| `numpy.ndarray` (< 1 KiB) | Inlined into the value blob (chunk overhead would exceed savings) |
+| `numpy.ndarray` (< 1 KiB), not a view | Inlined into the value blob (chunk overhead would exceed savings) |
 | Object-dtype ndarrays | Pass through to pickle (their elements may still be intercepted by other codecs) |
 | `pandas.DataFrame` / `Series` | Block ndarrays externalize via the numpy codec |
 | Containers (`dict`, `list`, dataclass) holding ndarrays | The container pickles normally; nested arrays still externalize |

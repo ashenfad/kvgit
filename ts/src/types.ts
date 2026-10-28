@@ -1,9 +1,9 @@
 /**
  * @agex-ts/kvgit public type contracts.
  *
- * Canonical source for the public types of @agex-ts/kvgit. Implementations
- * (`Repo`, `Worktree`, `Namespaced`, the backends) live in sibling files
- * and import from here.
+ * The store, merge and wire types, and the errors. `Repo`, `Worktree`,
+ * `Namespaced` and the backends, with their own option types, live in
+ * sibling files and import from here.
  */
 
 import type { PyFloat } from './pyjson'
@@ -90,10 +90,6 @@ export interface KVStore {
 
   clear(): Promise<void>
 }
-
-// ---------------------------------------------------------------------------
-// HAMT
-// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Versioned
@@ -225,9 +221,9 @@ export interface WireCommit {
   readonly hash: string
   /** Parent hashes, order-significant (order participates in `hash`).
    *  For three-way merges, `parents[0]` is the head the merge landed
-   *  on — the CAS winner for `commit()`, our own head for
-   *  `mergeHeads()` — and `updates`/`removals` are relative to it.
-   *  See `VersionedBase`. */
+   *  on — the CAS winner for a commit that lost its race, our own head
+   *  for `Worktree.merge` — and `updates`/`removals` are relative to
+   *  it. */
   readonly parents: readonly string[]
   /** Each parent's generation, as recorded (`__parent_gens__`); null
    *  when the commit records none (the root commit). */
@@ -245,7 +241,3 @@ export interface WireCommit {
   /** Keys present in `parents[0]`'s keyset but absent here. */
   readonly removals: ReadonlySet<string>
 }
-
-// ---------------------------------------------------------------------------
-// Encoding
-// ---------------------------------------------------------------------------

@@ -1,5 +1,18 @@
 # @agex-ts/kvgit
 
+From 0.5.0, both packages are recorded in the repository's
+[CHANGELOG](https://github.com/ashenfad/kvgit/blob/main/CHANGELOG.md).
+The entries below are the package's releases from agex-ts.
+
+## 0.2.1
+
+### Patch Changes
+
+- 8a29999: **`IndexedDB.open` adds a `storeName` the database lacks:** opening a second store in an existing database left it uncreated, so the first read or write threw `NotFoundError`; the open now bumps the database's version to create it, waiting up to the new `blockedMs` option (default 5 s) for other connections to the database to close.
+- ee3020b: **A keyset entry written before storage v4 keeps its `created_at`:** decoding dropped it, so re-encoding an untouched entry in a merge or a rewritten node gave different bytes, tree and commit hash than Python kvgit.
+- e3b247f: **`keys(prefix)` and `items(prefix)` find every key under the prefix on SQLite and IndexedDB:** the scan stopped at the prefix plus U+FFFF, so SQLite missed keys with a character outside the BMP after the prefix (an emoji, say), and both missed keys with U+FFFF there; the scan now runs up to the least string past the prefix, and is open above when there is none.
+- 83c2b5b: **Diffs and merges handle keys named like `Object.prototype` members:** a diff read a leaf's inherited members as keys, so removing a key such as `toString` threw instead of reporting it removed, and adding one such as `hasOwnProperty` went unreported.
+
 ## 0.2.0
 
 ### Minor Changes
