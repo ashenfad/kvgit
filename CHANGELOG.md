@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Both packages run on one Rust core.** Commits, merges, sweeps, history and sync run in `crates/core`, under a native extension in Python and WebAssembly in TypeScript; a store either package writes, the other reads, and their commits hash the same.
+- **Python ships platform wheels.** `abi3` wheels for CPython 3.10 and later on Linux (glibc and musl), macOS and Windows; building the sdist needs a Rust toolchain.
+- **The TypeScript package carries the core.** The wasm is inlined in the package and `Repo.open` loads it, under Node and in bundlers and workers alike.
 - **TypeScript's worktree values are bounded in bytes.** `valueCacheBytes` (32 MB per worktree by default, `0` holds none) bounds the decoded values each worktree remembers, least recently used first out, as Python's `value_cache_bytes` does; `wt.cache` is the `ValueCache`.
 - **Python resolves values it names.** `Repo.resolve(base, ours, theirs)` runs a branch merge's three-way resolve over caller-supplied values, and `Repo.merge_rule(key)` says which rule governs a key; `EMPTY_ROOT` is the root of an empty keyset.
 - **Python's `Repo` takes `now`.** The clock commit and tag times are read from and a sweep's `min_age` is measured by, as TypeScript's `now` is.
@@ -17,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Python syncs, internally.** `kvgit._sync` pushes, pulls and syncs branches with a remote as TypeScript does, from the same core, with a reference `MemoryRemote`; it isn't public API yet.
 
 ### Changed
+- **The TypeScript package takes kvgit's version.** `@agex-ts/kvgit` releases with the Python package under one version number, from 0.2.1 to 0.5.0.
 - **Breaking (TypeScript): the engine layer leaves the exports.** `VersionedKV`, `VersionedBase`, `Staged`, `jsonEncoder`/`jsonDecoder`, `Hamt`, `Keyset`, `NodeCache`, `encodeEntry`/`decodeEntry`, `resolveMerge`, `pickMergePolicy`, `diffKeysets` and `walkHistory` go with their types; so do `Repo.nodeCache` and `Worktree.nodeCache`, and `lazy` takes only a boolean.
 - **Breaking (TypeScript): `Namespaced` wraps a worktree.** Its `delete`, `keys` and `descendantKeys` are async (`Promise<boolean>`, `Promise<string[]>`), as a `Worktree`'s are.
 - **Breaking (Python): the IndexedDB backend is gone.** `kvgit.kv.indexeddb`, `kvgit.open("indexeddb")` and its `db_name` go, with the Pyodide guide; browsers use the TypeScript package.

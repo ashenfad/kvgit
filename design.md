@@ -38,8 +38,8 @@ In:
   host, TS host) run.
 - Dropping surface nobody should build on: `VersionedBase`, `Staged`,
   and `VersionedKV` as public API.
-- Dropping the fallbacks for history written before v4, once a
-  backfill has brought existing stores up to date.
+- Refusing stores stamped v2 or v3. History written before v4 in a
+  store stamped v4 reads as stored.
 
 Out:
 
@@ -269,17 +269,13 @@ core treats them this way:
   There is no separate read path for them.
 - **Entries carrying `created_at`** are read and written back with it,
   in its stored position, so an untouched subtree re-encodes to the
-  bytes it was stored as. The core never writes it on a new entry.
-  TypeScript's reader drops it today, which makes the two
-  implementations write different nodes for the same change on such a
-  store; the corpus covers it and the fix lands on `main` first.
-- **Commits without stored generations** are not read: there is no
-  whole-history walk for merge base. The backfill below writes their
-  generations first.
-- **Parent records stored as a bare string** are not read; the
-  backfill rewrites them as lists, which changes no hash.
-- **Stores stamped v2 or v3** are refused; the backfill raises the
-  stamp.
+  bytes it was stored as. The core never writes it on a new entry; the
+  corpus pins both hosts to it.
+- **Commits without stored generations** are read, and a search that
+  reaches one walks the whole history below it.
+- **Parent records stored as a bare string** read as a one-parent list.
+- **Stores stamped v2 or v3** are refused. kvgit 0.4.x stamps a store
+  v4 on its first commit to it.
 
 Chunks stay: entries keep their chunk references, GC marks and sweeps
 chunks, and the scientific codec keeps writing them from Python.
@@ -354,7 +350,7 @@ a conflict, as now).
   thread and in workers. Initialization happens inside `Repo.open`,
   which is already async, so callers see no new step. The module's
   bytes are inlined in the package as base64, so no bundler or server
-  has to resolve a `.wasm` URL; the release build is 97 KB gzipped.
+  has to resolve a `.wasm` URL; the release build is 242 KB gzipped.
 - **Versions:** both packages release together under one version
   number, starting at 0.5.0. `core` merges to `main` as that release.
 - **Changelog:** one `CHANGELOG.md` at the root, entries marked by
@@ -364,9 +360,10 @@ a conflict, as now).
 
 - **The corpus** (`corpus/`) is the shared specification: scenarios as
   data, each an initial store, a script of operations by named actors,
-  and the expected results and final store bytes. The core runs it
-  with an in-memory store and full control of interleaving; each host
-  runs it through its public API. The existing goldens (`golden-v4`,
+  and the expected results and final store bytes. Each host runs it
+  through its public API; the core runs its commit scenarios with an
+  in-memory store and full control of interleaving, and reads every
+  recorded store back. The existing goldens (`golden-v4`,
   `merge-golden`) become corpus scenarios; codec goldens
   (`golden-cbor`) stay with the TypeScript host.
 - **The current suites** keep testing each host's public API. Tests of
@@ -377,21 +374,14 @@ a conflict, as now).
 
 ## Migration
 
-For stores the core would refuse, the last pure-Python release on
-`main` (a 0.4.x) ships the tooling:
+No store is rewritten. A store stamped v4 opens as it is, whatever
+history it holds; one stamped v2 or v3 is refused, and takes one commit
+under kvgit 0.4.x, which raises its stamp, before 0.5 opens it.
 
-- **An inventory** that reports, per store, its stamp, how many commits
-  lack generations, how many parent records are bare strings, and, for
-  information, how many entries carry `created_at` and how many
-  reachable blobs use commit-keyed pointers.
-- **A backfill** that writes each commit's parents' generations,
-  rewrites bare-string parent records as lists, and raises the stamp
-  to 4. None of these is part of a commit's hash, so no commit changes
-  name and commit hashes recorded elsewhere stay valid. It only adds
-  keys or rewrites records to an equal value, so it is safe on a live
-  store and safe to re-run.
-
-Entries and blobs are not rewritten: the core reads both as stored.
+Python's `Disk` backend changes its files: it writes one SQLite table
+where it wrote diskcache's layout. `Disk.import_diskcache` copies a
+diskcache store into a new one, key for key, without unpickling
+anything; the old files stay until their owner removes them.
 
 ## Consumers
 
@@ -415,10 +405,10 @@ Made 2026-10-23:
 - The public APIs stay mostly as they are; changes are made where they
   pay and listed as breaking.
 - `VersionedBase`, `Staged` and `VersionedKV` leave the public API.
-- The fallbacks for pre-v4 history go (the merge-base walk, bare-string
-  parents, v2 and v3 stamps), after a hash-preserving backfill. Pre-v4
-  entries and blob pointers stay readable as stored; nothing is
-  rewritten.
+- Stores stamped v2 or v3 are refused. Pre-v4 history in a store
+  stamped v4 (commits without generations, bare-string parents, entries
+  with `created_at`, commit-keyed blob pointers) reads as stored;
+  nothing is rewritten.
 - No Pyodide build of the Python package.
 
 Made 2026-10-26, with sync:
@@ -438,6 +428,14 @@ Made 2026-10-27, with the public surface:
   writes nothing, so chunk-aware codecs encode its values as merge
   output.
 - TypeScript's `lazy` stays an accepted no-op.
+
+Made 2026-10-27, for the release:
+
+- No inventory or backfill release on `main`: the core reads pre-v4
+  history in a v4 store, and only a v2 or v3 stamp needs a commit under
+  0.4.x.
+- Python's `Disk` backend moves from diskcache to one SQLite table in
+  0.5.0, with an explicit import of diskcache stores.
 
 ## Open questions
 

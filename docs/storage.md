@@ -109,5 +109,5 @@ always wall-clock seconds.
 A store stamped with any version other than 4, or with branches and no
 stamp, is refused, by every handle and every sweep, and nothing is
 written to it. A fresh store is stamped 4 when it is opened. Stores
-written by kvgit 0.3 read once their stamp is raised to 4; nothing they
-hold is rewritten.
+written by kvgit 0.3 read once their stamp is raised to 4, which kvgit
+0.4's first commit to a store does; nothing they hold is rewritten.

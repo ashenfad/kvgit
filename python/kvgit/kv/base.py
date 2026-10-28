@@ -17,7 +17,7 @@ class KVStore(ABC):
       publishes every commit through it, with the GC lease among the
       expected keys, which is what lets a sweep run beside writers. Any
       store with a multi-key transaction or conditional batch can
-      provide it (SQLite, Postgres, IndexedDB, Redis, DynamoDB).
+      provide it (SQLite, Postgres, Redis, DynamoDB).
     * ``keys(prefix)`` — the keys under a prefix, which a backend with an
       ordered index answers without scanning everything.
 

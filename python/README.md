@@ -199,9 +199,10 @@ that reads it. For a store more than one party can write, use
 `bytes`, and you choose where (if anywhere) untrusted pickles are
 loaded. `snapshot.raw` reads the stored bytes under any codec.
 
-The codec is fixed per store in practice: values written under one read
-back as that codec's bytes under another, so switching an existing
-store means rewriting its values.
+The codec is fixed per store in practice: values written under one
+codec read back as their stored bytes under `"bytes"` and generally
+fail to decode under any other, so switching an existing store means
+rewriting its values.
 
 ## Chunked codecs (numpy / pandas)
 
@@ -218,7 +219,7 @@ s["full"] = big
 s["head"] = big[:100_000]
 s["tail"] = big[-100_000:]
 s.commit()
-# All three keys reference the same chunk on disk -- ~8 MB total, not ~24 MB.
+# All three keys reference the same chunk in the store -- ~8 MB total, not ~24 MB.
 ```
 
 Pandas DataFrames piggyback on the numpy codec via their underlying block ndarrays. See [`docs/quick-start.md`](../docs/quick-start.md#storing-scientific-data-efficiently-chunked-codecs) and the [API reference](../docs/api.md#chunked-codecs).
