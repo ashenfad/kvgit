@@ -4,7 +4,8 @@ The same workloads in both packages, through their public APIs, on the
 in-memory backend. Numbers from the code before the core are the
 baseline (`baseline/`) the core is measured against; the gate after the
 kernel stage asks that nothing that matters gets slower. `kernel/`,
-`protocol/` and `engine/` hold the numbers after each stage since.
+`protocol/`, `engine/` and `sync/` hold the numbers after each stage
+since, and `release/` the numbers of the code that releases.
 
 The in-memory backend keeps storage out of the numbers, so they show
 what the engine costs: encoding, hashing, building and walking the
@@ -385,3 +386,100 @@ decisions and each commit for its replay.
 
 "Before" here is the engine stage's wasm; the core now also carries
 the ancestry searches, the wire walk and replay, and sync heads.
+
+## The release
+
+Recorded on `core` at 9501605, with the public-surface stage merged:
+Python's `Engine` under its `Repo` and `Worktree`, and TypeScript's
+worktree values bounded in bytes (`valueCacheBytes`, 32 MB by default)
+(`release/`). Three builds were run twice, interleaved: the code before
+the core (c40337a, the baseline's), the sync stage's (5b98480), and
+this one, each with the same scripts. Each column is the faster of its
+two runs.
+
+**Python** (`release/python.json`):
+
+| workload | before the core ms | sync stage ms | release ms | ÷ before | ÷ sync stage |
+|---|---|---|---|---|---|
+| `world.bulk_import` | 3,458.341 | 1,949.847 | 2,039.761 | 0.59× | 1.05× |
+| `world.open` | 325.678 | 0.024 | 0.027 | 0.00× | 1.12× |
+| `world.keys_cold` | 321.118 | 136.920 | 132.439 | 0.41× | 0.97× |
+| `world.keys_warm` | 2.925 | 9.494 | 6.820 | 2.33× | 0.72× |
+| `world.list_dir` | 5.819 | 12.939 | 10.750 | 1.85× | 0.83× |
+| `world.read_all` | 521.337 | 737.756 | 785.540 | 1.51× | 1.06× |
+| `world.reads_10k` | 356.371 | 70.870 | 68.901 | 0.19× | 0.97× |
+| `world.commit_one` | 0.102 | 0.053 | 0.053 | 0.52× | 1.00× |
+| `world.commit_1k` | 45.713 | 25.042 | 24.652 | 0.54× | 0.98× |
+| `world.merge` | 9.263 | 4.903 | 4.845 | 0.52× | 0.99× |
+| `world.gc` | 707.353 | 306.820 | 299.718 | 0.42× | 0.98× |
+| `kvsql.snapshot` | 21.587 | 23.681 | 24.005 | 1.11× | 1.01× |
+| `kvsql.append` | 0.063 | 0.029 | 0.030 | 0.48× | 1.03× |
+| `kvsql.open` | 0.243 | 0.020 | 0.022 | 0.09× | 1.10× |
+| `kvsql.replay` | 92.040 | 67.019 | 69.768 | 0.76× | 1.04× |
+| `kvsql.merge` | 0.142 | 0.063 | 0.067 | 0.47× | 1.06× |
+| `kvsql.gc` | 684.674 | 50.098 | 49.903 | 0.07× | 1.00× |
+
+**TypeScript** (`release/ts.json`):
+
+| workload | before the core ms | sync stage ms | release ms | ÷ before | ÷ sync stage |
+|---|---|---|---|---|---|
+| `world.bulk_import` | 17,402.687 | 4,864.124 | 5,066.513 | 0.29× | 1.04× |
+| `world.open` | 247.328 | 0.090 | 0.068 | 0.00× | 0.76× |
+| `world.keys_cold` | 308.654 | 180.044 | 167.588 | 0.54× | 0.93× |
+| `world.keys_warm` | 46.711 | 33.839 | 20.550 | 0.44× | 0.61× |
+| `world.list_dir` | 47.805 | 36.400 | 20.861 | 0.44× | 0.57× |
+| `world.read_all` | 449.932 | 1,110.666 | 1,202.350 | 2.67× | 1.08× |
+| `world.reads_10k` | 235.084 | 15.177 | 16.605 | 0.07× | 1.09× |
+| `world.commit_one` | 0.236 | 0.152 | 0.155 | 0.66× | 1.02× |
+| `world.commit_1k` | 177.842 | 70.879 | 70.757 | 0.40× | 1.00× |
+| `world.merge` | 20.393 | 11.051 | 10.992 | 0.54× | 0.99× |
+| `world.gc` | 353.324 | 507.886 | 514.250 | 1.46× | 1.01× |
+| `kvsql.snapshot` | 33.239 | 30.969 | 34.433 | 1.04× | 1.11× |
+| `kvsql.append` | 0.134 | 0.089 | 0.089 | 0.66× | 1.00× |
+| `kvsql.open` | 0.193 | 0.039 | 0.030 | 0.16× | 0.77× |
+| `kvsql.replay` | 83.693 | 95.885 | 94.311 | 1.13× | 0.98× |
+| `kvsql.merge` | 0.208 | 0.161 | 0.147 | 0.71× | 0.91× |
+| `kvsql.gc` | 35.746 | 94.493 | 98.059 | 2.74× | 1.04× |
+| `sync.push_history` | 1,280.969 | 517.695 | 515.910 | 0.40× | 1.00× |
+| `sync.pull_history` | 1,270.245 | 543.946 | 555.707 | 0.44× | 1.02× |
+| `sync.push_one` | 0.358 | 0.378 | 0.404 | 1.13× | 1.07× |
+| `sync.pull_one` | 0.357 | 0.421 | 0.439 | 1.23× | 1.04× |
+
+Against the sync stage, the release costs what it did: most workloads
+are within a few percent either way, inside the spread between two
+runs of one build (Python's `read_all` ran 738 and 865 ms at the sync
+stage, TypeScript's snapshot 31 and 39 ms). TypeScript reading every
+file is the exception: 8% slower, and both its runs slower than either
+of the sync stage's. Listing an open
+worktree is faster, by a quarter in Python and by 40% in TypeScript.
+
+Against the code before the core, both packages are faster at
+importing, committing, merging, opening and syncing a history: the
+world's import takes 0.59× and 0.29× as long, a 1,000-file
+commit about half and two fifths, a whole history syncs in two fifths
+of the time, and every worktree opens in hundredths of a millisecond.
+What is slower, all but the last as the earlier stages recorded:
+
+- **Reading every file of the world**: 1.5× in Python, 2.7× in
+  TypeScript. Each read walks the tree through the content cache, where
+  a loaded worktree held every entry. Reads of a working set are five
+  times as fast in Python and fourteen times in TypeScript.
+- **Python's listings of an open worktree**: 3 ms to 7 ms over 100,000
+  keys, and one directory's files 6 ms to 11 ms, as the keys cross from
+  the core's index.
+- **TypeScript's sweeps**: 160 ms more over the world and 60 ms more
+  over kvsql's log, and its replay 10 ms more, the fixed cost of each
+  operation's crossing into wasm.
+- **Syncing one commit** takes a few hundredths of a millisecond more.
+- **Python writing kvsql's 64 MB snapshot**: 2 ms more (1.11×), slower
+  in both runs than either of the baseline's. TypeScript's snapshot is
+  within the spread of its runs (31 to 43 ms across the builds).
+
+TypeScript's value cache costs nothing a full pass can see: with
+`valueCacheBytes: 0`, reading every file takes 1,170 to 1,217 ms, and
+10,000 reads of 1,000 files take 130 ms where the default's take 17.
+
+| | sync stage | release |
+|---|---|---|
+| the wasm, bytes | 740,783 | 740,667 |
+| the wasm, gzipped | 242 KB | 242 KB |
