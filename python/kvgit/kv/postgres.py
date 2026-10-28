@@ -6,7 +6,7 @@ Requires ``pip install kvgit[postgres]`` (psycopg 3 and its pool).
 import re
 from collections.abc import Iterable, Mapping
 
-from .base import KVStore
+from .base import KVStore, prefix_upper_bound
 
 try:
     from psycopg import errors, sql
@@ -19,26 +19,6 @@ except ImportError as e:  # pragma: no cover - exercised only without the extra
 
 _TABLE_NAME = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
 _DEADLOCK_RETRIES = 5
-_MAX_CODE_POINT = 0x10FFFF
-
-
-def _prefix_upper_bound(prefix: str) -> str | None:
-    """The least string greater than every string starting with ``prefix``.
-
-    Under the C collation Postgres compares UTF-8 bytes, which order the
-    same as code points, so it is ``prefix`` with its last character
-    bumped by one — carried leftwards past characters already at
-    U+10FFFF, and stepped over the surrogates, which UTF-8 cannot hold.
-    None when every character is U+10FFFF: nothing is greater, and the
-    range is open above.
-    """
-    stem = prefix.rstrip(chr(_MAX_CODE_POINT))
-    if not stem:
-        return None
-    bumped = ord(stem[-1]) + 1
-    if 0xD800 <= bumped <= 0xDFFF:
-        bumped = 0xE000
-    return stem[:-1] + chr(bumped)
 
 
 class Postgres(KVStore):
@@ -166,11 +146,11 @@ class Postgres(KVStore):
         """Every key, or only those starting with ``prefix``.
 
         The prefix form is a range scan on the primary key, from the
-        prefix up to :func:`_prefix_upper_bound`.
+        prefix up to :func:`~kvgit.kv.base.prefix_upper_bound`.
         """
         if not prefix:
             return [r[0] for r in self._fetch("SELECT k FROM {t}")]
-        upper = _prefix_upper_bound(prefix)
+        upper = prefix_upper_bound(prefix)
         if upper is None:
             rows = self._fetch("SELECT k FROM {t} WHERE k >= %s", (prefix,))
         else:

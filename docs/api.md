@@ -972,17 +972,24 @@ store.memory  # underlying dict, for debugging
 
 ## Disk
 
-Persistent `KVStore` via [diskcache](https://pypi.org/project/diskcache/). Requires `pip install kvgit[disk]`.
+Persistent `KVStore` in one SQLite table, `kvgit.sqlite3` in a directory of its own. It needs only the standard library.
 
 ```python
 from kvgit.kv.disk import Disk
 
-store = Disk("/path/to/db")                      # default: unbounded
-store = Disk("/path/to/db", size_limit=10 * 1024**3)  # explicit 10 GiB cap
-store = Disk("/path/to/db", size_limit=None)     # also unbounded (explicit)
+store = Disk("/path/to/db")   # the directory, created if missing
 ```
 
-By default the store has no practical size cap. Pass `size_limit` (in bytes) to enable diskcache's eviction policy. CAS and transactional operations are safe across multiple processes (backed by SQLite file locking).
+Keys are an indexed `TEXT` primary key, so `keys(prefix)` reads only the keys under the prefix, and values are `BLOB`s of any size. The database runs in WAL mode, so readers never block the writer, and any number of processes may share the directory: every write is one transaction, and `cas_many` holds SQLite's write lock from its first read to its last write. Each thread uses its own connection; `close()` closes them all.
+
+A directory holding a diskcache store (the layout this backend kept before 0.5) and no `kvgit.sqlite3` raises `StorageVersionError`. Copy it with no writer running:
+
+```python
+store = Disk.import_diskcache("/path/to/db")                  # beside the old files
+store = Disk.import_diskcache("/path/to/db", "/path/to/new")  # into another directory
+```
+
+The import copies every key with its bytes, including the values diskcache kept in files of their own, and unpickles nothing: a key or value that isn't plain text and bytes, which kvgit never writes, refuses it with `ValueError`. It writes the database under a temporary name and links it into place whole, so a failed import leaves nothing that opens, and a store another process made at the destination meanwhile is left as it is. Imported beside them, the old files stay until you remove them: `cache.db` and diskcache's hex-named subdirectories. `FileExistsError` if the destination already holds a `Disk` store.
 
 ---
 

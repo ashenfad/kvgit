@@ -3,6 +3,28 @@
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
 
+_MAX_CODE_POINT = 0x10FFFF
+
+
+def prefix_upper_bound(prefix: str) -> str | None:
+    """The least string greater than every string starting with ``prefix``.
+
+    UTF-8 bytes order the same as code points, so a store that compares
+    keys as UTF-8 bytes answers ``keys(prefix)`` as the range from
+    ``prefix`` up to this. It is ``prefix`` with its last character
+    bumped by one — carried leftwards past characters already at
+    U+10FFFF, and stepped over the surrogates, which UTF-8 cannot hold.
+    None when every character is U+10FFFF: nothing is greater, and the
+    range is open above.
+    """
+    stem = prefix.rstrip(chr(_MAX_CODE_POINT))
+    if not stem:
+        return None
+    bumped = ord(stem[-1]) + 1
+    if 0xD800 <= bumped <= 0xDFFF:
+        bumped = 0xE000
+    return stem[:-1] + chr(bumped)
+
 
 class KVStore(ABC):
     """Key-value store operating on bytes only.

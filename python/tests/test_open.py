@@ -70,12 +70,8 @@ class TestOpenRoundTrip:
 
 
 class TestOpenDisk:
-    """Round trips against the disk-backed factory.
-
-    A regression once passed size_limit=0 to the diskcache backend, which
-    means "0 bytes allowed" rather than "no limit", so every write was
-    evicted immediately and the store appeared empty after commit.
-    """
+    """Round trips against the disk-backed factory: what a commit writes
+    is there after it, and after the store is reopened."""
 
     def test_disk_round_trip_within_session(self):
         with tempfile.TemporaryDirectory() as d:

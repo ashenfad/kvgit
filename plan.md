@@ -203,6 +203,11 @@ clean, with the four packages linked.
 - `core` merges to `main`; 0.5.0 releases both packages.
 - agex-ts drops `packages/kvgit-ts` and depends on the published
   package; agex-studio and nontainer raise their floors.
+- nontainer's 0.5 branch moves its disk stores with a one-off command,
+  in a module of its own, that runs `Disk.import_diskcache` on a
+  store's `kvgit` directory; opening a store not yet moved fails with
+  the command's name. Both leave nontainer in a later release, once
+  the stores worth keeping have moved.
 - `design.md` and this plan condense into `docs/design.md`, the
   decisions and their reasons, and leave the root.
 

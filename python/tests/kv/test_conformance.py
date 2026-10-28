@@ -11,6 +11,7 @@ import uuid
 
 import pytest
 
+from kvgit.kv.base import prefix_upper_bound
 from kvgit.kv.composite import Composite
 from kvgit.kv.disk import Disk
 from kvgit.kv.memory import Memory
@@ -164,3 +165,11 @@ class TestKeysByPrefix:
         )
         assert sorted(store.keys(f"a{top}")) == [f"a{top}", f"a{top}x"]
         assert sorted(store.keys(top)) == [top, f"{top}y"]
+
+
+def test_prefix_bounds_carry_past_the_last_code_point():
+    top = chr(0x10FFFF)
+    assert prefix_upper_bound("ab") == "ac"
+    assert prefix_upper_bound("a" + top) == "b"
+    assert prefix_upper_bound(top + top) is None
+    assert prefix_upper_bound("a퟿") == "a"

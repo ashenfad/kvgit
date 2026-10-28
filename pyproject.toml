@@ -35,13 +35,14 @@ dependencies = []
 "Source" = "https://github.com/ashenfad/kvgit"
 
 [project.optional-dependencies]
-disk = ["diskcache"]
+# The disk backend needs only the standard library; the extra stays so
+# that `kvgit[disk]` keeps resolving.
+disk = []
 numpy = ["numpy>=1.24"]
 pandas = ["numpy>=1.24", "pandas>=2.0"]
 scientific = ["numpy>=1.24", "pandas>=2.0"]
 postgres = ["psycopg[binary]>=3.2", "psycopg-pool>=3.2"]
 all = [
-    "diskcache",
     "numpy>=1.24",
     "pandas>=2.0",
     "psycopg[binary]>=3.2",
@@ -49,6 +50,7 @@ all = [
 ]
 dev = [
     "pytest",
+    # Writes the stores the disk backend's import tests copy.
     "diskcache",
     # Pinned to the minor line the [tool.ruff.lint] config below was
     # written against. Ruff's rule *defaults* move between minors, so a

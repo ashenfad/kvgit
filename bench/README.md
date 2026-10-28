@@ -5,7 +5,8 @@ in-memory backend. Numbers from the code before the core are the
 baseline (`baseline/`) the core is measured against; the gate after the
 kernel stage asks that nothing that matters gets slower. `kernel/`,
 `protocol/`, `engine/` and `sync/` hold the numbers after each stage
-since, and `release/` the numbers of the code that releases.
+since, and `release/` the numbers of the code that releases. `disk/`
+holds Python's numbers on its `Disk` backend.
 
 The in-memory backend keeps storage out of the numbers, so they show
 what the engine costs: encoding, hashing, building and walking the
@@ -23,7 +24,9 @@ python bench/table.py bench/baseline/python.json python.json
 
 `--only world`, `--only kvsql` or `--only sync` runs one shape (sync
 is TypeScript's alone); `--quick` shrinks
-every workload to check a script runs.
+every workload to check a script runs. Python's `--store disk` runs
+every workload on the `Disk` backend, in a temporary directory, where
+the rest run in memory.
 
 ## Workloads
 
@@ -483,3 +486,50 @@ TypeScript's value cache costs nothing a full pass can see: with
 |---|---|---|
 | the wasm, bytes | 740,783 | 740,667 |
 | the wasm, gzipped | 242 KB | 242 KB |
+
+## On disk
+
+Python's workloads on its `Disk` backend (`--store disk`), recorded
+with the backend's move from diskcache to one SQLite table
+(`disk/python.json`). The diskcache build (the release's) and this one
+were run twice each, interleaved, and each column is the faster of its
+two runs; the last column is the same workload in memory, from
+`release/`.
+
+| workload | diskcache ms | SQLite ms | ÷ diskcache | in memory ms |
+|---|---|---|---|---|
+| `world.bulk_import` | 7,163.432 | 2,216.629 | 0.31× | 2,039.761 |
+| `world.open` | 0.051 | 0.049 | 0.96× | 0.027 |
+| `world.keys_cold` | 378.073 | 301.851 | 0.80× | 132.439 |
+| `world.keys_warm` | 6.685 | 6.543 | 0.98× | 6.820 |
+| `world.list_dir` | 9.685 | 9.803 | 1.01× | 10.750 |
+| `world.read_all` | 1,636.359 | 1,419.996 | 0.87× | 785.540 |
+| `world.reads_10k` | 86.219 | 92.123 | 1.07× | 68.901 |
+| `world.commit_one` | 0.513 | 0.252 | 0.49× | 0.053 |
+| `world.commit_1k` | 173.518 | 62.812 | 0.36× | 24.652 |
+| `world.merge` | 12.526 | 8.609 | 0.69× | 4.845 |
+| `world.gc` | 39,986.542 | 590.859 | 0.01× | 299.718 |
+| `kvsql.snapshot` | 106.685 | 117.623 | 1.10× | 24.005 |
+| `kvsql.append` | 0.464 | 0.208 | 0.45× | 0.030 |
+| `kvsql.open` | 0.050 | 0.042 | 0.84× | 0.022 |
+| `kvsql.replay` | 191.399 | 160.841 | 0.84× | 69.768 |
+| `kvsql.merge` | 0.429 | 0.243 | 0.57× | 0.067 |
+| `kvsql.gc` | 1,215.739 | 244.965 | 0.20× | 49.903 |
+
+- **Sweeps** take a seventieth of the time over the world's 100,000
+  files (40 s to 0.6 s) and a fifth over kvsql's log. Each sweep asks
+  for the keys under a few prefixes; diskcache read every key in the
+  store for each, and the table answers each from its index.
+- **Commits** take half the time or less, and the world's import a
+  third.
+- **Reads** cost about what they did: a full pass is 13% faster, and
+  10,000 reads of a working set 7% slower. Each read is a lookup in
+  the primary key's index and then in the table.
+- **kvsql's snapshot**, eight 8 MB chunks, runs within the spread of
+  diskcache's runs (107 and 141 ms). WAL writes each chunk twice, to
+  the log and then the database, where diskcache wrote each file once;
+  16 KB pages keep the chunks' overflow pages few.
+
+The page size was measured on the same workloads: 4 KB pages took
+twice as long over the snapshot, and 64 KB pages made small commits
+twice as slow.
