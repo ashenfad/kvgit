@@ -11,10 +11,8 @@ wt = kvgit.open()
 That's it: a `Worktree` on branch `main` of an in-memory `Repo`. For persistence, pass a backend:
 
 ```python
-wt = kvgit.open("disk", path="/tmp/mydb")      # SQLite-backed via diskcache
+wt = kvgit.open("disk", path="/tmp/mydb")      # one SQLite file in that directory
 ```
-
-`kind="disk"` requires `pip install kvgit[disk]`.
 
 `kvgit.open()` is sugar. It builds a `Repo` over the backend and opens (or creates) one branch. Build the `Repo` yourself for any other backend, or to set repo-wide options:
 

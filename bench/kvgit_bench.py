@@ -3,10 +3,11 @@ package's public API on the in-memory backend.
 
 Usage, from the repository root:
 
-    uv run --extra dev python bench/kvgit_bench.py [--quick] [--json PATH] [--only SHAPE]
+    uv run --extra dev python bench/kvgit_bench.py [--quick] [--json PATH] [--only SHAPE] [--store disk]
 
 ``--quick`` shrinks every workload to check the script runs; its
-numbers mean nothing.
+numbers mean nothing. ``--store disk`` runs every workload on the
+``Disk`` backend, in a temporary directory, instead of in memory.
 """
 
 from __future__ import annotations
@@ -20,11 +21,14 @@ import random
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Callable
 from typing import Any
 
 from kvgit import Repo
+from kvgit.kv.base import KVStore
+from kvgit.kv.disk import Disk
 from kvgit.kv.memory import Memory
 
 HOST = "python"
@@ -62,6 +66,25 @@ def repeat(fn: Callable[[], Any], times: int) -> list[float]:
     return [timed(fn)[0] for _ in range(times)]
 
 
+# -- Stores --
+
+
+class Stores:
+    """Makes each workload's store: in memory, or on disk under one
+    temporary directory removed when the run ends."""
+
+    def __init__(self, kind: str) -> None:
+        self.kind = kind
+        self.root = tempfile.TemporaryDirectory(prefix="kvgit-bench-")
+        self.made = 0
+
+    def new(self) -> KVStore:
+        if self.kind == "memory":
+            return Memory()
+        self.made += 1
+        return Disk(f"{self.root.name}/{self.made}")
+
+
 # -- The world's shape: one key per file --
 
 
@@ -73,10 +96,10 @@ def file_body(i: int, version: int = 0) -> bytes:
     return (f"file {i} version {version}\n" * 12).encode()
 
 
-def world(results: Results, files: int, rounds: int) -> None:
+def world(results: Results, stores: Stores, files: int, rounds: int) -> None:
     imports = []
     for _ in range(3):
-        store = Memory()
+        store = stores.new()
         repo = Repo(store, codec="bytes")
         wt = repo.worktree("main", create=True)
         for i in range(files):
@@ -163,9 +186,11 @@ def world(results: Results, files: int, rounds: int) -> None:
 CHUNK = 8 << 20
 
 
-def kvsql(results: Results, entries: int, chunks: int, rounds: int) -> None:
+def kvsql(
+    results: Results, stores: Stores, entries: int, chunks: int, rounds: int
+) -> None:
     rng = random.Random(11)
-    store = Memory()
+    store = stores.new()
     repo = Repo(store, codec="bytes")
     wt = repo.worktree("db/1", create=True)
     for i in range(90):
@@ -255,15 +280,18 @@ def main() -> None:
     parser.add_argument("--quick", action="store_true")
     parser.add_argument("--json", metavar="PATH")
     parser.add_argument("--only", choices=["world", "kvsql"])
+    parser.add_argument("--store", choices=["memory", "disk"], default="memory")
     args = parser.parse_args()
 
     results = Results()
+    stores = Stores(args.store)
     rounds = 2 if args.quick else 5
     if args.only in (None, "world"):
-        world(results, files=2_000 if args.quick else 100_000, rounds=rounds)
+        world(results, stores, files=2_000 if args.quick else 100_000, rounds=rounds)
     if args.only in (None, "kvsql"):
         kvsql(
             results,
+            stores,
             entries=50 if args.quick else 3_000,
             chunks=2 if args.quick else 8,
             rounds=rounds,
@@ -273,6 +301,7 @@ def main() -> None:
         "runtime": f"CPython {platform.python_version()}",
         "machine": machine(),
         "quick": args.quick,
+        "store": args.store,
         "results": results.rows,
     }
     if args.json:

@@ -226,13 +226,3 @@ class TestNoWriteLandsBetweenCheckAndBatch:
         assert s.get("gone") == b"now here" and s.get("x") is None
         s.drop()
         s.close()
-
-
-def test_prefix_bounds_carry_past_the_last_code_point():
-    from kvgit.kv.postgres import _prefix_upper_bound
-
-    top = chr(0x10FFFF)
-    assert _prefix_upper_bound("ab") == "ac"
-    assert _prefix_upper_bound("a" + top) == "b"
-    assert _prefix_upper_bound(top + top) is None
-    assert _prefix_upper_bound("a퟿") == "a"

@@ -48,8 +48,8 @@ def open(
     anything more — another backend, merge rules, several branches.
 
     Args:
-        kind: ``"memory"`` (default) or ``"disk"`` (``pip install
-            kvgit[disk]``).
+        kind: ``"memory"`` (default) or ``"disk"`` (SQLite, in the
+            directory ``path``).
         path: The directory, for ``kind="disk"``.
         branch: The branch to check out (default ``"main"``).
         codec: How values are stored; see :class:`Repo`.

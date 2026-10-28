@@ -391,7 +391,10 @@ anything; the old files stay until their owner removes them.
   checkout. A change that spans kvgit and the world becomes two PRs.
 - **nontainer** moves off `kvgit.versioned.merge`,
   `kvgit.versioned.keyset` and `kvgit.hamt` to the public replacements
-  above, and raises its floor to 0.5.0.
+  above, and raises its floor to 0.5.0. It moves its disk stores with
+  a one-off command of its own, kept apart from the code that opens
+  them so that it leaves in a later release without touching that
+  code.
 
 ## Decisions
 
