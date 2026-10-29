@@ -1,8 +1,8 @@
 name: Build
 
 # Every distributable built on every change, none published: a wheel per
-# platform, the sdist, and the npm tarball. Publishing is the release
-# workflow's job.
+# platform, the sdist, and the npm tarball. The release workflow calls
+# this one and publishes what it built.
 
 on:
   push:
@@ -11,6 +11,7 @@ on:
   # branch of the PR below it.
   pull_request:
   workflow_dispatch:
+  workflow_call:
 
 jobs:
   # abi3 wheels for CPython 3.10 and up, one per platform. Each wheel

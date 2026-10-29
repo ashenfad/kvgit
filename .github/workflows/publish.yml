@@ -1,33 +1,90 @@
-name: Publish to PyPI
+name: Publish
+
+# A GitHub release publishes what the build workflow makes from its tag:
+# every wheel and the sdist to PyPI, the tarball to npm. Both registries
+# trust this workflow by OIDC (a trusted publisher on PyPI's `kvgit` and
+# on npm's `@agex-ts/kvgit`, each naming this repository and this file;
+# npm's must allow `npm publish`, which it doesn't by default), so no
+# token is stored, and each upload carries an attestation of the run
+# that built it. A registry that fails is retried by re-running its job
+# alone; a version once published can't be published again.
 
 on:
   release:
     types: [released]
 
+permissions:
+  contents: read
+
 jobs:
-  build:
+  # The tag names the version, and every package must carry it: the
+  # Cargo workspace's (which the wheels and the sdist take) and the npm
+  # package's.
+  versions:
     runs-on: ubuntu-latest
+
     steps:
     - uses: actions/checkout@v4
 
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: "3.12"
-
-    - name: Install build dependencies
+    - name: Check the versions against the tag
       run: |
-        python -m pip install --upgrade pip
-        pip install build twine
+        tag="${GITHUB_REF_NAME#v}"
+        cargo=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+        npm=$(node -p "require('./ts/package.json').version")
+        echo "tag $tag, Cargo $cargo, npm $npm"
+        [ "$cargo" = "$tag" ] && [ "$npm" = "$tag" ]
 
-    - name: Build package
-      run: python -m build
+  build:
+    needs: versions
+    uses: ./.github/workflows/build.yml
 
-    - name: Check package
-      run: twine check dist/*
+  pypi:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/kvgit/
+    permissions:
+      id-token: write
+
+    steps:
+    - uses: actions/download-artifact@v4
+      with:
+        pattern: wheel-*
+        merge-multiple: true
+        path: dist
+
+    - uses: actions/download-artifact@v4
+      with:
+        name: sdist
+        path: dist
 
     - name: Upload to PyPI
-      env:
-        TWINE_USERNAME: __token__
-        TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
-      run: twine upload dist/*
+      uses: pypa/gh-action-pypi-publish@release/v1
+
+  npm:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+
+    steps:
+    - uses: actions/download-artifact@v4
+      with:
+        name: npm
+        path: npm
+
+    # `registry-url` writes the `.npmrc` the OIDC exchange authenticates
+    # against.
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 24
+        registry-url: https://registry.npmjs.org
+
+    # Trusted publishing needs npm 11.5.1 or later, and attaches the
+    # provenance attestation itself.
+    - name: Update npm
+      run: npm install -g npm@11
+
+    - name: Publish to npm
+      run: npm publish npm/*.tgz --access public
