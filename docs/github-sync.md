@@ -118,9 +118,9 @@ is deterministic, checked in Node, and gzip is deterministic within one
 engine. So the parts get the same SHAs. Before uploading, one GraphQL
 query asks for all of them (`p0: object(oid: …) { oid }`, up to 100 a
 query, a read), and the push skips what GitHub already holds. GitHub
-prunes unreferenced objects only after weeks, so a resume within a
-session finds them. A git commit made but never landed is simply made
-again.
+doesn't prune unreferenced objects at once, so a resume soon after
+finds them; one that finds them gone uploads them again. A git commit
+made but never landed is simply made again.
 
 ### Secondary rate limits
 
