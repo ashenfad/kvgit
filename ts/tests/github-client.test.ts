@@ -162,6 +162,17 @@ describe('requests too large for GitHub', () => {
     expect(calls.length).toBe(1)
   })
 
+  it('measures the body in UTF-8 bytes, as sent', async () => {
+    // 30,000 three-byte characters: 30k UTF-16 units, 90 kB on the wire
+    const { client, calls } = makeClient([{ status: 0, throws: true, takesMs: 5_500 }])
+    const err = await client
+      .graphql('query($b: String!) { a }', { b: '漢'.repeat(30_000) })
+      .catch((e) => e)
+    expect((err as GithubError).kind).toBe('too-large')
+    expect((err as GithubError).message).toMatch(/^A 91 kB request/)
+    expect(calls.length).toBe(1)
+  })
+
   it('retries a network error that is early, on a small body, or on REST', async () => {
     for (const [send, takesMs] of [
       [(c: GithubClient) => c.graphql('query($b: String!) { a }', { b: big }), 100],
