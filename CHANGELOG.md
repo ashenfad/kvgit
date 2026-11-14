@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **TypeScript repositories cache what the store never rewrites.** Tree nodes and commit records are answered from a cache of `cacheBytes` (32 MB by default, 0 turns it off), as Python's are, and any writer's sweep empties it before the next commit builds.
 - **TypeScript gains the commit-scan recoverer.** `recoverByCommitScan`, passed as `recoverFromCorruptHead`, guesses a damaged branch's head as Python's `recover_by_commit_scan` does, from the same code.
 - **`IntegrityError`, in both packages.** A transferred commit whose hash or parent generations don't match what it carries, or whose parent never came, is refused with it before anything of it is written; TypeScript's `applyWire` threw a plain `Error`.
+- **TypeScript's GitHub client names a request too large to send.** A 413, a 499, or a large GraphQL request that fails when GitHub stops waiting for its body (about 5 s; a browser sees a network error) throws `GithubError` of the new kind `too-large`, unretried, and `PackRemote.push` names the pack that didn't make it.
 - **Python syncs, internally.** `kvgit._sync` pushes, pulls and syncs branches with a remote as TypeScript does, from the same core, with a reference `MemoryRemote`; it isn't public API yet.
 
 ### Changed
@@ -34,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking (TypeScript): an empty tag name throws `RangeError`.** It threw `TypeError`; every name the branch and tag calls refuse now throws `RangeError`.
 - **A log reads a level of history at a time.** `log` reads every commit queued in one batch, where it read each commit's records on its own.
 - **Python reads a damaged commit record without raising.** `get_commit` and `log` treat parents, a time or info that don't parse as absent, as TypeScript did.
+- **TypeScript's GitHub packs hold 2 MiB of values by default.** `PackRemote`'s `maxPackBytes` was 16 MiB, more than reaches GitHub within its body deadline on most connections; a fold now rides a push only within what the push's pack leaves of it.
 - **TypeScript's `diff` ignores a change of metadata alone.** A key whose blob is unchanged isn't reported as modified, as in Python.
 - **The commit scan breaks ties by hash.** Of two unclaimed tips made at the same time, it recovers to the smaller hash, where Python picked either.
 - **Breaking (TypeScript): the text merge needs the core loaded.** `text`, `textMergeResult` and the functions `makeTextMerge` builds run the core's merge, which `Repo.open` loads; code that merges text before opening any repository awaits the new `loadCore()` first.
