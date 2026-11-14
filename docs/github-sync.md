@@ -68,9 +68,15 @@ so the fallback is safe.
    parent is the default branch's commit, as now.
 4. **Ref.** GraphQL `updateRefs` with `beforeOid` set to the current
    commit (zero for a creation) and `afterOid` to the new one. This is
-   an exact compare-and-swap, like `expectedHeadOid`. A lost race reads
-   as `#updateRefs` reads one today: re-read, and return false if the
-   ref moved. The request is tiny, so the deadline doesn't matter.
+   an exact compare-and-swap, like `expectedHeadOid`. The request is
+   tiny, so the deadline doesn't matter. After an error, the push
+   re-reads the ref. If the ref is at this push's `afterOid`, the push
+   landed: an earlier attempt applied it and its response was lost, so
+   the client's retry failed on its stale `beforeOid`. If the ref is
+   anywhere else, the race was lost and the push returns false. Today's
+   `#updateRefs`, which archive and delete use, counts any move as a
+   lost race. It gets the same rule, since it can miss a response the
+   same way.
 
 A non-force REST `PATCH git/refs` checks only for a fast-forward. Take
 a session that was deleted and then re-created as a bare ref at the
@@ -137,9 +143,17 @@ proposal assumes git object POSTs count as content-generating.
 
 Writes stay serialized and spaced at 750 ms, under 80 a minute. The
 hourly limit of 500 caps a burst at about 2 GB an hour with 4 MiB
-parts. `Retry-After` is honored as now, with waits capped at 60 s and 3
-retries. A push that still hits the limit fails as `rate-limit`, and
-the next sync resumes without resending parts already up.
+parts.
+
+When a limit is hit, the client follows GitHub's guidance, which it
+doesn't today. It waits the whole `Retry-After`. Without one, it waits
+until `x-ratelimit-reset` when `x-ratelimit-remaining` is 0, and
+otherwise (a secondary limit) at least a minute. It never retries
+sooner, since continuing while limited risks a ban. A wait longer than
+a minute isn't spent inside one request: the request fails as
+`rate-limit`, carrying the time to wait (`retryAfterMs`), so the caller
+schedules the next sync then. That sync resumes without resending parts
+already up.
 
 ## Options
 
