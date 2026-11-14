@@ -187,8 +187,6 @@ export class GithubClient {
     deadlineMs?: number,
   ): Promise<T> {
     const payload = body === undefined ? undefined : JSON.stringify(body)
-    // JSON of base64 is ASCII: its length is its size, near enough
-    const size = payload?.length ?? 0
     const init: RequestInit = {
       method,
       headers: {
@@ -207,8 +205,11 @@ export class GithubClient {
         resp = await this.#fetch(url, init)
       } catch (err) {
         const elapsed = this.#now() - started
-        if (deadlineMs !== undefined && size >= SLOW_BODY_BYTES && elapsed >= deadlineMs) {
-          throw new GithubError('too-large', 0, tooLargeMessage(0, size, elapsed, ''))
+        if (deadlineMs !== undefined && elapsed >= deadlineMs && payload !== undefined) {
+          const size = utf8Bytes(payload)
+          if (size >= SLOW_BODY_BYTES) {
+            throw new GithubError('too-large', 0, tooLargeMessage(0, size, elapsed, ''))
+          }
         }
         if (attempt >= this.#maxRetries) {
           const detail = err instanceof Error ? err.message : String(err)
@@ -238,7 +239,7 @@ export class GithubClient {
         throw new GithubError(
           kind,
           resp.status,
-          tooLargeMessage(resp.status, size, elapsed, message),
+          tooLargeMessage(resp.status, utf8Bytes(payload ?? ''), elapsed, message),
           raw,
         )
       }
@@ -250,6 +251,9 @@ export class GithubClient {
     return this.#retryBaseMs * 2 ** attempt
   }
 }
+
+/** The bytes `text` sends as, in UTF-8 (fetch's encoding of a string body). */
+const utf8Bytes = (text: string): number => new TextEncoder().encode(text).length
 
 /** Why a request was too large, as a person reads it: refused for its
  *  size (413), or dropped before its body arrived (499, or a network
