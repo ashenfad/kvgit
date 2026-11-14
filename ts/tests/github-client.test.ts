@@ -5,6 +5,11 @@ interface Scripted {
   status: number
   body?: unknown
   headers?: Record<string, string>
+  /** How long the request takes, on the harness clock. */
+  takesMs?: number
+  /** Fail as fetch does on a network error (a browser seeing GitHub's
+   *  499, which has no CORS headers), after `takesMs`. */
+  throws?: boolean
 }
 
 interface Harness {
@@ -32,7 +37,9 @@ function makeClient(
       body: init?.body !== undefined ? JSON.parse(init.body as string) : undefined,
       headers,
     })
-    const next = script.shift() ?? { status: 500, body: { message: 'script exhausted' } }
+    const next: Scripted = script.shift() ?? { status: 500, body: { message: 'script exhausted' } }
+    clock += next.takesMs ?? 0
+    if (next.throws === true) throw new TypeError('Failed to fetch')
     return new Response(JSON.stringify(next.body ?? {}), {
       status: next.status,
       headers: next.headers ?? {},
@@ -138,6 +145,50 @@ describe('retry and taxonomy', () => {
     const err = await client.request('GET', 'x').catch((e) => e)
     expect((err as GithubError).kind).toBe('server')
     expect(calls.length).toBe(3)
+  })
+})
+
+describe('requests too large for GitHub', () => {
+  const big = 'A'.repeat(200 * 1024)
+
+  it('takes a large GraphQL request failing at the deadline for a drop: too-large, sent once', async () => {
+    const { client, calls } = makeClient([{ status: 0, throws: true, takesMs: 5_500 }])
+    const err = await client
+      .graphql('mutation($b: String!) { a }', { b: big }, { mutation: true })
+      .catch((e) => e)
+    expect(err).toBeInstanceOf(GithubError)
+    expect((err as GithubError).kind).toBe('too-large')
+    expect((err as GithubError).message).toMatch(/205 kB request failed after 5\.5 s/)
+    expect(calls.length).toBe(1)
+  })
+
+  it('retries a network error that is early, on a small body, or on REST', async () => {
+    for (const [send, takesMs] of [
+      [(c: GithubClient) => c.graphql('query($b: String!) { a }', { b: big }), 100],
+      [(c: GithubClient) => c.graphql('query { a }'), 5_500],
+      [(c: GithubClient) => c.request('POST', 'git/blobs', { content: big }), 5_500],
+    ] as const) {
+      const { client, calls } = makeClient([
+        { status: 0, throws: true, takesMs },
+        { status: 200, body: { data: { a: 1 } } },
+      ])
+      await send(client)
+      expect(calls.length).toBe(2)
+    }
+  })
+
+  it('reads 499 and 413 as too-large, naming the size, and never retries them', async () => {
+    for (const [status, pattern] of [
+      [499, /GitHub dropped a 205 kB request after 6\.0 s/],
+      [413, /GitHub refused a 205 kB request as too large/],
+    ] as const) {
+      const { client, calls } = makeClient([{ status, body: {}, takesMs: 6_000 }])
+      const err = await client.graphql('query($b: String!) { a }', { b: big }).catch((e) => e)
+      expect((err as GithubError).kind).toBe('too-large')
+      expect((err as GithubError).status).toBe(status)
+      expect((err as GithubError).message).toMatch(pattern)
+      expect(calls.length).toBe(1)
+    }
   })
 })
 

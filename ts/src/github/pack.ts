@@ -45,7 +45,7 @@ import { ancestorsAbove, isAncestor } from '../versioned/ancestry'
 import { generationOf, sha256Hex } from '../versioned/layout'
 import { bytesToBase64 } from './base64'
 import type { GithubClient, GraphqlError, GraphqlResult } from './client'
-import { GithubError } from './errors'
+import { GithubError, formatBytes } from './errors'
 import { gitBlobSha1 } from './git-hash'
 
 export const PACK_FORMAT = 1
@@ -109,8 +109,10 @@ export interface PackRemoteOptions {
   /** Packs a fold leaves alone (incremental pulls read only these). Default 4. */
   keepRecent?: number
   /** Most uncompressed value bytes in one pack (and one request); a
-   *  larger push lands as several commits. Default 16 MiB (GitHub
-   *  refuses GraphQL bodies over 45MB and times out well before). */
+   *  larger push lands as several commits, and a fold rides a push only
+   *  if the two together stay under it. Default 2 MiB: GitHub drops a
+   *  GraphQL request whose body hasn't arrived after about 5 s, and a
+   *  pack travels as base64, a third larger. */
   maxPackBytes?: number
 }
 
@@ -336,7 +338,7 @@ export class PackRemote implements Remote {
     this.#meta = opts.meta
     this.#maxPacks = opts.maxPacks ?? 16
     this.#keepRecent = opts.keepRecent ?? 4
-    this.#maxPackBytes = opts.maxPackBytes ?? 16 * 1024 * 1024
+    this.#maxPackBytes = opts.maxPackBytes ?? 2 * 1024 * 1024
     const api = apiRoot(client.apiBase)
     this.id = `github:${api === 'https://api.github.com' ? '' : `${api}/`}${client.repo.toLowerCase()}`
     const [owner, name] = client.repo.split('/') as [string, string]
@@ -548,14 +550,22 @@ export class PackRemote implements Remote {
 
     base = expectedOld
     for (const [i, chunk] of chunks.entries()) {
-      const landed = await this.#pushChunk(
-        branch,
-        st,
-        base,
-        chunk,
-        packs[i] as Uint8Array,
-        i === chunks.length - 1,
-      )
+      const pack = packs[i] as Uint8Array
+      let landed: BranchState | null
+      try {
+        landed = await this.#pushChunk(branch, st, base, chunk, pack, i === chunks.length - 1)
+      } catch (err) {
+        if (!(err instanceof GithubError) || err.kind !== 'too-large') throw err
+        const tip = (chunk.at(-1) as WireCommit).hash.slice(0, 7)
+        const what = chunk.length === 1 ? `commit ${tip}` : `${chunk.length} commits up to ${tip}`
+        const landedNote = i === 0 ? '' : ` (${i} of ${chunks.length} packs landed before it)`
+        throw new GithubError(
+          err.kind,
+          err.status,
+          `PackRemote.push: the pack of ${what}, ${formatBytes(pack.length)} compressed, didn't reach GitHub${landedNote}: ${err.message}`,
+          err.body,
+        )
+      }
       if (landed === null) {
         if (i === 0) return false
         throw new Error(`PackRemote.push: lost the ref after ${i} of ${chunks.length} chunks`)
@@ -595,11 +605,16 @@ export class PackRemote implements Remote {
     let nextSeq = seq + 1
     const deletions: Array<{ path: string }> = []
 
-    // Fold older packs into one when there are too many.
+    // Fold older packs into one when there are too many. The fold
+    // rides this push's request, so it gets what the pack leaves of
+    // maxPackBytes, and both must fit in one request; one that doesn't
+    // is left for a later, smaller push.
     if (last && packs.length > this.#maxPacks) {
-      const folded = await this.#fold(packs.slice(0, packs.length - this.#keepRecent), nextSeq)
-      // the fold rides this push's request, so both must fit in it; a
-      // fold that doesn't is left for a later, smaller push
+      const folded = await this.#fold(
+        packs.slice(0, packs.length - this.#keepRecent),
+        nextSeq,
+        this.#maxPackBytes - bytes.length,
+      )
       if (
         folded !== null &&
         base64Length(bytes.length) + base64Length(folded.bytes.length) <= MAX_BODY_BASE64
@@ -655,16 +670,17 @@ export class PackRemote implements Remote {
     return state
   }
 
-  /** Re-encode a run of packs as one, from the local store. Null when
-   *  the run is too short or too large to be worth one request. */
+  /** Re-encode a run of packs as one, from the local store: the newest
+   *  stretch whose stored bytes fit `budget`. Null when that stretch is
+   *  shorter than two packs. */
   async #fold(
     run: PackEntry[],
     seq: number,
+    budget: number,
   ): Promise<{ entry: PackEntry; bytes: Uint8Array; replaced: PackEntry[] } | null> {
-    // Fold the newest stretch that fits one pack.
     let start = run.length
     let total = 0
-    while (start > 0 && total + (run[start - 1] as PackEntry).bytes <= this.#maxPackBytes) {
+    while (start > 0 && total + (run[start - 1] as PackEntry).bytes <= budget) {
       start--
       total += (run[start] as PackEntry).bytes
     }

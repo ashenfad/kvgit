@@ -13,6 +13,11 @@
  *   - `validation`  422 — payload rejected; NOT retryable (the CAS
  *                   "not a fast forward" 422 is handled by the client's
  *                   ref methods before this surfaces)
+ *   - `too-large`   413, 499, or a large request that failed at GitHub's
+ *                   body deadline — too big, or too slow to arrive
+ *                   (GitHub drops a GraphQL request whose body hasn't
+ *                   arrived within about 5 s); NOT retryable: the same
+ *                   body fails the same way
  *   - `server`      5xx — GitHub-side; retryable
  *   - `network`     fetch itself failed; retryable
  */
@@ -23,6 +28,7 @@ export type GithubErrorKind =
   | 'permission'
   | 'not-found'
   | 'validation'
+  | 'too-large'
   | 'server'
   | 'network'
 
@@ -51,9 +57,15 @@ export function classify(status: number, message: string, headers: Headers): Git
     return 'permission'
   }
   if (status === 404) return 'not-found'
+  if (status === 413 || status === 499) return 'too-large'
   if (status === 422) return 'validation'
   if (status >= 500) return 'server'
   return 'validation'
+}
+
+/** A byte count as a person reads it: `512 kB`, `12.3 MB`. */
+export function formatBytes(n: number): string {
+  return n < 1e6 ? `${Math.ceil(n / 1e3)} kB` : `${(n / 1e6).toFixed(1)} MB`
 }
 
 /** Parse GitHub's `{"message": ...}` error body; fall back to raw text. */

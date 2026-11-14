@@ -432,8 +432,11 @@ await remote.roster() // every session: head, meta, packs, archived
   (`getBlobRaw`) and REST (`request`), scoped to one repo. Mutations
   run one at a time, spaced by `writeIntervalMs`; `server`,
   `rate-limit` and network failures retry with backoff, honoring
-  `Retry-After`, and `auth`, `permission` and `validation` don't (see
-  `GithubError`).
+  `Retry-After`, and `auth`, `permission`, `validation` and
+  `too-large` don't (see `GithubError`). `too-large` is a request
+  GitHub refused for its size (413) or dropped before its body arrived
+  (499, or in a browser a network error about 5 s into a large GraphQL
+  request): sending the same body again would fail the same way.
 - **`PackRemote`**: the `Remote`. `push` lands one pack per request,
   `fetch` reads the packs a receiver lacks, `roster` lists every
   session, live and archived. `archiveBranch`, `restoreBranch`,
@@ -480,15 +483,18 @@ bytes it takes for text).
 
 #### Limits
 
-- A push larger than `maxPackBytes` (16 MiB of values) lands as
-  several packs, each its own compare-and-swap. A single commit too
-  large for one request (about 22 MB compressed) is refused before
-  anything is sent.
+- GitHub drops a GraphQL request whose body hasn't arrived after
+  about 5 s, so what one request can carry depends on the connection.
+  A push larger than `maxPackBytes` (2 MiB of values) lands as several
+  packs, each its own compare-and-swap. A single commit too large for
+  one request (about 22 MB compressed) is refused before anything is
+  sent; one smaller than that but too slow to arrive fails with
+  `too-large`, naming the pack.
 - Past `maxPacks` (16), a push also folds older packs into one,
   re-encoded from the local store, in the same request: of all but the
   newest `keepRecent` (4), the newest run (two or more) that fits in
-  `maxPackBytes`. A fold that wouldn't fit in the push's request waits
-  for a later push.
+  what the push's own pack leaves of `maxPackBytes`. A fold that
+  doesn't fit waits for a later, smaller push.
 - Packs are opaque to git, so a repo grows with what is pushed (a
   small multiple of each session's size, with folding).
 - Live tests ([`tests/github-pack-live.test.ts`](https://github.com/ashenfad/kvgit/blob/main/ts/tests/github-pack-live.test.ts))

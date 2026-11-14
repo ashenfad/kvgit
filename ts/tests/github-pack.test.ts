@@ -8,6 +8,7 @@ import { Memory } from '../src/backends/memory'
 import { FakeGithub } from '../src/github/fake'
 import {
   GithubClient,
+  GithubError,
   MANIFEST_PATH,
   PackRemote,
   decodePack,
@@ -258,6 +259,40 @@ describe('PackRemote push / fetch', () => {
   })
 })
 
+describe('PackRemote and requests GitHub drops', () => {
+  it('names the pack that did not make it, and sends it once', async () => {
+    const gh = new FakeGithub()
+    const commits: string[] = []
+    // GitHub answers 499 to a request whose body is still arriving at ~5 s
+    const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (typeof init?.body === 'string' && init.body.includes('createCommitOnBranch')) {
+        commits.push(init.body)
+        return new Response('', { status: 499 })
+      }
+      return gh.fetch(input, init)
+    }) as typeof fetch
+    const client = new GithubClient({
+      token: 't',
+      repo: gh.repo,
+      fetchImpl,
+      writeIntervalMs: 0,
+      sleeper: async () => {},
+    })
+    const store = new Memory()
+    const wt = await commitN(store, 1, 'a')
+    const err = await pushBranch(store, new PackRemote(client, store), BRANCH).catch((e) => e)
+    expect(err).toBeInstanceOf(GithubError)
+    expect((err as GithubError).kind).toBe('too-large')
+    expect((err as GithubError).message).toMatch(
+      new RegExp(
+        `the pack of 2 commits up to ${wt.head.slice(0, 7)}, \\d+ kB compressed, didn't reach GitHub: GitHub dropped`,
+      ),
+    )
+    expect(commits).toHaveLength(1)
+    expect(gh.refs.has(`refs/heads/${BRANCH}`)).toBe(false)
+  })
+})
+
 describe('PackRemote and manifests it cannot use', () => {
   for (const [what, text] of [
     ['a newer format', '{"format": 2, "head": "x", "packs": []}'],
@@ -337,6 +372,28 @@ describe('PackRemote packs over time', () => {
     const pulled = await pullBranch(b.store, b.remote, BRANCH)
     expect(pulled.localHead).toBe(wt?.head)
     expect(pulled.transferred).toBe(17)
+  })
+
+  it('folds only within what the push leaves of maxPackBytes', async () => {
+    const gh = new FakeGithub()
+    const a = await device(gh, { maxPacks: 3, keepRecent: 2, maxPackBytes: 64 * 1024 })
+    const wt = await open(a.store)
+    const packsAfter = async (kib: number): Promise<number> => {
+      // random bytes don't compress: a pack is about the value's size
+      const value = new Uint8Array(kib * 1024)
+      crypto.getRandomValues(value)
+      wt.set(`files/${kib}-${Math.random()}`, value)
+      await wt.commit()
+      await pushBranch(a.store, a.remote, BRANCH)
+      return (await a.remote.roster())[0]?.packs ?? 0
+    }
+    for (let i = 0; i < 3; i++) await packsAfter(10)
+    // a 50 KiB push leaves ~14 KiB, less than the two oldest 10 KiB packs
+    expect(await packsAfter(50)).toBe(4)
+    // a 10 KiB push leaves room to fold the three older 10 KiB packs
+    expect(await packsAfter(10)).toBe(3)
+    const b = await device(gh)
+    expect((await pullBranch(b.store, b.remote, BRANCH)).localHead).toBe(wt.head)
   })
 
   it('repack folds everything into one pack; a fresh pull is one query + one read', async () => {

@@ -14,12 +14,18 @@
  * 2. **Retry/backoff.** `server` and `rate-limit` failures (and
  *    network errors) retry up to `maxRetries` with exponential
  *    backoff, honoring `Retry-After` / `x-ratelimit-reset` when
- *    present. `auth` / `permission` / `validation` never retry.
- * 3. **Error taxonomy.** Failures surface as `GithubError` with a
+ *    present. `auth` / `permission` / `validation` / `too-large`
+ *    never retry.
+ * 3. **The GraphQL body deadline.** GitHub drops a GraphQL request
+ *    whose body hasn't fully arrived after about 5 s: Node sees a 499,
+ *    a browser a network error (the 499 has no CORS headers). A large
+ *    GraphQL request that fails that way is `too-large`, not
+ *    retried, since the same body would be dropped again.
+ * 4. **Error taxonomy.** Failures surface as `GithubError` with a
  *    `kind` callers can branch on (see `errors.ts`).
  */
 
-import { GithubError, classify, errorMessage } from './errors'
+import { GithubError, classify, errorMessage, formatBytes } from './errors'
 
 export interface GithubClientOptions {
   /** PAT with contents read/write on the repo (fine-grained preferred). */
@@ -54,6 +60,15 @@ export interface GraphqlResult<T> {
 }
 
 const MAX_BACKOFF_MS = 60_000
+/** GitHub drops a GraphQL request whose body hasn't fully arrived
+ *  after about 5 s (measured: time, not size; 9.2 MiB landed at full
+ *  speed, 550 KiB throttled was cut at 5.5 s). A network error this
+ *  long into a GraphQL request, a little under that, is taken for the
+ *  drop. */
+const GRAPHQL_DEADLINE_MS = 4_500
+/** A body smaller than this that fails at the deadline is taken for a
+ *  network fault, and retried. */
+const SLOW_BODY_BYTES = 64 * 1024
 
 const defaultSleeper = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
@@ -133,10 +148,13 @@ export class GithubClient {
   ): Promise<GraphqlResult<T>> {
     const url = `${this.#apiBase}/graphql`
     const send = () =>
-      this.#attempt<{ data?: T | null; errors?: GraphqlError[] }>('POST', url, {
-        query,
-        variables,
-      })
+      this.#attempt<{ data?: T | null; errors?: GraphqlError[] }>(
+        'POST',
+        url,
+        { query, variables },
+        'json',
+        GRAPHQL_DEADLINE_MS,
+      )
     const raw = opts.mutation === true ? await this.#serialized(send) : await send()
     return { data: raw?.data ?? null, errors: raw?.errors ?? [] }
   }
@@ -158,28 +176,40 @@ export class GithubClient {
     }
   }
 
+  /** One request, retried as its failure allows. `deadlineMs`: how
+   *  long into the request a network error is taken for GitHub
+   *  dropping a body that hadn't arrived (GraphQL's deadline). */
   async #attempt<T>(
     method: string,
     url: string,
     body?: unknown,
     mode: 'json' | 'raw' = 'json',
+    deadlineMs?: number,
   ): Promise<T> {
+    const payload = body === undefined ? undefined : JSON.stringify(body)
+    // JSON of base64 is ASCII: its length is its size, near enough
+    const size = payload?.length ?? 0
     const init: RequestInit = {
       method,
       headers: {
         Accept: mode === 'raw' ? 'application/vnd.github.raw+json' : 'application/vnd.github+json',
         Authorization: `Bearer ${this.#token}`,
         'X-GitHub-Api-Version': '2022-11-28',
-        ...(body !== undefined && { 'Content-Type': 'application/json' }),
+        ...(payload !== undefined && { 'Content-Type': 'application/json' }),
       },
-      ...(body !== undefined && { body: JSON.stringify(body) }),
+      ...(payload !== undefined && { body: payload }),
     }
 
     for (let attempt = 0; ; attempt++) {
       let resp: Response
+      const started = this.#now()
       try {
         resp = await this.#fetch(url, init)
       } catch (err) {
+        const elapsed = this.#now() - started
+        if (deadlineMs !== undefined && size >= SLOW_BODY_BYTES && elapsed >= deadlineMs) {
+          throw new GithubError('too-large', 0, tooLargeMessage(0, size, elapsed, ''))
+        }
         if (attempt >= this.#maxRetries) {
           const detail = err instanceof Error ? err.message : String(err)
           throw new GithubError('network', 0, `Network error contacting GitHub: ${detail}`)
@@ -203,6 +233,15 @@ export class GithubClient {
         await this.#sleep(Math.min(hinted ?? this.#backoff(attempt), MAX_BACKOFF_MS))
         continue
       }
+      if (kind === 'too-large') {
+        const elapsed = this.#now() - started
+        throw new GithubError(
+          kind,
+          resp.status,
+          tooLargeMessage(resp.status, size, elapsed, message),
+          raw,
+        )
+      }
       throw new GithubError(kind, resp.status, message, raw)
     }
   }
@@ -210,6 +249,18 @@ export class GithubClient {
   #backoff(attempt: number): number {
     return this.#retryBaseMs * 2 ** attempt
   }
+}
+
+/** Why a request was too large, as a person reads it: refused for its
+ *  size (413), or dropped before its body arrived (499, or a network
+ *  error at GraphQL's deadline: status 0). */
+function tooLargeMessage(status: number, bytes: number, ms: number, message: string): string {
+  const size = formatBytes(bytes)
+  const after = `${(ms / 1000).toFixed(1)} s`
+  if (status === 413) return `GitHub refused a ${size} request as too large: ${message}`
+  const deadline = "GitHub drops a request whose body hasn't arrived after about 5 s"
+  if (status === 499) return `GitHub dropped a ${size} request after ${after}: ${deadline}`
+  return `A ${size} request failed after ${after}, as when ${deadline}: too large to send in one request on this connection`
 }
 
 /** Server-hinted retry delay: `Retry-After` (seconds) or
