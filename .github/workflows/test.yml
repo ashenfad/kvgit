@@ -129,8 +129,12 @@ jobs:
   # first), the bundle-shape check, the Node suite (fake IndexedDB),
   # the browser suite (real IndexedDB in Chromium) and the core's
   # loading on its own.
+  #
+  # On Ubuntu 24.04, not ubuntu-latest: Playwright installs Chromium's
+  # system packages only for the Ubuntu releases it knows, and the
+  # pinned Playwright refuses ubuntu-latest's 26.04.
   test-ts:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: ts
