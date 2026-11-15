@@ -410,13 +410,14 @@ or the hash inputs bumps the storage version.
 
 `PackRemote` syncs through a plain GitHub repo, with no backend and no
 git protocol (GitHub's smart-HTTP endpoints don't send CORS headers):
-GraphQL and one REST read, on a token that lives in the browser. A
-fine-grained token scoped to one sync repo, with **Contents: read and
-write**, is enough. A push is one request whatever the number of
-commits (up to `maxPackBytes`, below), a pull is one query plus one
-read per pack, and the session list with each session's head and
-metadata is one query per hundred branches. Both sync calls take the
-repository's raw store, `repo.store`, as `kv` below.
+GraphQL and REST git-data calls, on a token that lives in the browser.
+A fine-grained token scoped to one sync repo, with **Contents: read and
+write**, is enough. A push is one git commit whatever its size: one
+GraphQL request when it is small, else git objects over REST. A pull
+is one query plus one read per pack part, and the session list with
+each session's head and metadata is one query per hundred branches.
+Both sync calls take the repository's raw store, `repo.store`, as `kv`
+below.
 
 ```ts
 import { GithubClient, PackRemote } from '@agex-ts/kvgit/github'
@@ -442,7 +443,7 @@ await remote.roster() // every session: head, meta, packs, archived
   or a REST one at about a minute (a 401 "Bad credentials", or a
   network error). Sending the same body again would fail the same
   way.
-- **`PackRemote`**: the `Remote`. `push` lands one pack per request,
+- **`PackRemote`**: the `Remote`. `push` lands a push as one commit,
   `fetch` reads the packs a receiver lacks, `roster` lists every
   session, live and archived. `archiveBranch`, `restoreBranch`,
   `deleteBranch` and `emptyTrash` are one atomic, CAS-checked
@@ -450,56 +451,76 @@ await remote.roster() // every session: head, meta, packs, archived
   folds a session's packs into one.
 - **Lost races are results, not throws:** a push whose expected head
   moved returns false (the sync layer reports `'diverged'`), with
-  nothing written.
+  nothing written. After an error that leaves it unclear whether a push
+  landed (a lost response, say), the branch's manifest decides: one
+  whose `head` is the push's tip landed.
 
 #### The format
+
+[`docs/github-sync.md`](https://github.com/ashenfad/kvgit/blob/main/docs/github-sync.md)
+specifies it; in short, format 2:
 
 Each session is one git branch; archived ones (the trash) are
 `archived/<session>`. A branch holds two kinds of file:
 
-- **`kvgit/manifest.json`**, JSON: `{format: 1, kernel, branch, head,
+- **`kvgit/manifest.json`**, JSON: `{format: 2, kernel, branch, head,
   packs, nextSeq, meta}`. `head` is the session's kvgit head; `meta` is
   what the pusher's `meta(branch, head)` gave (a title, say); `packs`
   lists the packs oldest first, each `{path, seq, base, tip, commits,
-  bytes, sha256, blob}`: the kvgit commit its delta builds on (`base`,
-  null from the root), its last commit (`tip`), and the stored file's
-  size, SHA-256 and git blob SHA-1 (what a fetch reads it by). Each
-  pack's `base` is the previous pack's `tip`. A manifest that isn't
-  JSON, or has another `format`, makes the branch unusable here: it is
-  never pushed over.
-- **`kvgit/packs/<seq>-<tip12>.pack`** (`<seq>` six digits, zero-padded): gzip of CBOR `{format: 1,
-  kernel, base, tip, values, commits}`. `values` is a table of distinct
-  byte strings (each value once, ordered by key, so versions of a file
-  compress against each other); `commits` is parents first, each
-  `[record, updates]`, where `record` is the commit as kvgit hashes it
-  (Python-style JSON bytes of `{hash, parents, parentGens, time,
-  info, removals}`, `time` a float) and `updates` is `[key,
-  valueIndex]` pairs. A receiver recomputes every hash (`applyWire`).
+  bytes, sha256, parts}`: the kvgit commit its delta builds on (`base`,
+  null from the root), its last commit (`tip`), the stored pack's size
+  and SHA-256, and the git blob SHAs of its parts, which a fetch reads
+  them by. Each pack's `base` is the previous pack's `tip`. A format-1
+  manifest (each pack one `blob`) reads as format 2. A manifest that
+  isn't JSON, or has another `format`, makes the branch unusable here:
+  it is never pushed over.
+- **Packs**: gzip of CBOR `{format: 2, kernel, base, tip, values,
+  commits}`, one part at `kvgit/packs/<seq>-<tip12>.pack` (`<seq>` six
+  digits, zero-padded) or n parts at `….pack.0` … `….pack.<n-1>`.
+  `values` is a table of distinct values (each once, ordered by key, so
+  versions of a file compress against each other): byte strings, or a
+  reference `[sha256, size, [part SHAs]]` to a value kept outside the
+  pack. `commits` is parents first, each `[record, updates]`, where
+  `record` is the commit as kvgit hashes it (Python-style JSON bytes of
+  `{hash, parents, parentGens, time, info, removals}`, `time` a float)
+  and `updates` is `[key, valueIndex]` pairs. A receiver recomputes
+  every hash (`applyWire`).
 
 Each push is one git commit on the session's branch, headlined `kvgit
 <session> @ <head7> (+N)` with `Kvgit-Head: <head>` and
-`Kvgit-Pack-Format: 1` trailers, made by
-`createCommitOnBranch` with `expectedHeadOid` as the compare-and-swap.
-A new session's branch starts from the default branch's commit, its
-`createRef` in the same request. A fetch walks the manifest's packs
-from the newest back to one whose `base` the receiver has, and reads
-them by blob SHA (`GET git/blobs/<sha>`, raw: the contents API alters
-bytes it takes for text).
+`Kvgit-Pack-Format: 2` trailers. A small push is one
+`createCommitOnBranch`, `expectedHeadOid` its compare-and-swap; a new
+session's branch starts from the default branch's commit, its
+`createRef` in the same request. A larger one uploads its packs' parts
+as blobs (skipping those the repo already holds, so a push that stopped
+partway resumes), makes a tree and a commit, and moves the ref with
+`updateRefs` from the commit it read: an exact compare-and-swap. A
+fetch walks the manifest's packs from the newest back to one whose
+`base` the receiver has, and reads their parts by blob SHA (`GET
+git/blobs/<sha>`, raw: the contents API alters bytes it takes for
+text).
 
 #### Limits
 
-- GitHub drops a GraphQL request whose body hasn't arrived after
-  about 5 s, so what one request can carry depends on the connection.
-  A push larger than `maxPackBytes` (2 MiB of values) lands as several
-  packs, each its own compare-and-swap. A single commit too large for
-  one request (about 22 MB compressed) is refused before anything is
-  sent; one smaller than that but too slow to arrive fails with
-  `too-large`, naming the pack.
+- GitHub drops a GraphQL request whose body hasn't arrived after about
+  5 s, and answers a REST one still arriving after about a minute with
+  a 401. So a push goes inline only under `inlineBytes` (1 MiB of
+  request), and over REST in parts of at most `partBytes` (4 MiB). A
+  push GitHub drops inline goes over REST and halves the remote's
+  inline cutoff; a part that doesn't arrive within the minute halves
+  `partBytes`, down to 512 KiB, below which the push fails with
+  `too-large`, naming the part.
+- A push's values split into packs of at most `maxPackBytes` (8 MiB)
+  uncompressed, all in its one commit.
 - Past `maxPacks` (16), a push also folds older packs into one,
-  re-encoded from the local store, in the same request: of all but the
+  re-encoded from the local store, in the same commit: of all but the
   newest `keepRecent` (4), the newest run (two or more) that fits in
-  what the push's own pack leaves of `maxPackBytes`. A fold that
+  what the push's own packs leave of `maxPackBytes`. A fold that
   doesn't fit waits for a later, smaller push.
+- A large push makes a handful of REST writes (one per part, then a
+  tree and a commit), spaced under GitHub's secondary rate limits;
+  a limit that asks to wait longer than a minute fails the push with
+  `retryAfterMs`, and the next push resumes.
 - Packs are opaque to git, so a repo grows with what is pushed (a
   small multiple of each session's size, with folding).
 - Live tests ([`tests/github-pack-live.test.ts`](https://github.com/ashenfad/kvgit/blob/main/ts/tests/github-pack-live.test.ts))

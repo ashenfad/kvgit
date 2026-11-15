@@ -19,4 +19,5 @@ export {
   type PackManifest,
   type PackRemoteOptions,
   type RosterEntry,
+  type ValueRef,
 } from './pack'

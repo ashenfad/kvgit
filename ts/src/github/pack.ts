@@ -1,34 +1,45 @@
 /**
- * PackRemote: the kvgit `Remote` over a GitHub repo, one compressed
- * pack per push. The formats are specified in the package README
- * ("Pack sync").
+ * PackRemote: the kvgit `Remote` over a GitHub repo, as compressed
+ * packs of commits. The format is specified in `docs/github-sync.md`.
+ * A session's branch holds:
  *
- * A push's commits travel as ONE file, landed by ONE GraphQL
- * `createCommitOnBranch` whose `expectedHeadOid` is the
- * compare-and-swap. A session's branch holds:
+ *   kvgit/manifest.json                  head, pack list, caller metadata
+ *   kvgit/packs/<seq>-<tip12>.pack       gzip(CBOR) of a run of WireCommits
+ *   kvgit/packs/<seq>-<tip12>.pack.<i>   the same in parts, when stored so
  *
- *   kvgit/manifest.json              head, pack list, caller metadata
- *   kvgit/packs/<seq>-<tip12>.pack   gzip(CBOR) of a run of WireCommits
+ * A push lands as ONE git commit on the branch, whatever its size:
  *
- * Costs, per operation:
+ * - **Inline**, when the request stays under the inline cutoff
+ *   (`inlineBytes`): one GraphQL `createCommitOnBranch` carrying the
+ *   packs as base64, `expectedHeadOid` the compare-and-swap. GitHub
+ *   drops a GraphQL request whose body is still arriving at about 5 s;
+ *   a push dropped so goes the REST way, and lowers the cutoff.
+ * - **Over REST** otherwise: each pack as git blobs of at most
+ *   `partBytes` (`POST git/blobs`, skipping the ones GitHub already
+ *   holds, so a push that stopped partway resumes), then a tree, a
+ *   commit, and a GraphQL `updateRefs` from the branch's commit to the
+ *   new one: an exact compare-and-swap. A part that doesn't arrive
+ *   within GitHub's minute halves `partBytes`.
+ *
+ * Whether a push landed is the branch's manifest's say: after an error,
+ * one whose `head` is the push's tip landed, whichever request carried
+ * it. Other costs, per operation:
  *
  * - `listRefs` / `roster`: one GraphQL query for every branch, with
  *   each branch's manifest inlined (`Commit.file`), so the session
  *   list, heads and stub metadata (a title) come back together.
- * - `push`: one GraphQL request (creation folds `createRef` into the
- *   same document). The manifest the push builds on comes from the
- *   `listRefs` the sync layer just made.
- * - `fetch`: one raw blob read per needed pack, concurrently. The
- *   manifest says which packs a receiver needs: walking back from the
- *   newest, until a pack's base is a commit the receiver has.
+ * - `fetch`: one raw blob read per part of each needed pack,
+ *   concurrently. The manifest says which packs a receiver needs:
+ *   walking back from the newest, until a pack's base is a commit the
+ *   receiver has.
  * - `archiveBranch` / `restoreBranch` / `deleteBranch` / `emptyTrash`:
  *   one atomic, CAS-checked `updateRefs`.
  *
  * Packs accumulate one per push. When a push would exceed `maxPacks`,
  * it folds the older ones (all but `keepRecent`) into one, re-encoded
- * from the local store, in the same commit: still one request.
- * `repack` folds everything into one pack, so a fresh device's first
- * pull is the roster query plus one read.
+ * from the local store, in the same commit. `repack` folds everything
+ * into one pack, so a fresh device's first pull is the roster query
+ * plus one pack's reads.
  *
  * The integrity story is applyWire's: every commit hash is recomputed
  * on receipt. A pack also carries its SHA-256 in the manifest, so a
@@ -42,21 +53,27 @@ import type { Remote } from '../sync/remote'
 import { walkDelta } from '../sync/walk'
 import type { KVStore, WireCommit } from '../types'
 import { ancestorsAbove, isAncestor } from '../versioned/ancestry'
-import { generationOf, sha256Hex } from '../versioned/layout'
+import { BLOB_PREFIX, generationOf, sha256Hex } from '../versioned/layout'
 import { bytesToBase64 } from './base64'
 import type { GithubClient, GraphqlError, GraphqlResult } from './client'
 import { GithubError, formatBytes } from './errors'
 import { gitBlobSha1 } from './git-hash'
 
-export const PACK_FORMAT = 1
+/** The format this code writes, of manifests and packs alike. It reads
+ *  format 1 too. */
+export const PACK_FORMAT = 2
 export const MANIFEST_PATH = 'kvgit/manifest.json'
 export const PACKS_DIR = 'kvgit/packs'
 const ARCHIVED = 'archived/'
 const ZERO_OID = '0000000000000000000000000000000000000000'
+/** Raw blob reads in flight at once. */
 const GET_CHUNK = 16
-/** The most base64 one request may carry: GitHub refuses GraphQL bodies
- *  over 45MB and has timed out on 40MB; 30MB has landed. */
-const MAX_BODY_BASE64 = 30 * 1024 * 1024
+/** Object lookups in one GraphQL query. */
+const LOOKUP_CHUNK = 100
+/** The smallest part a push halves its parts to. */
+const MIN_PART_BYTES = 512 * 1024
+/** A commit request's bytes beyond its files, for the inline cutoff. */
+const REQUEST_OVERHEAD = 2048
 
 /** One pack as the manifest lists it. */
 export interface PackEntry {
@@ -71,8 +88,10 @@ export interface PackEntry {
   bytes: number
   /** SHA-256 of the stored bytes. */
   sha256: string
-  /** git blob SHA-1 of the stored bytes: fetch reads the blob by it. */
-  blob: string
+  /** git blob SHAs of the stored bytes' parts, in order: fetch reads
+   *  them by these. One part is stored at `path`, n at `path.0` …
+   *  `path.<n-1>`. */
+  parts: string[]
 }
 
 export interface PackManifest {
@@ -88,6 +107,13 @@ export interface PackManifest {
   /** Caller metadata (`PackRemoteOptions.meta`), e.g. a title. */
   meta: unknown
 }
+
+/**
+ * A value kept outside its pack, as the pack's value table names it in
+ * the value's place: the value's SHA-256 (its kvgit blob key's), its
+ * size, and the git blob SHAs of its parts, in order.
+ */
+export type ValueRef = [sha256: string, size: number, parts: string[]]
 
 export interface RosterEntry {
   branch: string
@@ -108,23 +134,72 @@ export interface PackRemoteOptions {
   maxPacks?: number
   /** Packs a fold leaves alone (incremental pulls read only these). Default 4. */
   keepRecent?: number
-  /** Most uncompressed value bytes in one pack (and one request); a
-   *  larger push lands as several commits, and a fold rides a push only
-   *  if the two together stay under it. Default 2 MiB: GitHub drops a
-   *  GraphQL request whose body hasn't arrived after about 5 s, and a
-   *  pack travels as base64, a third larger. */
+  /** Most uncompressed value bytes in one pack; a larger push lands as
+   *  several packs, still in one commit. A fold rides a push only if
+   *  the fold and the push's packs together stay under it. Default
+   *  8 MiB. */
   maxPackBytes?: number
+  /** The largest push sent inline, as one GraphQL request, in bytes of
+   *  request. Default 1 MiB, about 4 s at 2 Mbps: GitHub drops a GraphQL
+   *  request whose body hasn't arrived after about 5 s. A push GitHub
+   *  drops lowers it, for this remote's lifetime, to half that push's
+   *  size. */
+  inlineBytes?: number
+  /** The largest part a pack is stored in over REST. Default 4 MiB, a
+   *  request of about 5.6 MB that arrives within GitHub's minute down
+   *  to about 100 KB/s. A part that doesn't halves it, for this
+   *  remote's lifetime, down to 512 KiB. */
+  partBytes?: number
 }
 
 interface BranchState {
-  refId: string
   gitOid: string
+  /** The git tree at `gitOid`: the base a REST push's tree builds on. */
+  treeOid: string
   /** Null for a ref without a manifest file: a creation that never got
    *  its first commit, which the next creation claims. */
   manifest: PackManifest | null
   /** Why the manifest there can't be used (unparseable, a format this
    *  code doesn't know): such a branch is left alone, never claimed. */
   unreadable?: string
+}
+
+/** A pack a push makes, before it is laid out in parts. */
+interface NewPack {
+  path: string
+  seq: number
+  base: string | null
+  tip: string
+  commits: number
+  bytes: Uint8Array
+  sha256: string
+}
+
+/** What one commit on a branch makes of it: its packs in manifest
+ *  order (those it keeps, and new ones), the files it removes, and the
+ *  rest of its manifest. */
+interface Change {
+  packs: Array<PackEntry | NewPack>
+  deletions: string[]
+  head: string
+  nextSeq: number
+  meta: unknown
+  headline: string
+  /** Commits the change adds, for its headline and its errors. */
+  what: string
+}
+
+/** One file a change writes: a pack, or a part of one. */
+interface PackFile {
+  path: string
+  bytes: Uint8Array
+  sha: string
+  pack: NewPack
+}
+
+interface Layout {
+  manifest: PackManifest
+  files: PackFile[]
 }
 
 // ---------------------------------------------------------------------------
@@ -145,11 +220,18 @@ export interface DecodedPack {
  * commit's record as kvgit writes it (Python-style JSON, so floats stay
  * floats and the hash re-derives), and the values as a table of
  * distinct byte strings ordered by key, so the successive versions of
- * one file sit together and compress against each other.
+ * one file sit together and compress against each other. A value whose
+ * SHA-256 is in `refs` is kept outside the pack: its slot in the table
+ * holds that reference instead.
  */
 export async function encodePack(
   commits: readonly WireCommit[],
-  opts: { kernel: string; base: string | null; compress?: boolean },
+  opts: {
+    kernel: string
+    base: string | null
+    compress?: boolean
+    refs?: ReadonlyMap<string, ValueRef>
+  },
 ): Promise<Uint8Array> {
   const tip = commits.at(-1)?.hash
   if (tip === undefined) throw new Error('encodePack: no commits')
@@ -177,7 +259,7 @@ export async function encodePack(
     kernel: opts.kernel,
     base: opts.base,
     tip,
-    values: slots.map((s) => s.bytes),
+    values: slots.map((s) => opts.refs?.get(s.hex) ?? s.bytes),
     commits: commits.map((wc, i) => [
       pyDumpsBytes(
         new Map<string, unknown>([
@@ -195,21 +277,37 @@ export async function encodePack(
   return opts.compress === false ? body : gzip(body)
 }
 
-/** Decode a pack (gzip detected by its magic bytes). */
-export async function decodePack(stored: Uint8Array): Promise<DecodedPack> {
+/**
+ * Decode a pack (gzip detected by its magic bytes). A value kept
+ * outside the pack (format 2) is read with `resolve`; a pack holding
+ * one can't be decoded without it.
+ */
+export async function decodePack(
+  stored: Uint8Array,
+  resolve?: (ref: ValueRef) => Promise<Uint8Array>,
+): Promise<DecodedPack> {
   const raw = stored[0] === 0x1f && stored[1] === 0x8b ? await gunzip(stored) : stored
   const pack = cbor.decode(raw) as {
     format: unknown
     kernel: string
     base: string | null
     tip: string
-    values: Uint8Array[]
+    values: unknown[]
     commits: Array<[Uint8Array, Array<[string, number]>]>
   }
-  if (pack.format !== PACK_FORMAT) {
+  if (pack.format !== 1 && pack.format !== PACK_FORMAT) {
     throw new Error(`decodePack: unsupported format ${JSON.stringify(pack.format)}`)
   }
-  const values = pack.values.map((v) => new Uint8Array(v))
+  const values: Uint8Array[] = []
+  for (const v of pack.values) {
+    if (v instanceof Uint8Array) values.push(new Uint8Array(v))
+    else if (pack.format === PACK_FORMAT && isValueRef(v)) {
+      if (resolve === undefined) {
+        throw new Error('decodePack: a value is kept outside the pack, and nothing resolves it')
+      }
+      values.push(await resolve(v))
+    } else throw new Error('decodePack: a value is neither bytes nor a reference')
+  }
   const commits = pack.commits.map(([record, updates]): WireCommit => {
     const r = pyLoadsBytes(new Uint8Array(record)) as Record<string, unknown>
     if (!(r.time instanceof PyFloat)) throw new Error('decodePack: time must be a float')
@@ -232,6 +330,19 @@ export async function decodePack(stored: Uint8Array): Promise<DecodedPack> {
   return { kernel: pack.kernel, base: pack.base, tip: pack.tip, commits }
 }
 
+function isValueRef(v: unknown): v is ValueRef {
+  return (
+    Array.isArray(v) &&
+    v.length === 3 &&
+    typeof v[0] === 'string' &&
+    /^[0-9a-f]{64}$/.test(v[0]) &&
+    Number.isSafeInteger(v[1]) &&
+    Array.isArray(v[2]) &&
+    v[2].length > 0 &&
+    v[2].every((p) => typeof p === 'string' && /^[0-9a-f]{40}$/.test(p))
+  )
+}
+
 async function pipe(bytes: Uint8Array, stream: GenericTransformStream): Promise<Uint8Array> {
   const out = new Blob([bytes as Uint8Array<ArrayBuffer>])
     .stream()
@@ -248,12 +359,13 @@ export const gunzip = (bytes: Uint8Array): Promise<Uint8Array> =>
 // GraphQL documents
 // ---------------------------------------------------------------------------
 
-const REF_FIELDS = `id name target { oid ... on Commit { file(path: "${MANIFEST_PATH}") { object { ... on Blob { text } } } } }`
+const REF_FIELDS = `name target { oid ... on Commit { tree { oid } file(path: "${MANIFEST_PATH}") { object { ... on Blob { text } } } } }`
+const DEFAULT_REF = 'defaultBranchRef { name target { oid ... on Commit { tree { oid } } } }'
 
 const ROSTER_QUERY = `query($owner: String!, $name: String!, $after: String) {
   repository(owner: $owner, name: $name) {
     id
-    defaultBranchRef { name target { oid } }
+    ${DEFAULT_REF}
     refs(refPrefix: "refs/heads/", first: 100, after: $after) {
       pageInfo { hasNextPage endCursor }
       nodes { ${REF_FIELDS} }
@@ -264,7 +376,7 @@ const ROSTER_QUERY = `query($owner: String!, $name: String!, $after: String) {
 const ONE_REF_QUERY = `query($owner: String!, $name: String!, $q: String!) {
   repository(owner: $owner, name: $name) {
     id
-    defaultBranchRef { name target { oid } }
+    ${DEFAULT_REF}
     ref(qualifiedName: $q) { ${REF_FIELDS} }
   }
 }`
@@ -281,17 +393,30 @@ const COMMIT_MUTATION = (create: boolean): string => `mutation(
     expectedHeadOid: $oid,
     message: {headline: $headline, body: $body},
     fileChanges: {additions: $additions, deletions: $deletions}
-  }) { commit { oid } ref { id } }
+  }) { commit { oid tree { oid } } }
 }`
 
 const UPDATE_REFS = `mutation($repoId: ID!, $updates: [RefUpdate!]!) {
   updateRefs(input: {repositoryId: $repoId, refUpdates: $updates}) { clientMutationId }
 }`
 
+/** A query asking whether the repo holds each of `n` objects, by
+ *  variables `$o0` … */
+const OBJECTS_QUERY = (n: number): string => {
+  const vars = Array.from({ length: n }, (_, i) => `$o${i}: GitObjectID!`).join(', ')
+  const fields = Array.from({ length: n }, (_, i) => `o${i}: object(oid: $o${i}) { oid }`)
+  return `query($owner: String!, $name: String!, ${vars}) {
+  repository(owner: $owner, name: $name) { ${fields.join(' ')} }
+}`
+}
+
 interface RefNode {
-  id: string
   name: string
-  target: { oid: string; file?: { object: { text?: string | null } | null } | null }
+  target: {
+    oid: string
+    tree?: { oid: string }
+    file?: { object: { text?: string | null } | null } | null
+  }
 }
 
 interface RosterData {
@@ -302,7 +427,7 @@ interface RosterData {
 
 interface RepoHeader {
   id: string
-  defaultBranchRef: { name: string; target: { oid: string } } | null
+  defaultBranchRef: { name: string; target: { oid: string; tree?: { oid: string } } } | null
 }
 
 // ---------------------------------------------------------------------------
@@ -322,11 +447,15 @@ export class PackRemote implements Remote {
   readonly #maxPacks: number
   readonly #keepRecent: number
   readonly #maxPackBytes: number
+  readonly #minPartBytes: number
   readonly #owner: string
   readonly #name: string
+  #inlineBytes: number
+  #partBytes: number
 
   #repoId: string | null = null
   #defaultOid: string | null = null
+  #defaultTree: string | null = null
   #defaultName: string | null = null
   /** Branch (archived ones under `archived/`) → its last-observed ref. */
   readonly #refs = new Map<string, BranchState>()
@@ -338,7 +467,10 @@ export class PackRemote implements Remote {
     this.#meta = opts.meta
     this.#maxPacks = opts.maxPacks ?? 16
     this.#keepRecent = opts.keepRecent ?? 4
-    this.#maxPackBytes = opts.maxPackBytes ?? 2 * 1024 * 1024
+    this.#maxPackBytes = opts.maxPackBytes ?? 8 * 1024 * 1024
+    this.#inlineBytes = opts.inlineBytes ?? 1024 * 1024
+    this.#partBytes = Math.max(1, opts.partBytes ?? 4 * 1024 * 1024)
+    this.#minPartBytes = Math.min(this.#partBytes, MIN_PART_BYTES)
     const api = apiRoot(client.apiBase)
     this.id = `github:${api === 'https://api.github.com' ? '' : `${api}/`}${client.repo.toLowerCase()}`
     const [owner, name] = client.repo.split('/') as [string, string]
@@ -434,21 +566,16 @@ export class PackRemote implements Remote {
     }
     if (!anchored) throw new Error('PackRemote.fetch: pack chain does not reach a known commit')
 
+    const parts = await this.#readParts(
+      needed.flatMap((pack) => pack.parts.map((sha) => ({ sha, of: pack.path }))),
+    )
     const stored: Uint8Array[] = []
-    for (let i = 0; i < needed.length; i += GET_CHUNK) {
-      const part = needed.slice(i, i + GET_CHUNK)
-      stored.push(
-        ...(await Promise.all(
-          part.map(async (pack) => {
-            const bytes = await this.client.getBlobRaw(pack.blob)
-            if (bytes === null) throw new Error(`PackRemote.fetch: ${pack.path} missing`)
-            if ((await sha256Hex(bytes)) !== pack.sha256) {
-              throw new Error(`PackRemote.fetch: ${pack.path} fails its checksum`)
-            }
-            return bytes
-          }),
-        )),
-      )
+    for (const pack of needed) {
+      const bytes = concat(parts.splice(0, pack.parts.length))
+      if ((await sha256Hex(bytes)) !== pack.sha256) {
+        throw new Error(`PackRemote.fetch: ${pack.path} fails its checksum`)
+      }
+      stored.push(bytes)
     }
     // What we hold of the packs' commits, from as far down as their
     // lowest generation: a pack built on what we have can still repeat
@@ -457,7 +584,7 @@ export class PackRemote implements Remote {
     let haveSet = new Set<string>()
     for (const [i, bytes] of stored.entries()) {
       const entry = needed[i] as PackEntry
-      const pack = await decodePack(bytes)
+      const pack = await decodePack(bytes, (ref) => this.#readValue(ref))
       const low = lowestGeneration(pack.commits)
       if (haveList.length > 0 && low < floor) {
         floor = low
@@ -476,6 +603,37 @@ export class PackRemote implements Remote {
         yield wc
       }
     }
+  }
+
+  /** Blobs' bytes by git SHA, `GET_CHUNK` at a time, in order. */
+  async #readParts(parts: Array<{ sha: string; of: string }>): Promise<Uint8Array[]> {
+    const out: Uint8Array[] = []
+    for (let i = 0; i < parts.length; i += GET_CHUNK) {
+      const batch = parts.slice(i, i + GET_CHUNK)
+      out.push(
+        ...(await Promise.all(
+          batch.map(async ({ sha, of }) => {
+            const bytes = await this.client.getBlobRaw(sha)
+            if (bytes === null) throw new Error(`PackRemote.fetch: ${of} missing`)
+            return bytes
+          }),
+        )),
+      )
+    }
+    return out
+  }
+
+  /** A value kept outside its pack: from the local store when it holds
+   *  the blob, else read in parts and checked. */
+  async #readValue([sha256, size, parts]: ValueRef): Promise<Uint8Array> {
+    const local = await this.#store.get(`${BLOB_PREFIX}${sha256}`)
+    if (local !== null && local.length === size) return local
+    const of = `value ${sha256.slice(0, 12)}`
+    const bytes = concat(await this.#readParts(parts.map((sha) => ({ sha, of }))))
+    if (bytes.length !== size || (await sha256Hex(bytes)) !== sha256) {
+      throw new Error(`PackRemote.fetch: ${of} fails its checksum`)
+    }
+    return bytes
   }
 
   // -------------------------------------------------------------------------
@@ -516,7 +674,7 @@ export class PackRemote implements Remote {
       throw new Error(`PackRemote.push: stream ended at ${all.at(-1)?.hash.slice(0, 7) ?? '∅'}`)
     }
 
-    // Split oversized pushes; each chunk is its own CAS'd commit.
+    // Packs of at most maxPackBytes of values, all in one commit.
     const chunks: WireCommit[][] = []
     let current: WireCommit[] = []
     let size = 0
@@ -533,141 +691,49 @@ export class PackRemote implements Remote {
     }
     chunks.push(current)
 
-    // encoded and checked up front, so a push too large to land sends
-    // nothing rather than its first chunks
-    const packs: Uint8Array[] = []
+    const prior = st?.manifest ?? null
+    let nextSeq = prior?.nextSeq ?? 1
+    const fresh: NewPack[] = []
     let base = expectedOld
     for (const chunk of chunks) {
+      const tip = (chunk.at(-1) as WireCommit).hash
       const bytes = await encodePack(chunk, { kernel: this.#kernel, base })
-      if (base64Length(bytes.length) > MAX_BODY_BASE64) {
-        throw new Error(
-          `PackRemote.push: commit ${(chunk.at(-1) as WireCommit).hash.slice(0, 7)} is ${bytes.length} bytes compressed, more than one request can carry`,
-        )
-      }
-      packs.push(bytes)
-      base = (chunk.at(-1) as WireCommit).hash
+      fresh.push(await newPack(nextSeq++, base, tip, chunk.length, bytes))
+      base = tip
     }
 
-    base = expectedOld
-    for (const [i, chunk] of chunks.entries()) {
-      const pack = packs[i] as Uint8Array
-      let landed: BranchState | null
-      try {
-        landed = await this.#pushChunk(branch, st, base, chunk, pack, i === chunks.length - 1)
-      } catch (err) {
-        if (!(err instanceof GithubError) || err.kind !== 'too-large') throw err
-        const tip = (chunk.at(-1) as WireCommit).hash.slice(0, 7)
-        const what = chunk.length === 1 ? `commit ${tip}` : `${chunk.length} commits up to ${tip}`
-        const landedNote = i === 0 ? '' : ` (${i} of ${chunks.length} packs landed before it)`
-        throw new GithubError(
-          err.kind,
-          err.status,
-          `PackRemote.push: the pack of ${what}, ${formatBytes(pack.length)} compressed, didn't reach GitHub${landedNote}: ${err.message}`,
-          err.body,
-        )
-      }
-      if (landed === null) {
-        if (i === 0) return false
-        throw new Error(`PackRemote.push: lost the ref after ${i} of ${chunks.length} chunks`)
-      }
-      st = landed
-      base = (chunk.at(-1) as WireCommit).hash
-    }
-    return true
-  }
-
-  /** Land one pack; null when the CAS lost. */
-  async #pushChunk(
-    branch: string,
-    st: BranchState | null,
-    base: string | null,
-    chunk: WireCommit[],
-    bytes: Uint8Array,
-    last: boolean,
-  ): Promise<BranchState | null> {
-    const tip = (chunk.at(-1) as WireCommit).hash
-    const prior = st?.manifest ?? null
-    const seq = prior?.nextSeq ?? 1
-    const entry: PackEntry = {
-      path: `${PACKS_DIR}/${String(seq).padStart(6, '0')}-${tip.slice(0, 12)}.pack`,
-      seq,
-      base,
-      tip,
-      commits: chunk.length,
-      bytes: bytes.length,
-      sha256: await sha256Hex(bytes),
-      blob: await gitBlobSha1(bytes),
-    }
-    const additions: Array<{ path: string; contents: string }> = [
-      { path: entry.path, contents: bytesToBase64(bytes) },
-    ]
-    let packs = [...(prior?.packs ?? []), entry]
-    let nextSeq = seq + 1
-    const deletions: Array<{ path: string }> = []
-
-    // Fold older packs into one when there are too many. The fold
-    // rides this push's request, so it gets what the pack leaves of
-    // maxPackBytes, and both must fit in one request; one that doesn't
-    // is left for a later, smaller push.
-    if (last && packs.length > this.#maxPacks) {
-      const folded = await this.#fold(
-        packs.slice(0, packs.length - this.#keepRecent),
-        nextSeq,
-        this.#maxPackBytes - bytes.length,
-      )
-      if (
-        folded !== null &&
-        base64Length(bytes.length) + base64Length(folded.bytes.length) <= MAX_BODY_BASE64
-      ) {
-        additions.push({ path: folded.entry.path, contents: bytesToBase64(folded.bytes) })
-        deletions.push(...folded.replaced.map((p) => ({ path: p.path })))
+    // Fold older packs into one when there are too many: the newest
+    // stretch of all but keepRecent that fits in what the push's own
+    // packs leave of maxPackBytes. One that doesn't fit waits for a
+    // later, smaller push.
+    let packs: Array<PackEntry | NewPack> = [...(prior?.packs ?? []), ...fresh]
+    const deletions: string[] = []
+    if (packs.length > this.#maxPacks) {
+      const kept = prior?.packs ?? []
+      const run = kept.slice(0, Math.max(0, packs.length - this.#keepRecent))
+      const spent = fresh.reduce((n, p) => n + p.bytes.length, 0)
+      const folded = await this.#fold(run, nextSeq, this.#maxPackBytes - spent)
+      if (folded !== null) {
         const gone = new Set(folded.replaced.map((p) => p.path))
-        const firstKept = packs.findIndex((p) => gone.has(p.path))
+        const firstGone = packs.findIndex((p) => gone.has(p.path))
         packs = packs.filter((p) => !gone.has(p.path))
-        packs.splice(firstKept, 0, folded.entry)
+        packs.splice(firstGone, 0, folded.pack)
+        for (const p of folded.replaced) deletions.push(...filesOf(p))
         nextSeq++
       }
     }
 
-    const meta = last && this.#meta !== undefined ? await this.#meta(branch, tip) : prior?.meta
-    const manifest: PackManifest = {
-      format: PACK_FORMAT,
-      kernel: this.#kernel,
-      branch,
-      head: tip,
+    const tip7 = newHead.slice(0, 7)
+    const change: Change = {
       packs,
+      deletions,
+      head: newHead,
       nextSeq,
-      meta: meta ?? null,
+      meta: this.#meta !== undefined ? await this.#meta(branch, newHead) : prior?.meta,
+      headline: `kvgit ${branch} @ ${tip7} (+${all.length})`,
+      what: all.length === 1 ? `commit ${tip7}` : `${all.length} commits up to ${tip7}`,
     }
-    additions.push({ path: MANIFEST_PATH, contents: bytesToBase64(utf8(JSON.stringify(manifest))) })
-
-    const create = st === null
-    const res = await this.client.graphql<{
-      create?: { ref: { id: string } } | null
-      commit: { commit: { oid: string }; ref: { id: string } } | null
-    }>(
-      COMMIT_MUTATION(create),
-      {
-        ...(create && { repoId: this.#repoId, ref: `refs/heads/${branch}` }),
-        repo: this.client.repo,
-        branch,
-        oid: st?.gitOid ?? this.#defaultOid,
-        headline: `kvgit ${branch} @ ${tip.slice(0, 7)} (+${chunk.length})`,
-        body: `Kvgit-Head: ${tip}\nKvgit-Pack-Format: ${PACK_FORMAT}`,
-        additions,
-        deletions,
-      },
-      { mutation: true },
-    )
-    const landed = res.data?.commit ?? null
-    if (landed === null) {
-      const lost = res.errors.some(lostRace)
-      if (lost) return null
-      throw graphqlFailure('push', res.errors)
-    }
-    const state = { refId: landed.ref.id, gitOid: landed.commit.oid, manifest }
-    this.#refs.set(branch, state)
-    return state
+    return this.#land(branch, st, change, (m) => m.head === newHead)
   }
 
   /** Re-encode a run of packs as one, from the local store: the newest
@@ -677,7 +743,7 @@ export class PackRemote implements Remote {
     run: PackEntry[],
     seq: number,
     budget: number,
-  ): Promise<{ entry: PackEntry; bytes: Uint8Array; replaced: PackEntry[] } | null> {
+  ): Promise<{ pack: NewPack; replaced: PackEntry[] } | null> {
     let start = run.length
     let total = 0
     while (start > 0 && total + (run[start - 1] as PackEntry).bytes <= budget) {
@@ -696,23 +762,13 @@ export class PackRemote implements Remote {
       commits.push(wc)
     }
     const bytes = await encodePack(commits, { kernel: this.#kernel, base })
-    const entry: PackEntry = {
-      path: `${PACKS_DIR}/${String(seq).padStart(6, '0')}-${tip.slice(0, 12)}.pack`,
-      seq,
-      base,
-      tip,
-      commits: commits.length,
-      bytes: bytes.length,
-      sha256: await sha256Hex(bytes),
-      blob: await gitBlobSha1(bytes),
-    }
-    return { entry, bytes, replaced }
+    return { pack: await newPack(seq, base, tip, commits.length, bytes), replaced }
   }
 
   /**
    * Fold every pack of `branch` into one, from the local store (which
-   * must hold the remote head). One request; afterwards a fresh
-   * device's pull is the roster query plus one read.
+   * must hold the remote head), in one commit. Afterwards a fresh
+   * device's pull is the roster query plus one pack's reads.
    *
    * @returns false if the remote moved meanwhile.
    */
@@ -724,48 +780,293 @@ export class PackRemote implements Remote {
     const commits: WireCommit[] = []
     for await (const wc of walkDelta(this.#store, { want: manifest.head })) commits.push(wc)
     const bytes = await encodePack(commits, { kernel: this.#kernel, base: null })
-    if (base64Length(bytes.length) > MAX_BODY_BASE64) {
-      throw new Error(
-        `PackRemote.repack: '${branch}' is ${bytes.length} bytes as one pack, more than one request can carry`,
-      )
+    const pack = await newPack(manifest.nextSeq, null, manifest.head, commits.length, bytes)
+    const change: Change = {
+      packs: [pack],
+      deletions: manifest.packs.flatMap(filesOf),
+      head: manifest.head,
+      nextSeq: manifest.nextSeq + 1,
+      meta: manifest.meta,
+      headline: `kvgit ${branch} repack (${manifest.packs.length} → 1)`,
+      what: `the whole history up to ${manifest.head.slice(0, 7)}`,
     }
-    const seq = manifest.nextSeq
-    const entry: PackEntry = {
-      path: `${PACKS_DIR}/${String(seq).padStart(6, '0')}-${manifest.head.slice(0, 12)}.pack`,
-      seq,
-      base: null,
-      tip: manifest.head,
-      commits: commits.length,
-      bytes: bytes.length,
-      sha256: await sha256Hex(bytes),
-      blob: await gitBlobSha1(bytes),
+    return this.#land(
+      branch,
+      st,
+      change,
+      (m) => m.packs.length === 1 && m.packs[0]?.path === pack.path,
+    )
+  }
+
+  // -------------------------------------------------------------------------
+  // Landing a change: inline, or as git objects over REST
+  // -------------------------------------------------------------------------
+
+  /**
+   * Land `change` on `branch` as one commit, compare-and-swapped
+   * against `st`: inline when the request is small enough, else over
+   * REST. After an error that leaves it unclear, the branch is re-read,
+   * and `landed` of its manifest says whether the change is there.
+   *
+   * @returns false when the branch had moved (a lost race).
+   */
+  async #land(
+    branch: string,
+    st: BranchState | null,
+    change: Change,
+    landed: (m: PackManifest) => boolean,
+  ): Promise<boolean> {
+    const before = st?.gitOid ?? ZERO_OID
+    const rough = change.packs.reduce(
+      (n, p) => n + (isNew(p) ? base64Length(p.bytes.length) : 0),
+      0,
+    )
+    if (rough + REQUEST_OVERHEAD <= this.#inlineBytes) {
+      const layout = await this.#layout(branch, change, null)
+      const size = inlineSize(layout)
+      if (size <= this.#inlineBytes) {
+        try {
+          if (await this.#landInline(branch, st, change, layout)) return true
+          return (await this.#reread(branch, landed)).landed
+        } catch (err) {
+          if (!(err instanceof GithubError)) throw err
+          const unclear = err.kind === 'network' || err.kind === 'server'
+          if (err.kind !== 'too-large' && !unclear) throw err
+          if (err.kind === 'too-large') {
+            // GitHub stopped waiting for the body: that size doesn't
+            // reach it on this link, so smaller ones go over REST too.
+            this.#inlineBytes = Math.min(this.#inlineBytes, Math.floor(size / 2))
+          }
+          // A 499 or 413 is GitHub saying it applied nothing; a network
+          // error, at the deadline or not, or a server error leaves it
+          // unclear.
+          if (err.status === 0 || unclear) {
+            const now = await this.#readOne(branch)
+            if (now?.manifest != null && landed(now.manifest)) return true
+            // a creation's createRef can land without its commit: the
+            // bare ref it leaves is this push's to claim
+            const bare =
+              st === null &&
+              now !== null &&
+              now.manifest === null &&
+              now.unreadable === undefined &&
+              now.gitOid === this.#defaultOid
+            if (bare) st = now
+            else if ((now?.gitOid ?? ZERO_OID) !== before) return false
+            if (unclear) throw err
+          }
+        }
+      }
     }
-    const next: PackManifest = { ...manifest, packs: [entry], nextSeq: seq + 1 }
+    return this.#landRest(branch, st, change, landed)
+  }
+
+  /** One `createCommitOnBranch` (creating the ref in the same request
+   *  for a new session): true when it landed, false when the CAS lost. */
+  async #landInline(
+    branch: string,
+    st: BranchState | null,
+    change: Change,
+    layout: Layout,
+  ): Promise<boolean> {
+    const create = st === null
     const res = await this.client.graphql<{
-      commit: { commit: { oid: string }; ref: { id: string } } | null
+      create?: { ref: { id: string } } | null
+      commit: { commit: { oid: string; tree: { oid: string } } } | null
     }>(
-      COMMIT_MUTATION(false),
+      COMMIT_MUTATION(create),
       {
+        ...(create && { repoId: this.#repoId, ref: `refs/heads/${branch}` }),
         repo: this.client.repo,
         branch,
-        oid: st.gitOid,
-        headline: `kvgit ${branch} repack (${manifest.packs.length} → 1)`,
-        body: `Kvgit-Head: ${manifest.head}\nKvgit-Pack-Format: ${PACK_FORMAT}`,
+        oid: st?.gitOid ?? this.#defaultOid,
+        headline: change.headline,
+        body: trailers(change.head),
         additions: [
-          { path: entry.path, contents: bytesToBase64(bytes) },
-          { path: MANIFEST_PATH, contents: bytesToBase64(utf8(JSON.stringify(next))) },
+          ...layout.files.map((f) => ({ path: f.path, contents: bytesToBase64(f.bytes) })),
+          { path: MANIFEST_PATH, contents: bytesToBase64(manifestBytes(layout.manifest)) },
         ],
-        deletions: manifest.packs.map((p) => ({ path: p.path })),
+        deletions: change.deletions.map((path) => ({ path })),
       },
       { mutation: true },
     )
-    const landed = res.data?.commit ?? null
-    if (landed === null) {
+    const made = res.data?.commit ?? null
+    if (made === null) {
       if (res.errors.some(lostRace)) return false
-      throw graphqlFailure('repack', res.errors)
+      throw graphqlFailure('push', res.errors)
     }
-    this.#refs.set(branch, { refId: landed.ref.id, gitOid: landed.commit.oid, manifest: next })
+    this.#refs.set(branch, {
+      gitOid: made.commit.oid,
+      treeOid: made.commit.tree.oid,
+      manifest: layout.manifest,
+    })
     return true
+  }
+
+  /** The change as git objects: its packs' parts (those GitHub lacks),
+   *  a tree, a commit, and an `updateRefs` from `st`'s commit to it. */
+  async #landRest(
+    branch: string,
+    st: BranchState | null,
+    change: Change,
+    landed: (m: PackManifest) => boolean,
+  ): Promise<boolean> {
+    let layout: Layout
+    for (;;) {
+      layout = await this.#layout(branch, change, this.#partBytes)
+      try {
+        await this.#upload(layout.files, change)
+        break
+      } catch (err) {
+        if (!(err instanceof GithubError) || err.kind !== 'too-large') throw err
+        if (this.#partBytes <= this.#minPartBytes) throw err
+        // a part didn't arrive within GitHub's minute: smaller parts
+        this.#partBytes = Math.max(this.#minPartBytes, Math.floor(this.#partBytes / 2))
+      }
+    }
+    const baseTree = st === null ? this.#defaultTree : st.treeOid || null
+    const tree = await this.client.request<{ sha: string }>('POST', 'git/trees', {
+      ...(baseTree !== null && { base_tree: baseTree }),
+      tree: [
+        ...layout.files.map((f) => ({ path: f.path, mode: '100644', type: 'blob', sha: f.sha })),
+        {
+          path: MANIFEST_PATH,
+          mode: '100644',
+          type: 'blob',
+          content: new TextDecoder().decode(manifestBytes(layout.manifest)),
+        },
+        ...change.deletions.map((path) => ({ path, mode: '100644', type: 'blob', sha: null })),
+      ],
+    })
+    const commit = await this.client.request<{ sha: string }>('POST', 'git/commits', {
+      message: `${change.headline}\n\n${trailers(change.head)}`,
+      tree: tree.sha,
+      parents: [st?.gitOid ?? this.#defaultOid],
+    })
+
+    const before = st?.gitOid ?? ZERO_OID
+    let errors: GraphqlError[]
+    try {
+      const res = await this.client.graphql(
+        UPDATE_REFS,
+        {
+          repoId: this.#repoId,
+          updates: [{ name: `refs/heads/${branch}`, beforeOid: before, afterOid: commit.sha }],
+        },
+        { mutation: true },
+      )
+      errors = res.errors
+    } catch (err) {
+      if (!(err instanceof GithubError) || (err.kind !== 'network' && err.kind !== 'server')) {
+        throw err
+      }
+      const after = await this.#reread(branch, landed)
+      if (after.landed) return true
+      if (after.oid !== before) return false
+      throw err
+    }
+    if (errors.length === 0) {
+      this.#refs.set(branch, { gitOid: commit.sha, treeOid: tree.sha, manifest: layout.manifest })
+      return true
+    }
+    // GitHub reports a refused ref update with a generic error: the
+    // re-read says whether it landed after all (an earlier attempt
+    // whose response was lost), lost a race, or failed.
+    const after = await this.#reread(branch, landed)
+    if (after.landed) return true
+    if (after.oid !== before) return false
+    throw graphqlFailure('push', errors)
+  }
+
+  /** The change's manifest and files, its new packs one file each
+   *  (`partBytes` null) or cut into parts of at most `partBytes`. */
+  async #layout(branch: string, change: Change, partBytes: number | null): Promise<Layout> {
+    const entries: PackEntry[] = []
+    const files: PackFile[] = []
+    for (const p of change.packs) {
+      if (!isNew(p)) {
+        entries.push(p)
+        continue
+      }
+      const cuts: Uint8Array[] = []
+      const step = partBytes ?? p.bytes.length
+      for (let at = 0; at < p.bytes.length; at += step) cuts.push(p.bytes.subarray(at, at + step))
+      const parts: string[] = []
+      for (const [i, bytes] of cuts.entries()) {
+        const sha = await gitBlobSha1(bytes)
+        parts.push(sha)
+        files.push({ path: cuts.length === 1 ? p.path : `${p.path}.${i}`, bytes, sha, pack: p })
+      }
+      const { bytes, ...entry } = p
+      entries.push({ ...entry, bytes: bytes.length, parts })
+    }
+    const manifest: PackManifest = {
+      format: PACK_FORMAT,
+      kernel: this.#kernel,
+      branch,
+      head: change.head,
+      packs: entries,
+      nextSeq: change.nextSeq,
+      meta: change.meta ?? null,
+    }
+    return { manifest, files }
+  }
+
+  /** Upload the files GitHub doesn't already hold (a push that stopped
+   *  partway left some), one blob each. */
+  async #upload(files: PackFile[], change: Change): Promise<void> {
+    const held = await this.#held([...new Set(files.map((f) => f.sha))])
+    for (const f of files) {
+      if (held.has(f.sha)) continue
+      try {
+        await this.client.createBlob(f.bytes)
+      } catch (err) {
+        if (!(err instanceof GithubError) || err.kind !== 'too-large') throw err
+        const part = f.bytes.length === f.pack.bytes.length ? 'the pack' : 'a part of the pack'
+        throw new GithubError(
+          err.kind,
+          err.status,
+          `PackRemote.push: ${part} of ${change.what} (${formatBytes(f.bytes.length)} of ${formatBytes(f.pack.bytes.length)} compressed) didn't reach GitHub: ${err.message}`,
+          err.body,
+        )
+      }
+      held.add(f.sha)
+    }
+  }
+
+  /** Which of `shas` the repo holds, referenced or not: one query per
+   *  `LOOKUP_CHUNK`. */
+  async #held(shas: string[]): Promise<Set<string>> {
+    const out = new Set<string>()
+    for (let i = 0; i < shas.length; i += LOOKUP_CHUNK) {
+      const batch = shas.slice(i, i + LOOKUP_CHUNK)
+      const vars: Record<string, string> = { owner: this.#owner, name: this.#name }
+      batch.forEach((sha, j) => {
+        vars[`o${j}`] = sha
+      })
+      const res = await this.client.graphql<{ repository: Record<string, unknown> }>(
+        OBJECTS_QUERY(batch.length),
+        vars,
+      )
+      const repo = expectData(res, 'object lookup').repository
+      batch.forEach((sha, j) => {
+        if (repo[`o${j}`] != null) out.add(sha)
+      })
+    }
+    return out
+  }
+
+  /** Re-read `branch` after an unclear outcome: whether `landed` holds
+   *  of its manifest, and its git commit now (zeros when it is gone). */
+  async #reread(
+    branch: string,
+    landed: (m: PackManifest) => boolean,
+  ): Promise<{ landed: boolean; oid: string }> {
+    const st = await this.#readOne(branch)
+    return {
+      landed: st?.manifest != null && landed(st.manifest),
+      oid: st?.gitOid ?? ZERO_OID,
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -830,24 +1131,41 @@ export class PackRemote implements Remote {
 
   /** Apply ref updates atomically: false when a ref wasn't where it
    *  was expected (a lost race; the caller re-reads). GitHub reports a
-   *  rejected batch with a generic error, so an error is read as a lost
-   *  race only if a re-read shows one of the refs moved; any other
-   *  (a token's permission, a malformed request) throws. */
+   *  rejected batch with a generic error, so after an error the refs
+   *  are re-read: every ref at its `afterOid` means the batch landed
+   *  (an earlier attempt whose response was lost); one moved anywhere
+   *  else, a lost race; none moved, a failure (a token's permission, a
+   *  malformed request), which throws. */
   async #updateRefs(
     updates: Array<{ name: string; beforeOid: string; afterOid: string }>,
   ): Promise<boolean> {
     if (this.#repoId === null) await this.refresh()
-    const res = await this.client.graphql(
-      UPDATE_REFS,
-      { repoId: this.#repoId, updates },
-      { mutation: true },
-    )
-    if (res.errors.length === 0) return true
+    let errors: GraphqlError[]
+    let failure: unknown = null
+    try {
+      errors = (
+        await this.client.graphql(
+          UPDATE_REFS,
+          { repoId: this.#repoId, updates },
+          { mutation: true },
+        )
+      ).errors
+    } catch (err) {
+      if (!(err instanceof GithubError) || (err.kind !== 'network' && err.kind !== 'server')) {
+        throw err
+      }
+      failure = err
+      errors = []
+    }
+    if (failure === null && errors.length === 0) return true
+    const now: string[] = []
     for (const u of updates) {
       const st = await this.#readOne(u.name.slice('refs/heads/'.length))
-      if ((st?.gitOid ?? ZERO_OID) !== u.beforeOid) return false
+      now.push(st?.gitOid ?? ZERO_OID)
     }
-    throw graphqlFailure('updateRefs', res.errors)
+    if (updates.every((u, i) => now[i] === u.afterOid)) return true
+    if (updates.some((u, i) => now[i] !== u.beforeOid)) return false
+    throw failure ?? graphqlFailure('updateRefs', errors)
   }
 
   // -------------------------------------------------------------------------
@@ -871,12 +1189,17 @@ export class PackRemote implements Remote {
   #repoHeader(repo: RepoHeader): void {
     this.#repoId = repo.id
     this.#defaultOid = repo.defaultBranchRef?.target.oid ?? null
+    this.#defaultTree = repo.defaultBranchRef?.target.tree?.oid ?? null
     this.#defaultName = repo.defaultBranchRef?.name ?? null
   }
 
   #remember(node: RefNode, branch = node.name): BranchState {
     const file = node.target.file
-    const st: BranchState = { refId: node.id, gitOid: node.target.oid, manifest: null }
+    const st: BranchState = {
+      gitOid: node.target.oid,
+      treeOid: node.target.tree?.oid ?? '',
+      manifest: null,
+    }
     if (file != null) {
       // a manifest that is there but unusable is never treated as
       // absent: the next creation would claim the branch over it
@@ -903,6 +1226,53 @@ export class PackRemote implements Remote {
   }
 }
 
+async function newPack(
+  seq: number,
+  base: string | null,
+  tip: string,
+  commits: number,
+  bytes: Uint8Array,
+): Promise<NewPack> {
+  return {
+    path: `${PACKS_DIR}/${String(seq).padStart(6, '0')}-${tip.slice(0, 12)}.pack`,
+    seq,
+    base,
+    tip,
+    commits,
+    bytes,
+    sha256: await sha256Hex(bytes),
+  }
+}
+
+const isNew = (p: PackEntry | NewPack): p is NewPack => p.bytes instanceof Uint8Array
+
+/** The files a manifest entry is stored in. */
+function filesOf(entry: PackEntry): string[] {
+  return entry.parts.length === 1 ? [entry.path] : entry.parts.map((_, i) => `${entry.path}.${i}`)
+}
+
+/** How large an inline commit request for `layout` is. */
+function inlineSize(layout: Layout): number {
+  let n = REQUEST_OVERHEAD + base64Length(manifestBytes(layout.manifest).length)
+  for (const f of layout.files) n += f.path.length + base64Length(f.bytes.length)
+  return n
+}
+
+const manifestBytes = (manifest: PackManifest): Uint8Array => utf8(JSON.stringify(manifest))
+
+const trailers = (head: string): string => `Kvgit-Head: ${head}\nKvgit-Pack-Format: ${PACK_FORMAT}`
+
+function concat(chunks: Uint8Array[]): Uint8Array {
+  if (chunks.length === 1) return chunks[0] as Uint8Array
+  const out = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0))
+  let at = 0
+  for (const c of chunks) {
+    out.set(c, at)
+    at += c.length
+  }
+  return out
+}
+
 /** The lowest generation among `commits`; 0 if one doesn't say. */
 function lowestGeneration(commits: readonly WireCommit[]): number {
   let low = Number.POSITIVE_INFINITY
@@ -913,7 +1283,8 @@ function lowestGeneration(commits: readonly WireCommit[]): number {
   return low
 }
 
-/** A manifest from its text, or why it can't be used. */
+/** A manifest from its text, or why it can't be used. A format-1
+ *  manifest reads as format 2: each pack one part, its `blob`. */
 function readManifest(text: string | null | undefined): PackManifest | string {
   if (typeof text !== 'string') return 'its manifest could not be read as text'
   let parsed: unknown
@@ -923,9 +1294,16 @@ function readManifest(text: string | null | undefined): PackManifest | string {
     return 'its manifest is not JSON'
   }
   const format = (parsed as { format?: unknown } | null)?.format
-  if (format !== PACK_FORMAT)
-    return `its manifest is format ${JSON.stringify(format)}, not ${PACK_FORMAT}`
-  return parsed as PackManifest
+  if (format !== 1 && format !== PACK_FORMAT) {
+    return `its manifest is format ${JSON.stringify(format)}, not 1 or ${PACK_FORMAT}`
+  }
+  const manifest = parsed as PackManifest
+  if (format === 1) {
+    manifest.packs = (manifest.packs as Array<PackEntry & { blob: string }>).map(
+      ({ blob, ...entry }) => ({ ...entry, parts: [blob] }),
+    )
+  }
+  return manifest
 }
 
 /** The data, or a throw. A branch without a manifest (`main`, a

@@ -159,13 +159,15 @@ export class FakeGithub {
     this.refs.set(`refs/heads/${branch}`, oid)
   }
 
-  /** Put a commit holding `files` (text) on `branch`, as another
+  /** Put a commit holding `files` (text or bytes) on `branch`, as another
    *  writer would: on top of its head, or of main's for a new branch. */
-  plant(branch: string, files: Record<string, string>): void {
+  plant(branch: string, files: Record<string, string | Uint8Array>): void {
     const ref = `refs/heads/${branch}`
     const parent = this.refs.get(ref) ?? (this.refs.get('refs/heads/main') as string)
     const next = new Map((this.commits.get(parent) as Commit).files)
-    for (const [path, text] of Object.entries(files)) next.set(path, enc.encode(text))
+    for (const [path, data] of Object.entries(files)) {
+      next.set(path, typeof data === 'string' ? enc.encode(data) : data)
+    }
     this.refs.set(ref, this.#commit(parent, next, 'planted').oid)
   }
 
@@ -510,7 +512,7 @@ export class FakeGithub {
     const message = `${String(vars.headline)}\n\n${String(vars.body)}`
     const commit = this.#commit(head, files, message)
     this.refs.set(ref, commit.oid)
-    data.commit = { commit: { oid: commit.oid }, ref: { id: `REF_${ref}` } }
+    data.commit = { commit: { oid: commit.oid, tree: { oid: commit.tree } } }
     return errors.length > 0 ? { data, errors } : { data }
   }
 

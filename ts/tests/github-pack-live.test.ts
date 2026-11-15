@@ -9,7 +9,7 @@
 
 import { afterAll, describe, expect, it } from 'vitest'
 import { Memory } from '../src/backends/memory'
-import { GithubClient, PackRemote } from '../src/github/index'
+import { GithubClient, PackRemote, type PackRemoteOptions } from '../src/github/index'
 import { Repo, pullBranch, pushBranch, walkDelta } from '../src/index'
 
 const TOKEN = process.env.KVGIT_GH_TOKEN ?? ''
@@ -19,10 +19,20 @@ const LIVE = TOKEN.length > 0 && REPO.length > 0
 const enc = new TextEncoder()
 const stamp = Date.now().toString(36)
 
-function device(): { store: Memory; remote: PackRemote } {
+function device(opts: PackRemoteOptions = {}): { store: Memory; remote: PackRemote } {
   const store = new Memory()
   const client = new GithubClient({ token: TOKEN, repo: REPO })
-  return { store, remote: new PackRemote(client, store, { meta: () => ({ title: 'live' }) }) }
+  return {
+    store,
+    remote: new PackRemote(client, store, { meta: () => ({ title: 'live' }), ...opts }),
+  }
+}
+
+/** `n` random bytes, which don't compress. */
+function random(n: number): Uint8Array {
+  const out = new Uint8Array(n)
+  for (let i = 0; i < n; i += 65536) crypto.getRandomValues(out.subarray(i, Math.min(n, i + 65536)))
+  return out
 }
 
 async function extend(store: Memory, branch: string, tag: string): Promise<string> {
@@ -43,7 +53,7 @@ describe.runIf(LIVE)('PackRemote (live)', () => {
           .catch(() => undefined)
       }
     }
-  })
+  }, 120_000)
 
   it('two devices race a push from the same head: exactly one lands, the other gets false', async () => {
     const branch = `pack-race-${stamp}`
@@ -92,6 +102,42 @@ describe.runIf(LIVE)('PackRemote (live)', () => {
     const refs = await device().remote.listRefs()
     expect(refs.find((r) => r.branch === branch)?.head).toBe(okA ? headA : headB)
   }, 120_000)
+
+  it('lands a push past the inline cutoff over REST, creating the ref with updateRefs', async () => {
+    const branch = `pack-rest-${stamp}`
+    branches.push(branch)
+    const a = device({ inlineBytes: 0, partBytes: 64 * 1024 })
+    const wt = await (await Repo.open(a.store)).worktree(branch, { create: true })
+    const value = random(200_000)
+    wt.set('files/big.bin', value)
+    await wt.commit()
+    const t0 = performance.now()
+    expect((await pushBranch(a.store, a.remote, branch)).status).toBe('created')
+    console.log(JSON.stringify({ rest: 'create', ms: Math.round(performance.now() - t0) }))
+    // and on top of it, building on the branch's tree
+    await extend(a.store, branch, 'next')
+    expect((await pushBranch(a.store, a.remote, branch)).status).toBe('pushed')
+
+    const b = device()
+    const pulled = await pullBranch(b.store, b.remote, branch)
+    expect(pulled.localHead).toBe(await (await Repo.open(a.store)).branches.get(branch))
+    const copy = await (await Repo.open(b.store)).worktree(branch)
+    expect(await copy.get('files/big.bin')).toEqual(value)
+  }, 180_000)
+
+  it('lands a 12 MB commit, more than GraphQL takes in its 5 s on most links', async () => {
+    const branch = `pack-big-${stamp}`
+    branches.push(branch)
+    const a = device()
+    const wt = await (await Repo.open(a.store)).worktree(branch, { create: true })
+    wt.set('files/big.bin', random(12 * 1024 * 1024))
+    await wt.commit()
+    const t0 = performance.now()
+    expect((await pushBranch(a.store, a.remote, branch)).status).toBe('created')
+    console.log(JSON.stringify({ rest: '12MB', ms: Math.round(performance.now() - t0) }))
+    const b = device()
+    expect((await pullBranch(b.store, b.remote, branch)).localHead).toBe(wt.head)
+  }, 600_000)
 
   it('archive, roster, restore: one updateRefs each', async () => {
     const branch = `pack-life-${stamp}`
