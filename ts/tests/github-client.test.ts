@@ -148,6 +148,63 @@ describe('retry and taxonomy', () => {
   })
 })
 
+describe('rate limits', () => {
+  const secondary = { message: 'You have exceeded a secondary rate limit.' }
+
+  it('waits a minute on a secondary limit that names no wait', async () => {
+    const { client, sleeps } = makeClient([
+      { status: 403, body: secondary },
+      { status: 201, body: { sha: 'a' } },
+    ])
+    await client.request('POST', 'git/blobs', {})
+    expect(sleeps).toEqual([60_000])
+  })
+
+  it('waits until the reset when the quota is spent', async () => {
+    const { client, sleeps } = makeClient([
+      {
+        status: 403,
+        body: { message: 'API rate limit exceeded' },
+        // the harness clock starts at 1,000 s
+        headers: { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': '1030' },
+      },
+      { status: 200, body: {} },
+    ])
+    await client.request('GET', 'x')
+    expect(sleeps).toEqual([30_000])
+  })
+
+  it('fails a wait longer than a minute at once, carrying it', async () => {
+    for (const headers of [
+      { 'retry-after': '90' },
+      { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': '1600' },
+    ]) {
+      const { client, calls, sleeps } = makeClient([{ status: 429, body: secondary, headers }])
+      const err = await client.request('POST', 'git/blobs', {}).catch((e) => e)
+      expect(err).toBeInstanceOf(GithubError)
+      expect((err as GithubError).kind).toBe('rate-limit')
+      expect((err as GithubError).retryAfterMs).toBeGreaterThanOrEqual(90_000)
+      expect((err as GithubError).message).toMatch(/GitHub asks to wait \d+ s/)
+      expect(calls.length).toBe(1)
+      expect(sleeps).toEqual([])
+    }
+  })
+
+  it('carries the wait when retries run out', async () => {
+    const { client, sleeps } = makeClient(
+      [
+        { status: 403, body: secondary },
+        { status: 403, body: secondary },
+      ],
+      { maxRetries: 1 },
+    )
+    const err = await client.request('POST', 'git/blobs', {}).catch((e) => e)
+    expect((err as GithubError).kind).toBe('rate-limit')
+    expect((err as GithubError).retryAfterMs).toBe(60_000)
+    expect(sleeps).toEqual([60_000])
+  })
+})
+
 describe('requests too large for GitHub', () => {
   const big = 'A'.repeat(200 * 1024)
 
@@ -188,6 +245,35 @@ describe('requests too large for GitHub', () => {
     }
   })
 
+  it('takes a large REST write answered 401 a minute in for the deadline, not the token', async () => {
+    for (const script of [
+      { status: 401, body: { message: 'Bad credentials' }, takesMs: 56_000 },
+      { status: 0, throws: true, takesMs: 56_000 },
+    ]) {
+      const { client, calls } = makeClient([script])
+      const err = await client
+        .request('POST', 'git/blobs', { content: big, encoding: 'base64' })
+        .catch((e) => e)
+      expect((err as GithubError).kind).toBe('too-large')
+      expect((err as GithubError).message).toMatch(/205 kB request .*after 56\.0 s/)
+      expect((err as GithubError).message).toMatch(/about a minute/)
+      expect(calls.length).toBe(1)
+    }
+  })
+
+  it('reads a 401 that is early or on a small body as a bad token', async () => {
+    for (const [body, takesMs] of [
+      [{ content: big }, 1_000],
+      [{ content: 'small' }, 56_000],
+    ] as const) {
+      const { client } = makeClient([
+        { status: 401, body: { message: 'Bad credentials' }, takesMs },
+      ])
+      const err = await client.request('POST', 'git/blobs', body).catch((e) => e)
+      expect((err as GithubError).kind).toBe('auth')
+    }
+  })
+
   it('reads 499 and 413 as too-large, naming the size, and never retries them', async () => {
     for (const [status, pattern] of [
       [499, /GitHub dropped a 205 kB request after 6\.0 s/],
@@ -204,6 +290,21 @@ describe('requests too large for GitHub', () => {
 })
 
 describe('graphql and raw blobs', () => {
+  it('creates a blob as base64 and returns its SHA, checked', async () => {
+    const sha = 'b6fc4c620b67d95f953a5c1c1230aaab5db5a1b0' // git hash-object of "hello"
+    const { client, calls } = makeClient([
+      { status: 201, body: { sha } },
+      { status: 201, body: { sha: 'f'.repeat(40) } },
+    ])
+    const hello = new TextEncoder().encode('hello')
+    expect(await client.createBlob(hello)).toBe(sha)
+    expect(calls[0]?.url).toBe('https://api.github.com/repos/o/r/git/blobs')
+    expect(calls[0]?.body).toEqual({ content: 'aGVsbG8=', encoding: 'base64' })
+    const err = await client.createBlob(hello).catch((e) => e)
+    expect((err as GithubError).kind).toBe('validation')
+    expect((err as GithubError).message).toMatch(/not b6fc4c6/)
+  })
+
   it('posts a GraphQL document and returns its data beside its errors', async () => {
     const { client, calls } = makeClient([
       { status: 200, body: { data: { a: 1 }, errors: [{ type: 'NOT_FOUND', message: 'x' }] } },
