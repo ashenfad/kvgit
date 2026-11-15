@@ -429,14 +429,19 @@ await remote.roster() // every session: head, meta, packs, archived
 ```
 
 - **`GithubClient`**: GraphQL (`graphql`), raw blob reads by SHA
-  (`getBlobRaw`) and REST (`request`), scoped to one repo. Mutations
-  run one at a time, spaced by `writeIntervalMs`; `server`,
-  `rate-limit` and network failures retry with backoff, honoring
-  `Retry-After`, and `auth`, `permission`, `validation` and
-  `too-large` don't (see `GithubError`). `too-large` is a request
-  GitHub refused for its size (413) or dropped before its body arrived
-  (499, or in a browser a network error about 5 s into a large GraphQL
-  request): sending the same body again would fail the same way.
+  (`getBlobRaw`), blob creation (`createBlob`) and REST (`request`),
+  scoped to one repo. Mutations run one at a time, spaced by
+  `writeIntervalMs`. `server` and network failures retry with backoff;
+  `auth`, `permission`, `validation` and `too-large` don't (see
+  `GithubError`). A `rate-limit` waits as GitHub asks: the whole
+  `Retry-After`, else until `x-ratelimit-reset` when the quota is
+  spent, else a minute. A wait longer than a minute fails the request
+  with the wait in `retryAfterMs`. `too-large` is a request GitHub
+  refused for its size (413) or stopped waiting for: a GraphQL body
+  still arriving at about 5 s (a 499, or in a browser a network error),
+  or a REST one at about a minute (a 401 "Bad credentials", or a
+  network error). Sending the same body again would fail the same
+  way.
 - **`PackRemote`**: the `Remote`. `push` lands one pack per request,
   `fetch` reads the packs a receiver lacks, `roster` lists every
   session, live and archived. `archiveBranch`, `restoreBranch`,
@@ -504,8 +509,9 @@ bytes it takes for text).
 #### A fake GitHub, for tests
 
 `FakeGithub` (`@agex-ts/kvgit/github/fake`) is an in-memory stand-in
-for the slice of GitHub `PackRemote` uses: its GraphQL documents and
-raw blob reads. Use it in-process (`fake.client()`, or `fake.fetch` as
+for the slice of GitHub `PackRemote` uses: its GraphQL documents
+(object lookups among them), the REST git-data writes (`git/blobs`,
+`git/trees`, `git/commits`) and raw blob reads. Use it in-process (`fake.client()`, or `fake.fetch` as
 a client's `fetchImpl`), or over HTTP with `serveFakeGithub`
 (`@agex-ts/kvgit/github/fake-server`, Node), whose URL is a client's
 `apiBase`. The server answers any origin's cross-origin requests, so a
@@ -513,7 +519,12 @@ page in a browser can sync against it, and two browser profiles can
 play two devices. `fake.failNext({ status, body, headers, path })`
 answers the next requests with a failure (a rate limit, a server
 error); `maxBodyBytes` refuses larger requests with 413, standing in
-for GitHub's undocumented size limit. From `ts/`:
+for GitHub's undocumented size limit. `uplinkBytesPerSecond` makes each
+request take its body's time on the fake's clock (`fake.now()`, which
+`fake.client()` uses), with GitHub's deadlines: a GraphQL body still
+arriving at 5 s gets a 499, a REST one at 60 s a 401. `fake.prune()`
+forgets blobs no branch references, as GitHub eventually does. From
+`ts/`:
 
 ```sh
 pnpm build

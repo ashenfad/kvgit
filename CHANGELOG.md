@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **TypeScript gains the commit-scan recoverer.** `recoverByCommitScan`, passed as `recoverFromCorruptHead`, guesses a damaged branch's head as Python's `recover_by_commit_scan` does, from the same code.
 - **`IntegrityError`, in both packages.** A transferred commit whose hash or parent generations don't match what it carries, or whose parent never came, is refused with it before anything of it is written; TypeScript's `applyWire` threw a plain `Error`.
 - **TypeScript's GitHub client names a request too large to send.** A 413, a 499, or a large GraphQL request that fails when GitHub stops waiting for its body (about 5 s; a browser sees a network error) throws `GithubError` of the new kind `too-large`, unretried, and `PackRemote.push` names the pack that didn't make it.
+- **TypeScript's GitHub client waits out rate limits as GitHub asks.** It waits the whole `Retry-After`, else until the quota resets, else a minute for a secondary limit, where it capped waits at 60 s and retried a secondary limit after a second; a wait over a minute fails as `rate-limit` with the new `GithubError.retryAfterMs`.
+- **TypeScript's GitHub client creates blobs, and knows REST's minute.** `createBlob` stores bytes as a git blob and checks the SHA GitHub gives it; a large REST write answered 401 or failing a minute in is `too-large`, since GitHub answers a body still arriving then as a bad token.
+- **The fake GitHub takes git objects over REST.** `FakeGithub` answers `git/blobs`, `git/trees` and `git/commits` writes and `object(oid:)` lookups, and `uplinkBytesPerSecond` simulates a slow link, with GitHub's body deadlines on the fake's clock.
 - **Python syncs, internally.** `kvgit._sync` pushes, pulls and syncs branches with a remote as TypeScript does, from the same core, with a reference `MemoryRemote`; it isn't public API yet.
 
 ### Changed

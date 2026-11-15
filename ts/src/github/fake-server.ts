@@ -52,6 +52,9 @@ export async function serveFakeGithub(
     new FakeGithub({
       ...(opts.repo !== undefined && { repo: opts.repo }),
       ...(opts.maxBodyBytes !== undefined && { maxBodyBytes: opts.maxBodyBytes }),
+      ...(opts.uplinkBytesPerSecond !== undefined && {
+        uplinkBytesPerSecond: opts.uplinkBytesPerSecond,
+      }),
     })
   const host = opts.host ?? '127.0.0.1'
   const server = createServer((req, res) => {

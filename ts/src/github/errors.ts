@@ -7,7 +7,8 @@
  *
  *   - `auth`        401 — token invalid / expired / missing scope
  *   - `rate-limit`  403/429 carrying rate-limit indicators (primary
- *                   or secondary) — retryable with backoff
+ *                   or secondary) — retried after GitHub's wait; one
+ *                   longer than a minute fails with `retryAfterMs`
  *   - `permission`  other 403 — token scope / repo access; NOT retryable
  *   - `not-found`   404 — repo or object missing (also: deleted refs)
  *   - `validation`  422 — payload rejected; NOT retryable (the CAS
@@ -16,8 +17,9 @@
  *   - `too-large`   413, 499, or a large request that failed at GitHub's
  *                   body deadline — too big, or too slow to arrive
  *                   (GitHub drops a GraphQL request whose body hasn't
- *                   arrived within about 5 s); NOT retryable: the same
- *                   body fails the same way
+ *                   arrived within about 5 s, and answers a REST one
+ *                   still arriving after about a minute with a 401);
+ *                   NOT retryable: the same body fails the same way
  *   - `server`      5xx — GitHub-side; retryable
  *   - `network`     fetch itself failed; retryable
  */
@@ -39,12 +41,22 @@ export class GithubError extends Error {
   readonly status: number
   /** Raw response body, for debugging. */
   readonly body: string
+  /** For `rate-limit`: how long GitHub asked to wait before the next
+   *  request, in ms, when that is known. */
+  readonly retryAfterMs: number | undefined
 
-  constructor(kind: GithubErrorKind, status: number, message: string, body = '') {
+  constructor(
+    kind: GithubErrorKind,
+    status: number,
+    message: string,
+    body = '',
+    retryAfterMs?: number,
+  ) {
     super(message)
     this.kind = kind
     this.status = status
     this.body = body
+    this.retryAfterMs = retryAfterMs
   }
 }
 
