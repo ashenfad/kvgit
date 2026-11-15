@@ -1,271 +1,240 @@
-# GitHub sync past one request (proposal)
+# GitHub sync format (format 2)
 
-Status: accepted 2026-11-15, being built. The decisions, with the
-changes they made to the proposal, are at the end. Once built, this
-file becomes the GitHub transport's format contract (see "The format
-as a contract").
+How kvgit sessions are stored in a plain GitHub repository, and how a
+writer changes them. TypeScript's `PackRemote`
+(`@agex-ts/kvgit/github`) implements it; another implementation that
+follows this file can share a repository with it. The golden fixture
+[`ts/tests/fixtures/github-format-2.json`](../ts/tests/fixtures/github-format-2.json)
+holds a manifest, the pack it lists, a value kept outside that pack,
+and the state its commits decode to.
 
-## The problem
+The transport moves kvgit's wire commits (`wire_walk` and
+`wire_replay` in [`protocol.md`](protocol.md)); commit hashes are
+[`storage.md`](storage.md)'s. It uses GraphQL and REST git-data calls
+only, never the git protocol, so it runs in a browser on a token with
+**Contents: read and write** on the one repository.
 
-`PackRemote` (TypeScript, `ts/src/github/pack.ts`) lands every push as
-one GraphQL `createCommitOnBranch` carrying the pack inline as base64.
-GitHub drops a GraphQL request whose body hasn't fully arrived after
-about 5 s. What one push can carry therefore depends on the uplink:
-about 9 MiB at 1.9 MB/s, but only 450 KiB at 90 KB/s. #143 names the
-failure (`too-large`) and keeps packs to 2 MiB of values. A push can
-only be split at commit boundaries, though, so a single commit can't
-shrink. A real session has a 12 MB commit that no ordinary connection
-can land through GraphQL.
+## Branches
 
-## What was measured
+- A session is the branch `refs/heads/<session>`. An archived session
+  (the trash) is `refs/heads/archived/<session>`.
+- A branch is a session when its head commit holds
+  `kvgit/manifest.json`.
+- A new session's branch starts from the default branch's commit. A
+  branch with no manifest that sits at the default branch's commit is
+  a creation that never got its first commit, and the next creation of
+  that session may claim it. A writer never pushes to any other branch
+  without a manifest, nor to the default branch.
+- A branch whose manifest isn't JSON, or has a `format` other than 1
+  or 2, is left alone: never pushed over, never listed.
 
-| Request | Body | Upload | Result |
-|---|---|---|---|
-| GraphQL query, padded | 600 KiB | 50 KiB/s | 499 at 6.1 s, 313 KB sent |
-| GraphQL query, padded | 20 MiB | full (≈20 MB/s) | 200 in 1.6 s |
-| REST `POST git/refs`, schema-invalid, padded | 600 KiB | 50 KiB/s | 422 at 12 s, all sent |
-| the same | 3 MiB | 150 KiB/s | 422 at 20.7 s |
-| the same | 1.2 MiB, 1.6 MiB | 30 KiB/s | 422 at 40 s, 55 s |
-| the same | 2 MiB | 30 KiB/s | **401 "Bad credentials"** at 68 s |
-| the same | 80 MB | full | 422 in 3 s |
-| REST `POST /markdown` (2026-11-13) | | throttled | 200 at 13.5 s |
+## Files on a session's branch
 
-None of these probes writes anything. GitHub can only reject the
-invalid `git/refs` request after reading its whole body, so a 422
-shows the body arrived. `POST git/blobs` itself couldn't be probed:
-`ashenfad/agex-sync-test` is archived, so every write there gets a
-404. The live check of blob uploads waits until it is unarchived.
+| Path | Holds |
+|---|---|
+| `kvgit/manifest.json` | The manifest. |
+| `kvgit/packs/<seq>-<tip12>.pack` | A pack stored in one part. `<seq>` is the pack's sequence number, six digits, zero-padded; `<tip12>` the first 12 hex digits of its tip. |
+| `kvgit/packs/<seq>-<tip12>.pack.<i>` | Part `i` (from 0) of a pack stored in n > 1 parts. |
+| `kvgit/values/<sha256>` | A value kept outside its pack, raw, in one part. `<sha256>` is the value's SHA-256 in hex, its kvgit blob key. |
+| `kvgit/values/<sha256>.<i>` | Part `i` of such a value in n > 1 parts. |
 
-So the 5 s deadline belongs to GraphQL. REST's git-data routes take a
-body for at least 55 s and at least 80 MB. Past about a minute, GitHub
-answers 401 "Bad credentials", which today's client would report as a
-bad token.
+Other files (the default branch's, which a new branch starts with) are
+left as they are.
 
-## Proposal
+**Parts.** A stored object's parts, concatenated in order, are its
+bytes. The writer chooses each part's size; a reader goes by the part
+SHAs it is given, never by sizes. The parts' git blob SHAs
+(`sha1("blob <len>\0" + bytes)`) are how a reader fetches them.
 
-### A push that fits goes as today
+**Values.** A branch whose packs reference a value names that value's
+files in its tree, so a value stays reachable while any branch uses it.
+The same value written by two writers in different parts gives two
+sets of files, both valid.
 
-A push whose GraphQL body (packs, manifest and document) stays under
-`inlineBytes` (default 1 MiB, about 4 s at 2 Mbps) lands as now: one
-`createCommitOnBranch`, with `expectedHeadOid` as the compare-and-swap.
-Most pushes are a chat turn or a file edit, a few KB, so they stay one
-request. If GitHub drops the request at its deadline (`too-large`), the
-same push goes the REST way instead, and the remote lowers its own
-inline cutoff below the size that was dropped for the rest of its
-lifetime, so a slow link doesn't spend 5 s on every medium-sized push.
-A dropped body is normally never applied; when it's unclear whether it
-was, the landed check below settles it.
+## The manifest
 
-### A larger push goes as git objects over REST
+JSON (UTF-8):
 
-1. **Blobs.** Each pack goes up as one or more git blobs by
-   `POST git/blobs` (`{content, encoding: "base64"}`), cut into parts of
-   at most `partBytes`. The default is 4 MiB of pack, a request of about
-   5.6 MB, which arrives within the minute down to about 100 KB/s. Each part's SHA is computed
-   locally (`gitBlobSha1`), as fetch already does.
-2. **Tree.** `POST git/trees` with `base_tree` set to the branch's
-   current tree. Its entries are each new part by SHA, the manifest
-   inline (`content`, UTF-8), and `sha: null` for files a fold
-   replaces. The roster query gains each ref's `tree { oid }`.
-3. **Commit.** `POST git/commits` with `{message, tree, parents:
-   [current commit]}` and today's headline and trailers. A creation's
-   parent is the default branch's commit, as now.
-4. **Ref.** GraphQL `updateRefs` with `beforeOid` set to the current
-   commit (zero for a creation) and `afterOid` to the new one. This is
-   an exact compare-and-swap, like `expectedHeadOid`. The request is
-   tiny, so the deadline doesn't matter.
+```json
+{
+  "format": 2,
+  "kernel": "ts",
+  "branch": "chat-1",
+  "head": "<kvgit head, 40 hex>",
+  "packs": [
+    {
+      "path": "kvgit/packs/000001-5c292a483b6a.pack",
+      "seq": 1,
+      "base": null,
+      "tip": "<kvgit commit>",
+      "commits": 4,
+      "bytes": 812,
+      "sha256": "<SHA-256 of the stored pack>",
+      "parts": ["<git blob SHA of each part>"]
+    }
+  ],
+  "nextSeq": 2,
+  "meta": { "title": "…" }
+}
+```
 
-**Did it land?** After an error, a push re-reads the branch's manifest.
-If its `head` (also the commit's `Kvgit-Head` trailer) is this push's
-tip, the push landed, whichever request carried it: an `updateRefs`
-whose response was lost (the client's retry then fails on its stale
-`beforeOid`), or an inline request that failed ambiguously before the
-REST fallback ran. Comparing git oids would get the second wrong, since
-the ref holds the inline request's commit, not the fallback's. Any
-other head means the race was lost, and the push returns false.
-`#updateRefs` for archive, restore and delete has no manifest head to
-compare, so it keeps its own check: a ref at its `afterOid` landed.
-Today it counts any move as a lost race; it gets that rule.
+- `head` is the session's kvgit head at this commit.
+- `packs` runs oldest first. The first pack's `base` is null (it starts
+  at the root); every other pack's `base` is the previous pack's `tip`,
+  and the last pack's `tip` is `head`.
+- `bytes` and `sha256` describe the stored pack (gzip, all parts
+  together); a reader checks the SHA-256 before decoding.
+- `parts` has one entry for a pack stored at `path`, n for a pack
+  stored at `path.0` … `path.<n-1>`.
+- `nextSeq` is the next unused sequence number.
+- `kernel` names the encoder; a reader refuses packs of another kernel.
+- `meta` is whatever the writer records for listing sessions without
+  fetching them (a title, say), or null.
 
-A non-force REST `PATCH git/refs` checks only for a fast-forward. Take
-a session that was deleted and then re-created as a bare ref at the
-default branch's commit. The push's commit descends from that commit,
-so the PATCH would land there; `updateRefs` refuses it.
+**Format 1** is the same with `"format": 1` and each pack's `parts`
+replaced by `blob`, the git SHA of the pack in one part. A reader takes
+a format-1 entry as a one-part pack. A writer writes format 2, keeping
+format-1 entries as one-part entries.
 
-All of a push's packs go into one git commit under one CAS. That
-removes today's partial push ("lost the ref after i of n chunks").
-Packs still split at `maxPackBytes` of values, for incremental pulls
-and folds, and `maxPackBytes` can go back up to 8 MiB, since parts now
-carry the request limit. Only memory limits the size of a commit.
+## Packs
 
-`fetch` keeps reading blobs raw by SHA, now part by part (16 at a time,
-as now). It concatenates the parts and checks the SHA-256 before
-decoding.
+A pack is gzip of one CBOR map:
 
-### The REST minute
+```
+{ "format": 2, "kernel": "ts", "base": <commit or null>, "tip": <commit>,
+  "values": [ <value>, … ], "commits": [ [ <record>, [ [<key>, <index>], … ] ], … ] }
+```
 
-The client treats a REST request with a large body (64 KiB or more)
-that fails 55 s or more in, with a 401 or a network error, as
-`too-large`, the way #143 treats GraphQL's 5 s. With 4 MiB parts that
-means an uplink under about 100 KB/s. A push that meets it halves
-`partBytes` and tries again, down to a floor of 512 KiB, before it
-fails. The manifest lists each pack's parts, so readers don't depend on
-the part size; a resume after a halving re-uploads, since the parts'
-SHAs change.
+- **CBOR.** Maps with text keys, byte strings as CBOR byte strings
+  (major type 2), arrays, text, integers and null; no tags. A reader
+  accepts any valid encoding of that data. Writers needn't agree byte
+  for byte, since each pack is named by its own SHAs, but one writer
+  must encode the same commits to the same bytes, gzip included, so
+  that a push that stopped partway finds its parts again. TypeScript's
+  writer (cbor-x, keys in the order shown) is pinned by the fixture's
+  `packCbor`.
+- **`values`** is a table of the distinct values the pack's commits
+  write. Each slot is either the value's bytes, or a reference to a
+  value kept outside the pack: `[sha256, size, [part SHAs]]`, the
+  value's SHA-256 in hex, its length, and its parts' git blob SHAs. A
+  writer orders the slots by the key that first wrote each value, then
+  by first appearance, so successive versions of a file sit together
+  and compress against each other.
+- **`commits`** run parents first. Each is `[record, updates]`.
+  `record` is a byte string: the commit's record as JSON, the way
+  Python's `json.dumps(…, separators=(",", ":"))` writes it
+  (`ensure_ascii`, floats as `repr`), of the object `{"hash",
+  "parents", "parentGens", "time", "info", "removals"}` in that key
+  order. `time` is a float (`1700000000.25`, never `1700000000`);
+  `parentGens` is null on the root commit; `removals` is sorted.
+  `updates` is `[key, index]` pairs, `index` a slot in `values`.
+- **`base`** is the commit the pack's run builds on (null from the
+  root); `tip` is its last commit. Both must match the manifest entry.
 
-### Format 2
+A receiver resolves each reference (from its own store when it holds
+the blob, else by reading the parts and checking the size and SHA-256),
+applies each commit's updates and removals to its first parent's state,
+and recomputes its hash; a commit whose hash doesn't match is refused
+before anything of it is written. A pack may repeat commits the
+receiver has (a fold re-sends its run whole); a receiver skips those.
 
-The manifest becomes `format: 2`. A pack entry keeps `path`, `seq`,
-`base`, `tip`, `commits`, `bytes` and `sha256`, and replaces `blob` with
-`parts`, the git SHAs of its parts in order. A one-part pack is stored
-at `path`, as today. A pack of n parts is stored at `path.0` …
-`path.<n-1>`, so a fold can name the files it deletes.
+A format-1 pack is the same with `"format": 1` and no references.
 
-A reader takes format 1 as before: a format-1 entry is a one-part pack
-whose part is `blob`. Writers write format 2 from then on. An older
-client already treats a manifest with another format as one it can't
-use: it leaves the branch alone and never pushes over it. Studio
-deploys from `main`, so for a person that window is one reload.
+## Writing: one git commit per push
 
-### Resuming a push that stopped partway
+Every change to a session (a push, a fold riding a push, a repack) is
+one git commit on its branch, parented on the branch's current commit,
+with the message:
 
-A push that stops partway leaves only git objects that nothing
-references: a closed tab, a rate limit or a dropped part does that. The
-next push re-encodes the same commits to the same bytes. The encoding
-is deterministic, checked in Node, and gzip is deterministic within one
-engine. So the parts get the same SHAs. Before uploading, one GraphQL
-query asks for all of them (`p0: object(oid: …) { oid }`, up to 100 a
-query, a read), and the push skips what GitHub already holds. GitHub
-doesn't prune unreferenced objects at once, so a resume soon after
-finds them; one that finds them gone uploads them again. A git commit
-made but never landed is simply made again.
+```
+kvgit <session> @ <head7> (+<commits>)
 
-### Secondary rate limits
+Kvgit-Head: <head>
+Kvgit-Pack-Format: 2
+```
 
-GitHub documents these limits: 80 content-generating requests a minute
-and 500 an hour, 900 points a minute for REST (5 for a POST or PATCH),
-2,000 for GraphQL (5 for a mutation), and 100 concurrent requests. This
-proposal assumes git object POSTs count as content-generating.
+A repack's headline is `kvgit <session> repack (<n> → 1)`. The commit
+lands by one of two compare-and-swaps on the branch's commit, never by
+a plain ref update:
 
-| Push | Writes today | Writes proposed |
-|---|---|---|
-| A chat turn, a few KB | 1 mutation | 1 mutation |
-| One 12 MB commit | can't land | 3 parts + tree + commit + ref = 6 |
-| A 300 MB session's first sync | 150 mutations (2 MiB), many past the deadline | 75 parts + 3 = 78 |
+- **Inline**: one GraphQL `createCommitOnBranch` carrying every new
+  file as base64, with `expectedHeadOid` the commit the writer read.
+  For a new session, `createRef` at the default branch's commit runs
+  in the same request.
+- **Over REST**: `POST git/blobs` for each part GitHub doesn't already
+  hold (a GraphQL `object(oid:)` lookup says which), `POST git/trees`
+  on the branch's tree (`base_tree`; the default branch's for a new
+  session) with the new parts, the manifest, and `sha: null` for files
+  removed, `POST git/commits`, then GraphQL `updateRefs` with
+  `beforeOid` the commit read (zeros for a new session) and `afterOid`
+  the new commit.
 
-Writes stay serialized and spaced at 750 ms, under 80 a minute. The
-hourly limit of 500 caps a burst at about 2 GB an hour with 4 MiB
-parts.
+A REST `PATCH git/refs` without `force` checks only that the move is a
+fast-forward, which a stale writer can pass; `updateRefs` checks the
+exact commit.
 
-When a limit is hit, the client follows GitHub's guidance, which it
-doesn't today. It waits the whole `Retry-After`. Without one, it waits
-until `x-ratelimit-reset` when `x-ratelimit-remaining` is 0, and
-otherwise (a secondary limit) at least a minute. It never retries
-sooner, since continuing while limited risks a ban. A wait longer than
-a minute isn't spent inside one request: the request fails as
-`rate-limit`, carrying the time to wait (`retryAfterMs`), so the caller
-schedules the next sync then. That sync resumes without resending parts
-already up.
+**Did it land?** A writer that can't tell (a lost response, a network
+error) re-reads the branch: if the manifest's `head` is its push's tip,
+the push landed, whichever request carried it. If the branch moved
+anywhere else, the push lost a race. Lifecycle changes, which have no
+manifest head to compare, count refs already at their targets as
+landed.
 
-## Options
+**Folds.** A writer may replace a run of adjacent packs with one pack
+re-encoding the same commits: the first pack's `base`, the last one's
+`tip`, a new `seq`, the run's files removed in the same commit.
+`repack` folds every pack into one.
 
-### A. Large values as blobs of their own (dedup)
+**Lifecycle**, each one atomic `updateRefs`:
 
-Values of at least `valueBlobBytes` (say 1 MiB) leave the pack. Each is
-stored at `kvgit/values/<sha256>` (in parts, as above), and the pack's
-value table holds a reference, `[sha256, size, [part SHAs]]`, in its
-place. The sha256 is the value's kvgit blob key (`kvgit:blob:<sha256>`).
-That gives:
+- archive: create `archived/<s>` at the session's commit and delete
+  `<s>` (beforeOid that commit);
+- restore: the reverse;
+- delete: `<s>` to zeros from the commit holding the head the caller
+  expects;
+- empty trash: delete every `archived/*` at the commits read.
 
-- **On push**, one existence query covers all of a push's values. A
-  value the repo already holds costs a tree entry, not an upload,
-  wherever it came from: another session, a fork, an earlier snapshot.
-  A fork or compacted copy of a media-heavy session resends only its
-  records and small values. Studio's compact fork with about 50 MB of
-  media would upload nothing for the media.
-- **On pull**, a value the receiver already holds isn't downloaded:
-  `fetch` reads `kvgit:blob:<sha256>` from the local store and gives
-  the replay those bytes.
-- **On delete**, each branch's tree names every value its packs
-  reference. A value stays reachable while any branch uses it, so
-  deleting one session never strands another's values.
+## Reading
 
-The cost is one write per new value. With a 1 MiB threshold, that is up
-to 4× the writes packing would take for values just over the threshold,
-and the same for values of 4 MiB or more. Values under the threshold
-stay in packs and aren't deduped; studio's are mostly screenshots of a
-few hundred KB. Format 2 should allow references in the value table
-from the start, so that turning A on later doesn't need a format 3.
+A reader lists sessions with one GraphQL query per hundred branches,
+each with its manifest inlined (`Commit.file`). To fetch a head, it
+takes the manifest's packs from the newest back to the first whose
+`base` it holds (or null), reads their parts raw by git SHA (`GET
+git/blobs/<sha>` with `Accept: application/vnd.github.raw+json`; the
+contents API transcodes bytes it takes for text), concatenates them,
+checks the SHA-256, and decodes.
 
-### B. A fork reuses its parent's packs
+## Limits a writer works within
 
-A new branch's first push sends its whole history: `push_plan` gives
-an empty `have` for a branch the remote lacks. `PackRemote` could look
-in its roster for a session whose packs run from the root up to a tip
-that is an ancestor of the new head. It would check ancestry in the
-local store, which holds that history. The fork then lists those
-entries in its manifest and names their files in its tree (same paths
-and SHAs, nothing uploaded), and packs only the commits after the last
-reused tip (`walkDelta` from there). There is no format change and no
-change to the core or the `Remote` interface. With A, the large values
-are already deduped, so what B saves is the history's records and small
-values. That isn't small: a full fork of a 3,900-commit session would
-still upload about 6,800 values under 1 MiB, roughly 60 MiB compressed.
+- **GraphQL body deadline.** GitHub drops a GraphQL request whose body
+  hasn't arrived after about 5 s (a 499; a browser sees a network
+  error). `PackRemote` goes inline only under 1 MiB of request, and
+  falls back to REST, halving its cutoff, when GitHub drops one.
+- **REST body deadline.** GitHub answers a REST request whose body is
+  still arriving after about a minute with 401 "Bad credentials".
+  `PackRemote` stores parts of at most 4 MiB, halving that, down to
+  512 KiB, when a part doesn't arrive.
+- **Secondary rate limits.** About 80 content-creating requests a
+  minute and 500 an hour. Writes go one at a time, 750 ms apart; a
+  rate limit waits as GitHub asks, and a wait over a minute ends the
+  push for the caller to schedule. The next push re-encodes the same
+  bytes (the encoding is deterministic) and skips the parts GitHub
+  already holds.
+- **Large values.** `PackRemote` keeps values of 1 MiB or more outside
+  packs in pushes that go over REST, so each is uploaded once per
+  repository and read only by receivers that lack it.
 
-## The format as a contract
+## Why this shape
 
-`docs/protocol.md` is the core's request protocol, between a host and
-the core. The pack layout is a different contract, between transports
-through GitHub. So this file would become that contract, written as
-what a Python transport would implement: the branch layout, manifest,
-pack encoding, parts, value references, commit messages and the CAS.
-The README's "The format" section moves here. Golden fixtures (a
-manifest and packs, with the commits they decode to) can go in
-`corpus/` once a second implementation exists to run them.
-
-## Not changing
-
-The core's `push_plan`, `wire_walk` and `wire_replay`, the `Remote`
-interface, the sync layer, and fetch's choice of which packs to read.
-
-## Plan
-
-1. **Client and fake:** the REST minute, blob creation, rate-limit
-   waits. The fake gains `git/blobs`, `git/trees`, `git/commits`,
-   `object(oid:)` lookups and a GraphQL body cap answered with 499.
-2. **`PackRemote`:** format 2, the REST path, the inline fallback and
-   cutoff, part halving, resume, one git commit per push, the landed
-   check.
-3. **Option A** at 1 MiB, its own PR.
-4. This file trimmed to the contract, with one golden format-2 fixture.
-5. A live check on `ashenfad/agex-sync-test`, including that
-   `updateRefs` can create a ref (zero `beforeOid`) on a fine-grained
-   token; then a note for studio's floor bump.
-6. **Option B**, next after A, its own PR.
-
-## Decisions (2026-11-15)
-
-1. **The REST path**, inline below `inlineBytes` and falling back on
-   `too-large`: yes, with three changes, written in above. A push
-   decides whether it landed by the manifest's kvgit head, not a git
-   oid. `inlineBytes` defaults to 1 MiB, and a GraphQL `too-large`
-   lowers the remote's cutoff for its lifetime. A REST `too-large`
-   halves `partBytes`, down to 512 KiB, before failing.
-2. **`updateRefs` for the CAS**, not `PATCH git/refs`: yes. The live
-   check confirms it can create a ref on a fine-grained token.
-3. **Option A**: yes, in this stack, at 1 MiB, as its own PR after the
-   REST path; the format-2 reader takes value references either way. In
-   one 3,900-commit studio session, 42 distinct values are 1 MiB or
-   more, 88 MiB in all: 25 workspace files (15 PNG, 10 MP3, about
-   50 MiB), which dedupe across compact forks, snapshots and undo
-   restores, and 17 run records (38 MiB), which don't. A 256 KiB
-   threshold would add 88 values, 68 of them run records: writes for
-   nothing.
-4. **Option B**: later, next after A, its own PR.
-5. **This file as the contract**, not `docs/protocol.md`: yes. Once
-   built, it's trimmed to the normative spec and a short why; the
-   measurements and rate-limit arithmetic stay in PR history. One golden
-   format-2 fixture (a manifest, a pack, and the commits they decode to)
-   goes in this stack rather than waiting for a second implementation.
-6. **The scratch repo** is unarchived, and writes to it for the live
-   check are allowed.
+GitHub's smart-HTTP endpoints send no CORS headers, so a browser can't
+speak git; GraphQL and the REST git-data API can. One inline request
+per push was simplest, but GraphQL's 5 s body deadline caps it by the
+uplink, and a single commit can't be split, so larger pushes go as git
+objects over REST, which takes a body for a minute and any size, in
+parts that bound each request. Packs keep a session's many small
+values compressed together; large values (images, audio) go on their
+own, raw and named by content, so forks, snapshots and other sessions
+share them. The measurements and arithmetic behind these numbers are in
+the pull requests that built this format:
+[#143](https://github.com/ashenfad/kvgit/pull/143) through
+[#148](https://github.com/ashenfad/kvgit/pull/148).

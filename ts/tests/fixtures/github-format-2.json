@@ -1,0 +1,55 @@
+{
+  "description": "A format-2 branch: its manifest, the one pack it lists, and the blob of the value the pack keeps outside it. Decoding the pack (resolving the value) and applying its commits gives `state` at `manifest.head`; encoding those commits, with the same value kept out, gives `packCbor` exactly.",
+  "branch": "golden",
+  "commits": [
+    {
+      "hash": "821bf06b4dcb406ea508a4a992eadc22f29850cd",
+      "parents": []
+    },
+    {
+      "hash": "0dd30c5dce5180b953a7c76006e3b3a3fdfc89c3",
+      "parents": ["821bf06b4dcb406ea508a4a992eadc22f29850cd"]
+    },
+    {
+      "hash": "b2c7de81144d14d8c20715f629f09792b11817b9",
+      "parents": ["0dd30c5dce5180b953a7c76006e3b3a3fdfc89c3"]
+    },
+    {
+      "hash": "5c292a483b6aca660d5e4216800947de6342019b",
+      "parents": ["b2c7de81144d14d8c20715f629f09792b11817b9"]
+    }
+  ],
+  "state": {
+    "bin/blob": "AP8B/h+L",
+    "media/photo.png": "CzBVep/E6Q4zWH2ix+wRNluApcrvFDleg6jN8hc8YYar0PUaP2SJrtP4HUJnjLHW+yBFao+02f4jSG2St9wBJktwlbrfBClOc5i94gcsUXabwOUKL1R5nsPoDTJXfKHG",
+    "notes/copy.txt": "aGVsbG8sIHdvcmxkCg==",
+    "notes/hello.txt": "aGVsbG8gYWdhaW4K"
+  },
+  "manifest": {
+    "format": 2,
+    "kernel": "ts",
+    "branch": "golden",
+    "head": "5c292a483b6aca660d5e4216800947de6342019b",
+    "packs": [
+      {
+        "path": "kvgit/packs/000001-5c292a483b6a.pack",
+        "seq": 1,
+        "base": null,
+        "tip": "5c292a483b6aca660d5e4216800947de6342019b",
+        "commits": 4,
+        "bytes": 577,
+        "sha256": "2c91c280171ed4f7e26a2f1b0a801cc33a10195a733c9dce2aec79dfc451840b",
+        "parts": ["7741beea705ef4bb7374702bad918330da313b0b"]
+      }
+    ],
+    "nextSeq": 2,
+    "meta": {
+      "title": "Golden"
+    }
+  },
+  "pack": "H4sIAAAAAAAAE42TvW4TQRSFk4Ao8gR0RFOlsOw7s/ObClFAA32kYMH8ZlesdyzvhBghS2QDFU8CDTVSOj8Cb8BDUAJjk1jYkSJvNXf2aPd858x833kQQpyMdNoLb/yk8bVJrTO69b9sqsbTQ2aJIprKwnBtNefgmKcEcwmgqHCeF5QAVia81fWZbz893fmz+/vR5yfzq8vpYym9kCxIrwkUynKHJTY0MMDaFoFSJo0C6vJrCcFzHohjCpywoKQzhD18fTE9dFhwoR2zWHKFMRjIQuEDVZIKakJBLDfCiRelr+vYOziPk9rtP19OB/pUV83+qY2jUZXaj93xxXtU6rZER0gSbAJwQ501FLjXDKSmWinitbOEBKIkA+tQD431xDepRUcnw5vhmW/y3JzVdQ+lauTRERZw/fQJ66GqCfFGMPGjmPNZfmD2oTv+uTIBzhVgmbOeYQlGsUILKzhkP4UpdBFcsFLZYs3E9tY37J7A8E6371GKsc62QlX7V+eTKvn845TV/axpfJu8W6jqqs2bJ7iHpqi3QBzOZhuUXTcu519yBYP5VTP/ZqPzu11sYvLtYFlNP03Tve746yoKQ2w+TxJjSh2mTloCArPAiQqghCIG59MjjFqPYusAN6PAt6PAfXFXcZddaapmYOpodro48q7Sg3EZU+yPm9O9rvkHZ+P43TXbjxXbtrdonW3rRDbZyG224j+2Vc0ZIaH15lD58gzAq0Vzi1WwzXIjLBpEw9nFrRLv/wWKPWeQRAQAAA==",
+  "packCbor": "uQAGZmZvcm1hdAJma2VybmVsYnRzZGJhc2X2Y3RpcHgoNWMyOTJhNDgzYjZhY2E2NjBkNWU0MjE2ODAwOTQ3ZGU2MzQyMDE5YmZ2YWx1ZXOFRgD/Af4fi0LDvIN4QDg4ZTc4NWY4ZWEyMDM5YzZkMTgxYjRmNTAxYWMzZjQ0NThiOTA0ZGVhMjgwZmU2NmYyZDU5MGQ3YzA5OGRiMjUYYIF4KGQxNzY3YWQ1YzE4NjkxMTBiMDY2ZjdlZjQ5ODQ3NGJmMzJjNmI3ZDdNaGVsbG8sIHdvcmxkCkxoZWxsbyBhZ2FpbgpnY29tbWl0c4SCWIF7Imhhc2giOiI4MjFiZjA2YjRkY2I0MDZlYTUwOGE0YTk5MmVhZGMyMmYyOTg1MGNkIiwicGFyZW50cyI6W10sInBhcmVudEdlbnMiOm51bGwsInRpbWUiOjE3MDAwMDAwMDAuMjUsImluZm8iOm51bGwsInJlbW92YWxzIjpbXX2AgljieyJoYXNoIjoiMGRkMzBjNWRjZTUxODBiOTUzYTdjNzYwMDZlM2IzYTNmZGZjODljMyIsInBhcmVudHMiOlsiODIxYmYwNmI0ZGNiNDA2ZWE1MDhhNGE5OTJlYWRjMjJmMjk4NTBjZCJdLCJwYXJlbnRHZW5zIjpbMF0sInRpbWUiOjE3MDAwMDAwMDAuMjUsImluZm8iOnsidG9vbCI6ImZpbGVfd3JpdGUiLCJ0IjoxLjUsIm5lc3RlZCI6eyJsaXN0IjpbMSwieCIsbnVsbF19fSwicmVtb3ZhbHMiOltdfYKCcGjDqWxsby/DvG7Dr2NvZGUBgm9ub3Rlcy9oZWxsby50eHQDgliqeyJoYXNoIjoiYjJjN2RlODExNDRkMTRkOGMyMDcxNWY2MjlmMDk3OTJiMTE4MTdiOSIsInBhcmVudHMiOlsiMGRkMzBjNWRjZTUxODBiOTUzYTdjNzYwMDZlM2IzYTNmZGZjODljMyJdLCJwYXJlbnRHZW5zIjpbMV0sInRpbWUiOjE3MDAwMDAwMDEuNzUsImluZm8iOm51bGwsInJlbW92YWxzIjpbXX2DgmhiaW4vYmxvYgCCb21lZGlhL3Bob3RvLnBuZwKCbm5vdGVzL2NvcHkudHh0A4JY03siaGFzaCI6IjVjMjkyYTQ4M2I2YWNhNjYwZDVlNDIxNjgwMDk0N2RlNjM0MjAxOWIiLCJwYXJlbnRzIjpbImIyYzdkZTgxMTQ0ZDE0ZDhjMjA3MTVmNjI5ZjA5NzkyYjExODE3YjkiXSwicGFyZW50R2VucyI6WzJdLCJ0aW1lIjoxNzAwMDAwMDAzLjc1LCJpbmZvIjp7InRvb2wiOiJlZGl0In0sInJlbW92YWxzIjpbImhcdTAwZTlsbG8vXHUwMGZjblx1MDBlZmNvZGUiXX2Bgm9ub3Rlcy9oZWxsby50eHQE",
+  "blobs": {
+    "d1767ad5c1869110b066f7ef498474bf32c6b7d7": "CzBVep/E6Q4zWH2ix+wRNluApcrvFDleg6jN8hc8YYar0PUaP2SJrtP4HUJnjLHW+yBFao+02f4jSG2St9wBJktwlbrfBClOc5i94gcsUXabwOUKL1R5nsPoDTJXfKHG"
+  }
+}
