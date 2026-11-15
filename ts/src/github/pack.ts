@@ -804,7 +804,7 @@ export class PackRemote implements Remote {
 
   /**
    * Land `change` on `branch` as one commit, compare-and-swapped
-   * against `st`: inline when the request is small enough, else over
+   * against `read`, the branch as last read: inline when the request is small enough, else over
    * REST. After an error that leaves it unclear, the branch is re-read,
    * and `landed` of its manifest says whether the change is there.
    *
@@ -812,10 +812,11 @@ export class PackRemote implements Remote {
    */
   async #land(
     branch: string,
-    st: BranchState | null,
+    read: BranchState | null,
     change: Change,
     landed: (m: PackManifest) => boolean,
   ): Promise<boolean> {
+    let st = read
     const before = st?.gitOid ?? ZERO_OID
     const rough = change.packs.reduce(
       (n, p) => n + (isNew(p) ? base64Length(p.bytes.length) : 0),
