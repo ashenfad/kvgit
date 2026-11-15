@@ -3,6 +3,7 @@
  * fetched by manifest, with CAS on `expectedHeadOid`.
  */
 
+import { Encoder } from 'cbor-x'
 import { describe, expect, it } from 'vitest'
 import { Memory } from '../src/backends/memory'
 import { FakeGithub } from '../src/github/fake'
@@ -10,10 +11,13 @@ import {
   GithubClient,
   GithubError,
   MANIFEST_PATH,
+  type PackManifest,
   PackRemote,
   decodePack,
   encodePack,
+  gitBlobSha1,
 } from '../src/github/index'
+import { gunzip, gzip } from '../src/github/pack'
 import {
   Repo,
   type Worktree,
@@ -24,6 +28,7 @@ import {
   walkDelta,
 } from '../src/index'
 import type { WireCommit } from '../src/types'
+import { sha256Hex } from '../src/versioned/layout'
 
 const enc = new TextEncoder()
 const dec = new TextDecoder()
@@ -80,6 +85,69 @@ async function commitN(store: Memory, n: number, prefix: string): Promise<Worktr
   return wt
 }
 
+/** `n` random bytes, which don't compress: a pack is about their size. */
+function random(n: number): Uint8Array {
+  const out = new Uint8Array(n)
+  for (let i = 0; i < n; i += 65536) crypto.getRandomValues(out.subarray(i, Math.min(n, i + 65536)))
+  return out
+}
+
+/** Commit `value` at `key` on the branch; the new head. */
+async function commitValue(store: Memory, key: string, value: Uint8Array): Promise<string> {
+  const wt = await open(store)
+  wt.set(key, value)
+  await wt.commit()
+  return wt.head
+}
+
+/** The manifest at a branch's head on the fake. */
+function manifestAt(gh: FakeGithub, branch = BRANCH): PackManifest {
+  const oid = gh.refs.get(`refs/heads/${branch}`) as string
+  const bytes = gh.commits.get(oid)?.files.get(MANIFEST_PATH) as Uint8Array
+  return JSON.parse(dec.decode(bytes)) as PackManifest
+}
+
+/**
+ * A client on `gh` whose fetch passes through `wrap` first, so a test
+ * can lose a response or fail a request; it keeps a log of what each
+ * request was (`createCommitOnBranch`, `updateRefs`, `POST git/blobs`,
+ * …) and runs on a clock `wrap` may advance.
+ */
+function wrapped(
+  gh: FakeGithub,
+  wrap: (
+    what: string,
+    send: () => Promise<Response>,
+    clock: { ms: number },
+  ) => Promise<Response> = (_, send) => send(),
+  opts: { maxRetries?: number } = {},
+) {
+  const log: string[] = []
+  const clock = { ms: 0 }
+  const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const body = typeof init?.body === 'string' ? init.body : ''
+    const name =
+      /createCommitOnBranch|updateRefs/.exec(body)?.[0] ??
+      (body.includes('object(oid:') ? 'objects' : null) ??
+      (body.startsWith('{"query"') ? 'query' : null) ??
+      `${init?.method ?? 'GET'} ${new URL(String(input)).pathname.split('/git/')[1]}`
+    log.push(name)
+    return wrap(name, () => gh.fetch(input, init), clock)
+  }) as typeof fetch
+  const client = new GithubClient({
+    token: 't',
+    repo: gh.repo,
+    fetchImpl,
+    maxRetries: opts.maxRetries ?? 0,
+    writeIntervalMs: 0,
+    sleeper: async (ms) => {
+      clock.ms += ms
+    },
+    now: () => clock.ms,
+  })
+  return { client, log }
+}
+
 async function collect(iter: AsyncIterable<WireCommit>): Promise<WireCommit[]> {
   const out: WireCommit[] = []
   for await (const wc of iter) out.push(wc)
@@ -103,6 +171,56 @@ describe('pack codec', () => {
     const copy = await open(dst)
     expect(text(await copy.get('files/a3.txt'))).toContain('a 3')
     expect(await copy.get('files/a0.txt')).toBeUndefined()
+  })
+
+  it('reads a value kept outside its pack, from the local store when it holds it', async () => {
+    const gh = new FakeGithub()
+    const src = new Memory()
+    const value = random(300_000)
+    const head = await commitValue(src, 'files/big.bin', value)
+    const sha = await sha256Hex(value)
+    const part = await gh.client().createBlob(value)
+    const pack = await encodePack(await collect(walkDelta(src, { want: head })), {
+      kernel: 'ts',
+      base: null,
+      refs: new Map([[sha, [sha, value.length, [part]]]]),
+    })
+    expect(pack.length).toBeLessThan(10_000)
+    await expect(decodePack(pack)).rejects.toThrow(/kept outside the pack/)
+    const path = `kvgit/packs/000001-${head.slice(0, 12)}.pack`
+    const entry = {
+      path,
+      seq: 1,
+      base: null,
+      tip: head,
+      commits: 2,
+      bytes: pack.length,
+      sha256: await sha256Hex(pack),
+      parts: [await gitBlobSha1(pack)],
+    }
+    const manifest = {
+      format: 2,
+      kernel: 'ts',
+      branch: BRANCH,
+      head,
+      packs: [entry],
+      nextSeq: 2,
+      meta: null,
+    }
+    gh.plant(BRANCH, { [MANIFEST_PATH]: JSON.stringify(manifest), [path]: pack })
+
+    gh.calls.length = 0
+    const b = await device(gh)
+    expect((await pullBranch(b.store, b.remote, BRANCH)).localHead).toBe(head)
+    expect(await (await open(b.store)).get('files/big.bin')).toEqual(value)
+    expect(gh.count('raw')).toBe(2) // the pack, then the value
+
+    // a store that holds the value already reads only the pack
+    gh.calls.length = 0
+    const c = await device(gh)
+    await c.store.set(`kvgit:blob:${sha}`, value)
+    expect((await pullBranch(c.store, c.remote, BRANCH)).localHead).toBe(head)
+    expect(gh.count('raw')).toBe(1)
   })
 
   it('stores a value repeated across commits once', async () => {
@@ -247,55 +365,287 @@ describe('PackRemote push / fetch', () => {
     expect((await pushBranch(b.store, b.remote, BRANCH)).status).toBe('diverged')
   })
 
-  it('splits a push larger than maxPackBytes into several CAS-chained commits', async () => {
+  it('splits a push larger than maxPackBytes into several packs, landed in one commit', async () => {
     const gh = new FakeGithub()
     const a = await device(gh, { maxPackBytes: 150 })
     const wt = await commitN(a.store, 6, 'a') // ~80 bytes of values per commit
     expect((await pushBranch(a.store, a.remote, BRANCH)).status).toBe('created')
-    expect(gh.count('graphql-mutation')).toBeGreaterThan(1)
+    expect(gh.count('graphql-mutation')).toBe(1)
+    expect(manifestAt(gh).packs.length).toBeGreaterThan(1)
     const b = await device(gh)
     const pulled = await pullBranch(b.store, b.remote, BRANCH)
     expect(pulled.localHead).toBe(wt.head)
   })
 })
 
-describe('PackRemote and requests GitHub drops', () => {
-  it('names the pack that did not make it, and sends it once', async () => {
+describe('PackRemote over REST', () => {
+  it('lands a push past the inline cutoff as blobs, a tree, a commit and one updateRefs', async () => {
     const gh = new FakeGithub()
-    const commits: string[] = []
-    // GitHub answers 499 to a request whose body is still arriving at ~5 s
-    const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      if (typeof init?.body === 'string' && init.body.includes('createCommitOnBranch')) {
-        commits.push(init.body)
-        return new Response('', { status: 499 })
-      }
-      return gh.fetch(input, init)
-    }) as typeof fetch
-    const client = new GithubClient({
-      token: 't',
-      repo: gh.repo,
-      fetchImpl,
-      writeIntervalMs: 0,
-      sleeper: async () => {},
-    })
+    const a = await device(gh, { inlineBytes: 0 })
+    const wt = await commitN(a.store, 3, 'a')
+    gh.calls.length = 0
+    expect((await pushBranch(a.store, a.remote, BRANCH)).status).toBe('created')
+    const rest = gh.calls.filter((c) => c.kind === 'rest').map((c) => c.detail)
+    expect(rest).toEqual(['blob', 'tree', 'commit'])
+    expect(gh.calls.filter((c) => c.kind === 'graphql-mutation').map((c) => c.detail)).toEqual([
+      'updateRefs',
+    ])
+    expect(gh.messageAt(BRANCH)).toMatch(
+      new RegExp(
+        `^kvgit ${BRANCH} @ ${wt.head.slice(0, 7)} \\(\\+4\\)\n\nKvgit-Head: ${wt.head}\n`,
+      ),
+    )
+    expect(manifestAt(gh)).toMatchObject({ format: 2, head: wt.head })
+
+    const b = await device(gh)
+    expect((await pullBranch(b.store, b.remote, BRANCH)).localHead).toBe(wt.head)
+    // the next push builds on the branch's tree
+    const next = await commitN(a.store, 1, 'b')
+    expect((await pushBranch(a.store, a.remote, BRANCH)).status).toBe('pushed')
+    expect(gh.filesAt(BRANCH).filter((p) => p.endsWith('.pack'))).toHaveLength(2)
+    expect(gh.filesAt(BRANCH)).toContain('README.md')
+    expect((await pullBranch(b.store, b.remote, BRANCH)).localHead).toBe(next.head)
+  })
+
+  it('stores a pack larger than partBytes in parts, read back in order', async () => {
+    const gh = new FakeGithub()
+    const a = await device(gh, { partBytes: 100_000 })
+    const value = random(1_200_000) // past the 1 MiB inline cutoff
+    const head = await commitValue(a.store, 'files/big.bin', value)
+    expect((await pushBranch(a.store, a.remote, BRANCH)).status).toBe('created')
+    const [entry] = manifestAt(gh).packs
+    expect(entry?.parts).toHaveLength(13)
+    const files = gh.filesAt(BRANCH).filter((p) => p.includes('.pack'))
+    expect(files).toEqual(entry?.parts.map((_, i) => `${entry.path}.${i}`).sort())
+
+    const b = await device(gh)
+    expect((await pullBranch(b.store, b.remote, BRANCH)).localHead).toBe(head)
+    expect(await (await open(b.store)).get('files/big.bin')).toEqual(value)
+  })
+
+  it('resumes a push that stopped partway, sending only the parts GitHub lacks', async () => {
+    const gh = new FakeGithub()
+    let blobs = 0
+    const { client } = wrapped(gh, async (what, send) =>
+      what === 'POST blobs' && ++blobs === 3
+        ? new Response('{"message": "boom"}', { status: 502 })
+        : send(),
+    )
     const store = new Memory()
-    const wt = await commitN(store, 1, 'a')
-    const err = await pushBranch(store, new PackRemote(client, store), BRANCH).catch((e) => e)
+    const remote = new PackRemote(client, store, { inlineBytes: 0, partBytes: 50_000 })
+    const head = await commitValue(store, 'files/big.bin', random(200_000))
+    await expect(pushBranch(store, remote, BRANCH)).rejects.toMatchObject({ kind: 'server' })
+    expect(gh.refs.has(`refs/heads/${BRANCH}`)).toBe(false)
+    expect(gh.count('rest')).toBe(2) // two parts went up
+
+    gh.calls.length = 0
+    expect((await pushBranch(store, remote, BRANCH)).status).toBe('created')
+    const parts = manifestAt(gh).packs[0]?.parts.length ?? 0
+    expect(parts).toBe(5)
+    const sent = gh.calls.filter((c) => c.kind === 'rest' && c.detail === 'blob')
+    expect(sent).toHaveLength(parts - 2)
+    const b = await device(gh)
+    expect((await pullBranch(b.store, b.remote, BRANCH)).localHead).toBe(head)
+  })
+
+  it('sends again the parts GitHub has forgotten', async () => {
+    const gh = new FakeGithub()
+    const { client } = wrapped(gh, async (what, send) =>
+      what === 'updateRefs' ? new Response('{"message": "boom"}', { status: 502 }) : send(),
+    )
+    const store = new Memory()
+    const remote = new PackRemote(client, store, { inlineBytes: 0, partBytes: 50_000 })
+    await commitValue(store, 'files/big.bin', random(120_000))
+    await expect(pushBranch(store, remote, BRANCH)).rejects.toMatchObject({ kind: 'server' })
+    await gh.prune()
+    gh.calls.length = 0
+    expect(
+      (
+        await pushBranch(
+          store,
+          new PackRemote(gh.client(), store, { inlineBytes: 0, partBytes: 50_000 }),
+          BRANCH,
+        )
+      ).status,
+    ).toBe('created')
+    expect(gh.calls.filter((c) => c.kind === 'rest' && c.detail === 'blob')).toHaveLength(3)
+  })
+
+  it('deletes every part of the packs a fold replaces', async () => {
+    const gh = new FakeGithub()
+    const a = await device(gh, { inlineBytes: 0, partBytes: 20_000, maxPacks: 3, keepRecent: 1 })
+    for (let i = 0; i < 4; i++) {
+      await commitValue(a.store, `files/${i}.bin`, random(30_000))
+      await pushBranch(a.store, a.remote, BRANCH)
+    }
+    const manifest = manifestAt(gh)
+    expect(manifest.packs).toHaveLength(2)
+    const expected = manifest.packs.flatMap((p) =>
+      p.parts.length === 1 ? [p.path] : p.parts.map((_, i) => `${p.path}.${i}`),
+    )
+    expect(gh.filesAt(BRANCH).filter((p) => p.includes('.pack'))).toEqual(expected.sort())
+    const b = await device(gh)
+    expect((await pullBranch(b.store, b.remote, BRANCH)).localHead).toBe(manifest.head)
+  })
+
+  it('loses a race at the ref cleanly: false, the ref where the other writer left it', async () => {
+    const gh = new FakeGithub()
+    const a = await device(gh, { inlineBytes: 0 })
+    const old = (await commitN(a.store, 1, 'a')).head
+    await pushBranch(a.store, a.remote, BRANCH)
+    const head = (await commitN(a.store, 1, 'x')).head
+    const main = gh.refs.get('refs/heads/main') as string
+    gh.beforeMutation = () => {
+      gh.refs.set(`refs/heads/${BRANCH}`, main)
+      gh.beforeMutation = null
+    }
+    const pushed = a.remote.push(BRANCH, old, head, walkDelta(a.store, { want: head, have: [old] }))
+    expect(await pushed).toBe(false)
+    expect(gh.refs.get(`refs/heads/${BRANCH}`)).toBe(main)
+  })
+
+  it('throws an updateRefs failure that is no race, the ref unmoved', async () => {
+    const gh = new FakeGithub()
+    const a = await device(gh, { inlineBytes: 0 })
+    await commitN(a.store, 1, 'a')
+    gh.updateRefsError = 'Resource not accessible by personal access token'
+    await expect(pushBranch(a.store, a.remote, BRANCH)).rejects.toThrow(/Resource not accessible/)
+    expect(gh.refs.has(`refs/heads/${BRANCH}`)).toBe(false)
+  })
+})
+
+describe('PackRemote on a slow link', () => {
+  it('sends a push GitHub drops at its deadline over REST, and lowers its inline cutoff', async () => {
+    const gh = new FakeGithub({ uplinkBytesPerSecond: 50_000 }) // GraphQL carries 250 kB
+    const { client, log } = wrapped(gh)
+    const store = new Memory()
+    const remote = new PackRemote(client, store)
+    await commitValue(store, 'files/a.bin', random(400_000))
+    expect((await pushBranch(store, remote, BRANCH)).status).toBe('created')
+    expect(log.filter((w) => w === 'createCommitOnBranch')).toHaveLength(1) // dropped
+    expect(log).toContain('POST blobs')
+
+    // the cutoff is now half the dropped request: this one goes over REST at once
+    log.length = 0
+    await commitValue(store, 'files/b.bin', random(250_000))
+    expect((await pushBranch(store, remote, BRANCH)).status).toBe('pushed')
+    expect(log).not.toContain('createCommitOnBranch')
+    // and a small one inline
+    log.length = 0
+    const head = await commitValue(store, 'k', bytes('small'))
+    expect((await pushBranch(store, remote, BRANCH)).status).toBe('pushed')
+    expect(log).toContain('createCommitOnBranch')
+    expect(log).not.toContain('POST blobs')
+
+    const b = await device(gh)
+    expect((await pullBranch(b.store, b.remote, BRANCH)).localHead).toBe(head)
+  })
+
+  it("halves its parts while one doesn't arrive within GitHub's minute", async () => {
+    const gh = new FakeGithub({ uplinkBytesPerSecond: 20_000 }) // REST carries 1.2 MB
+    const a = await device(gh)
+    const head = await commitValue(a.store, 'files/a.bin', random(1_500_000))
+    expect((await pushBranch(a.store, a.remote, BRANCH)).status).toBe('created')
+    expect(manifestAt(gh).packs[0]?.parts).toHaveLength(3) // 512 KiB parts
+    const b = await device(gh)
+    expect((await pullBranch(b.store, b.remote, BRANCH)).localHead).toBe(head)
+  })
+
+  it("names the part that doesn't arrive even at 512 KiB, and lands nothing", async () => {
+    const gh = new FakeGithub({ uplinkBytesPerSecond: 5_000 }) // REST carries 300 kB
+    const a = await device(gh)
+    const head = await commitValue(a.store, 'files/a.bin', random(600_000))
+    const err = await pushBranch(a.store, a.remote, BRANCH).catch((e) => e)
     expect(err).toBeInstanceOf(GithubError)
     expect((err as GithubError).kind).toBe('too-large')
     expect((err as GithubError).message).toMatch(
       new RegExp(
-        `the pack of 2 commits up to ${wt.head.slice(0, 7)}, \\d+ kB compressed, didn't reach GitHub: GitHub dropped`,
+        `^PackRemote.push: a part of the pack of 2 commits up to ${head.slice(0, 7)} \\(525 kB of 6\\d\\d kB compressed\\) didn't reach GitHub: GitHub answered`,
       ),
     )
-    expect(commits).toHaveLength(1)
     expect(gh.refs.has(`refs/heads/${BRANCH}`)).toBe(false)
+  })
+})
+
+describe('PackRemote and a push whose outcome is unclear', () => {
+  for (const maxRetries of [0, 1]) {
+    it(`counts a lost updateRefs response as landed (retries: ${maxRetries})`, async () => {
+      const gh = new FakeGithub()
+      const { client, log } = wrapped(
+        gh,
+        async (what, send) => {
+          const resp = await send()
+          if (what === 'updateRefs' && log.filter((w) => w === what).length === 1) {
+            throw new TypeError('Failed to fetch')
+          }
+          return resp
+        },
+        { maxRetries },
+      )
+      const store = new Memory()
+      const head = (await commitN(store, 2, 'a')).head
+      const remote = new PackRemote(client, store, { inlineBytes: 0 })
+      expect((await pushBranch(store, remote, BRANCH)).status).toBe('created')
+      expect(manifestAt(gh).head).toBe(head)
+    })
+
+    it(`counts an inline push whose response was lost as landed, sending nothing more (retries: ${maxRetries})`, async () => {
+      const gh = new FakeGithub()
+      const { client, log } = wrapped(
+        gh,
+        async (what, send) => {
+          const resp = await send()
+          if (what === 'createCommitOnBranch' && log.filter((w) => w === what).length === 1) {
+            throw new TypeError('Failed to fetch')
+          }
+          return resp
+        },
+        { maxRetries },
+      )
+      const store = new Memory()
+      const head = (await commitN(store, 2, 'a')).head
+      expect((await pushBranch(store, new PackRemote(client, store), BRANCH)).status).toBe(
+        'created',
+      )
+      expect(manifestAt(gh).head).toBe(head)
+      expect(gh.count('rest')).toBe(0)
+    })
+  }
+
+  it('claims the bare ref a creation left when only its createRef landed', async () => {
+    const gh = new FakeGithub()
+    const { client } = wrapped(gh, async (what, send, clock) => {
+      if (what !== 'createCommitOnBranch') return send()
+      gh.setRef(BRANCH, gh.refs.get('refs/heads/main') as string) // the createRef, alone
+      clock.ms += 5_000
+      throw new TypeError('Failed to fetch')
+    })
+    const store = new Memory()
+    const head = await commitValue(store, 'files/a.bin', random(100_000))
+    expect((await pushBranch(store, new PackRemote(client, store), BRANCH)).status).toBe('created')
+    expect(manifestAt(gh).head).toBe(head)
+    expect(gh.count('rest')).toBeGreaterThan(0)
+  })
+
+  it('counts a request that failed at the deadline but landed as landed, with no REST fallback', async () => {
+    const gh = new FakeGithub()
+    const { client } = wrapped(gh, async (what, send, clock) => {
+      const resp = await send()
+      if (what !== 'createCommitOnBranch') return resp
+      clock.ms += 5_000 // applied, then the browser saw a network error at 5 s
+      throw new TypeError('Failed to fetch')
+    })
+    const store = new Memory()
+    const head = await commitValue(store, 'files/a.bin', random(100_000))
+    expect((await pushBranch(store, new PackRemote(client, store), BRANCH)).status).toBe('created')
+    expect(manifestAt(gh).head).toBe(head)
+    expect(gh.count('rest')).toBe(0)
   })
 })
 
 describe('PackRemote and manifests it cannot use', () => {
   for (const [what, text] of [
-    ['a newer format', '{"format": 2, "head": "x", "packs": []}'],
+    ['a newer format', '{"format": 3, "head": "x", "packs": []}'],
     ['text that is not JSON', '{"format": 1, "head":'],
   ] as const) {
     it(`never claims a branch whose manifest is ${what}: the push refuses, the roster skips it`, async () => {
@@ -312,20 +662,18 @@ describe('PackRemote and manifests it cannot use', () => {
     })
   }
 
-  it('refuses a commit too large for one request, before sending it', async () => {
+  it('lands a commit too large for one request, as parts', async () => {
     const gh = new FakeGithub()
     const a = await device(gh)
-    const wt = await open(a.store)
-    // random bytes don't compress: 24MB stays over the 30MB base64 cap
-    const big = new Uint8Array(24 * 1024 * 1024)
-    for (let i = 0; i < big.length; i += 65536) crypto.getRandomValues(big.subarray(i, i + 65536))
-    wt.set('files/big.bin', big)
-    await wt.commit()
-    await expect(pushBranch(a.store, a.remote, BRANCH)).rejects.toThrow(
-      /more than one request can carry/,
-    )
-    expect(gh.count('graphql-mutation')).toBe(0)
-  })
+    // random bytes don't compress: 24MB is over what GraphQL takes at all
+    const big = random(24 * 1024 * 1024)
+    const head = await commitValue(a.store, 'files/big.bin', big)
+    expect((await pushBranch(a.store, a.remote, BRANCH)).status).toBe('created')
+    // the root commit's pack, then the big commit's in 4 MiB parts
+    expect(manifestAt(gh).packs.map((p) => p.parts.length)).toEqual([1, 7])
+    const b = await device(gh)
+    expect((await pullBranch(b.store, b.remote, BRANCH)).localHead).toBe(head)
+  }, 30_000)
 })
 
 describe('PackRemote and branches that are not sessions', () => {
@@ -418,24 +766,79 @@ describe('PackRemote packs over time', () => {
   })
 })
 
-describe('PackRemote.repack and its request size', () => {
-  // 24MB committed, pushed and packed: seconds, more on a loaded runner.
-  it('refuses a history too large for one request, before sending it', async () => {
+describe('PackRemote.repack over REST', () => {
+  it('folds a history past the inline cutoff, deleting every old part', async () => {
     const gh = new FakeGithub()
-    const a = await device(gh)
-    const wt = await open(a.store)
-    // random bytes don't compress: two 12MB pushes fit, one 24MB pack doesn't
+    const a = await device(gh, { inlineBytes: 0, partBytes: 50_000 })
     for (const name of ['one', 'two']) {
-      const big = new Uint8Array(12 * 1024 * 1024)
-      for (let i = 0; i < big.length; i += 65536) crypto.getRandomValues(big.subarray(i, i + 65536))
-      wt.set(`files/${name}.bin`, big)
-      await wt.commit()
-      expect((await pushBranch(a.store, a.remote, BRANCH)).status).not.toBe('diverged')
+      await commitValue(a.store, `files/${name}.bin`, random(120_000))
+      await pushBranch(a.store, a.remote, BRANCH)
     }
-    const mutations = gh.count('graphql-mutation')
-    await expect(a.remote.repack(BRANCH)).rejects.toThrow(/more than one request can carry/)
-    expect(gh.count('graphql-mutation')).toBe(mutations)
-  }, 30_000)
+    expect(await a.remote.repack(BRANCH)).toBe(true)
+    const [entry, ...rest] = manifestAt(gh).packs
+    expect(rest).toEqual([])
+    expect(gh.filesAt(BRANCH).filter((p) => p.includes('.pack'))).toEqual(
+      entry?.parts.map((_, i) => `${entry.path}.${i}`).sort(),
+    )
+    const b = await device(gh)
+    expect((await pullBranch(b.store, b.remote, BRANCH)).localHead).toBe(entry?.tip)
+  })
+})
+
+describe('PackRemote and format 1', () => {
+  it('pulls a format-1 branch, and pushes onto it as format 2', async () => {
+    const gh = new FakeGithub()
+    const src = new Memory()
+    const head = (await commitN(src, 3, 'a')).head
+    // a format-1 pack differs from a format-2 one by its format alone
+    const codec = new Encoder({ useRecords: false, mapsAsObjects: true, tagUint8Array: false })
+    const body = codec.decode(
+      await gunzip(
+        await encodePack(await collect(walkDelta(src, { want: head })), {
+          kernel: 'ts',
+          base: null,
+        }),
+      ),
+    ) as Record<string, unknown>
+    const pack = await gzip(codec.encode({ ...body, format: 1 }))
+    const path = `kvgit/packs/000001-${head.slice(0, 12)}.pack`
+    const manifest = {
+      format: 1,
+      kernel: 'ts',
+      branch: BRANCH,
+      head,
+      packs: [
+        {
+          path,
+          seq: 1,
+          base: null,
+          tip: head,
+          commits: 4,
+          bytes: pack.length,
+          sha256: await sha256Hex(pack),
+          blob: await gitBlobSha1(pack),
+        },
+      ],
+      nextSeq: 2,
+      meta: null,
+    }
+    gh.plant(BRANCH, { [MANIFEST_PATH]: JSON.stringify(manifest), [path]: pack })
+
+    const b = await device(gh)
+    expect((await pullBranch(b.store, b.remote, BRANCH)).localHead).toBe(head)
+    const next = (await commitN(b.store, 1, 'b')).head
+    expect((await pushBranch(b.store, b.remote, BRANCH)).status).toBe('pushed')
+    const now = manifestAt(gh)
+    expect(now.format).toBe(2)
+    expect(now.packs[0]).toEqual({
+      ...manifest.packs[0],
+      blob: undefined,
+      parts: [manifest.packs[0]?.blob],
+    })
+    expect(JSON.stringify(now)).not.toContain('"blob"')
+    const c = await device(gh)
+    expect((await pullBranch(c.store, c.remote, BRANCH)).localHead).toBe(next)
+  })
 })
 
 describe('PackRemote roster and lifecycle', () => {
