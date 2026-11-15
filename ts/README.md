@@ -458,51 +458,17 @@ await remote.roster() // every session: head, meta, packs, archived
 #### The format
 
 [`docs/github-sync.md`](https://github.com/ashenfad/kvgit/blob/main/docs/github-sync.md)
-specifies it; in short, format 2:
-
-Each session is one git branch; archived ones (the trash) are
-`archived/<session>`. A branch holds two kinds of file:
-
-- **`kvgit/manifest.json`**, JSON: `{format: 2, kernel, branch, head,
-  packs, nextSeq, meta}`. `head` is the session's kvgit head; `meta` is
-  what the pusher's `meta(branch, head)` gave (a title, say); `packs`
-  lists the packs oldest first, each `{path, seq, base, tip, commits,
-  bytes, sha256, parts}`: the kvgit commit its delta builds on (`base`,
-  null from the root), its last commit (`tip`), the stored pack's size
-  and SHA-256, and the git blob SHAs of its parts, which a fetch reads
-  them by. Each pack's `base` is the previous pack's `tip`. A format-1
-  manifest (each pack one `blob`) reads as format 2. A manifest that
-  isn't JSON, or has another `format`, makes the branch unusable here:
-  it is never pushed over.
-- **Packs**: gzip of CBOR `{format: 2, kernel, base, tip, values,
-  commits}`, one part at `kvgit/packs/<seq>-<tip12>.pack` (`<seq>` six
-  digits, zero-padded) or n parts at `….pack.0` … `….pack.<n-1>`.
-  `values` is a table of distinct values (each once, ordered by key, so
-  versions of a file compress against each other): byte strings, or a
-  reference `[sha256, size, [part SHAs]]` to a value kept outside the
-  pack. `commits` is parents first, each `[record, updates]`, where
-  `record` is the commit as kvgit hashes it (Python-style JSON bytes of
-  `{hash, parents, parentGens, time, info, removals}`, `time` a float)
-  and `updates` is `[key, valueIndex]` pairs. A receiver recomputes
-  every hash (`applyWire`).
-- **Large values**, raw, at `kvgit/values/<sha256>` (one part) or
-  `….0` … `….<n-1>`, named by the value's SHA-256, its kvgit blob key.
-  A pack that references one is on a branch whose tree names its
-  files, so a value stays while any session uses it.
-
-Each push is one git commit on the session's branch, headlined `kvgit
-<session> @ <head7> (+N)` with `Kvgit-Head: <head>` and
-`Kvgit-Pack-Format: 2` trailers. A small push is one
-`createCommitOnBranch`, `expectedHeadOid` its compare-and-swap; a new
-session's branch starts from the default branch's commit, its
-`createRef` in the same request. A larger one uploads its packs' parts
-as blobs (skipping those the repo already holds, so a push that stopped
-partway resumes), makes a tree and a commit, and moves the ref with
-`updateRefs` from the commit it read: an exact compare-and-swap. A
-fetch walks the manifest's packs from the newest back to one whose
-`base` the receiver has, and reads their parts by blob SHA (`GET
-git/blobs/<sha>`, raw: the contents API alters bytes it takes for
-text).
+specifies it (format 2), with a golden fixture. In short: each session
+is one git branch (archived ones `archived/<session>`) holding
+`kvgit/manifest.json`, which names the session's kvgit head and lists
+its packs, oldest first; the packs, gzip of CBOR runs of wire commits
+whose values sit in a table, each pack in one file or in parts; and
+`kvgit/values/<sha256>`, the large values the packs reference. Each
+push is one git commit with `Kvgit-Head: <head>` and
+`Kvgit-Pack-Format: 2` trailers, landed by a compare-and-swap on the
+branch's commit: `createCommitOnBranch`'s `expectedHeadOid` inline, or
+`updateRefs` after the parts, a tree and a commit go up over REST. A
+receiver recomputes every commit hash (`applyWire`).
 
 #### Limits
 
