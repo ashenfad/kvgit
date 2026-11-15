@@ -37,6 +37,7 @@ describe('the fake GitHub, as git objects over REST', () => {
       parents: [main],
     })
     expect(gh.refs.has('refs/heads/s')).toBe(false) // nothing references it yet
+    expect(gh.commits.get(commit.sha)?.tree).toBe(tree.sha)
 
     const res = await client.graphql(
       `mutation($repoId: ID!, $updates: [RefUpdate!]!) {
