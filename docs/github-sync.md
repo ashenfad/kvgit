@@ -1,8 +1,9 @@
 # GitHub sync past one request (proposal)
 
-Status: proposal, 2026-11-14. Nothing here is built. The decisions it
-needs are at the end. Once they're made, this file becomes the GitHub
-transport's format contract (see "The format as a contract").
+Status: accepted 2026-11-15, being built. The decisions, with the
+changes they made to the proposal, are at the end. Once built, this
+file becomes the GitHub transport's format contract (see "The format
+as a contract").
 
 ## The problem
 
@@ -49,8 +50,11 @@ A push whose GraphQL body (packs, manifest and document) stays under
 `createCommitOnBranch`, with `expectedHeadOid` as the compare-and-swap.
 Most pushes are a chat turn or a file edit, a few KB, so they stay one
 request. If GitHub drops the request at its deadline (`too-large`), the
-same push goes the REST way instead. A dropped body was never applied,
-so the fallback is safe.
+same push goes the REST way instead, and the remote lowers its own
+inline cutoff below the size that was dropped for the rest of its
+lifetime, so a slow link doesn't spend 5 s on every medium-sized push.
+A dropped body is normally never applied; when it's unclear whether it
+was, the landed check below settles it.
 
 ### A larger push goes as git objects over REST
 
@@ -69,14 +73,19 @@ so the fallback is safe.
 4. **Ref.** GraphQL `updateRefs` with `beforeOid` set to the current
    commit (zero for a creation) and `afterOid` to the new one. This is
    an exact compare-and-swap, like `expectedHeadOid`. The request is
-   tiny, so the deadline doesn't matter. After an error, the push
-   re-reads the ref. If the ref is at this push's `afterOid`, the push
-   landed: an earlier attempt applied it and its response was lost, so
-   the client's retry failed on its stale `beforeOid`. If the ref is
-   anywhere else, the race was lost and the push returns false. Today's
-   `#updateRefs`, which archive and delete use, counts any move as a
-   lost race. It gets the same rule, since it can miss a response the
-   same way.
+   tiny, so the deadline doesn't matter.
+
+**Did it land?** After an error, a push re-reads the branch's manifest.
+If its `head` (also the commit's `Kvgit-Head` trailer) is this push's
+tip, the push landed, whichever request carried it: an `updateRefs`
+whose response was lost (the client's retry then fails on its stale
+`beforeOid`), or an inline request that failed ambiguously before the
+REST fallback ran. Comparing git oids would get the second wrong, since
+the ref holds the inline request's commit, not the fallback's. Any
+other head means the race was lost, and the push returns false.
+`#updateRefs` for archive, restore and delete has no manifest head to
+compare, so it keeps its own check: a ref at its `afterOid` landed.
+Today it counts any move as a lost race; it gets that rule.
 
 A non-force REST `PATCH git/refs` checks only for a fast-forward. Take
 a session that was deleted and then re-created as a bare ref at the
@@ -98,8 +107,11 @@ decoding.
 The client treats a REST request with a large body (64 KiB or more)
 that fails 55 s or more in, with a 401 or a network error, as
 `too-large`, the way #143 treats GraphQL's 5 s. With 4 MiB parts that
-means an uplink under about 100 KB/s. Sizing parts from measured
-throughput is a later option.
+means an uplink under about 100 KB/s. A push that meets it halves
+`partBytes` and tries again, down to a floor of 512 KiB, before it
+fails. The manifest lists each pack's parts, so readers don't depend on
+the part size; a resume after a halving re-uploads, since the parts'
+SHAs change.
 
 ### Format 2
 
@@ -197,7 +209,8 @@ and SHAs, nothing uploaded), and packs only the commits after the last
 reused tip (`walkDelta` from there). There is no format change and no
 change to the core or the `Remote` interface. With A, the large values
 are already deduped, so what B saves is the history's records and small
-values, often a few MB. B can wait.
+values. That isn't small: a full fork of a 3,900-commit session would
+still upload about 6,800 values under 1 MiB, roughly 60 MiB compressed.
 
 ## The format as a contract
 
@@ -217,25 +230,42 @@ interface, the sync layer, and fetch's choice of which packs to read.
 
 ## Plan
 
-1. Decisions on this note.
-2. **Client:** the REST minute, blob creation. **Fake:** `git/blobs`,
-   `git/trees`, `git/commits`, `object(oid:)` lookups, `updateRefs`
-   creating refs, and a GraphQL body cap answered with 499.
-3. **`PackRemote`:** format 2, the REST path, the inline fallback,
-   resume, one git commit per push.
-4. Option A if wanted; option B later.
-5. A live check on `ashenfad/agex-sync-test` (unarchived), then a note
-   for studio's floor bump.
+1. **Client and fake:** the REST minute, blob creation, rate-limit
+   waits. The fake gains `git/blobs`, `git/trees`, `git/commits`,
+   `object(oid:)` lookups and a GraphQL body cap answered with 499.
+2. **`PackRemote`:** format 2, the REST path, the inline fallback and
+   cutoff, part halving, resume, one git commit per push, the landed
+   check.
+3. **Option A** at 1 MiB, its own PR.
+4. This file trimmed to the contract, with one golden format-2 fixture.
+5. A live check on `ashenfad/agex-sync-test`, including that
+   `updateRefs` can create a ref (zero `beforeOid`) on a fine-grained
+   token; then a note for studio's floor bump.
+6. **Option B**, next after A, its own PR.
 
-## Decisions wanted
+## Decisions (2026-11-15)
 
-1. The REST path, with inline below `inlineBytes` and a fallback on
-   `too-large`? Recommended.
-2. `updateRefs` for the CAS, not `PATCH git/refs`? Recommended.
-3. Option A: now, later or never, and at what threshold? Recommended:
-   in this stack, at 1 MiB, with the reader in format 2 either way.
-4. Option B? Recommended: later.
-5. This file as the format contract (and not `docs/protocol.md`)?
-   Recommended.
-6. Unarchive `ashenfad/agex-sync-test`, and allow writes to it for the
-   live check.
+1. **The REST path**, inline below `inlineBytes` and falling back on
+   `too-large`: yes, with three changes, written in above. A push
+   decides whether it landed by the manifest's kvgit head, not a git
+   oid. `inlineBytes` defaults to 1 MiB, and a GraphQL `too-large`
+   lowers the remote's cutoff for its lifetime. A REST `too-large`
+   halves `partBytes`, down to 512 KiB, before failing.
+2. **`updateRefs` for the CAS**, not `PATCH git/refs`: yes. The live
+   check confirms it can create a ref on a fine-grained token.
+3. **Option A**: yes, in this stack, at 1 MiB, as its own PR after the
+   REST path; the format-2 reader takes value references either way. In
+   one 3,900-commit studio session, 42 distinct values are 1 MiB or
+   more, 88 MiB in all: 25 workspace files (15 PNG, 10 MP3, about
+   50 MiB), which dedupe across compact forks, snapshots and undo
+   restores, and 17 run records (38 MiB), which don't. A 256 KiB
+   threshold would add 88 values, 68 of them run records: writes for
+   nothing.
+4. **Option B**: later, next after A, its own PR.
+5. **This file as the contract**, not `docs/protocol.md`: yes. Once
+   built, it's trimmed to the normative spec and a short why; the
+   measurements and rate-limit arithmetic stay in PR history. One golden
+   format-2 fixture (a manifest, a pack, and the commits they decode to)
+   goes in this stack rather than waiting for a second implementation.
+6. **The scratch repo** is unarchived, and writes to it for the live
+   check are allowed.
