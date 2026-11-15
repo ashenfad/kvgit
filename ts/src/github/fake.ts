@@ -182,8 +182,15 @@ export class FakeGithub {
     return oid
   }
 
-  #commit(parent: string | null, files: Map<string, Uint8Array>, message: string): Commit {
-    const commit: Commit = { oid: nextOid(), parent, files, tree: this.#tree(files), message }
+  /** A commit of `files`, on `tree` when given (a REST commit names
+   *  the tree it commits), else on a new tree of them. */
+  #commit(
+    parent: string | null,
+    files: Map<string, Uint8Array>,
+    message: string,
+    tree = this.#tree(files),
+  ): Commit {
+    const commit: Commit = { oid: nextOid(), parent, files, tree, message }
     this.commits.set(commit.oid, commit)
     return commit
   }
@@ -312,7 +319,12 @@ export class FakeGithub {
     if (files === undefined) return refuse('Invalid tree: not found')
     const parents = (body.parents ?? []) as string[]
     if (parents.some((p) => !this.commits.has(p))) return refuse('Invalid parent: not found')
-    const commit = this.#commit(parents[0] ?? null, files, String(body.message ?? ''))
+    const commit = this.#commit(
+      parents[0] ?? null,
+      files,
+      String(body.message ?? ''),
+      body.tree as string,
+    )
     return json(201, { sha: commit.oid, tree: { sha: commit.tree } })
   }
 
