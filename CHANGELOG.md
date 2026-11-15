@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **TypeScript's GitHub client waits out rate limits as GitHub asks.** It waits the whole `Retry-After`, else until the quota resets, else a minute for a secondary limit, where it capped waits at 60 s and retried a secondary limit after a second; a wait over a minute fails as `rate-limit` with the new `GithubError.retryAfterMs`.
 - **TypeScript's GitHub client creates blobs, and knows REST's minute.** `createBlob` stores bytes as a git blob and checks the SHA GitHub gives it; a large REST write answered 401 or failing a minute in is `too-large`, since GitHub answers a body still arriving then as a bad token.
 - **The fake GitHub takes git objects over REST.** `FakeGithub` answers `git/blobs`, `git/trees` and `git/commits` writes and `object(oid:)` lookups, and `uplinkBytesPerSecond` simulates a slow link, with GitHub's body deadlines on the fake's clock.
+- **TypeScript's GitHub sync sends a large value once per repo.** In a push over REST, values of `valueBlobBytes` (1 MiB) or more go up as blobs of their own under `kvgit/values/<sha256>`, skipped when the repo already holds them from any session, and a pull reads one only when the local store lacks it.
 - **Python syncs, internally.** `kvgit._sync` pushes, pulls and syncs branches with a remote as TypeScript does, from the same core, with a reference `MemoryRemote`; it isn't public API yet.
 
 ### Changed

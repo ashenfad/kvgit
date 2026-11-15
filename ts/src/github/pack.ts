@@ -6,6 +6,7 @@
  *   kvgit/manifest.json                  head, pack list, caller metadata
  *   kvgit/packs/<seq>-<tip12>.pack       gzip(CBOR) of a run of WireCommits
  *   kvgit/packs/<seq>-<tip12>.pack.<i>   the same in parts, when stored so
+ *   kvgit/values/<sha256>[.<i>]          a large value, kept outside packs
  *
  * A push lands as ONE git commit on the branch, whatever its size:
  *
@@ -19,7 +20,10 @@
  *   holds, so a push that stopped partway resumes), then a tree, a
  *   commit, and a GraphQL `updateRefs` from the branch's commit to the
  *   new one: an exact compare-and-swap. A part that doesn't arrive
- *   within GitHub's minute halves `partBytes`.
+ *   within GitHub's minute halves `partBytes`. Values of
+ *   `valueBlobBytes` or more go up as blobs of their own, which the
+ *   packs reference: a value the repo already holds, from any branch,
+ *   isn't sent again, and a receiver that holds it doesn't read it.
  *
  * Whether a push landed is the branch's manifest's say: after an error,
  * one whose `head` is the push's tip landed, whichever request carried
@@ -64,6 +68,7 @@ import { gitBlobSha1 } from './git-hash'
 export const PACK_FORMAT = 2
 export const MANIFEST_PATH = 'kvgit/manifest.json'
 export const PACKS_DIR = 'kvgit/packs'
+export const VALUES_DIR = 'kvgit/values'
 const ARCHIVED = 'archived/'
 const ZERO_OID = '0000000000000000000000000000000000000000'
 /** Raw blob reads in flight at once. */
@@ -145,11 +150,17 @@ export interface PackRemoteOptions {
    *  drops lowers it, for this remote's lifetime, to half that push's
    *  size. */
   inlineBytes?: number
-  /** The largest part a pack is stored in over REST. Default 4 MiB, a
-   *  request of about 5.6 MB that arrives within GitHub's minute down
-   *  to about 100 KB/s. A part that doesn't halves it, for this
-   *  remote's lifetime, down to 512 KiB. */
+  /** The largest part a pack or value is stored in over REST. Default
+   *  4 MiB, a request of about 5.6 MB that arrives within GitHub's
+   *  minute down to about 100 KB/s. A part that doesn't halves it, for
+   *  this remote's lifetime, down to 512 KiB. */
   partBytes?: number
+  /** Values at least this large, in a push that goes over REST, are
+   *  stored as blobs of their own under `kvgit/values/<sha256>`, which
+   *  the pack references: uploaded once per repo, and read only by a
+   *  receiver that lacks them. Default 1 MiB; `Infinity` keeps every
+   *  value in its pack. */
+  valueBlobBytes?: number
 }
 
 interface BranchState {
@@ -171,8 +182,11 @@ interface NewPack {
   base: string | null
   tip: string
   commits: number
+  /** The pack with every value in it. */
   bytes: Uint8Array
   sha256: string
+  /** The commits it holds, to encode it again with values kept out. */
+  run: WireCommit[]
 }
 
 /** What one commit on a branch makes of it: its packs in manifest
@@ -189,12 +203,15 @@ interface Change {
   what: string
 }
 
-/** One file a change writes: a pack, or a part of one. */
+/** One file a change writes: a pack or a value, or a part of one. */
 interface PackFile {
   path: string
   bytes: Uint8Array
   sha: string
-  pack: NewPack
+  /** What the file holds or is a part of, for errors. */
+  of: string
+  /** The size of that whole. */
+  whole: number
 }
 
 interface Layout {
@@ -448,6 +465,7 @@ export class PackRemote implements Remote {
   readonly #keepRecent: number
   readonly #maxPackBytes: number
   readonly #minPartBytes: number
+  readonly #valueBlobBytes: number
   readonly #owner: string
   readonly #name: string
   #inlineBytes: number
@@ -471,6 +489,7 @@ export class PackRemote implements Remote {
     this.#inlineBytes = opts.inlineBytes ?? 1024 * 1024
     this.#partBytes = Math.max(1, opts.partBytes ?? 4 * 1024 * 1024)
     this.#minPartBytes = Math.min(this.#partBytes, MIN_PART_BYTES)
+    this.#valueBlobBytes = opts.valueBlobBytes ?? 1024 * 1024
     const api = apiRoot(client.apiBase)
     this.id = `github:${api === 'https://api.github.com' ? '' : `${api}/`}${client.repo.toLowerCase()}`
     const [owner, name] = client.repo.split('/') as [string, string]
@@ -698,7 +717,7 @@ export class PackRemote implements Remote {
     for (const chunk of chunks) {
       const tip = (chunk.at(-1) as WireCommit).hash
       const bytes = await encodePack(chunk, { kernel: this.#kernel, base })
-      fresh.push(await newPack(nextSeq++, base, tip, chunk.length, bytes))
+      fresh.push(await newPack(nextSeq++, base, tip, chunk, bytes))
       base = tip
     }
 
@@ -762,7 +781,7 @@ export class PackRemote implements Remote {
       commits.push(wc)
     }
     const bytes = await encodePack(commits, { kernel: this.#kernel, base })
-    return { pack: await newPack(seq, base, tip, commits.length, bytes), replaced }
+    return { pack: await newPack(seq, base, tip, commits, bytes), replaced }
   }
 
   /**
@@ -780,7 +799,7 @@ export class PackRemote implements Remote {
     const commits: WireCommit[] = []
     for await (const wc of walkDelta(this.#store, { want: manifest.head })) commits.push(wc)
     const bytes = await encodePack(commits, { kernel: this.#kernel, base: null })
-    const pack = await newPack(manifest.nextSeq, null, manifest.head, commits.length, bytes)
+    const pack = await newPack(manifest.nextSeq, null, manifest.head, commits, bytes)
     const change: Change = {
       packs: [pack],
       deletions: manifest.packs.flatMap(filesOf),
@@ -916,7 +935,7 @@ export class PackRemote implements Remote {
     for (;;) {
       layout = await this.#layout(branch, change, this.#partBytes)
       try {
-        await this.#upload(layout.files, change)
+        await this.#upload(layout.files)
         break
       } catch (err) {
         if (!(err instanceof GithubError) || err.kind !== 'too-large') throw err
@@ -984,22 +1003,55 @@ export class PackRemote implements Remote {
   async #layout(branch: string, change: Change, partBytes: number | null): Promise<Layout> {
     const entries: PackEntry[] = []
     const files: PackFile[] = []
+    const placed = new Set<string>()
+    /** Lay out `bytes` at `path` in parts; their SHAs. */
+    const place = async (path: string, bytes: Uint8Array, of: string): Promise<string[]> => {
+      const cuts = cut(bytes, partBytes)
+      const parts: string[] = []
+      for (const [i, part] of cuts.entries()) {
+        const sha = await gitBlobSha1(part)
+        parts.push(sha)
+        const at = cuts.length === 1 ? path : `${path}.${i}`
+        if (placed.has(at)) continue
+        placed.add(at)
+        files.push({ path: at, bytes: part, sha, of, whole: bytes.length })
+      }
+      return parts
+    }
     for (const p of change.packs) {
       if (!isNew(p)) {
         entries.push(p)
         continue
       }
-      const cuts: Uint8Array[] = []
-      const step = partBytes ?? p.bytes.length
-      for (let at = 0; at < p.bytes.length; at += step) cuts.push(p.bytes.subarray(at, at + step))
-      const parts: string[] = []
-      for (const [i, bytes] of cuts.entries()) {
-        const sha = await gitBlobSha1(bytes)
-        parts.push(sha)
-        files.push({ path: cuts.length === 1 ? p.path : `${p.path}.${i}`, bytes, sha, pack: p })
+      // Over REST, large values go up as blobs of their own, under
+      // their SHA-256, and the pack references them.
+      const refs = new Map<string, ValueRef>()
+      if (partBytes !== null) {
+        for (const wc of p.run) {
+          for (const value of wc.updates.values()) {
+            if (value.length < this.#valueBlobBytes) continue
+            const sha256 = await sha256Hex(value)
+            if (refs.has(sha256)) continue
+            const of = `value ${sha256.slice(0, 12)} of ${change.what}`
+            const parts = await place(`${VALUES_DIR}/${sha256}`, value, of)
+            refs.set(sha256, [sha256, value.length, parts])
+          }
+        }
       }
-      const { bytes, ...entry } = p
-      entries.push({ ...entry, bytes: bytes.length, parts })
+      const bytes =
+        refs.size === 0
+          ? p.bytes
+          : await encodePack(p.run, { kernel: this.#kernel, base: p.base, refs })
+      entries.push({
+        path: p.path,
+        seq: p.seq,
+        base: p.base,
+        tip: p.tip,
+        commits: p.commits,
+        bytes: bytes.length,
+        sha256: bytes === p.bytes ? p.sha256 : await sha256Hex(bytes),
+        parts: await place(p.path, bytes, `the pack of ${change.what}`),
+      })
     }
     const manifest: PackManifest = {
       format: PACK_FORMAT,
@@ -1015,7 +1067,7 @@ export class PackRemote implements Remote {
 
   /** Upload the files GitHub doesn't already hold (a push that stopped
    *  partway left some), one blob each. */
-  async #upload(files: PackFile[], change: Change): Promise<void> {
+  async #upload(files: PackFile[]): Promise<void> {
     const held = await this.#held([...new Set(files.map((f) => f.sha))])
     for (const f of files) {
       if (held.has(f.sha)) continue
@@ -1023,11 +1075,14 @@ export class PackRemote implements Remote {
         await this.client.createBlob(f.bytes)
       } catch (err) {
         if (!(err instanceof GithubError) || err.kind !== 'too-large') throw err
-        const part = f.bytes.length === f.pack.bytes.length ? 'the pack' : 'a part of the pack'
+        const what =
+          f.bytes.length === f.whole
+            ? `${f.of} (${formatBytes(f.whole)})`
+            : `a part of ${f.of} (${formatBytes(f.bytes.length)} of ${formatBytes(f.whole)})`
         throw new GithubError(
           err.kind,
           err.status,
-          `PackRemote.push: ${part} of ${change.what} (${formatBytes(f.bytes.length)} of ${formatBytes(f.pack.bytes.length)} compressed) didn't reach GitHub: ${err.message}`,
+          `PackRemote.push: ${what} didn't reach GitHub: ${err.message}`,
           err.body,
         )
       }
@@ -1231,7 +1286,7 @@ async function newPack(
   seq: number,
   base: string | null,
   tip: string,
-  commits: number,
+  run: WireCommit[],
   bytes: Uint8Array,
 ): Promise<NewPack> {
   return {
@@ -1239,13 +1294,22 @@ async function newPack(
     seq,
     base,
     tip,
-    commits,
+    commits: run.length,
     bytes,
     sha256: await sha256Hex(bytes),
+    run,
   }
 }
 
-const isNew = (p: PackEntry | NewPack): p is NewPack => p.bytes instanceof Uint8Array
+/** `bytes` cut into parts of at most `size` (one part when `size` is null). */
+function cut(bytes: Uint8Array, size: number | null): Uint8Array[] {
+  if (size === null || bytes.length <= size) return [bytes]
+  const out: Uint8Array[] = []
+  for (let at = 0; at < bytes.length; at += size) out.push(bytes.subarray(at, at + size))
+  return out
+}
+
+const isNew = (p: PackEntry | NewPack): p is NewPack => 'run' in p
 
 /** The files a manifest entry is stored in. */
 function filesOf(entry: PackEntry): string[] {
