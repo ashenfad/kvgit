@@ -139,6 +139,37 @@ describe.runIf(LIVE)('PackRemote (live)', () => {
     expect((await pullBranch(b.store, b.remote, branch)).localHead).toBe(wt.head)
   }, 600_000)
 
+  it('sends a large value once, though two sessions hold it', async () => {
+    const value = random(1_500_000)
+    let blobPosts = 0
+    const counting = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'POST' && String(input).endsWith('/git/blobs')) blobPosts++
+      return fetch(input, init)
+    }) as typeof fetch
+    const heads: string[] = []
+    const posts: number[] = []
+    for (const tag of ['one', 'two']) {
+      const branch = `pack-value-${tag}-${stamp}`
+      branches.push(branch)
+      const store = new Memory()
+      const client = new GithubClient({ token: TOKEN, repo: REPO, fetchImpl: counting })
+      const remote = new PackRemote(client, store)
+      const wt = await (await Repo.open(store)).worktree(branch, { create: true })
+      wt.set(`files/${tag}.png`, value)
+      await wt.commit()
+      blobPosts = 0
+      expect((await pushBranch(store, remote, branch)).status).toBe('created')
+      posts.push(blobPosts)
+      heads.push(wt.head)
+    }
+    console.log(JSON.stringify({ value: 'dedup', posts }))
+    expect(posts).toEqual([2, 1]) // value + pack, then the pack alone
+    const b = device()
+    expect((await pullBranch(b.store, b.remote, `pack-value-two-${stamp}`)).localHead).toBe(
+      heads[1],
+    )
+  }, 180_000)
+
   it('archive, roster, restore: one updateRefs each', async () => {
     const branch = `pack-life-${stamp}`
     branches.push(branch)

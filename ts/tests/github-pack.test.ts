@@ -409,7 +409,7 @@ describe('PackRemote over REST', () => {
 
   it('stores a pack larger than partBytes in parts, read back in order', async () => {
     const gh = new FakeGithub()
-    const a = await device(gh, { partBytes: 100_000 })
+    const a = await device(gh, { partBytes: 100_000, valueBlobBytes: Number.POSITIVE_INFINITY })
     const value = random(1_200_000) // past the 1 MiB inline cutoff
     const head = await commitValue(a.store, 'files/big.bin', value)
     expect((await pushBranch(a.store, a.remote, BRANCH)).status).toBe('created')
@@ -514,6 +514,104 @@ describe('PackRemote over REST', () => {
   })
 })
 
+describe('PackRemote and large values', () => {
+  it('stores a large value as a blob of its own, which the pack references', async () => {
+    const gh = new FakeGithub()
+    const a = await device(gh)
+    const value = random(1_500_000)
+    const head = await commitValue(a.store, 'files/photo.png', value)
+    expect((await pushBranch(a.store, a.remote, BRANCH)).status).toBe('created')
+    const sha = await sha256Hex(value)
+    expect(gh.filesAt(BRANCH)).toContain(`kvgit/values/${sha}`)
+    const [entry] = manifestAt(gh).packs
+    expect(entry?.bytes).toBeLessThan(10_000)
+
+    gh.calls.length = 0
+    const b = await device(gh)
+    expect((await pullBranch(b.store, b.remote, BRANCH)).localHead).toBe(head)
+    expect(await (await open(b.store)).get('files/photo.png')).toEqual(value)
+    expect(gh.count('raw')).toBe(2) // the pack, then the value
+  })
+
+  it('sends a value the repo holds from any branch once, and reads one the store holds not at all', async () => {
+    const gh = new FakeGithub()
+    const value = random(1_500_000)
+    const a = await device(gh)
+    await commitValue(a.store, 'files/photo.png', value)
+    await pushBranch(a.store, a.remote, BRANCH)
+
+    // another session, with its own history, holding the same bytes
+    gh.calls.length = 0
+    const b = await device(gh)
+    const head = await commitValue(b.store, 'copy.png', value)
+    await b.remote.listRefs()
+    await expect(
+      b.remote.push('chat-2', null, head, walkDelta(b.store, { want: head })),
+    ).resolves.toBe(true)
+    expect(gh.calls.filter((c) => c.kind === 'rest' && c.detail === 'blob')).toHaveLength(1) // the pack
+    expect(gh.filesAt('chat-2')).toContain(`kvgit/values/${await sha256Hex(value)}`)
+
+    // a device that holds it (from the first session) pulls the second without reading it
+    gh.calls.length = 0
+    const c = await device(gh)
+    await pullBranch(c.store, c.remote, BRANCH)
+    gh.calls.length = 0
+    const pulled = await pullBranch(c.store, c.remote, 'chat-2')
+    expect(pulled.localHead).toBe(head)
+    expect(gh.count('raw')).toBe(1) // the pack alone
+  })
+
+  it('keeps a value another session uses when one session is deleted', async () => {
+    const gh = new FakeGithub()
+    const value = random(1_500_000)
+    const a = await device(gh)
+    await commitValue(a.store, 'files/photo.png', value)
+    await pushBranch(a.store, a.remote, BRANCH)
+    const b = await device(gh)
+    const head = await commitValue(b.store, 'copy.png', value)
+    await b.remote.listRefs()
+    await b.remote.push('chat-2', null, head, walkDelta(b.store, { want: head }))
+
+    expect((await deleteRemoteBranch(a.store, a.remote, BRANCH)).status).toBe('deleted')
+    await gh.prune()
+    const c = await device(gh)
+    expect((await pullBranch(c.store, c.remote, 'chat-2')).localHead).toBe(head)
+    expect(await (await open(c.store, 'chat-2')).get('copy.png')).toEqual(value)
+  })
+
+  it('keeps large values in the pack when a push goes inline', async () => {
+    const gh = new FakeGithub()
+    const a = await device(gh)
+    // 2 MB that compresses to almost nothing fits one GraphQL request
+    const head = await commitValue(a.store, 'files/log.txt', bytes('x'.repeat(2_000_000)))
+    gh.calls.length = 0
+    expect((await pushBranch(a.store, a.remote, BRANCH)).status).toBe('created')
+    expect(gh.count('rest')).toBe(0)
+    expect(gh.filesAt(BRANCH).some((p) => p.startsWith('kvgit/values/'))).toBe(false)
+    const b = await device(gh)
+    expect((await pullBranch(b.store, b.remote, BRANCH)).localHead).toBe(head)
+  })
+
+  it('a fold references the values its packs did, uploading nothing for them again', async () => {
+    const gh = new FakeGithub()
+    const a = await device(gh, { maxPacks: 3, keepRecent: 1, maxPackBytes: 64 * 1024 * 1024 })
+    const values: Uint8Array[] = []
+    for (let i = 0; i < 4; i++) {
+      values.push(random(1_100_000))
+      await commitValue(a.store, `files/${i}.png`, values[i] as Uint8Array)
+      gh.calls.length = 0
+      await pushBranch(a.store, a.remote, BRANCH)
+    }
+    // the last push folded: its blob uploads are its own value and two packs
+    expect(manifestAt(gh).packs).toHaveLength(2)
+    expect(gh.calls.filter((c) => c.kind === 'rest' && c.detail === 'blob')).toHaveLength(3)
+    const b = await device(gh)
+    await pullBranch(b.store, b.remote, BRANCH)
+    const wt = await open(b.store)
+    for (const [i, v] of values.entries()) expect(await wt.get(`files/${i}.png`)).toEqual(v)
+  })
+})
+
 describe('PackRemote on a slow link', () => {
   it('sends a push GitHub drops at its deadline over REST, and lowers its inline cutoff', async () => {
     const gh = new FakeGithub({ uplinkBytesPerSecond: 50_000 }) // GraphQL carries 250 kB
@@ -544,9 +642,13 @@ describe('PackRemote on a slow link', () => {
   it("halves its parts while one doesn't arrive within GitHub's minute", async () => {
     const gh = new FakeGithub({ uplinkBytesPerSecond: 20_000 }) // REST carries 1.2 MB
     const a = await device(gh)
-    const head = await commitValue(a.store, 'files/a.bin', random(1_500_000))
+    const value = random(1_500_000)
+    const head = await commitValue(a.store, 'files/a.bin', value)
     expect((await pushBranch(a.store, a.remote, BRANCH)).status).toBe('created')
-    expect(manifestAt(gh).packs[0]?.parts).toHaveLength(3) // 512 KiB parts
+    const sha = await sha256Hex(value)
+    expect(gh.filesAt(BRANCH).filter((p) => p.startsWith('kvgit/values/'))).toEqual(
+      [0, 1, 2].map((i) => `kvgit/values/${sha}.${i}`), // 512 KiB parts
+    )
     const b = await device(gh)
     expect((await pullBranch(b.store, b.remote, BRANCH)).localHead).toBe(head)
   })
@@ -560,7 +662,7 @@ describe('PackRemote on a slow link', () => {
     expect((err as GithubError).kind).toBe('too-large')
     expect((err as GithubError).message).toMatch(
       new RegExp(
-        `^PackRemote.push: a part of the pack of 2 commits up to ${head.slice(0, 7)} \\(525 kB of 6\\d\\d kB compressed\\) didn't reach GitHub: GitHub answered`,
+        `^PackRemote.push: a part of the pack of 2 commits up to ${head.slice(0, 7)} \\(525 kB of 6\\d\\d kB\\) didn't reach GitHub: GitHub answered`,
       ),
     )
     expect(gh.refs.has(`refs/heads/${BRANCH}`)).toBe(false)
@@ -669,8 +771,11 @@ describe('PackRemote and manifests it cannot use', () => {
     const big = random(24 * 1024 * 1024)
     const head = await commitValue(a.store, 'files/big.bin', big)
     expect((await pushBranch(a.store, a.remote, BRANCH)).status).toBe('created')
-    // the root commit's pack, then the big commit's in 4 MiB parts
-    expect(manifestAt(gh).packs.map((p) => p.parts.length)).toEqual([1, 7])
+    // the value on its own in six 4 MiB parts; the packs small
+    expect(manifestAt(gh).packs.map((p) => p.parts.length)).toEqual([1, 1])
+    const sha = await sha256Hex(big)
+    expect(gh.filesAt(BRANCH).filter((p) => p.startsWith('kvgit/values/'))).toHaveLength(6)
+    expect(gh.filesAt(BRANCH)).toContain(`kvgit/values/${sha}.5`)
     const b = await device(gh)
     expect((await pullBranch(b.store, b.remote, BRANCH)).localHead).toBe(head)
   }, 30_000)

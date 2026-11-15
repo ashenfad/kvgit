@@ -12,6 +12,7 @@ export {
   PACK_FORMAT,
   PACKS_DIR,
   PackRemote,
+  VALUES_DIR,
   decodePack,
   encodePack,
   type DecodedPack,

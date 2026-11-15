@@ -485,6 +485,10 @@ Each session is one git branch; archived ones (the trash) are
   `{hash, parents, parentGens, time, info, removals}`, `time` a float)
   and `updates` is `[key, valueIndex]` pairs. A receiver recomputes
   every hash (`applyWire`).
+- **Large values**, raw, at `kvgit/values/<sha256>` (one part) or
+  `….0` … `….<n-1>`, named by the value's SHA-256, its kvgit blob key.
+  A pack that references one is on a branch whose tree names its
+  files, so a value stays while any session uses it.
 
 Each push is one git commit on the session's branch, headlined `kvgit
 <session> @ <head7> (+N)` with `Kvgit-Head: <head>` and
@@ -511,7 +515,10 @@ text).
   `partBytes`, down to 512 KiB, below which the push fails with
   `too-large`, naming the part.
 - A push's values split into packs of at most `maxPackBytes` (8 MiB)
-  uncompressed, all in its one commit.
+  uncompressed, all in its one commit. In a push over REST, values of
+  `valueBlobBytes` (1 MiB) or more go up as blobs of their own instead:
+  once per repo, whichever session or fork sent them first, and a pull
+  reads one only if the local store lacks it.
 - Past `maxPacks` (16), a push also folds older packs into one,
   re-encoded from the local store, in the same commit: of all but the
   newest `keepRecent` (4), the newest run (two or more) that fits in
