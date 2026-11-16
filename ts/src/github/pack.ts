@@ -25,6 +25,11 @@
  *   packs reference: a value the repo already holds, from any branch,
  *   isn't sent again, and a receiver that holds it doesn't read it.
  *
+ * A new branch whose history another branch's packs already carry (a
+ * fork) reuses them: its manifest lists those packs as they are, its
+ * tree is built on that branch's, and it packs only the commits after
+ * the last one it reuses.
+ *
  * Whether a push landed is the branch's manifest's say: after an error,
  * one whose `head` is the push's tip landed, whichever request carried
  * it. Other costs, per operation:
@@ -201,6 +206,23 @@ interface Change {
   headline: string
   /** Commits the change adds, for its headline and its errors. */
   what: string
+  /** The tree to build the commit's on in place of the branch's (a
+   *  fork builds on the tree of the branch whose packs it reuses);
+   *  such a change goes over REST. */
+  baseTree?: string
+}
+
+/** Another branch's packs a new branch can list as its own: the
+ *  leading `entries` of its `manifest`, up to `tip`, an ancestor of the
+ *  new head. */
+interface Reuse {
+  manifest: PackManifest
+  entries: PackEntry[]
+  tip: string
+  /** That branch's tree, which the new branch's builds on. */
+  treeOid: string
+  /** Files in that tree the new branch doesn't keep: its later packs. */
+  drop: string[]
 }
 
 /** One file a change writes: a pack or a value, or a part of one. */
@@ -472,6 +494,8 @@ export class PackRemote implements Remote {
   #partBytes: number
 
   #repoId: string | null = null
+  /** Whether `#refs` has held every branch since this remote began. */
+  #rostered = false
   #defaultOid: string | null = null
   #defaultTree: string | null = null
   #defaultName: string | null = null
@@ -514,7 +538,10 @@ export class PackRemote implements Remote {
       const repo: RosterData['repository'] = expectData(res, 'roster').repository
       this.#repoHeader(repo)
       for (const node of repo.refs.nodes) this.#remember(node)
-      if (!repo.refs.pageInfo.hasNextPage) return
+      if (!repo.refs.pageInfo.hasNextPage) {
+        this.#rostered = true
+        return
+      }
       after = repo.refs.pageInfo.endCursor
     }
   }
@@ -687,10 +714,20 @@ export class PackRemote implements Remote {
       return false
     }
 
+    // A new branch reuses another's packs when they carry enough of its
+    // history; it then sends only what comes after them, and the
+    // stream (its whole history) is left unread.
+    const reuse = expectedOld === null ? await this.#reusable(branch, newHead) : null
     const all: WireCommit[] = []
-    for await (const wc of commits) all.push(wc)
-    if (all.at(-1)?.hash !== newHead) {
-      throw new Error(`PackRemote.push: stream ended at ${all.at(-1)?.hash.slice(0, 7) ?? '∅'}`)
+    if (reuse === null) {
+      for await (const wc of commits) all.push(wc)
+      if (all.at(-1)?.hash !== newHead) {
+        throw new Error(`PackRemote.push: stream ended at ${all.at(-1)?.hash.slice(0, 7) ?? '∅'}`)
+      }
+    } else {
+      for await (const wc of walkDelta(this.#store, { want: newHead, have: [reuse.tip] })) {
+        all.push(wc)
+      }
     }
 
     // Packs of at most maxPackBytes of values, all in one commit.
@@ -708,12 +745,17 @@ export class PackRemote implements Remote {
       current.push(wc)
       size += n
     }
-    chunks.push(current)
+    if (current.length > 0) chunks.push(current)
 
-    const prior = st?.manifest ?? null
+    // a fork's manifest starts as the reused packs, numbered on from
+    // the branch it reuses, so no path of its means another's file
+    const prior =
+      reuse === null
+        ? (st?.manifest ?? null)
+        : { ...reuse.manifest, packs: reuse.entries, meta: null }
     let nextSeq = prior?.nextSeq ?? 1
     const fresh: NewPack[] = []
-    let base = expectedOld
+    let base = reuse?.tip ?? expectedOld
     for (const chunk of chunks) {
       const tip = (chunk.at(-1) as WireCommit).hash
       const bytes = await encodePack(chunk, { kernel: this.#kernel, base })
@@ -726,7 +768,7 @@ export class PackRemote implements Remote {
     // packs leave of maxPackBytes. One that doesn't fit waits for a
     // later, smaller push.
     let packs: Array<PackEntry | NewPack> = [...(prior?.packs ?? []), ...fresh]
-    const deletions: string[] = []
+    const deletions: string[] = [...(reuse?.drop ?? [])]
     if (packs.length > this.#maxPacks) {
       const kept = prior?.packs ?? []
       const run = kept.slice(0, Math.max(0, packs.length - this.#keepRecent))
@@ -751,8 +793,48 @@ export class PackRemote implements Remote {
       meta: this.#meta !== undefined ? await this.#meta(branch, newHead) : prior?.meta,
       headline: `kvgit ${branch} @ ${tip7} (+${all.length})`,
       what: all.length === 1 ? `commit ${tip7}` : `${all.length} commits up to ${tip7}`,
+      ...(reuse !== null && { baseTree: reuse.treeOid }),
     }
     return this.#land(branch, st, change, (m) => m.head === newHead)
+  }
+
+  /**
+   * The packs a new branch at `head` can reuse: of every other branch
+   * whose packs run from the root, the leading run up to the newest
+   * tip that is an ancestor of `head` here, from the branch that
+   * covers the most commits so. Null when none does, or when what it
+   * covers would fit in one inline request anyway (reuse makes a push
+   * go over REST). The manifests come with the roster; ancestry is
+   * checked against `head`'s history in the local store.
+   */
+  async #reusable(branch: string, head: string): Promise<Reuse | null> {
+    if (!this.#rostered) await this.refresh()
+    let history: Set<string> | null = null
+    let best: { st: BranchState; count: number; covered: number } | null = null
+    for (const [name, st] of this.#refs) {
+      const packs = st.manifest?.packs ?? []
+      if (name === branch || st.treeOid === '' || st.manifest?.kernel !== this.#kernel) continue
+      if (packs[0]?.base !== null) continue
+      history ??= await ancestorsAbove(this.#store, [head], 0)
+      let count = packs.length
+      while (count > 0 && !history.has((packs[count - 1] as PackEntry).tip)) count--
+      const covered = packs.slice(0, count).reduce((n, p) => n + p.commits, 0)
+      if (count > 0 && (best === null || covered > best.covered)) {
+        best = { st, count, covered }
+      }
+    }
+    if (best === null) return null
+    const manifest = best.st.manifest as PackManifest
+    const entries = manifest.packs.slice(0, best.count)
+    const bytes = entries.reduce((n, p) => n + p.bytes, 0)
+    if (base64Length(bytes) + REQUEST_OVERHEAD <= this.#inlineBytes) return null
+    return {
+      manifest,
+      entries,
+      tip: (entries.at(-1) as PackEntry).tip,
+      treeOid: best.st.treeOid,
+      drop: manifest.packs.slice(best.count).flatMap(filesOf),
+    }
   }
 
   /** Re-encode a run of packs as one, from the local store: the newest
@@ -841,7 +923,7 @@ export class PackRemote implements Remote {
       (n, p) => n + (isNew(p) ? base64Length(p.bytes.length) : 0),
       0,
     )
-    if (rough + REQUEST_OVERHEAD <= this.#inlineBytes) {
+    if (change.baseTree === undefined && rough + REQUEST_OVERHEAD <= this.#inlineBytes) {
       const layout = await this.#layout(branch, change, null)
       const size = inlineSize(layout)
       if (size <= this.#inlineBytes) {
@@ -944,7 +1026,7 @@ export class PackRemote implements Remote {
         this.#partBytes = Math.max(this.#minPartBytes, Math.floor(this.#partBytes / 2))
       }
     }
-    const baseTree = st === null ? this.#defaultTree : st.treeOid || null
+    const baseTree = change.baseTree ?? (st === null ? this.#defaultTree : st.treeOid || null)
     const tree = await this.client.request<{ sha: string }>('POST', 'git/trees', {
       ...(baseTree !== null && { base_tree: baseTree }),
       tree: [

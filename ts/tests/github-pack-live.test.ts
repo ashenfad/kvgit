@@ -170,6 +170,45 @@ describe.runIf(LIVE)('PackRemote (live)', () => {
     )
   }, 180_000)
 
+  it("a fork reuses its parent's packs: only its own commit goes up", async () => {
+    const parentBranch = `pack-parent-${stamp}`
+    const forkBranch = `pack-fork-${stamp}`
+    branches.push(parentBranch, forkBranch)
+    let blobPosts = 0
+    const counting = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'POST' && String(input).endsWith('/git/blobs')) blobPosts++
+      return fetch(input, init)
+    }) as typeof fetch
+    const store = new Memory()
+    const remote = new PackRemote(
+      new GithubClient({ token: TOKEN, repo: REPO, fetchImpl: counting }),
+      store,
+    )
+    const repo = await Repo.open(store)
+    const wt = await repo.worktree(parentBranch, { create: true })
+    for (const i of [0, 1]) {
+      // under 1 MiB: these stay in the packs, 1.4 MB of them
+      wt.set(`files/${i}.bin`, random(700_000))
+      await wt.commit()
+      await pushBranch(store, remote, parentBranch)
+    }
+    await repo.branches.create(forkBranch, wt.head)
+    const fork = await repo.worktree(forkBranch)
+    fork.set('notes.txt', enc.encode('mine'))
+    await fork.commit()
+    blobPosts = 0
+    const t0 = performance.now()
+    expect((await pushBranch(store, remote, forkBranch)).status).toBe('created')
+    console.log(
+      JSON.stringify({ fork: 'reuse', blobPosts, ms: Math.round(performance.now() - t0) }),
+    )
+    expect(blobPosts).toBe(1)
+    const b = device()
+    expect((await pullBranch(b.store, b.remote, forkBranch)).localHead).toBe(fork.head)
+    const copy = await (await Repo.open(b.store)).worktree(forkBranch)
+    expect(await copy.get('files/1.bin')).toEqual(await wt.get('files/1.bin'))
+  }, 180_000)
+
   it('archive, roster, restore: one updateRefs each', async () => {
     const branch = `pack-life-${stamp}`
     branches.push(branch)
