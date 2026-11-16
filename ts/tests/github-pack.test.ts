@@ -660,7 +660,8 @@ describe('PackRemote and forks', () => {
     const head = await commitOn(a.store, 'fork', 'notes.txt', bytes('mine'))
 
     gh.calls.length = 0
-    expect((await pushBranch(a.store, a.remote, 'fork')).status).toBe('created')
+    const pushed = await pushBranch(a.store, a.remote, 'fork')
+    expect(pushed).toMatchObject({ status: 'created', transferred: 1 })
     expect(blobPosts(gh)).toBe(1) // the fork's one new pack
     const fork = manifestAt(gh, 'fork')
     expect(fork.packs.slice(0, 3)).toEqual(before.packs)
@@ -697,7 +698,8 @@ describe('PackRemote and forks', () => {
     const a = await parent(gh)
     await forkAt(a.store, BRANCH, 'copy')
     gh.calls.length = 0
-    expect((await pushBranch(a.store, a.remote, 'copy')).status).toBe('created')
+    const pushed = await pushBranch(a.store, a.remote, 'copy')
+    expect(pushed).toMatchObject({ status: 'created', transferred: 0 })
     expect(blobPosts(gh)).toBe(0)
     expect(manifestAt(gh, 'copy').packs).toEqual(manifestAt(gh).packs)
   })
