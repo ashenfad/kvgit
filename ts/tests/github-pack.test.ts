@@ -612,6 +612,256 @@ describe('PackRemote and large values', () => {
   })
 })
 
+/** Branch `to` at `from`'s head in `store`, as a fork is made. */
+async function forkAt(store: Memory, from: string, to: string): Promise<void> {
+  const repo = await Repo.open(store)
+  await repo.branches.create(to, await repo.branches.get(from))
+}
+
+/** Commit `value` at `key` on `branch`; the new head. */
+async function commitOn(
+  store: Memory,
+  branch: string,
+  key: string,
+  value: Uint8Array,
+): Promise<string> {
+  const wt = await open(store, branch)
+  wt.set(key, value)
+  await wt.commit()
+  return wt.head
+}
+
+const blobPosts = (gh: FakeGithub): number =>
+  gh.calls.filter((c) => c.kind === 'rest' && c.detail === 'blob').length
+
+/** The files a manifest's packs are stored in. */
+const packFiles = (m: PackManifest): string[] =>
+  m.packs.flatMap((p) =>
+    p.parts.length === 1 ? [p.path] : p.parts.map((_, i) => `${p.path}.${i}`),
+  )
+
+describe('PackRemote and forks', () => {
+  /** A session of three pushes of 400 kB each: 1.2 MB of packs, more
+   *  than one inline request takes. */
+  async function parent(gh: FakeGithub, opts: ConstructorParameters<typeof PackRemote>[2] = {}) {
+    const a = await device(gh, opts)
+    for (let i = 0; i < 3; i++) {
+      await commitValue(a.store, `files/${i}.bin`, random(400_000))
+      await pushBranch(a.store, a.remote, BRANCH)
+    }
+    return a
+  }
+
+  it("reuses its parent's packs, sending only the commits after the fork point", async () => {
+    const gh = new FakeGithub()
+    const a = await parent(gh)
+    const before = manifestAt(gh)
+    await forkAt(a.store, BRANCH, 'fork')
+    const head = await commitOn(a.store, 'fork', 'notes.txt', bytes('mine'))
+
+    gh.calls.length = 0
+    expect((await pushBranch(a.store, a.remote, 'fork')).status).toBe('created')
+    expect(blobPosts(gh)).toBe(1) // the fork's one new pack
+    const fork = manifestAt(gh, 'fork')
+    expect(fork.packs.slice(0, 3)).toEqual(before.packs)
+    expect(fork.packs[3]).toMatchObject({ base: before.head, tip: head, commits: 1 })
+    expect(fork.packs[3]?.seq).toBe(before.nextSeq)
+    expect(fork).toMatchObject({ format: 2, branch: 'fork', head, meta: null })
+    expect(gh.filesAt('fork').filter((f) => f.includes('.pack'))).toEqual(packFiles(fork).sort())
+    expect(gh.filesAt('fork')).toContain('README.md')
+
+    const b = await device(gh)
+    expect((await pullBranch(b.store, b.remote, 'fork')).localHead).toBe(head)
+    expect(text(await (await open(b.store, 'fork')).get('notes.txt'))).toBe('mine')
+  })
+
+  it('reuses only the packs up to the fork point, dropping the later ones from its tree', async () => {
+    const gh = new FakeGithub()
+    const a = await parent(gh)
+    // the fork starts at the second push's head; the parent moves on
+    const repo = await Repo.open(a.store)
+    const second = manifestAt(gh).packs[1]?.tip as string
+    await repo.branches.create('fork', second)
+    const head = await commitOn(a.store, 'fork', 'notes.txt', bytes('mine'))
+    expect((await pushBranch(a.store, a.remote, 'fork')).status).toBe('created')
+    const fork = manifestAt(gh, 'fork')
+    expect(fork.packs.slice(0, 2)).toEqual(manifestAt(gh).packs.slice(0, 2))
+    expect(fork.packs[2]).toMatchObject({ base: second, tip: head })
+    expect(gh.filesAt('fork').filter((f) => f.includes('.pack'))).toEqual(packFiles(fork).sort())
+    const b = await device(gh)
+    expect((await pullBranch(b.store, b.remote, 'fork')).localHead).toBe(head)
+  })
+
+  it('lists the parent packs alone when the fork adds nothing', async () => {
+    const gh = new FakeGithub()
+    const a = await parent(gh)
+    await forkAt(a.store, BRANCH, 'copy')
+    gh.calls.length = 0
+    expect((await pushBranch(a.store, a.remote, 'copy')).status).toBe('created')
+    expect(blobPosts(gh)).toBe(0)
+    expect(manifestAt(gh, 'copy').packs).toEqual(manifestAt(gh).packs)
+  })
+
+  it('a fork of a fork reuses the packs of the one covering the most history', async () => {
+    const gh = new FakeGithub()
+    const a = await parent(gh)
+    await forkAt(a.store, BRANCH, 'one')
+    for (let i = 0; i < 2; i++) {
+      await commitOn(a.store, 'one', `one/${i}.bin`, random(50_000))
+      await pushBranch(a.store, a.remote, 'one')
+    }
+    await forkAt(a.store, 'one', 'two')
+    const head = await commitOn(a.store, 'two', 'two.txt', bytes('two'))
+    gh.calls.length = 0
+    expect((await pushBranch(a.store, a.remote, 'two')).status).toBe('created')
+    expect(blobPosts(gh)).toBe(1)
+    const one = manifestAt(gh, 'one')
+    const two = manifestAt(gh, 'two')
+    expect(two.packs.slice(0, 5)).toEqual(one.packs)
+    expect(two.packs[5]).toMatchObject({ base: one.head, tip: head })
+    const b = await device(gh)
+    expect((await pullBranch(b.store, b.remote, 'two')).localHead).toBe(head)
+  })
+
+  it('keeps the large values its reused packs reference, after the parent is deleted', async () => {
+    const gh = new FakeGithub()
+    const a = await device(gh)
+    const value = random(1_500_000)
+    await commitValue(a.store, 'files/photo.png', value)
+    await pushBranch(a.store, a.remote, BRANCH)
+    await forkAt(a.store, BRANCH, 'fork')
+    const head = await commitOn(a.store, 'fork', 'notes.txt', bytes('mine'))
+    gh.calls.length = 0
+    expect((await pushBranch(a.store, a.remote, 'fork')).status).toBe('created')
+    expect(blobPosts(gh)).toBe(1)
+    expect(gh.filesAt('fork')).toContain(`kvgit/values/${await sha256Hex(value)}`)
+
+    expect((await deleteRemoteBranch(a.store, a.remote, BRANCH)).status).toBe('deleted')
+    await gh.prune()
+    const b = await device(gh)
+    expect((await pullBranch(b.store, b.remote, 'fork')).localHead).toBe(head)
+    expect(await (await open(b.store, 'fork')).get('files/photo.png')).toEqual(value)
+  })
+
+  it("folds and repacks only its own tree, leaving the parent's", async () => {
+    const gh = new FakeGithub()
+    const a = await parent(gh, { maxPacks: 4, keepRecent: 1, maxPackBytes: 8 * 1024 * 1024 })
+    await forkAt(a.store, BRANCH, 'fork')
+    const parentFiles = gh.filesAt(BRANCH)
+    for (let i = 0; i < 3; i++) {
+      await commitOn(a.store, 'fork', `fork/${i}.txt`, bytes(`fork ${i}`))
+      await pushBranch(a.store, a.remote, 'fork')
+    }
+    expect(manifestAt(gh, 'fork').packs.length).toBeLessThan(6) // it folded
+    expect(gh.filesAt('fork').filter((f) => f.includes('.pack'))).toEqual(
+      packFiles(manifestAt(gh, 'fork')).sort(),
+    )
+    expect(await a.remote.repack('fork')).toBe(true)
+    expect(gh.filesAt('fork').filter((f) => f.includes('.pack'))).toHaveLength(1)
+    expect(gh.filesAt(BRANCH)).toEqual(parentFiles)
+    const b = await device(gh)
+    expect((await pullBranch(b.store, b.remote, BRANCH)).localHead).toBe(manifestAt(gh).head)
+    expect((await pullBranch(b.store, b.remote, 'fork')).localHead).toBe(
+      manifestAt(gh, 'fork').head,
+    )
+  })
+
+  it('reuses a parent folded since, as far as its packs still match', async () => {
+    const gh = new FakeGithub()
+    const a = await device(gh, { maxPacks: 3, keepRecent: 1 })
+    const heads: string[] = []
+    for (let i = 0; i < 4; i++) {
+      heads.push(await commitValue(a.store, `files/${i}.bin`, random(400_000)))
+      await pushBranch(a.store, a.remote, BRANCH)
+    }
+    // the first three pushes folded into one pack up to heads[2]
+    const folded = manifestAt(gh)
+    expect(folded.packs.map((p) => p.tip)).toEqual([heads[2], heads[3]])
+
+    // a fork at heads[3] reuses both packs; one at heads[1], inside the
+    // folded run, reuses nothing and sends its history whole
+    const repo = await Repo.open(a.store)
+    await repo.branches.create('late', heads[3] as string)
+    await repo.branches.create('early', heads[1] as string)
+    for (const [name, reused] of [
+      ['late', 2],
+      ['early', 0],
+    ] as const) {
+      const head = await commitOn(a.store, name, 'notes.txt', bytes(name))
+      expect((await pushBranch(a.store, a.remote, name)).status).toBe('created')
+      const m = manifestAt(gh, name)
+      expect(m.packs.slice(0, reused)).toEqual(folded.packs.slice(0, reused))
+      expect(m.packs[reused]?.base ?? null).toBe(reused === 0 ? null : heads[3])
+      const b = await device(gh)
+      expect((await pullBranch(b.store, b.remote, name)).localHead).toBe(head)
+    }
+  })
+
+  it('reuses a format-1 parent as one-part format-2 entries', async () => {
+    const gh = new FakeGithub()
+    const src = new Memory()
+    let head = ''
+    for (let i = 0; i < 3; i++) head = await commitValue(src, `files/${i}.bin`, random(400_000))
+    const codec = new Encoder({ useRecords: false, mapsAsObjects: true, tagUint8Array: false })
+    const body = codec.decode(
+      await gunzip(
+        await encodePack(await collect(walkDelta(src, { want: head })), {
+          kernel: 'ts',
+          base: null,
+        }),
+      ),
+    ) as Record<string, unknown>
+    const pack = await gzip(codec.encode({ ...body, format: 1 }))
+    const path = `kvgit/packs/000001-${head.slice(0, 12)}.pack`
+    const blob = await gitBlobSha1(pack)
+    const entry = {
+      path,
+      seq: 1,
+      base: null,
+      tip: head,
+      commits: 4,
+      bytes: pack.length,
+      sha256: await sha256Hex(pack),
+    }
+    gh.plant(BRANCH, {
+      [MANIFEST_PATH]: JSON.stringify({
+        format: 1,
+        kernel: 'ts',
+        branch: BRANCH,
+        head,
+        packs: [{ ...entry, blob }],
+        nextSeq: 2,
+        meta: null,
+      }),
+      [path]: pack,
+    })
+
+    const remote = new PackRemote(gh.client(), src)
+    await forkAt(src, BRANCH, 'fork')
+    const next = await commitOn(src, 'fork', 'notes.txt', bytes('mine'))
+    expect((await pushBranch(src, remote, 'fork')).status).toBe('created')
+    const fork = manifestAt(gh, 'fork')
+    expect(fork.format).toBe(2)
+    expect(fork.packs[0]).toEqual({ ...entry, parts: [blob] })
+    expect(JSON.stringify(fork)).not.toContain('"blob"')
+    const b = await device(gh)
+    expect((await pullBranch(b.store, b.remote, 'fork')).localHead).toBe(next)
+  })
+
+  it('sends a small fork whole, in one inline request', async () => {
+    const gh = new FakeGithub()
+    const a = await device(gh)
+    await commitN(a.store, 3, 'a')
+    await pushBranch(a.store, a.remote, BRANCH)
+    await forkAt(a.store, BRANCH, 'fork')
+    await commitOn(a.store, 'fork', 'notes.txt', bytes('mine'))
+    gh.calls.length = 0
+    expect((await pushBranch(a.store, a.remote, 'fork')).status).toBe('created')
+    expect(gh.count('rest')).toBe(0)
+    expect(manifestAt(gh, 'fork').packs).toHaveLength(1)
+  })
+})
+
 describe('PackRemote on a slow link', () => {
   it('sends a push GitHub drops at its deadline over REST, and lowers its inline cutoff', async () => {
     const gh = new FakeGithub({ uplinkBytesPerSecond: 50_000 }) // GraphQL carries 250 kB

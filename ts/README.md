@@ -485,6 +485,11 @@ receiver recomputes every commit hash (`applyWire`).
   `valueBlobBytes` (1 MiB) or more go up as blobs of their own instead:
   once per repo, whichever session or fork sent them first, and a pull
   reads one only if the local store lacks it.
+- A new session forked from another (its history another branch's
+  packs already carry) reuses those packs: its manifest lists them as
+  they are, its tree is built on that branch's, and it uploads only
+  the commits after the fork point. It does so when the reused packs
+  are past `inlineBytes`; a small fork goes whole, inline.
 - Past `maxPacks` (16), a push also folds older packs into one,
   re-encoded from the local store, in the same commit: of all but the
   newest `keepRecent` (4), the newest run (two or more) that fits in

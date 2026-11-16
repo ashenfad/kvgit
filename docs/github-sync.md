@@ -49,7 +49,9 @@ SHAs it is given, never by sizes. The parts' git blob SHAs
 **Values.** A branch whose packs reference a value names that value's
 files in its tree, so a value stays reachable while any branch uses it.
 The same value written by two writers in different parts gives two
-sets of files, both valid.
+sets of files, both valid. A branch's tree may name value files its
+packs don't reference (a fork keeps those of the branch it reused);
+they are harmless.
 
 ## The manifest
 
@@ -179,6 +181,20 @@ the push landed, whichever request carried it. If the branch moved
 anywhere else, the push lost a race. Lifecycle changes, which have no
 manifest head to compare, count refs already at their targets as
 landed.
+
+**Forks.** A new branch whose history another branch's packs already
+carry may list that branch's leading manifest entries as its own,
+unchanged: from the first pack (`base` null) up to one whose `tip` is
+an ancestor of the new head. Its first commit's tree is built on that
+branch's tree (`base_tree`), so it names the same pack files, by the
+same paths and part SHAs, and the value files they reference, less the
+files of that branch's later packs, which it removes. It numbers its
+own packs on from that branch's `nextSeq`, and its first own pack's
+`base` is the last reused `tip`. Nothing reused is uploaded. From then
+on its tree is its own: a fold or repack removes files from its tree
+alone. A writer reuses only when the reused packs wouldn't fit in one
+inline request anyway, since building on another tree takes the REST
+path.
 
 **Folds.** A writer may replace a run of adjacent packs with one pack
 re-encoding the same commits: the first pack's `base`, the last one's
