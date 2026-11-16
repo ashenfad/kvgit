@@ -728,6 +728,13 @@ export class PackRemote implements Remote {
       for await (const wc of walkDelta(this.#store, { want: newHead, have: [reuse.tip] })) {
         all.push(wc)
       }
+      // The caller counts the commits a push takes from `commits` as
+      // the ones it sent. Take as many as this push sends, so that the
+      // count holds; they are the oldest of the history, and unused.
+      let taken = 0
+      if (all.length > 0) {
+        for await (const _ of commits) if (++taken >= all.length) break
+      }
     }
 
     // Packs of at most maxPackBytes of values, all in one commit.
