@@ -1,12 +1,13 @@
 name: Publish
 
-# A GitHub release publishes what the build workflow makes from its tag:
-# every wheel and the sdist to PyPI, the tarball to npm. Both registries
-# trust this workflow by OIDC (a trusted publisher on PyPI's `kvgit` and
-# on npm's `@agex-ts/kvgit`, each naming this repository and this file;
-# npm's must allow `npm publish`, which it doesn't by default), so no
-# token is stored, and each upload carries an attestation of the run
-# that built it. A registry that fails is retried by re-running its job
+# A GitHub release publishes what the build workflow makes from its
+# tag, once the test workflow passes on the same tag: every wheel and
+# the sdist to PyPI, the tarball to npm. Both registries trust this
+# workflow by OIDC (a trusted publisher on PyPI's `kvgit` and on npm's
+# `@agex-ts/kvgit`, each naming this repository and this file; npm's
+# must allow `npm publish`, which it doesn't by default), so no token
+# is stored, and each upload carries an attestation of the run that
+# built it. A registry that fails is retried by re-running its job
 # alone; a version once published can't be published again.
 
 on:
@@ -38,8 +39,14 @@ jobs:
     needs: versions
     uses: ./.github/workflows/build.yml
 
+  # Every suite, as on a pull request: nothing is published from a tag
+  # whose tests fail.
+  test:
+    needs: versions
+    uses: ./.github/workflows/test.yml
+
   pypi:
-    needs: build
+    needs: [build, test]
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -63,7 +70,7 @@ jobs:
       uses: pypa/gh-action-pypi-publish@release/v1
 
   npm:
-    needs: build
+    needs: [build, test]
     runs-on: ubuntu-latest
     permissions:
       id-token: write

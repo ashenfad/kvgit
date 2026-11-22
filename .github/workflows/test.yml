@@ -6,6 +6,9 @@ on:
   # Every pull request, whatever its base: a PR in a stack targets the
   # branch of the PR below it.
   pull_request:
+  # The release workflow runs the suites on the release's tag before
+  # it publishes.
+  workflow_call:
 
 jobs:
   # Lint runs once, in its own job. It used to be two trailing steps of
