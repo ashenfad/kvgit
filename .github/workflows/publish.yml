@@ -66,8 +66,12 @@ jobs:
         name: sdist
         path: dist
 
+    # Each file is final once up; `skip-existing` lets a re-run after a
+    # partial upload send only the ones missing.
     - name: Upload to PyPI
       uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        skip-existing: true
 
   npm:
     needs: [build, test]
