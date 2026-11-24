@@ -133,13 +133,17 @@ with :func:`kvgit.encoding.dumps`. A record whose ``expires`` is in the
 past — or whose bytes do not decode — is not a lease: it may be taken
 over by CAS against those exact bytes. Absent, unreadable and expired
 all mean "no live lease", so a holder that dies mid-sweep blocks the
-store only until its expiry passes.
+store only until its expiry passes. A running sweep renews its record
+before it lapses; a writer that finds one lapsed but never released
+releases it before writing, so a sweep that stalled past its lease
+removes nothing.
 """
 
-GC_LEASE_TTL = 600.0
-"""Default seconds a sweep's GC lease stays live.
+GC_LEASE_TTL = 60.0
+"""Default seconds a sweep's GC lease stays live without renewal.
 
-A sweep that crashes holding it blocks writers for at most this long.
+A sweep that crashes holding it blocks writers for at most this long. A
+running sweep renews it, so it needn't cover a whole sweep.
 """
 
 IN_FLIGHT_KEY = "__inflight__%s"
@@ -614,8 +618,9 @@ def gc(
     concurrent writers at any ``min_age``, 0 included. If another sweep
     holds the lease, ``wait=True`` waits it out and ``wait=False``
     raises :class:`GcBusy`. ``lease_ttl`` bounds what a sweep that
-    crashes holding the lease costs writers; a sweep that outlives it
-    finishes and logs a warning rather than extending it.
+    crashes holding the lease costs writers; a running sweep renews the
+    lease, and one that stalls past it between renewals, so that a
+    writer released it, removes nothing and raises :class:`GcBusy`.
 
     Raises:
         GcBusy: with ``wait=False``, if another sweep holds the lease.

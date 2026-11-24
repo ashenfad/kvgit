@@ -18,9 +18,10 @@
 
 import { safeLoads } from './layout'
 
-/** Default seconds a sweep's lease stays live: what a sweep that dies
- *  holding it costs writers, at most. */
-export const GC_LEASE_TTL = 600
+/** Default seconds a sweep's lease stays live without renewal: what a
+ *  sweep that dies holding it costs writers, at most. A running sweep
+ *  renews it, so this needn't cover a whole sweep. */
+export const GC_LEASE_TTL = 60
 
 /** Seconds an in-flight marker protects an unpublished commit. */
 export const IN_FLIGHT_TTL = 600

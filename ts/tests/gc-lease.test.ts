@@ -21,6 +21,7 @@ import {
   publishHead,
   pullBranch,
   walkDelta,
+  watchGcWaits,
 } from '../src/index'
 import { PyFloat } from '../src/pyjson'
 import type { KVStore } from '../src/types'
@@ -253,6 +254,41 @@ describe('writers under the lease', () => {
     const started = Date.now()
     await commitOne(wt, 'k', 'v')
     expect(Date.now() - started).toBeLessThan(2000)
+  })
+
+  it('a writer releases a lapsed lease before writing', async () => {
+    // The sweep that held it died or stalled: the writer marks the
+    // record released, so that sweep can no longer remove anything.
+    const store = new Memory()
+    const wt = await open(store)
+    await store.set(GC_LEASE_KEY, liveLease(Date.now() / 1000 + 0.05))
+    await commitOne(wt, 'k', 'v')
+    const record = safeLoads((await store.get(GC_LEASE_KEY)) as Uint8Array)
+    expect(record).toEqual({ owner: 'someone-else', expires: 0 })
+  })
+
+  it('tells watchers when writes wait out a sweep, once per wait', async () => {
+    const store = new Memory()
+    const a = await open(store)
+    const b = await (await Repo.open(store)).worktree('other', { create: true })
+    const calls: boolean[] = []
+    const stop = watchGcWaits(store, (waiting) => calls.push(waiting))
+    const held = liveLease(Date.now() / 1000 + 60)
+    await store.set(GC_LEASE_KEY, held)
+
+    const writing = Promise.all([commitOne(a, 'k', 'v'), commitOne(b, 'k', 'w')])
+    await new Promise((r) => setTimeout(r, 200))
+    // Two writers polling the lease many times: one `true`, no flicker.
+    expect(calls).toEqual([true])
+
+    await store.cas(GC_LEASE_KEY, liveLease(0), held)
+    await writing
+    expect(calls).toEqual([true, false])
+
+    stop()
+    await store.set(GC_LEASE_KEY, liveLease(Date.now() / 1000 + 0.1))
+    await commitOne(a, 'k', 'again')
+    expect(calls).toEqual([true, false])
   })
 
   it('tags, branches and resets wait for the lease too', async () => {

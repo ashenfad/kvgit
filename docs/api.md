@@ -176,14 +176,14 @@ This is the merge with the base chosen by the caller rather than found in histor
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `gc(*, min_age=3600, deep=False, wait=True, lease_ttl=600)` | `int` | Reclaim what no branch, tag or in-flight commit reaches; returns how many commits were removed |
+| `gc(*, min_age=3600, deep=False, wait=True, lease_ttl=60)` | `int` | Reclaim what no branch, tag or in-flight commit reaches; returns how many commits were removed |
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `min_age` | `3600` | Orphans younger than this many seconds survive. Policy only: any value, `0` included, is safe beside concurrent writers. |
 | `deep` | `False` | Also scan the content namespaces for anything no commit references — crash leftovers. See [`deep=True`](#deeptrue--reclaiming-commit-less-artifacts). |
 | `wait` | `True` | Wait for another sweep's lease; `False` raises [`GcBusy`](#errors) instead |
-| `lease_ttl` | `600` | Seconds a crashed sweep can hold writers up. See [The GC lease](#the-gc-lease). |
+| `lease_ttl` | `60` | Seconds a crashed sweep can hold writers up; a running sweep renews its lease. See [The GC lease](#the-gc-lease). |
 
 Nothing sweeps implicitly — deleting a branch or tag doesn't. Run `gc()` when it suits the deployment: a scheduled job for a shared Postgres store, a quiet moment in the embedding process for a local one. See [Orphan Cleanup](#orphan-cleanup).
 
@@ -908,7 +908,7 @@ Writers hold up their end inside the store's own atomicity. Every path that writ
 
 Every acquisition writes a fresh owner id and release writes an expired record rather than deleting the key, so bytes a writer read before a sweep can never match again: a sweep that starts after the read makes the write fail, and the writer waits and tries again. The head writes check their target commit exists and write the head against the same lease record, so `branches.create(at=...)`, `reset` and `tags.create` aimed at a commit a concurrent sweep collects report it gone rather than installing a head that names nothing.
 
-`lease_ttl` (default 600 seconds) bounds what a crashed holder costs: writers wait out a lease's remaining term and no longer. A sweep that outlives its own lease is **not** extended silently — it finishes, logs a warning at `kvgit.orphans` naming the overrun, and during that window writers are free to write. Set `lease_ttl` above the longest sweep this store has taken.
+`lease_ttl` (default 60 seconds) bounds what a crashed holder costs: writers wait out a lease's remaining term and no longer. A running sweep renews its lease whenever less than half of it is left, so the TTL needn't cover a whole sweep, only the longest step between renewals (one batched read of a history level or of the trees). A writer that finds a lease lapsed but never released (its sweep died, or stalled past it) releases it before writing; a stalled sweep then fails its next renewal or its removal, both conditional on the record it last wrote, and raises `GcBusy` having removed nothing. A sweep that ran past its lease between renewals logs a warning at `kvgit.orphans` naming the overrun.
 
 The price is that writers wait while a sweep runs, including the mark phase, which walks every live commit's keyset once; on a large store, schedule sweeps for quiet moments.
 

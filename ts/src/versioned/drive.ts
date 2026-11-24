@@ -28,7 +28,7 @@ import {
 import { CantMark } from '../merges'
 import { pyDumps } from '../pyjson'
 import { type BytesMergeFn, type KVStore, MergeChoice, type PostCheck } from '../types'
-import { blobKey, loadsInfo } from './layout'
+import { GC_LEASE_KEY, blobKey, loadsInfo } from './layout'
 import { leaseEnv } from './lease'
 
 /** What a landed (or abandoned) commit reports. */
@@ -97,6 +97,65 @@ export function cacheStore(store: KVStore, cache: ContentCache): void {
 /** @internal The content cache `store` is read through, if any. */
 export function cacheOf(store: KVStore): ContentCache | undefined {
   return caches.get(store)
+}
+
+/** Per store: who to tell when its operations wait out a sweep, and
+ *  how many are waiting now. */
+interface GcWaits {
+  listeners: Set<(waiting: boolean) => void>
+  waiting: number
+}
+
+const gcWaits = new WeakMap<KVStore, GcWaits>()
+
+function gcWaitsOf(store: KVStore): GcWaits {
+  let entry = gcWaits.get(store)
+  if (entry === undefined) {
+    entry = { listeners: new Set(), waiting: 0 }
+    gcWaits.set(store, entry)
+  }
+  return entry
+}
+
+/**
+ * Be told when writes to `store` are held up by a sweep: `listener`
+ * gets `true` when the first operation on the store starts waiting out
+ * another's GC lease, and `false` when none is waiting any more. Every
+ * handle on the store counts, whichever repository opened it. Returns
+ * the function that stops the listener.
+ */
+export function watchGcWaits(store: KVStore, listener: (waiting: boolean) => void): () => void {
+  const entry = gcWaitsOf(store)
+  entry.listeners.add(listener)
+  return () => {
+    entry.listeners.delete(listener)
+  }
+}
+
+/** Mark `run` waiting on a sweep or not, telling the store's listeners
+ *  when the first starts waiting and when the last stops. */
+function setWaiting(store: KVStore, run: Run, waiting: boolean): void {
+  if (run.waiting === waiting) return
+  run.waiting = waiting
+  const entry = gcWaitsOf(store)
+  entry.waiting += waiting ? 1 : -1
+  if (entry.waiting !== (waiting ? 1 : 0)) return
+  for (const listener of entry.listeners) {
+    try {
+      listener(waiting)
+    } catch (e) {
+      console.warn('kvgit: a GC wait listener threw:', e)
+    }
+  }
+}
+
+/** Whether request `kind` keeps an operation that waits on a sweep
+ *  waiting: another sleep, or the read of the lease between sleeps. */
+function stillWaiting(op: Op, kind: string): boolean {
+  if (kind === 'wait') return true
+  if (kind !== 'get') return false
+  const keys = JSON.parse(op.requestJson()) as string[]
+  return keys.length === 1 && keys[0] === GC_LEASE_KEY
 }
 
 /** Byte strings laid end to end, and their lengths. */
@@ -177,15 +236,19 @@ export async function* streamCore(
 ): AsyncGenerator<unknown, void, undefined> {
   const op = cached(await start(name, args), env.store)
   try {
-    const run: Run = { causes: new Map(), raised: null }
-    let kind = op.start(leaseEnv.clock())
-    while (kind !== 'done') {
-      if (kind === 'emit') {
-        yield* parseValue(op.requestJson()) as unknown[]
-        kind = op.replyNext(leaseEnv.clock())
-      } else {
-        kind = await advance(op, kind, env, run)
+    const run: Run = { causes: new Map(), raised: null, waiting: false }
+    try {
+      let kind = op.start(leaseEnv.clock())
+      while (kind !== 'done') {
+        if (kind === 'emit') {
+          yield* parseValue(op.requestJson()) as unknown[]
+          kind = op.replyNext(leaseEnv.clock())
+        } else {
+          kind = await advance(op, kind, env, run)
+        }
       }
+    } finally {
+      setWaiting(env.store, run, false)
     }
     finish(op, parseValue, run)
   } finally {
@@ -211,10 +274,12 @@ export async function driveCommit(
 }
 
 /** What an operation's driver keeps while it runs: the exceptions
- *  merge functions raised, by key, and the first request that threw. */
+ *  merge functions raised, by key, the first request that threw, and
+ *  whether it is waiting out a sweep. */
 interface Run {
   causes: Map<string, unknown>
   raised: { error: unknown } | null
+  waiting: boolean
 }
 
 /** Perform `op`'s requests until it is done, and return its outcome,
@@ -229,16 +294,20 @@ async function drive(
   parse: (text: string) => unknown,
   settled?: (value: unknown) => void,
 ): Promise<unknown> {
-  const run: Run = { causes: new Map(), raised: null }
+  const run: Run = { causes: new Map(), raised: null, waiting: false }
   const done = () => {
     const value = finish(op, parse, run)
     settled?.(value)
     return value
   }
-  let kind = op.start(leaseEnv.clock())
-  while (kind !== 'done') {
-    const next = await request(op, kind, env, run)
-    kind = next(leaseEnv.clock())
+  try {
+    let kind = op.start(leaseEnv.clock())
+    while (kind !== 'done') {
+      const next = await request(op, kind, env, run)
+      kind = next(leaseEnv.clock())
+    }
+  } finally {
+    setWaiting(env.store, run, false)
   }
   return done()
 }
@@ -257,6 +326,7 @@ async function request(
   env: DriveEnv,
   run: Run,
 ): Promise<(wall: number) => string> {
+  setWaiting(env.store, run, kind === 'wait' || (run.waiting && stillWaiting(op, kind)))
   try {
     return await perform(op, kind, env, run.causes)
   } catch (e) {
@@ -430,7 +500,7 @@ function toError(f: Failure, causes: Map<string, unknown>): Error {
 function warn(note: Note): void {
   if (note.kind === 'lease_overrun') {
     console.warn(
-      `kvgit: a sweep ran ${note.overrun.toFixed(1)}s past its ${note.ttl}s GC lease; writers were free to write during that window. Raise leaseTtl.`,
+      `kvgit: a sweep ran ${note.overrun.toFixed(1)}s past its ${note.ttl}s GC lease between renewals. Raise leaseTtl.`,
     )
     return
   }

@@ -11,7 +11,10 @@
 //! A sweep runs under the store's GC lease. No commit's batch lands
 //! while it is held, and every commit written but not published carries
 //! an in-flight marker the sweep marks from, so a sweep is safe beside
-//! writers at any `min_age`, 0 included.
+//! writers at any `min_age`, 0 included. The sweep renews the lease as
+//! it goes, and its removals expect the record it last wrote, so a
+//! sweep that stalled past its lease, which a writer may then have
+//! released and written under, removes nothing.
 
 use crate::error::Error;
 use crate::head::{Note, Notes, resolve_head};
@@ -22,7 +25,7 @@ use crate::layout::{
     BLOB_PREFIX, BRANCH_HEAD_PREFIX, COMMIT_ROOT_PREFIX, EMPTY_HASH, GC_LEASE_KEY,
     IN_FLIGHT_PREFIX, commit_root, commit_time, info_key, parent_commit, parent_gens,
 };
-use crate::lease::{lease_expiry, wait_for_gc};
+use crate::lease::{lease_expiry, released, wait_for_gc};
 use crate::machine::{Cas, Io, Write};
 use crate::store::{dumps, loads_str, safe_loads};
 use crate::tree::{Shape, walk_many};
@@ -40,15 +43,59 @@ pub struct Gc {
     pub deep: bool,
     /// Whether to wait out a sweep holding the lease, rather than fail.
     pub wait: bool,
-    /// Seconds the lease stays live: what a sweep that dies holding it
-    /// costs writers, at most.
+    /// Seconds the lease stays live without renewal: what a sweep that
+    /// dies holding it costs writers, at most. A running sweep renews it
+    /// once less than half is left.
     pub lease_ttl: f64,
+}
+
+/// The lease a running sweep holds: the record it last wrote, and when
+/// that record runs out.
+struct Held {
+    record: Vec<u8>,
+    owner: Value,
+    expires: f64,
+    ttl: f64,
+}
+
+impl Held {
+    /// Renew the lease if less than half its TTL is left. Fails with
+    /// [`Error::GcBusy`] if the record is no longer ours: the lease
+    /// lapsed and a writer released it, or another sweep took it, so
+    /// what this sweep decided may no longer hold.
+    async fn keep(&mut self, io: &Io) -> Result<(), Error> {
+        let now = io.wall();
+        if self.expires - now > self.ttl / 2.0 {
+            return Ok(());
+        }
+        let expires = now + self.ttl;
+        let record = dumps(&Value::Object(vec![
+            ("owner".into(), self.owner.clone()),
+            ("expires".into(), Value::Float(expires)),
+        ]));
+        let cas = Cas {
+            expect: vec![(GC_LEASE_KEY.to_string(), Some(self.record.clone()))],
+            writes: vec![(GC_LEASE_KEY.to_string(), Write::Bytes(record.clone()))],
+            removes: vec![],
+        };
+        if !io.cas(cas).await? {
+            return Err(lost());
+        }
+        self.record = record;
+        self.expires = expires;
+        Ok(())
+    }
+}
+
+/// A sweep whose lease was taken from it, having removed nothing.
+fn lost() -> Error {
+    Error::GcBusy("The sweep's GC lease lapsed and was taken from it; it removed nothing".into())
 }
 
 /// Run a sweep under the lease, and return how many commits it removed.
 /// A sweep that outlives its lease finishes, and notes it.
 pub async fn gc(io: &Io, shape: Shape, args: &Gc, notes: &mut Notes) -> Result<u64, Error> {
-    let (ours, expires) = loop {
+    let mut held = loop {
         if args.wait {
             wait_for_gc(io, None).await?;
         }
@@ -60,11 +107,11 @@ pub async fn gc(io: &Io, shape: Shape, args: &Gc, notes: &mut Notes) -> Result<u
     // A sweep reads every live node once; leaving them in the content
     // cache would only push out what commits and reads use.
     io.pass_cache(true);
-    let swept = sweep(io, shape, args.min_age, args.deep, notes).await;
+    let swept = sweep(io, shape, args.min_age, args.deep, &mut held, notes).await;
     io.pass_cache(false);
-    let released = release(io, &ours, expires, args.lease_ttl, notes).await;
+    let given_up = release(io, &held, notes).await;
     let removed = swept?;
-    released?;
+    given_up?;
     Ok(removed)
 }
 
@@ -73,7 +120,7 @@ pub async fn gc(io: &Io, shape: Shape, args: &Gc, notes: &mut Notes) -> Result<u
 /// one expired lease can't both win, and a live one is never taken.
 /// Bytes that don't hold a numeric expiry read as expired, so damage
 /// under the key can't wedge the store.
-async fn acquire(io: &Io, ttl: f64) -> Result<(Vec<u8>, f64), Error> {
+async fn acquire(io: &Io, ttl: f64) -> Result<Held, Error> {
     let raw = io.get_one(GC_LEASE_KEY).await?;
     let now = io.wall();
     let expiry = lease_expiry(raw.as_deref());
@@ -90,8 +137,9 @@ async fn acquire(io: &Io, ttl: f64) -> Result<(Vec<u8>, f64), Error> {
         )));
     }
     let expires = now + ttl;
+    let owner = Value::Str(io.owner().await?);
     let record = Value::Object(vec![
-        ("owner".into(), Value::Str(io.owner().await?)),
+        ("owner".into(), owner.clone()),
         ("expires".into(), Value::Float(expires)),
     ]);
     let ours = dumps(&record);
@@ -105,35 +153,33 @@ async fn acquire(io: &Io, ttl: f64) -> Result<(Vec<u8>, f64), Error> {
             "Another sweep took the GC lease first".into(),
         ));
     }
-    Ok((ours, expires))
+    Ok(Held {
+        record: ours,
+        owner,
+        expires,
+        ttl,
+    })
 }
 
 /// Give up a lease this sweep took, if the store still holds it: our
 /// record overwritten with itself expired, never deleted, so a writer
 /// that read the lease before this sweep began can never match it
-/// again. A lease that is no longer ours ran out and another sweep took
-/// it, and must not be cleared.
-async fn release(
-    io: &Io,
-    ours: &[u8],
-    expires: f64,
-    ttl: f64,
-    notes: &mut Notes,
-) -> Result<(), Error> {
-    let overrun = io.wall() - expires;
+/// again. A lease that is no longer ours was released by a writer or
+/// taken by another sweep, and must not be cleared.
+async fn release(io: &Io, held: &Held, notes: &mut Notes) -> Result<(), Error> {
+    let overrun = io.wall() - held.expires;
     if overrun > 0.0 {
-        notes.push(Note::LeaseOverrun { overrun, ttl });
+        notes.push(Note::LeaseOverrun {
+            overrun,
+            ttl: held.ttl,
+        });
     }
-    let owner = safe_loads(ours)
-        .and_then(|r| r.get("owner").cloned())
-        .unwrap_or(Value::Null);
-    let record = Value::Object(vec![
-        ("owner".into(), owner),
-        ("expires".into(), Value::Int(0)),
-    ]);
     let cas = Cas {
-        expect: vec![(GC_LEASE_KEY.to_string(), Some(ours.to_vec()))],
-        writes: vec![(GC_LEASE_KEY.to_string(), Write::Bytes(dumps(&record)))],
+        expect: vec![(GC_LEASE_KEY.to_string(), Some(held.record.clone()))],
+        writes: vec![(
+            GC_LEASE_KEY.to_string(),
+            Write::Bytes(released(&held.record)),
+        )],
         removes: vec![],
     };
     io.cas(cas).await?;
@@ -152,7 +198,14 @@ struct Marks {
 impl Marks {
     /// Mark the content of the trees at `roots`, skipping subtrees
     /// already marked.
-    async fn trees(&mut self, io: &Io, shape: &Shape, roots: Vec<String>) -> Result<(), Error> {
+    async fn trees(
+        &mut self,
+        io: &Io,
+        shape: &Shape,
+        roots: Vec<String>,
+        lease: &mut Held,
+    ) -> Result<(), Error> {
+        lease.keep(io).await?;
         let nodes = &self.nodes;
         let (items, visited) =
             walk_many(io.clone(), shape.clone(), roots, |h| nodes.contains(h)).await?;
@@ -168,7 +221,13 @@ impl Marks {
     /// Mark every commit `tips` reach, then everything their trees hold.
     /// History goes first, a level of it per read, and then every tree
     /// at once, so the trees' shared structure is read once.
-    async fn reached(&mut self, io: &Io, shape: &Shape, tips: Vec<String>) -> Result<(), Error> {
+    async fn reached(
+        &mut self,
+        io: &Io,
+        shape: &Shape,
+        tips: Vec<String>,
+        lease: &mut Held,
+    ) -> Result<(), Error> {
         let mut frontier: Vec<String> = tips
             .into_iter()
             .filter(|c| !self.commits.contains(c))
@@ -177,6 +236,7 @@ impl Marks {
             .collect();
         let mut roots = Vec::new();
         while !frontier.is_empty() {
+            lease.keep(io).await?;
             self.commits.extend(frontier.iter().cloned());
             let keys = frontier
                 .iter()
@@ -196,7 +256,7 @@ impl Marks {
             }
             frontier = next.into_iter().collect();
         }
-        self.trees(io, shape, roots).await
+        self.trees(io, shape, roots, lease).await
     }
 }
 
@@ -207,6 +267,7 @@ async fn sweep(
     shape: Shape,
     min_age: f64,
     deep: bool,
+    lease: &mut Held,
     notes: &mut Notes,
 ) -> Result<u64, Error> {
     let cutoff = io.now().await? - min_age;
@@ -236,7 +297,7 @@ async fn sweep(
             stale.push(key);
         }
     }
-    marks.reached(io, &shape, in_flight).await?;
+    marks.reached(io, &shape, in_flight, lease).await?;
 
     // Every root is a head, tags included: a tag is a head under the
     // reserved `refs/tags/` name. Heads resolve without the caller's
@@ -245,15 +306,17 @@ async fn sweep(
     // young orphans until `min_age` and a repair settle it.
     let mut tips = Vec::new();
     for key in io.scan(BRANCH_HEAD_PREFIX).await? {
+        lease.keep(io).await?;
         let branch = &key[BRANCH_HEAD_PREFIX.len()..];
         if let Some(head) = resolve_head(io, branch, false, None, notes).await? {
             tips.push(head);
         }
     }
-    marks.reached(io, &shape, tips).await?;
+    marks.reached(io, &shape, tips, lease).await?;
 
     // Unreached commits, old enough to go or young enough to keep. One
     // with no time a number can be read from is left alone.
+    lease.keep(io).await?;
     let candidates: Vec<String> = io
         .scan(COMMIT_ROOT_PREFIX)
         .await?
@@ -285,7 +348,7 @@ async fn sweep(
         }
     }
     // Young orphans are kept whole, so what they hold is live too.
-    marks.trees(io, &shape, young).await?;
+    marks.trees(io, &shape, young, lease).await?;
 
     // Everything an orphan alone holds. Content is keyed by what it
     // holds, so an orphan's blob or node may be one a live commit uses;
@@ -298,6 +361,7 @@ async fn sweep(
         .filter_map(|(_, r)| r.clone())
         .filter(|r| r != EMPTY_HASH.as_str())
         .collect();
+    lease.keep(io).await?;
     let content = match orphan_content(io, &shape, roots.clone(), &marks).await {
         Ok(content) => content,
         Err(Error::Host) => return Err(Error::Host),
@@ -325,6 +389,7 @@ async fn sweep(
     }
 
     if deep {
+        lease.keep(io).await?;
         // What no orphan's tree points at: a crash's leftovers, an
         // interrupted write, a damaged orphan's content.
         for key in io.scan(&shape.prefix).await? {
@@ -347,12 +412,17 @@ async fn sweep(
     }
 
     if !removals.is_empty() {
+        // Only under the lease as last renewed: a writer that released
+        // a lapsed lease may have written what these removals would take.
+        lease.keep(io).await?;
         let cas = Cas {
-            expect: vec![],
+            expect: vec![(GC_LEASE_KEY.to_string(), Some(lease.record.clone()))],
             writes: vec![],
             removes: removals.into_iter().collect(),
         };
-        io.cas(cas).await?;
+        if !io.cas(cas).await? {
+            return Err(lost());
+        }
     }
     Ok(orphans.len() as u64)
 }

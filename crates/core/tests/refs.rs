@@ -421,3 +421,113 @@ fn no_lease_costs_one_read() {
     assert_eq!(lease, Ok(None));
     assert_eq!(reads, 1);
 }
+
+/// A store with `main` at A, and B an orphan child of A: what a sweep
+/// at `min_age` 0 removes is B's records.
+fn with_an_orphan() -> Store {
+    let mut store = Store::new();
+    store.put(STORAGE_VERSION_KEY.into(), &Value::Int(4));
+    store.commit(A, &[], T0);
+    store.commit(B, &[A], T0 + 1.0);
+    store.head("main", A);
+    store.clock = T0 + 100.0;
+    store
+}
+
+fn sweep(ttl: f64) -> Op {
+    call(
+        "gc",
+        &[
+            ("min_age", Value::Int(0)),
+            ("deep", Value::Bool(false)),
+            ("wait", Value::Bool(true)),
+            ("lease_ttl", Value::Float(ttl)),
+        ],
+    )
+}
+
+fn lease_expires(raw: &[u8]) -> f64 {
+    kvgit_core::lease::lease_expiry(Some(raw))
+}
+
+#[test]
+fn a_sweep_renews_its_lease_while_it_runs() {
+    // Each read takes 1.5 s of a 10 s lease: unrenewed, it would lapse
+    // midway; renewed, it never does, and the sweep finishes.
+    let mut store = with_an_orphan();
+    let mut renewals = 0;
+    let mut lapsed = false;
+    let result = store.run(sweep(10.0), |store, r| {
+        if let Some(raw) = store.data.get(GC_LEASE_KEY) {
+            let expires = lease_expires(raw);
+            lapsed |= expires > 0.0 && expires <= store.clock;
+        }
+        match r {
+            Request::Get(_) | Request::Scan(_) => store.clock += 1.5,
+            // A renewal: our record, expected and rewritten.
+            Request::Cas(cas)
+                if cas.removes.is_empty()
+                    && cas.writes.len() == 1
+                    && cas.expect.len() == 1
+                    && cas.expect[0].1.is_some() =>
+            {
+                renewals += 1;
+            }
+            _ => {}
+        }
+    });
+    assert_eq!(result, Ok(Value::Int(1)));
+    assert!(!lapsed, "the lease lapsed while the sweep ran");
+    assert!(renewals > 1, "the lease was renewed {renewals} times");
+    assert!(!store.data.contains_key(&commit_root(B)));
+    assert_eq!(lease_expires(&store.data[GC_LEASE_KEY]), 0.0);
+}
+
+#[test]
+fn a_sweep_whose_lapsed_lease_a_writer_released_removes_nothing() {
+    // The sweep stalls past its lease before removing; a writer waiting
+    // on it finds the lease lapsed, releases it and writes. The sweep's
+    // removal expects the record it held, so nothing goes.
+    let mut store = with_an_orphan();
+    let mut stalled = false;
+    let result = store.run(sweep(10.0), |store, r| {
+        let removing = matches!(r, Request::Cas(cas) if !cas.removes.is_empty());
+        let scanning_commits = matches!(r, Request::Scan(prefix) if prefix == "__commit_root__");
+        if scanning_commits && !stalled {
+            stalled = true;
+            store.clock += 60.0;
+            let machine = Machine::new(|io| async move { wait_for_gc(&io, None).await });
+            let lease = drive(store, machine, |_, _| {}).unwrap();
+            assert_eq!(lease.map(|raw| lease_expires(&raw)), Some(0.0));
+        }
+        assert!(!removing, "a sweep without its lease tried to remove");
+    });
+    assert!(stalled);
+    assert!(matches!(result, Err(Error::GcBusy(_))), "{result:?}");
+    assert!(store.data.contains_key(&commit_root(B)));
+}
+
+#[test]
+fn a_writer_waits_out_a_live_lease_and_releases_a_lapsed_one() {
+    let mut store = Store::new();
+    let held = dumps(
+        &Value::Object(vec![
+            ("owner".into(), s("someone")),
+            ("expires".into(), Value::Float(T0 + 5.0)),
+        ]),
+        false,
+    );
+    store.data.insert(GC_LEASE_KEY.into(), held.into_bytes());
+    let mut waited = 0.0;
+    let machine = Machine::new(|io| async move { wait_for_gc(&io, None).await });
+    let lease = drive(&mut store, machine, |_, r| {
+        if let Request::Wait(seconds) = r {
+            waited += seconds;
+        }
+    })
+    .unwrap();
+    assert!((waited - 5.0).abs() < 0.1, "waited {waited}s");
+    let released = br#"{"owner":"someone","expires":0}"#.to_vec();
+    assert_eq!(lease, Some(released.clone()));
+    assert_eq!(store.data[GC_LEASE_KEY], released);
+}

@@ -38,8 +38,8 @@ _NOTES = {
     "recoverer_missed": "Branch '%s': recoverer returned %r, which is not a commit "
     "in this store; treating the branch as unrecoverable",
     "healed": "Branch '%s': corrupt HEAD replaced with recovered commit",
-    "lease_overrun": "a sweep ran %.1fs past its %.1fs GC lease; writers were "
-    "free to write during that window. Raise lease_ttl.",
+    "lease_overrun": "a sweep ran %.1fs past its %.1fs GC lease between "
+    "renewals. Raise lease_ttl.",
 }
 
 # The logger each note goes to, where it isn't "kvgit".

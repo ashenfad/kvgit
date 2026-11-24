@@ -457,7 +457,7 @@ except kvgit.GcBusy:
 repo.gc(deep=True)
 ```
 
-`lease_ttl` (default 600 seconds) bounds the damage from a sweep that crashes holding the lease: writers wait out its remaining term and no longer. Raise it above the longest sweep this store has taken -- an overrun is not extended silently, it logs a warning and leaves writers free during the overrun.
+`lease_ttl` (default 60 seconds) bounds the damage from a sweep that crashes holding the lease: writers wait out its remaining term and no longer. A running sweep renews its lease as it goes, and one that stalls past it, so that a waiting writer released it, removes nothing and raises `GcBusy`.
 
 A writer that bypasses kvgit is still exposed -- a process editing the backend directly. Older kvgit is locked out of a v4 store by its version stamp.
 
