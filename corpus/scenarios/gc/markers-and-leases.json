@@ -1,5 +1,5 @@
 {
-  "description": "An in-flight marker keeps an unpublished commit alive until it expires; a live lease makes a sweep that won't wait raise GcBusy, a sweep or a commit that will wait does so until it expires, and an expired one is taken over; a deep sweep reclaims content no commit references, which an ordinary sweep leaves.",
+  "description": "An in-flight marker keeps an unpublished commit alive until it expires; a live lease makes a sweep that won't wait raise GcBusy, a sweep or a commit that will wait does so until it expires, an expired one is taken over, and a commit that finds one lapsed but never released releases it before writing; a deep sweep reclaims content no commit references, which an ordinary sweep leaves.",
   "clock": 1700001100.25,
   "steps": [
     { "op": "open", "as": "r" },
@@ -37,7 +37,7 @@
     "__commit_time__55c8668cfc38785f195092f8dbd4bb5b9f3cd791": "1700003000.25",
     "__commit_time__821bf06b4dcb406ea508a4a992eadc22f29850cd": "1700003000.25",
     "__commit_time__f8e46711ba37cc27401864bcf56c71685551619a": "1700003030.25",
-    "__gc_lease__": "{\"expires\":1700003030.25,\"owner\":\"someone\"}",
+    "__gc_lease__": "{\"owner\":\"someone\",\"expires\":0}",
     "__kvgit_version__": "4",
     "__parent_commit__55c8668cfc38785f195092f8dbd4bb5b9f3cd791": "[\"821bf06b4dcb406ea508a4a992eadc22f29850cd\"]",
     "__parent_commit__821bf06b4dcb406ea508a4a992eadc22f29850cd": "[]",

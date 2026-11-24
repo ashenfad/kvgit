@@ -8,6 +8,14 @@
 //! expects the record its writer read after waiting any live lease out.
 //! So no such write lands while a sweep runs, and one that lands before
 //! carries what protects it: a commit's batch, its in-flight marker.
+//!
+//! A sweep renews its record while it runs, so a live sweep's lease
+//! never lapses and the TTL only bounds what a dead one costs. A writer
+//! that finds a record lapsed but never released (its sweep died, or
+//! stalled past it) marks it released before writing. That changes the
+//! record a stalled sweep holds, so its next renewal and its removals,
+//! which expect that record, fail: it can't remove what was decided
+//! before writes it never saw.
 
 use crate::json::Value;
 use crate::layout::{GC_LEASE_KEY, STORAGE_VERSION_KEY};
@@ -36,11 +44,26 @@ pub fn lease_expiry(raw: Option<&[u8]>) -> f64 {
     }
 }
 
+/// The record a lease is given up as: its owner's, expired at 0. A
+/// released record is never deleted, so a write that expects the record
+/// a sweep held can never match again.
+pub fn released(raw: &[u8]) -> Vec<u8> {
+    let owner = safe_loads(raw)
+        .and_then(|r| r.get("owner").cloned())
+        .unwrap_or(Value::Null);
+    dumps(&Value::Object(vec![
+        ("owner".into(), owner),
+        ("expires".into(), Value::Int(0)),
+    ]))
+}
+
 /// Wait until no live lease is held, and return the lease record then:
 /// what a write that must not land under a sweep expects the key to
 /// hold. `raw` is the record if the caller has just read it; otherwise
 /// this reads it. While a lease is live this polls, sleeping at most
-/// until that lease's own expiry.
+/// until that lease's own expiry. A lease that lapsed without being
+/// released is released here first, fencing off the sweep that held
+/// it, and the released record is returned.
 pub async fn wait_for_gc(
     io: &Io,
     raw: Option<Option<Vec<u8>>>,
@@ -49,12 +72,25 @@ pub async fn wait_for_gc(
         Some(raw) => raw,
         None => io.get_one(GC_LEASE_KEY).await?,
     };
-    while raw.is_some() {
-        let remaining = lease_expiry(raw.as_deref()) - io.wall();
-        if remaining <= 0.0 {
+    while let Some(record) = &raw {
+        let expiry = lease_expiry(Some(record));
+        let remaining = expiry - io.wall();
+        if remaining > 0.0 {
+            io.wait(remaining.min(GC_WAIT_POLL)).await?;
+        } else if expiry > 0.0 {
+            // Lapsed, never released: release it, or read what beat us.
+            let ours = released(record);
+            let cas = Cas {
+                expect: vec![(GC_LEASE_KEY.to_string(), raw.clone())],
+                writes: vec![(GC_LEASE_KEY.to_string(), Write::Bytes(ours.clone()))],
+                removes: vec![],
+            };
+            if io.cas(cas).await? {
+                return Ok(Some(ours));
+            }
+        } else {
             return Ok(raw);
         }
-        io.wait(remaining.min(GC_WAIT_POLL)).await?;
         raw = io.get_one(GC_LEASE_KEY).await?;
     }
     Ok(None)

@@ -236,10 +236,17 @@ only they held: records, blobs and HAMT nodes.
 - Lease and marker expiries are always wall-clock time: they coordinate
   writers in different handles and processes. A `now` option pins only
   commit and tag times and the `minAge` cutoff.
-- The lease expires (`leaseTtl`, in seconds, default ten minutes), so
+- The lease expires (`leaseTtl`, in seconds, default a minute), so
   a sweep that dies holding it delays writers by the rest of its term
-  and no longer. A second sweep, deep or not, waits for the first, or
-  with `wait: false` throws `GcBusy`.
+  and no longer. A running sweep renews it once less than half is
+  left. A writer that finds a lease lapsed but never released releases
+  it before writing, and a sweep that stalled past its lease then
+  removes nothing and throws `GcBusy`. A second sweep, deep or not,
+  waits for the first, or with `wait: false` throws `GcBusy`.
+- `watchGcWaits(store, listener)` tells a caller when writes to a
+  store are held up by a sweep: `listener(true)` when the first
+  operation starts waiting, `listener(false)` when none is waiting
+  any more. It returns the function that stops watching.
 
 `deep` also scans the `kvgit:keyset:`, `kvgit:chunk:` and `kvgit:blob:`
 namespaces for
